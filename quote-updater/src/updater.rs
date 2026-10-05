@@ -20,8 +20,9 @@ use crate::{
 pub struct Updater;
 
 impl Updater {
-    /// Starts assembling an updater: the built-in pricing models are always there;
-    /// register more on the builder, then run it.
+    /// Starts assembling an updater. Nothing is registered yet, the three pricing kinds
+    /// this crate ships (`pricers::{Fixed, Feed, Volatile}`) included: register the kinds
+    /// the config may name on the builder, then run it.
     pub fn builder() -> UpdaterBuilder {
         UpdaterBuilder {
             parts: Parts::default(),
@@ -42,7 +43,7 @@ pub(crate) struct Parts {
     pub(crate) shutdown: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
     /// Where updater keys are read from; `None` is the process environment.
     pub(crate) key_lookup: Option<crate::config::KeyLookup>,
-    /// The pricing kinds this binary registered, beside the built-ins.
+    /// The pricing kinds this binary registered.
     pub(crate) kinds: crate::kinds::Kinds,
     /// The channel an [`UpdaterHandle`] reloads through, when the run was `start`ed.
     pub(crate) control: Option<Control>,
@@ -56,8 +57,8 @@ pub(crate) struct Parts {
 }
 
 impl Parts {
-    /// What the binary got wrong registering, all of it: a kind twice or under a
-    /// built-in's name, two observers under one name. One check for `run` and
+    /// What the binary got wrong registering, all of it: a kind twice, a guard under the
+    /// deviation breaker's name, two observers under one name. One check for `run` and
     /// `run_from_env`, so both refuse the same things before reading anything.
     pub(crate) fn registration_errors(&self) -> eyre::Result<()> {
         self.kinds.errors()?;
@@ -122,8 +123,9 @@ impl UpdaterBuilder {
     }
 
     /// Registers a pricing kind: a pair whose `[pairs.pricing]` stanza says `kind = "<kind>"`
-    /// is priced by what `factory` builds from the rest of that stanza. Registering a name
-    /// twice, or a built-in's (`fixed`, `feed`, `volatile`), is the binary's bug: `run`
+    /// is priced by what `factory` builds from the rest of that stanza. The kinds this crate
+    /// ships are registered the same way (`pricers::{Fixed, Feed, Volatile}`), under
+    /// whatever names the binary picks. Registering a name twice is the binary's bug: `run`
     /// refuses it before reading any config, and `run_from_env` before parsing the command
     /// line, so it shows on every invocation, `--help` included.
     pub fn pricer<F: crate::pricing::Factory>(mut self, kind: &'static str, factory: F) -> Self {
@@ -155,7 +157,8 @@ impl UpdaterBuilder {
     /// Registers a market guard kind: a pair whose `[[pairs.guards]]` stanza says
     /// `kind = "<kind>"` runs, in its composite task, what `factory` builds from the rest of
     /// that stanza. Market and quote guards share one namespace, and `deviation` is the
-    /// built-in's; registering a name twice is the binary's bug, refused as a pricer's is.
+    /// breaker's, configured by its own keys; registering a name twice is the binary's bug,
+    /// refused as a pricer's is.
     /// A pair that streams no price has no composite to judge, so a file giving it a market
     /// guard is refused, as one giving it a breaker is.
     pub fn market_guard<F: crate::pricing::MarketGuardFactory>(
@@ -665,7 +668,7 @@ mod tests {
     fn raw_pair(key_env: &str, symbol: Option<&str>) -> RawPair {
         let symbol = symbol.map_or(String::new(), |s| format!("symbol = \"{s}\"\n"));
         toml::from_str(&format!(
-            "tokens = [\"0x01\", \"0x02\"]\nkey_env = \"{key_env}\"\n{symbol}"
+            "tokens = [\"0x01\", \"0x02\"]\nkey_env = \"{key_env}\"\npricing = {{ kind = \"feed\" }}\n{symbol}"
         ))
         .unwrap()
     }

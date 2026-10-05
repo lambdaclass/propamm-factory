@@ -138,6 +138,14 @@ tokens  = ["0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
            "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"]
 symbol  = "ETHUSDC"
 key_env = "UPDATER_KEY_WETH_USDC"
+# How this pair turns its market into the [delta, mid] it publishes. Every pair names a
+# pricing kind, and the binary decides which kinds exist by registering them (README,
+# "What you can plug in"); the three this crate ships are `feed`, `fixed` and `volatile`, and a
+# binary may register its own beside them. `feed` publishes the streamed mid with the
+# book's own half-spread, or with `delta` as the half-spread:
+# pricing = { kind = "feed", delta = "0.0005" }. Any key the kind takes goes in the same
+# table, and only that kind reads and checks it.
+pricing = { kind = "feed" }
 # The band this pair's published mid must fall inside. Nothing else catches a corrupt book,
 # and one would otherwise put an arbitrary price on chain that the next fill prices against.
 # A mid outside the band is refused: the RPC service skips the push, and Titan mode
@@ -180,10 +188,11 @@ max_deviation_window_blocks = "1000"
 
 # The same pair priced as a volatile one: instead of copying Binance's spread or sending a
 # fixed `delta`, we recompute the spread every block from how much the price has been moving
-# and how much of the vault's value is in WETH (see README, "Volatile pairs"). `gamma`, `k`
+# and how much of the vault's value is in WETH (see docs/manual.md, "Volatile pairs"). `gamma`, `k`
 # and `kappa` come as a set; the four below them have defaults. All seven are editable from
 # the backoffice, which is where γ, k and κ get tuned: they are guesses, nothing measures
-# them.
+# them. A kind's keys live in its `[pairs.pricing]` table, which in TOML comes after the
+# pair's own keys.
 #
 # [[pairs]]
 # tokens  = ["0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
@@ -193,6 +202,8 @@ max_deviation_window_blocks = "1000"
 # min_mid = "0.0001"
 # max_mid = "0.001"
 # max_deviation = "0.02"
+# [pairs.pricing]
+# kind = "volatile"
 # # γ. Bigger charges more for holding WETH while it can drop, and skews harder.
 # gamma = "0.1"
 # # k. Bigger means people leave faster when we charge more, so we charge less. Pick it from
@@ -210,7 +221,7 @@ max_deviation_window_blocks = "1000"
 # # fill_delay_secs = "6"
 # # Seconds of Binance prices σ is computed from, 60 to 3600. Default 600.
 # # volatility_window_secs = "600"
-# # Inventory charge (see README, "The inventory charge"). λ: once the WETH share leaves the
+# # Inventory charge (see docs/manual.md, "Volatile pairs"). λ: once the WETH share leaves the
 # # band below, the trade that pushes it further off gets λ·σ·√τ·(distance past the edge)
 # # worse; the trade that brings it back is priced as if the charge were off. 0 (default) is
 # # off, so pricing is unchanged. It has its own coefficient because one γ cannot drive both
@@ -236,6 +247,7 @@ tokens  = ["0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599",
            "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"]
 symbol  = "BTCUSDC"
 key_env = "UPDATER_KEY_WBTC_USDC"
+pricing = { kind = "feed" }
 
 [[pairs]]
 # USDC, USDT.
@@ -243,6 +255,7 @@ tokens  = ["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
            "0xdAC17F958D2ee523a2206206994597C13D831ec7"]
 symbol  = "USDCUSDT"
 key_env = "UPDATER_KEY_USDC_USDT"
+pricing = { kind = "feed" }
 # Why the threshold is per pair and not one setting for the run: on a stablecoin, the 2%
 # above is a depeg the breaker exists to catch, while on ETHUSDC it is an ordinary hour.
 # A single process-wide number would have to be loose enough for the loosest pair.
@@ -265,8 +278,8 @@ max_deviation = "0.002"
 # a source that goes quiet drops out and its weight is spread over the rest, and the pair
 # stops publishing (its quote is withdrawn, like a stalled feed) when fewer than
 # `min_sources` are fresh. Weights are relative: 2 and 1 mean the same as 0.667 and 0.333;
-# blank is 1. `min_sources` defaults to 1. A pair with more than one source needs a `delta`
-# or the volatile knobs: there is no single book whose spread it could copy.
+# blank is 1. `min_sources` defaults to 1. A `feed` pair with more than one source needs a
+# `delta`: there is no single book whose spread it could copy.
 #
 # The startup symbol cross-check runs per source, spelled the way each venue spells its
 # markets. A USDC or USDT pair may read the base's USDC, USDT or USD market at any venue
@@ -276,22 +289,21 @@ max_deviation = "0.002"
 # tokens  = ["0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
 #            "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"]
 # key_env = "UPDATER_KEY_WETH_USDC"
-# delta   = "0.0005"
+# pricing = { kind = "feed", delta = "0.0005" }
 # min_sources = "1"
 # sources = [
 #   { venue = "binance", symbol = "ETHUSDC", weight = "2" },
 #   { venue = "binance", symbol = "ETHUSDT", weight = "1" },
 # ]
 
-# A pair priced by a pricing kind a binary registered (README, "Building your own quote
-# updater"). A stanza naming a kind its binary did not register is refused at startup, so
-# a binary that registers none refuses every stanza. The `[pairs.pricing]` table names the
-# kind and holds its settings, which only that kind reads and checks. `symbol` (or
-# `sources`) is still the pair's market, and the freshness gate, the band and the core's
-# bounds on what any pricer publishes still apply; the built-in pricing keys (`mid`,
-# `delta`, `gamma`, ...) are refused beside a stanza, since the kind computes the whole
-# [delta, mid]. A secret goes in as `{ env = "NAME" }`, never as the value itself: with
-# recording on, the config is written to Postgres.
+# A pair priced by a pricing kind a binary registered (docs/building-your-own.md),
+# the same way `feed`, `fixed` and `volatile` are. A stanza naming a kind its
+# binary did not register is refused at startup, so a binary that registers none refuses
+# every pair. The `[pairs.pricing]` table names the kind and holds its settings, which only
+# that kind reads and checks. `symbol` (or `sources`) is still the pair's market, and the
+# freshness gate, the band and the core's bounds on what any pricer publishes still apply.
+# A secret goes in as `{ env = "NAME" }`, never as the value itself: with recording on, the
+# config is written to Postgres.
 #
 # [[pairs]]
 # tokens  = ["0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
@@ -319,15 +331,14 @@ max_deviation = "0.002"
 # kind       = "dispersion"
 # max_spread = "0.003"
 
-# Instead of `symbol`, a pair can publish a fixed price with `mid` and `delta` as decimal
-# strings in whole-token units. Used by the end-to-end make targets so their assertions do
-# not depend on a live Binance book:
+# Instead of `symbol`, a pair can publish a fixed price: the `fixed` kind, with `mid` and
+# `delta` as decimal strings in whole-token units. Used by the end-to-end make targets so
+# their assertions do not depend on a live Binance book:
 #
 # [[pairs]]
 # tokens  = ["0xA0b8…", "0xdAC1…"]
-# mid     = "0.9998"
-# delta   = "0.0005"
 # key_env = "UPDATER_KEY_USDC_USDT"
+# pricing = { kind = "fixed", mid = "0.9998", delta = "0.0005" }
 #
 # `mid` is in the SAME market orientation as `tokens` — the price of one whole `tokens[0]`
 # in `tokens[1]`, the number a human says out loud — exactly like the price a `symbol`

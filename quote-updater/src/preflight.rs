@@ -767,17 +767,10 @@ pub async fn build_report(
             _ => crate::config::lane_label(spec.lane),
         };
         let orientation = if spec.invert { "inverted" } else { "direct" }.to_owned();
-        let stream = match &spec.source {
-            crate::config::SourceSpec::Feed { feeds, .. } => feeds.describe(),
-            crate::config::SourceSpec::Volatile { feeds, .. } => {
-                format!("{} (volatile)", feeds.describe())
-            }
-            crate::config::SourceSpec::Static { .. } => "static".to_owned(),
-            // The market as for a feed pair, and the kind as the volatile row names its model.
-            crate::config::SourceSpec::Custom { kind, feeds, .. } => match feeds {
-                Some(feeds) => format!("{} ({kind})", feeds.describe()),
-                None => kind.clone(),
-            },
+        // The pair's market, if it streams one, and the kind that prices it.
+        let stream = match &spec.feeds {
+            Some(feeds) => format!("{} ({})", feeds.describe(), spec.pricing.kind),
+            None => spec.pricing.kind.clone(),
         };
 
         let mut row = Row {
@@ -841,7 +834,7 @@ pub async fn build_report(
         // publishing BTC's price on the WETH lane is arbitraged within a block. Every source
         // is checked, since one wrong venue in an average is still a wrong price. The
         // decision itself lives in `check_symbol`, tested independently of the chain.
-        if let Some(feeds) = spec.source.feeds() {
+        if let Some(feeds) = &spec.feeds {
             let mut unreadable = false;
             for source in &feeds.sources {
                 match check_symbol(
@@ -959,29 +952,27 @@ pub async fn build_report(
 }
 /// The warning a pair with no `min_mid`/`max_mid` earns, if it earns one. Carried over from
 /// the single-pair CLI's --min-mid/--max-mid note: bounds are optional, so a pair without
-/// them is the default and would otherwise be invisible. A static mid gets none: it cannot
-/// drift, and parse time already proved it sits inside whatever band was declared. A feed
-/// does, and so does a custom pricer with no market, which is bounded by less than a feed
-/// is: the core's backstop compares a mid with the market's, and without one only
+/// them is the default and would otherwise be invisible. A fixed mid gets none: it cannot
+/// drift, and its kind already proved it sits inside whatever band was declared. A pair
+/// with a market does, and so does a kind with no market, which is bounded by less: only
 /// `delta < 1` and a nonzero mid stand between its output and the chain.
 fn band_warning(spec: &crate::config::PairSpec) -> Option<String> {
     if !spec.band.is_unset() {
         return None;
     }
-    match &spec.source {
-        crate::config::SourceSpec::Custom {
-            kind, feeds: None, ..
-        } => Some(format!(
+    match (&spec.feeds, spec.pricing.kind.as_str()) {
+        // A fixed mid cannot drift, and its kind checked it against the band at parse time.
+        (None, "fixed") => None,
+        (None, kind) => Some(format!(
             "no min_mid/max_mid set, and pricing `{kind}` has no market to be checked against, \
              so nothing bounds this pair's published mid but a nonzero value; whatever the \
              pricer computes goes on chain as-is"
         )),
-        source if source.feeds().is_some() => Some(
+        (Some(_), _) => Some(
             "no min_mid/max_mid set, so nothing bounds this pair's published mid; a corrupt \
              feed would go on chain as-is and the first fill would price against it"
                 .to_owned(),
         ),
-        _ => None,
     }
 }
 

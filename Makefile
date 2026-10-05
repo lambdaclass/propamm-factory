@@ -92,9 +92,9 @@ mkdir -p .local; \
   echo 'key_env = "$(PUSHER_KEY_ENV)"'; \
   if [ -n "$(SYMBOL)" ]; then \
     echo 'symbol  = "$(SYMBOL)"'; \
+    echo 'pricing = { kind = "feed" }'; \
   else \
-    echo 'mid     = "$(PRICE)"'; \
-    echo 'delta   = "$(DELTA)"'; \
+    echo 'pricing = { kind = "fixed", mid = "$(PRICE)", delta = "$(DELTA)" }'; \
   fi; \
 } > $(2)
 endef

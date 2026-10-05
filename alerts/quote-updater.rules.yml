@@ -156,9 +156,10 @@ groups:
       # answer is a human rebalancing or widening the pair, not a restart.
       - alert: PusherPoolSeverelyImbalanced
         expr: >-
-          abs(quote_updater_pricing_inventory) > 0.6
+          abs(quote_updater_diagnostic{kind="volatile",name="q"}) > 0.6
             and on (pair)
-          (quote_updater_inventory_base > 0 or quote_updater_inventory_quote > 0)
+          (quote_updater_diagnostic{kind="volatile",name="inventory_base"} > 0
+            or quote_updater_diagnostic{kind="volatile",name="inventory_quote"} > 0)
         for: 0m
         labels: { severity: page }
         annotations:
@@ -166,9 +167,9 @@ groups:
           description: >-
             The pool has passed 80/20 and is close to holding a single asset. The inventory
             tilt cannot correct this on its own past here — the skew is clamped at ±delta so a
-            side never crosses the market mid, and quote_updater_pricing_skew sitting on that
-            cap means further drift changes the quote by nothing. Check
-            quote_updater_inventory_base_share for the direction, then rebalance the vault or
+            side never crosses the market mid, and the volatile kind's `skew` diagnostic
+            sitting on that cap means further drift changes the quote by nothing. Check its
+            `inventory_base_share` diagnostic for the direction, then rebalance the vault or
             widen the pair. PusherPoolImbalanced is suppressed while this fires.
 
       # "A week of ETH left", asked of the ETH itself rather than of a count of updates.
@@ -469,8 +470,8 @@ groups:
       # this file reads the inventory series at all: they arrived with volatile pricing and
       # were alerted on by nothing.
       #
-      # Reads `pricing_inventory` (q), not the raw share, because the updater has already
-      # divided by the pair's own `target_share` (`volatile.rs`). One threshold therefore
+      # Reads the volatile kind's `q` diagnostic, not the raw share, because the kind has
+      # already divided by the pair's own `target_share` (`pricing/volatile.rs`). One threshold therefore
       # means the same thing on a pair meant to hold half its value in base and on one meant
       # to hold a fifth: 0.4 is "40% away from target, relative to target", which at the
       # default `target_share` of 0.5 is a base share outside roughly 30–70%, and a
@@ -490,22 +491,25 @@ groups:
       # q cannot. A genuinely one-sided vault still fires, because the surviving side is
       # `> 0` — which is the case the guard must not swallow.
       #
-      # Silent on stable pairs without a mode clause: `adopt_metrics` writes NaN to all
-      # three of these gauges on any pair whose kind is not `PricingKind::Volatile`, and
-      # both the comparison and the guard are false against NaN.
+      # Silent on pairs priced by any other kind without a mode clause: these are the
+      # volatile kind's declared diagnostics, `quote_updater_diagnostic{kind="volatile"}`,
+      # which a pair priced otherwise never publishes, and a pair whose kind changed gets
+      # NaN written into every series it had, against which both the comparison and the
+      # guard are false.
       - alert: PusherPoolImbalanced
         expr: >-
-          abs(quote_updater_pricing_inventory) > 0.4
+          abs(quote_updater_diagnostic{kind="volatile",name="q"}) > 0.4
             and on (pair)
-          (quote_updater_inventory_base > 0 or quote_updater_inventory_quote > 0)
+          (quote_updater_diagnostic{kind="volatile",name="inventory_base"} > 0
+            or quote_updater_diagnostic{kind="volatile",name="inventory_quote"} > 0)
         for: 15m
         labels: { severity: ticket }
         annotations:
           summary: "{{ $labels.pair }}: vault is {{ $value | humanizePercentage }} off its target share"
           description: >-
             The quote has been tilted to correct this for fifteen minutes and the pool has not
-            come back. Check quote_updater_inventory_base_share for which way it is leaning and
-            quote_updater_pricing_skew for whether the tilt has hit its cap — the skew is
+            come back. Check the volatile kind's `inventory_base_share` diagnostic for which
+            way it is leaning and its `skew` diagnostic for whether the tilt has hit its cap — the skew is
             clamped at ±delta so a side never crosses the market mid, and a skew sitting on
             that cap means the pricing has stopped responding to further drift.
 

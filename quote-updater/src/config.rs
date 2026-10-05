@@ -16,9 +16,8 @@ use url::Url;
 
 use crate::{
     breaker::{BreakerConfig, WindowConfig, percent},
-    feed::{format_scaled, parse_decimal_scaled, reciprocal_scaled},
+    feed::{format_scaled, parse_decimal_scaled},
     venue::VenueId,
-    volatile::{RawKnobs, VolatileParams},
 };
 
 /// Squaring the price scale during inversion must fit a uint256: 10^(2d) < 2^256.
@@ -243,10 +242,6 @@ pub struct RawPair {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_sources: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub mid: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub delta: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub min_mid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_mid: Option<String>,
@@ -271,41 +266,12 @@ pub struct RawPair {
     /// the button. One written by hand beside `halted = true` makes that halt as sticky.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub halt_reason: Option<String>,
-    // Volatile pricing (see `volatile.rs`). Setting any of the first three puts the pair on
-    // the computed spread; the other four then have defaults.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gamma: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub k: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kappa: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub target_share: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hold_secs: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fill_delay_secs: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub volatility_window_secs: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub inventory_aversion: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub inventory_band_lower: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub inventory_band_upper: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub inventory_aversion_hard: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub inventory_band_hard_lower: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub inventory_band_hard_upper: Option<String>,
-    /// A custom pricer's stanza: `kind` names a pricer the binary registered, and the rest
-    /// is that kind's own config. Kept as the table it was written as, so the backoffice's
-    /// round-trip preserves a stanza it cannot interpret, and reload compares it as written.
-    /// Excludes every built-in model's key (mid, delta, gamma, ...). Last, and a table, so
-    /// the serializer writes it after the pair's plain keys.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pricing: Option<toml::Table>,
+    /// The pair's pricing stanza: `kind` names a pricing kind the binary registered
+    /// (`fixed`, `feed`, `volatile`, or its own), and the rest is that kind's own config.
+    /// Kept as the table it was written as, so the backoffice's round-trip preserves a stanza
+    /// it has no form for, and reload compares it as written. A table, so the serializer
+    /// writes it after the pair's plain keys.
+    pub pricing: toml::Table,
     /// The pair's registered guards, `[[pairs.guards]]` stanzas in file order: each names a
     /// `kind` the binary registered and carries that kind's own config. Kept as written for
     /// the same reasons `pricing` is. An array of tables, so last of all.
@@ -452,89 +418,57 @@ impl MidBand {
     }
 }
 
-/// Where a pair's `[delta, mid]` comes from, with orientation already resolved: a
-/// `Static` mid is the value the lane publishes, and a `Feed` is inverted on arrival
-/// using the pair's `invert` (see `quote_from_ticker`). Both are declared in market
-/// orientation; neither carries it any further than this module.
+/// One `[pairs.pricing]` stanza: the registered kind it names, and the stanza as written
+/// (`kind` included), which `kinds::Kinds` deserializes into the kind's own config and a
+/// reload compares as text. Every pair has one; the kinds this crate ships are configured
+/// the same way as a binary's own.
 #[derive(Clone, Debug, PartialEq)]
-pub enum SourceSpec {
-    Feed {
-        feeds: Feeds,
-        /// The half-spread to publish. `None` publishes the book's own
-        /// `(ask - bid) / (ask + bid)`, which is the default and is only allowed for a
-        /// single source: there is one book to copy.
-        delta: Option<U256>,
-    },
-    Static {
-        delta: U256,
-        mid: U256,
-    },
-    /// A feed whose spread is computed every tick from the recent volatility and the
-    /// vault's inventory, and whose mid is shifted by the inventory tilt. See `volatile.rs`.
-    Volatile {
-        feeds: Feeds,
-        params: VolatileParams,
-    },
-    /// A pricer registered by the binary (`Updater::builder().pricer(...)`), named by the
-    /// pair's `[pairs.pricing] kind`. `config` is the stanza as written, `kind` included:
-    /// `kinds::Kinds` deserializes it into the kind's own type, and reload compares it as
-    /// written. `feeds` is the pair's reference market, if it sets `symbol` or `sources`.
-    Custom {
-        kind: String,
-        config: toml::Table,
-        feeds: Option<Feeds>,
-    },
+pub struct PricingSpec {
+    pub kind: String,
+    pub config: toml::Table,
 }
 
-impl SourceSpec {
-    /// The venues this pair streams from, if it streams.
-    pub fn feeds(&self) -> Option<&Feeds> {
-        match self {
-            SourceSpec::Feed { feeds, .. } | SourceSpec::Volatile { feeds, .. } => Some(feeds),
-            SourceSpec::Custom { feeds, .. } => feeds.as_ref(),
-            SourceSpec::Static { .. } => None,
+#[cfg(test)]
+impl PricingSpec {
+    /// A stanza naming `kind` with the given string-valued keys, as a test writes one.
+    pub(crate) fn for_tests(kind: &str, keys: &[(&str, &str)]) -> Self {
+        let mut config = toml::Table::new();
+        config.insert("kind".to_owned(), toml::Value::String(kind.to_owned()));
+        for (key, value) in keys {
+            config.insert((*key).to_owned(), toml::Value::String((*value).to_owned()));
+        }
+        PricingSpec {
+            kind: kind.to_owned(),
+            config,
         }
     }
 
-    /// The half-spread to publish for a feed sample: this pair's own `delta` when it
-    /// states one, otherwise the book's.
-    ///
-    /// Resolved here rather than at each call site so the service path and `--check`
-    /// cannot disagree about what a pair would publish - a `--check` that prints a spread
-    /// the run does not charge is worse than no report at all.
-    ///
-    /// `spread_scale` is one whole unit at the price scale in use. A book-derived spread
-    /// is refused at or above it: PropAMM subtracts the spread as a fraction of the mid,
-    /// so a whole unit leaves the taker nothing and anything beyond reverts
-    /// `SpreadTooWide`. A book that gapes that wide is not one to quote against anyway,
-    /// and refusing routes it through the same unusable-price path a stale feed takes:
-    /// node mode skips the push, builder mode withdraws the live quote, rather than every
-    /// taker reverting. A configured `delta` needs no check here, having been bounded at
-    /// parse time.
-    pub fn published_delta(&self, feed_delta: U256, spread_scale: U256) -> Result<U256> {
-        match self {
-            SourceSpec::Feed {
-                delta: Some(delta), ..
-            } => Ok(*delta),
-            SourceSpec::Feed { delta: None, .. } => {
-                ensure!(
-                    feed_delta < spread_scale,
-                    "the book's half-spread {feed_delta} is not below one whole unit \
-                     ({spread_scale}); refusing to publish a spread that leaves the taker \
-                     nothing"
-                );
-                Ok(feed_delta)
-            }
-            // A static pair publishes the delta it declared, whatever it is handed.
-            SourceSpec::Static { delta, .. } => Ok(*delta),
-            // Needs σ and the vault balance as well as the sample; `VolatilePricer` computes
-            // it, and `--check` prints it from there.
-            SourceSpec::Volatile { .. } => {
-                eyre::bail!("a volatile pair's delta is computed per tick, not taken from the feed")
-            }
-            SourceSpec::Custom { .. } => eyre::bail!("a custom pair's delta comes from its pricer"),
+    pub(crate) fn fixed_for_tests(mid: &str, delta: &str) -> Self {
+        Self::for_tests("fixed", &[("mid", mid), ("delta", delta)])
+    }
+
+    pub(crate) fn feed_for_tests(delta: Option<&str>) -> Self {
+        match delta {
+            Some(delta) => Self::for_tests("feed", &[("delta", delta)]),
+            None => Self::for_tests("feed", &[]),
         }
     }
+}
+
+/// `delta` means the same thing wherever a kind takes one: the half-spread to publish, as a
+/// fraction of the mid. Parsed in one place so every kind bounds it identically: PropAMM
+/// subtracts the spread as a fraction of the mid, so at one whole unit the fill is zero and
+/// beyond it `_quote` reverts `SpreadTooWide`. Rejected here rather than on-chain, where it
+/// would surface as an unrelated revert on every fill the lane takes.
+pub(crate) fn parse_delta(text: &str, price_decimals: u32) -> Result<U256> {
+    let delta = parse_decimal_scaled(text, price_decimals).wrap_err("invalid delta")?;
+    ensure!(
+        delta < spread_scale(price_decimals),
+        "delta {text} is not below 1; the spread is a fraction of the mid, so a whole unit \
+         leaves the taker nothing and more than that reverts on-chain"
+    );
+    crate::ensure_fits_216_bits(delta)?;
+    Ok(delta)
 }
 
 /// One `[[pairs.guards]]` stanza: the registered kind it names, and the stanza as written
@@ -674,64 +608,6 @@ fn parse_feeds(raw: &RawPair, at: &str) -> Result<Option<Feeds>> {
     }))
 }
 
-/// Builds one pair's volatile pricing knobs, or `None` when it declares none.
-///
-/// The three without a default (γ, k, κ) come as a set: a pair with some of them is a pair
-/// whose operator stopped half way, not one that wants the missing ones defaulted to a
-/// guess. The timings default because the chain fixes them, and the target share defaults
-/// to half and half.
-fn parse_volatile(raw: &RawPair, at: &str) -> Result<Option<VolatileParams>> {
-    let required = [("gamma", &raw.gamma), ("k", &raw.k), ("kappa", &raw.kappa)];
-    let optional = [
-        ("target_share", &raw.target_share),
-        ("hold_secs", &raw.hold_secs),
-        ("fill_delay_secs", &raw.fill_delay_secs),
-        ("volatility_window_secs", &raw.volatility_window_secs),
-    ];
-    let set: Vec<&str> = required
-        .iter()
-        .chain(&optional)
-        .filter(|(_, value)| value.is_some())
-        .map(|(name, _)| *name)
-        .collect();
-    if set.is_empty() {
-        return Ok(None);
-    }
-    let missing: Vec<&str> = required
-        .iter()
-        .filter(|(_, value)| value.is_none())
-        .map(|(name, _)| *name)
-        .collect();
-    ensure!(
-        missing.is_empty(),
-        "{at}: volatile pricing needs gamma, k and kappa together; {} set but {} missing",
-        set.join(", "),
-        missing.join(", ")
-    );
-    fn get(value: &Option<String>) -> &str {
-        value.as_deref().expect("checked above")
-    }
-    VolatileParams::parse(
-        at,
-        RawKnobs {
-            gamma: get(&raw.gamma),
-            k: get(&raw.k),
-            kappa: get(&raw.kappa),
-            target_share: raw.target_share.as_deref(),
-            hold_secs: raw.hold_secs.as_deref(),
-            fill_delay_secs: raw.fill_delay_secs.as_deref(),
-            volatility_window_secs: raw.volatility_window_secs.as_deref(),
-            inventory_aversion: raw.inventory_aversion.as_deref(),
-            inventory_band_lower: raw.inventory_band_lower.as_deref(),
-            inventory_band_upper: raw.inventory_band_upper.as_deref(),
-            inventory_aversion_hard: raw.inventory_aversion_hard.as_deref(),
-            inventory_band_hard_lower: raw.inventory_band_hard_lower.as_deref(),
-            inventory_band_hard_upper: raw.inventory_band_hard_upper.as_deref(),
-        },
-    )
-    .map(Some)
-}
-
 /// Parses one threshold fraction, applying every check that makes a threshold trustworthy.
 /// Shared by both thresholds so they cannot drift apart: a guard whose windowed limit was
 /// validated less carefully than its tick limit is a guard with a soft edge.
@@ -791,7 +667,7 @@ fn parse_breaker(
     max_deviation: Option<&str>,
     max_deviation_window: Option<&str>,
     max_deviation_window_blocks: Option<&str>,
-    source: &SourceSpec,
+    streams: bool,
     price_decimals: u32,
     at: &str,
 ) -> Result<Option<BreakerConfig>> {
@@ -804,10 +680,10 @@ fn parse_breaker(
     // A fixed mid is the same number every tick, so no check could ever trip on it.
     // Silently accepting that would leave a pair the operator believes is guarded.
     ensure!(
-        source.feeds().is_some(),
+        streams,
         "{at}: the circuit breaker watches a streamed price for a move, and this pair \
-         publishes a fixed mid, which cannot deviate; drop its breaker keys, or give the \
-         pair a symbol"
+         streams none, so nothing could trip it; drop its breaker keys, or give the pair a \
+         symbol or sources"
     );
 
     let threshold_scaled = max_deviation
@@ -869,7 +745,11 @@ pub struct PairSpec {
     /// True when the declared `[base, quote]` order is the reverse of the sorted order,
     /// so the feed must publish the reciprocal price.
     pub invert: bool,
-    pub source: SourceSpec,
+    /// The kind that prices the pair and its stanza, as written.
+    pub pricing: PricingSpec,
+    /// The pair's reference market: the venues it streams from, or `None` for a pair with
+    /// no `symbol`/`sources`, which only a kind that reads no market can price.
+    pub feeds: Option<Feeds>,
     pub band: MidBand,
     /// Trip/recovery settings for this pair's price circuit breaker; `None` leaves the
     /// pair unguarded, which is the default.
@@ -988,54 +868,25 @@ pub fn parse_config(toml_text: &str, price_decimals: u32) -> Result<Config> {
     parse_config_with(toml_text, price_decimals, false)
 }
 
-/// A `[pairs.pricing]` stanza, as its pair's source. The stanza computes the whole
-/// `[delta, mid]`, so no built-in model's key may stand beside it, and a built-in kind is
-/// configured with its own keys rather than named in one. `symbol`/`sources` stay: they are
-/// the pair's reference market, which the core's freshness gate and backstop judge.
-fn custom_source(raw: &RawPair, stanza: &toml::Table, at: &str) -> Result<SourceSpec> {
+/// The pair's `[pairs.pricing]` stanza, checked for shape: a string `kind`. Whether the kind
+/// is registered, and whether the rest of the stanza is what it expects, is the binary's to
+/// say once `Kinds` sees the file.
+fn parse_pricing(stanza: &toml::Table, at: &str) -> Result<PricingSpec> {
     let kind = match stanza.get("kind") {
-        Some(toml::Value::String(kind)) => kind.clone(),
+        Some(toml::Value::String(kind)) if !kind.trim().is_empty() => kind.clone(),
+        Some(toml::Value::String(_)) => eyre::bail!("{at}: [pairs.pricing] kind is empty"),
         Some(other) => eyre::bail!(
             "{at}: [pairs.pricing] kind must be a string, not {}",
             other.type_str()
         ),
         None => eyre::bail!(
-            "{at}: [pairs.pricing] needs kind = \"...\", the name the binary registered its \
-             pricer under"
+            "{at}: [pairs.pricing] needs kind = \"...\": a pricing kind the binary registered \
+             (fixed, feed, volatile, or its own)"
         ),
     };
-    ensure!(
-        !crate::pricing::BUILT_IN_KINDS.contains(&kind.as_str()),
-        "{at}: pricing kind `{kind}` is built in; configure it with the pair's own keys (mid \
-         and delta, symbol or sources, gamma/k/kappa), not a [pairs.pricing] stanza"
-    );
-    let built_in = [
-        ("mid", raw.mid.is_some()),
-        ("delta", raw.delta.is_some()),
-        ("gamma", raw.gamma.is_some()),
-        ("k", raw.k.is_some()),
-        ("kappa", raw.kappa.is_some()),
-        ("target_share", raw.target_share.is_some()),
-        ("hold_secs", raw.hold_secs.is_some()),
-        ("fill_delay_secs", raw.fill_delay_secs.is_some()),
-        (
-            "volatility_window_secs",
-            raw.volatility_window_secs.is_some(),
-        ),
-        ("inventory_aversion", raw.inventory_aversion.is_some()),
-        ("inventory_band_lower", raw.inventory_band_lower.is_some()),
-        ("inventory_band_upper", raw.inventory_band_upper.is_some()),
-    ];
-    if let Some((key, _)) = built_in.iter().find(|(_, set)| *set) {
-        eyre::bail!(
-            "{at}: set [pairs.pricing] or {key}, not both: a custom pricer computes the whole \
-             [delta, mid]"
-        );
-    }
-    Ok(SourceSpec::Custom {
+    Ok(PricingSpec {
         kind,
         config: stanza.clone(),
-        feeds: parse_feeds(raw, at)?,
     })
 }
 
@@ -1047,7 +898,40 @@ pub fn parse_config_with(
     price_decimals: u32,
     allow_no_pairs: bool,
 ) -> Result<Config> {
-    let raw: RawConfig = toml::from_str(toml_text).wrap_err("could not parse TOML")?;
+    let raw: RawConfig = toml::from_str(toml_text).map_err(|err| {
+        // The pricing keys that used to sit on the pair itself now live in its
+        // `[pairs.pricing]` stanza; say so, since serde's "unknown field" names the key
+        // and nothing else.
+        let text = err.to_string();
+        let moved = [
+            "mid",
+            "delta",
+            "gamma",
+            "k",
+            "kappa",
+            "target_share",
+            "hold_secs",
+            "fill_delay_secs",
+            "volatility_window_secs",
+            "inventory_aversion",
+            "inventory_band_lower",
+            "inventory_band_upper",
+            "inventory_aversion_hard",
+            "inventory_band_hard_lower",
+            "inventory_band_hard_upper",
+        ];
+        let hint = if moved
+            .iter()
+            .any(|key| text.contains(&format!("unknown field `{key}`")))
+        {
+            "; a pair's pricing goes in its [pairs.pricing] stanza: kind = \"fixed\" with \
+             mid and delta, kind = \"feed\" with an optional delta, or kind = \"volatile\" \
+             with gamma, k, kappa and the rest"
+        } else {
+            ""
+        };
+        eyre!("could not parse TOML: {text}{hint}")
+    })?;
     ensure!(
         allow_no_pairs || !raw.pairs.is_empty(),
         "no pairs configured; at least one is required"
@@ -1062,10 +946,6 @@ pub fn parse_config_with(
         !target.is_zero(),
         "target is the zero address; set `target` to the PropAMM these lanes belong to"
     );
-
-    // One whole unit at this scale. `delta` is a fraction of the mid, and this is the
-    // 100% mark PropAMM's own `SPREAD_SCALE` measures it against.
-    let spread_scale = spread_scale(price_decimals);
 
     let mut pairs = Vec::with_capacity(raw.pairs.len());
     let mut halted = Vec::new();
@@ -1132,107 +1012,8 @@ pub fn parse_config_with(
             raw_pair.key_env
         );
 
-        // `delta` means the same thing wherever it appears: the half-spread to publish,
-        // as a fraction of the mid. Parsed in one place so a feed's and a static pair's
-        // are bounded identically.
-        let parse_delta = |text: &str| -> Result<U256> {
-            let delta = parse_decimal_scaled(text, price_decimals)
-                .wrap_err_with(|| format!("{at}: invalid delta"))?;
-            // PropAMM subtracts the spread as a fraction of the mid, so at one whole unit
-            // the fill is zero and beyond it `_quote` reverts `SpreadTooWide`. Rejected
-            // here rather than on-chain, where it would surface as an unrelated revert on
-            // every fill the lane takes.
-            ensure!(
-                delta < spread_scale,
-                "{at}: delta {text} is not below 1; the spread is a fraction of the mid, \
-                 so a whole unit leaves the taker nothing and more than that reverts \
-                 on-chain"
-            );
-            crate::ensure_fits_216_bits(delta).wrap_err_with(|| at.clone())?;
-            Ok(delta)
-        };
-
-        let source = if let Some(stanza) = &raw_pair.pricing {
-            custom_source(raw_pair, stanza, &at)?
-        } else {
-            let volatile = parse_volatile(raw_pair, &at)?;
-            let feeds = parse_feeds(raw_pair, &at)?;
-            match (feeds, &raw_pair.mid, &raw_pair.delta) {
-                (Some(feeds), None, None) if volatile.is_some() => SourceSpec::Volatile {
-                    feeds,
-                    params: volatile.expect("checked above"),
-                },
-                // The computed spread replaces the declared one; both at once would leave the
-                // operator guessing which the lane charges.
-                _ if volatile.is_some() => eyre::bail!(
-                    "{at}: gamma/k/kappa price a streamed pair, so set symbol and leave mid and \
-                 delta blank"
-                ),
-                // A feed without a delta publishes the book's own half-spread. With several
-                // venues there is no single book to copy, and a made-up average of their
-                // spreads is not a number anyone asked to charge.
-                (Some(feeds), None, None) => {
-                    ensure!(
-                        feeds.sources.len() == 1,
-                        "{at}: a pair with more than one source needs a delta (or gamma/k/kappa); \
-                     only a single source can copy its venue's spread"
-                    );
-                    SourceSpec::Feed { feeds, delta: None }
-                }
-                // With one, that delta is published instead. The book's half-spread is what a
-                // venue charges a taker it can quote away from in milliseconds; a published
-                // quote cannot be pulled that way, since it stands for the whole block and the
-                // maker wears every move that happens inside it.
-                (Some(feeds), None, Some(delta_text)) => SourceSpec::Feed {
-                    feeds,
-                    delta: Some(parse_delta(delta_text)?),
-                },
-                (None, Some(mid_text), Some(delta_text)) => {
-                    let declared_mid = parse_decimal_scaled(mid_text, price_decimals)
-                        .wrap_err_with(|| format!("{at}: invalid mid"))?;
-                    ensure!(
-                        !declared_mid.is_zero(),
-                        "{at}: mid must be nonzero; PropAMM rejects a zero mid"
-                    );
-                    // A static `mid` is declared in the same market orientation as `tokens`,
-                    // so an inverted lane publishes its reciprocal — byte-for-byte the rule a
-                    // feed follows in `quote_from_ticker`. Without this, `symbol` and `mid` would
-                    // mean different things behind the same `tokens` array: the one setting that is
-                    // deliberately derived rather than stated would be back, only silent, because
-                    // nothing downstream can tell a market-oriented mid from a lane-oriented one.
-                    let mid = if invert {
-                        // Cannot fail: `price_decimals <= MAX_INVERTED_PRICE_DECIMALS` was
-                        // enforced above for this pair, and the mid is nonzero.
-                        reciprocal_scaled(declared_mid, price_decimals).ok_or_else(|| {
-                        eyre!("{at}: mid {declared_mid} has no reciprocal at {price_decimals} decimals")
-                    })?
-                    } else {
-                        declared_mid
-                    };
-                    // Truncation, not overflow: inverting a mid far above the scale floors to
-                    // zero, and PropAMM rejects a zero mid. Reported against the number the
-                    // operator actually wrote, not against the inverted zero.
-                    ensure!(
-                        !mid.is_zero(),
-                        "{at}: mid {mid_text} inverts to zero at {price_decimals} decimals; this \
-                     lane is {t0:#x} priced in {t1:#x}, so it publishes 1/{mid_text}, which is \
-                     too small to represent at this scale",
-                        t0 = tokens.0,
-                        t1 = tokens.1,
-                    );
-                    // Not inverted, and that is not an oversight: `delta` is the half-spread as
-                    // a fraction of the mid, and (ask-bid)/(ask+bid) is invariant under
-                    // inversion — the 1/(bid·ask) factors cancel. Same reason `quote_from_ticker`
-                    // computes it from the original sides in both orientations.
-                    let delta = parse_delta(delta_text)?;
-                    SourceSpec::Static { delta, mid }
-                }
-                _ => eyre::bail!(
-                    "{at}: set exactly one price source: either symbol or sources, on their own \
-                 or with a delta, or both mid and delta"
-                ),
-            }
-        };
+        let pricing = parse_pricing(&raw_pair.pricing, &at)?;
+        let feeds = parse_feeds(raw_pair, &at)?;
 
         // Bounds are read in lane orientation, so they need no inversion: they describe the
         // number this lane publishes, which is the one the check below has in hand.
@@ -1254,18 +1035,12 @@ pub fn parse_config_with(
                 "{at}: min_mid {min} is above max_mid {max}, so no mid could ever be published"
             );
         }
-        // A static price is fixed, so a band it already violates can only be a mistake — and
-        // one that would otherwise surface as every push refusing to publish, at run time.
-        if let SourceSpec::Static { mid, .. } = &source {
-            band.check(*mid)
-                .wrap_err_with(|| format!("{at}: the configured mid is outside its own band"))?;
-        }
 
         let breaker = parse_breaker(
             raw_pair.max_deviation.as_deref(),
             raw_pair.max_deviation_window.as_deref(),
             raw_pair.max_deviation_window_blocks.as_deref(),
-            &source,
+            feeds.is_some(),
             price_decimals,
             &at,
         )?;
@@ -1276,7 +1051,8 @@ pub fn parse_config_with(
             tokens,
             lane,
             invert,
-            source,
+            pricing,
+            feeds,
             band,
             breaker,
             guards,
@@ -1331,15 +1107,16 @@ pub struct Pair {
     pub band: MidBand,
 }
 
-/// A [`Pair`] plus what it needs to *start* its price source, which the caller converts
-/// into a live one and then discards. Kept separate so the running pair carries no field
-/// nothing reads: `invert` is consumed by the feed it spawns, and `source` by the
-/// `ValueSource` built from it.
+/// A [`Pair`] plus what it needs to *start* pricing, which the caller converts into a live
+/// lane and then discards. Kept separate so the running pair carries no field nothing
+/// reads: `invert` is consumed by the feed it spawns, and `pricing` by the pricer built
+/// from it.
 #[derive(Clone, Debug)]
 pub struct ResolvedPair {
     pub pair: Pair,
-    pub source: SourceSpec,
-    /// Only the feed path needs this — a static mid was already inverted at parse time.
+    pub pricing: PricingSpec,
+    pub feeds: Option<Feeds>,
+    /// The lane's orientation, which the feed it spawns and every kind's `PairShape` carry.
     pub invert: bool,
     /// The settings a live breaker is built from, which the caller does exactly once.
     ///
@@ -1430,7 +1207,8 @@ pub fn resolve_pairs<F: Fn(&str) -> Option<String>>(
                 label: lane_label(spec.lane),
                 band: spec.band,
             },
-            source: spec.source,
+            pricing: spec.pricing,
+            feeds: spec.feeds,
             invert: spec.invert,
             guards: spec.guards,
             breaker: spec.breaker,
@@ -1598,7 +1376,7 @@ api_key = "k"
     pub(crate) fn guarded(kind: &str) -> String {
         CUSTOM.replace(
             "[pairs.pricing]\nkind = \"skewed\"\nhalf_spread = 0.0005\n",
-            &format!("[[pairs.guards]]\nkind = \"{kind}\"\n"),
+            &format!("pricing = {{ kind = \"feed\" }}\n[[pairs.guards]]\nkind = \"{kind}\"\n"),
         )
     }
 
@@ -1635,16 +1413,19 @@ target = "{TARGET}"
 tokens  = ["{WETH}", "{USDC}"]
 symbol  = "ETHUSDC"
 key_env = "K_WETH_USDC"
+pricing = {{ kind = "feed" }}
 
 [[pairs]]
 tokens  = ["{WBTC}", "{USDC}"]
 symbol  = "BTCUSDC"
 key_env = "K_WBTC_USDC"
+pricing = {{ kind = "feed" }}
 
 [[pairs]]
 tokens  = ["{USDC}", "{USDT}"]
 symbol  = "USDCUSDT"
 key_env = "K_USDC_USDT"
+pricing = {{ kind = "feed" }}
 "#
         )
     }
@@ -1688,99 +1469,6 @@ key_env = "K_USDC_USDT"
         assert_eq!(quote, config.pairs[0].tokens.0); // USDC
     }
 
-    #[test]
-    fn accepts_static_mid_and_delta_instead_of_a_symbol() {
-        let text = format!(
-            r#"
-target = "{TARGET}"
-[[pairs]]
-tokens  = ["{USDC}", "{USDT}"]
-mid     = "0.9998"
-delta   = "0.0005"
-key_env = "K"
-"#
-        );
-        let config = parse_config(&text, 18).unwrap();
-        match &config.pairs[0].source {
-            SourceSpec::Static { delta, mid } => {
-                assert_eq!(*mid, U256::from_dec_str("999800000000000000").unwrap());
-                assert_eq!(*delta, U256::from_dec_str("500000000000000").unwrap());
-            }
-            _ => panic!("expected a static source"),
-        }
-    }
-
-    /// A static price is declared in market orientation, exactly like `symbol`, so an
-    /// inverted lane publishes its reciprocal.
-    ///
-    /// This is the one case where a wrong answer is silent and catastrophic: nothing
-    /// downstream can tell a market-oriented mid from a lane-oriented one, `check_symbol`
-    /// does not run for static pairs, and publishing 4001.98 where 0.000249… belongs is
-    /// wrong by a factor of 1.6e7 on a lane a taker can trade.
-    #[test]
-    fn a_static_mid_on_an_inverted_lane_publishes_the_reciprocal() {
-        // WETH, USDC declared in market order; sorts to USDC/WETH, so the lane carries
-        // USDC priced in WETH and 4001.98 USDC-per-WETH must publish as its reciprocal.
-        let text = format!(
-            r#"
-target = "{TARGET}"
-[[pairs]]
-tokens  = ["{WETH}", "{USDC}"]
-mid     = "4001.98"
-delta   = "0.00025"
-key_env = "K"
-"#
-        );
-        let config = parse_config(&text, 18).unwrap();
-        assert!(config.pairs[0].invert, "WETH/USDC must invert");
-        match &config.pairs[0].source {
-            SourceSpec::Static { delta, mid } => {
-                // Golden: 10^36 / 4001.98e18, the same floor division the feed path takes.
-                assert_eq!(*mid, U256::from_dec_str("249876311225943").unwrap());
-                // Not the declared value — the whole point.
-                assert_ne!(*mid, U256::from_dec_str("4001980000000000000000").unwrap());
-                // Delta is a fraction of the mid, and (ask-bid)/(ask+bid) is invariant
-                // under inversion, so it must pass through untouched.
-                assert_eq!(*delta, U256::from_dec_str("250000000000000").unwrap());
-            }
-            _ => panic!("expected a static source"),
-        }
-
-        // And `--check`'s reciprocal line reads it back as the number the operator wrote,
-        // which is the only reason an inverted lane is auditable by eye at all.
-        let published = match &config.pairs[0].source {
-            SourceSpec::Static { mid, .. } => *mid,
-            _ => unreachable!(),
-        };
-        let back = reciprocal_scaled(published, 18).expect("a nonzero mid inverts back");
-        assert_eq!(
-            crate::feed::format_scaled(back, 18),
-            "4001.980000000002532693",
-            "the reciprocal line must land back on the declared price (two truncations)"
-        );
-
-        // The same declared pair the other way round does not invert, so the identical mid
-        // publishes verbatim. Same numbers, opposite handling — only orientation differs.
-        let flipped = format!(
-            r#"
-target = "{TARGET}"
-[[pairs]]
-tokens  = ["{USDC}", "{WETH}"]
-mid     = "4001.98"
-delta   = "0.00025"
-key_env = "K"
-"#
-        );
-        let config = parse_config(&flipped, 18).unwrap();
-        assert!(!config.pairs[0].invert);
-        match &config.pairs[0].source {
-            SourceSpec::Static { mid, .. } => {
-                assert_eq!(*mid, U256::from_dec_str("4001980000000000000000").unwrap())
-            }
-            _ => panic!("expected a static source"),
-        }
-    }
-
     /// Carried over from the single-pair CLI's `--min-mid`/`--max-mid`, now per pair.
     #[test]
     fn a_mid_band_rejects_values_outside_it() {
@@ -1821,125 +1509,6 @@ key_env = "K"
         assert!(unbounded.is_unset());
     }
 
-    /// Bounds are declared in lane orientation, so an inverted pair's band is compared
-    /// against what the lane publishes — the number `--check`'s mid column prints — not
-    /// against the market-oriented mid the operator wrote.
-    #[test]
-    fn a_bands_bounds_are_read_in_lane_orientation() {
-        let text = format!(
-            r#"
-target = "{TARGET}"
-[[pairs]]
-tokens  = ["{WETH}", "{USDC}"]
-mid     = "4000"
-delta   = "0.0001"
-min_mid = "0.0002"
-max_mid = "0.0003"
-key_env = "K"
-"#
-        );
-        // 4000 market-oriented publishes 0.00025 on the lane, which is inside [0.0002,
-        // 0.0003]. Had the band been compared against 4000 it would have been rejected.
-        let config = parse_config(&text, 18).unwrap();
-        let band = config.pairs[0].band;
-        assert_eq!(band.min, Some(parse_decimal_scaled("0.0002", 18).unwrap()));
-        match &config.pairs[0].source {
-            SourceSpec::Static { mid, .. } => band.check(*mid).expect("0.00025 is inside"),
-            _ => panic!("expected a static source"),
-        }
-    }
-
-    /// The three knobs without defaults switch a streamed pair to the computed spread; the
-    /// timings default to the chain's and the target share to half and half.
-    #[test]
-    fn gamma_k_and_kappa_make_a_volatile_pair() {
-        let text = format!(
-            r#"
-target = "{TARGET}"
-[[pairs]]
-tokens  = ["{WETH}", "{USDC}"]
-symbol  = "ETHUSDC"
-gamma   = "0.1"
-k       = "700"
-kappa   = "1"
-key_env = "K"
-"#
-        );
-        let config = parse_config(&text, 18).unwrap();
-        match &config.pairs[0].source {
-            SourceSpec::Volatile { feeds, params } => {
-                assert_eq!(feeds, &Feeds::single_binance("ETHUSDC"));
-                assert_eq!(params.gamma.get(), 0.1);
-                assert_eq!(params.k.get(), 700.0);
-                assert_eq!(params.kappa.get(), 1.0);
-                assert_eq!(params.target_share.get(), 0.5);
-                assert_eq!(params.hold_secs.get(), 12.0);
-                assert_eq!(params.fill_delay_secs.get(), 6.0);
-                assert_eq!(
-                    params.volatility_window,
-                    std::time::Duration::from_secs(600)
-                );
-            }
-            _ => panic!("expected a volatile source"),
-        }
-        assert_eq!(
-            config.pairs[0].source.feeds(),
-            Some(&Feeds::single_binance("ETHUSDC"))
-        );
-        // A volatile pair streams, so it may carry a breaker like any feed.
-        let text = text.replace(
-            "key_env = \"K\"",
-            "key_env = \"K\"\nmax_deviation = \"0.02\"",
-        );
-        assert!(parse_config(&text, 18).unwrap().pairs[0].breaker.is_some());
-    }
-
-    /// Half a set of knobs is a pair someone stopped configuring, not one that wants the
-    /// rest guessed; and the computed spread cannot sit beside a declared one or a fixed mid.
-    #[test]
-    fn volatile_knobs_come_as_a_set_and_exclude_a_fixed_price() {
-        let base = format!(
-            r#"
-target = "{TARGET}"
-[[pairs]]
-tokens  = ["{WETH}", "{USDC}"]
-key_env = "K"
-"#
-        );
-        let err = |extra: &str| match parse_config(&format!("{base}{extra}"), 18) {
-            Ok(_) => panic!("{extra:?} should have been refused"),
-            Err(err) => err.to_string(),
-        };
-        let partial = err("symbol = \"ETHUSDC\"\ngamma = \"0.1\"\nk = \"700\"");
-        assert!(
-            partial.contains("gamma, k set but kappa missing"),
-            "{partial}"
-        );
-        let timing_only = err("symbol = \"ETHUSDC\"\nhold_secs = \"12\"");
-        assert!(timing_only.contains("hold_secs set but"), "{timing_only}");
-        let full = "gamma = \"0.1\"\nk = \"700\"\nkappa = \"1\"\n";
-        let with_delta = err(&format!("symbol = \"ETHUSDC\"\ndelta = \"0.0005\"\n{full}"));
-        assert!(
-            with_delta.contains("leave mid and delta blank"),
-            "{with_delta}"
-        );
-        let with_mid = err(&format!("mid = \"4000\"\ndelta = \"0.0005\"\n{full}"));
-        assert!(with_mid.contains("leave mid and delta blank"), "{with_mid}");
-        let no_symbol = err(full);
-        assert!(
-            no_symbol.contains("leave mid and delta blank"),
-            "{no_symbol}"
-        );
-        let bad_gamma = err(&format!(
-            "symbol = \"ETHUSDC\"\n{}",
-            full.replace("\"0.1\"", "\"0\"")
-        ));
-        assert!(
-            bad_gamma.contains("gamma must be above zero"),
-            "{bad_gamma}"
-        );
-    }
-
     /// The knobs round-trip through the file the backoffice writes, and a change to one is
     /// a change a reload sees.
     #[test]
@@ -1950,10 +1519,8 @@ target = "{TARGET}"
 [[pairs]]
 tokens  = ["{WETH}", "{USDC}"]
 symbol  = "ETHUSDC"
-gamma   = "0.1"
-k       = "700"
-kappa   = "1"
 key_env = "K"
+pricing = {{ kind = "volatile", gamma = "0.1", k = "700", kappa = "1" }}
 "#
         );
         let raw: RawConfig = toml::from_str(&text).unwrap();
@@ -1968,37 +1535,10 @@ key_env = "K"
             parse_config(&text, 18).unwrap().pairs
         );
 
-        let retuned = text.replace("gamma   = \"0.1\"", "gamma   = \"0.2\"");
+        let retuned = text.replace("gamma = \"0.1\"", "gamma = \"0.2\"");
         assert_ne!(
             parse_config(&retuned, 18).unwrap().pairs,
             parse_config(&text, 18).unwrap().pairs
-        );
-    }
-
-    /// A feed that states no `delta` publishes the book's own half-spread, so stating one
-    /// is opt-in and leaving it out is the behaviour that existed before.
-    #[test]
-    fn a_feed_without_a_delta_publishes_the_book_half_spread() {
-        let text = format!(
-            r#"
-target = "{TARGET}"
-[[pairs]]
-tokens  = ["{USDC}", "{USDT}"]
-symbol  = "USDCUSDT"
-key_env = "K"
-"#
-        );
-        let config = parse_config(&text, 18).unwrap();
-        let source = &config.pairs[0].source;
-        match source {
-            SourceSpec::Feed { delta, .. } => assert!(delta.is_none()),
-            _ => panic!("expected a feed source"),
-        }
-        let book = parse_decimal_scaled("0.000002", 18).unwrap();
-        assert_eq!(
-            source.published_delta(book, spread_scale(18)).unwrap(),
-            book,
-            "an unstated delta must publish the book's own half-spread"
         );
     }
 
@@ -2006,14 +1546,21 @@ key_env = "K"
     /// means what it means everywhere else: the half-spread to publish. Binance's ETHUSDC
     /// half-spread is ~0.02bp, far too tight for a quote that stands for a whole block and
     /// cannot be pulled inside it.
+    /// One WETH/USDC pair with `body` as the rest of its stanza; priced by `feed` unless
+    /// the body prices it itself.
     fn pair_with(body: &str) -> String {
+        let pricing = if body.contains("pricing") {
+            ""
+        } else {
+            "pricing = { kind = \"feed\" }\n"
+        };
         format!(
             r#"
 target = "{TARGET}"
 [[pairs]]
 tokens  = ["{WETH}", "{USDC}"]
 key_env = "K"
-{body}
+{pricing}{body}
 "#
         )
     }
@@ -2022,7 +1569,7 @@ key_env = "K"
     fn sources_parse_with_weights_and_a_minimum() {
         let text = pair_with(
             r#"
-delta = "0.0005"
+pricing = { kind = "feed", delta = "0.0005" }
 min_sources = "2"
 sources = [
   { venue = "binance", symbol = "ETHUSDC", weight = "2" },
@@ -2032,7 +1579,7 @@ sources = [
 "#,
         );
         let config = parse_config(&text, 18).unwrap();
-        let feeds = config.pairs[0].source.feeds().expect("a streamed pair");
+        let feeds = config.pairs[0].feeds.as_ref().expect("a streamed pair");
         assert_eq!(feeds.min_sources, 2);
         let weights: Vec<String> = feeds
             .sources
@@ -2061,7 +1608,7 @@ sources = [
         // Weights aside, the same markets in any order share a history.
         let text2 = pair_with(
             r#"
-delta = "0.0005"
+pricing = { kind = "feed", delta = "0.0005" }
 sources = [
   { venue = "binance", symbol = "ethfdusd" },
   { venue = "binance", symbol = "ETHUSDT", weight = "9" },
@@ -2072,7 +1619,7 @@ sources = [
         let other = parse_config(&text2, 18).unwrap();
         assert_eq!(
             feeds.history_key(),
-            other.pairs[0].source.feeds().unwrap().history_key()
+            other.pairs[0].feeds.as_ref().unwrap().history_key()
         );
     }
 
@@ -2080,7 +1627,7 @@ sources = [
     fn symbol_is_one_binance_source_with_weight_one() {
         let text = pair_with(r#"symbol = "ETHUSDC""#);
         let config = parse_config(&text, 18).unwrap();
-        let feeds = config.pairs[0].source.feeds().unwrap();
+        let feeds = config.pairs[0].feeds.as_ref().unwrap();
         assert_eq!(feeds, &Feeds::single_binance("ETHUSDC"));
         assert_eq!(feeds.describe(), "binance:ETHUSDC");
         assert_eq!(feeds.history_key(), "binance:ETHUSDC");
@@ -2098,36 +1645,46 @@ sources = [{ venue = "binance", symbol = "ETHUSDT" }]
     fn sources_refuse_what_cannot_be_averaged() {
         let cases = [
             (
-                r#"sources = [{ venue = "nasdaq", symbol = "ETH" }]"#,
+                r#"
+pricing = { kind = "feed" }
+sources = [{ venue = "nasdaq", symbol = "ETH" }]"#,
                 "unknown venue",
             ),
             (
-                r#"sources = [{ venue = "binance", symbol = "" }]"#,
+                r#"
+pricing = { kind = "feed" }
+sources = [{ venue = "binance", symbol = "" }]"#,
                 "has no symbol",
             ),
             (
-                r#"sources = [{ venue = "binance", symbol = "ETHUSDC", weight = "0" }]"#,
+                r#"
+pricing = { kind = "feed" }
+sources = [{ venue = "binance", symbol = "ETHUSDC", weight = "0" }]"#,
                 "weight 0 is zero",
             ),
             (
-                r#"sources = [{ venue = "binance", symbol = "ETHUSDC", weight = "-1" }]"#,
+                r#"
+pricing = { kind = "feed" }
+sources = [{ venue = "binance", symbol = "ETHUSDC", weight = "-1" }]"#,
                 "invalid weight",
             ),
             (
-                r#"sources = [{ venue = "binance", symbol = "ETHUSDC", weight = "1000001" }]"#,
+                r#"
+pricing = { kind = "feed" }
+sources = [{ venue = "binance", symbol = "ETHUSDC", weight = "1000001" }]"#,
                 "is above 1000000",
             ),
             (
                 r#"
 sources = [{ venue = "binance", symbol = "ETHUSDC" }, { venue = "binance", symbol = "ethusdc" }]
-delta = "0.0005"
+pricing = { kind = "feed", delta = "0.0005" }
 "#,
                 "repeats binance:ethusdc",
             ),
             (
                 r#"
 sources = [{ venue = "binance", symbol = "ETHUSDC" }, { venue = "binance", symbol = "ETHUSDT" }]
-delta = "0.0005"
+pricing = { kind = "feed", delta = "0.0005" }
 min_sources = "3"
 "#,
                 "min_sources is 3 but there are 2",
@@ -2135,23 +1692,17 @@ min_sources = "3"
             (
                 r#"
 sources = [{ venue = "binance", symbol = "ETHUSDC" }]
-delta = "0.0005"
+pricing = { kind = "feed", delta = "0.0005" }
 min_sources = "0"
 "#,
                 "min_sources is 0",
             ),
             (
                 r#"
-mid = "4000"
-delta = "0.0005"
+pricing = { kind = "fixed", mid = "4000", delta = "0.0005" }
 min_sources = "1"
 "#,
                 "min_sources needs sources",
-            ),
-            // No delta with two venues: there is no single book whose spread to copy.
-            (
-                r#"sources = [{ venue = "binance", symbol = "ETHUSDC" }, { venue = "binance", symbol = "ETHUSDT" }]"#,
-                "needs a delta",
             ),
         ];
         for (body, expected) in cases {
@@ -2164,12 +1715,19 @@ min_sources = "1"
                 "{body}\n  expected {expected:?} in: {err}"
             );
         }
-        // One venue may still copy its own spread, as before.
-        let one = pair_with(r#"sources = [{ venue = "binance", symbol = "ETHUSDC" }]"#);
-        assert!(matches!(
-            parse_config(&one, 18).unwrap().pairs[0].source,
-            SourceSpec::Feed { delta: None, .. }
-        ));
+        // One venue streams as one source; whether its spread may be copied is the feed
+        // kind's rule (pricing/feed.rs), not the file's.
+        let one = pair_with(
+            r#"
+pricing = { kind = "feed" }
+sources = [{ venue = "binance", symbol = "ETHUSDC" }]"#,
+        );
+        let config = parse_config(&one, 18).unwrap();
+        assert_eq!(config.pairs[0].pricing.kind, "feed");
+        assert_eq!(
+            config.pairs[0].feeds.as_ref().map(|f| f.sources.len()),
+            Some(1)
+        );
     }
 
     #[test]
@@ -2189,133 +1747,6 @@ min_sources = "1"
         assert!(text.contains("[endpoints]"), "{text}");
         let back: FileSettings = toml::from_str(&text).unwrap();
         assert_eq!(back, a);
-    }
-
-    #[test]
-    fn a_feed_delta_replaces_the_book_half_spread() {
-        let text = format!(
-            r#"
-target = "{TARGET}"
-[[pairs]]
-tokens  = ["{WETH}", "{USDC}"]
-symbol  = "ETHUSDC"
-delta   = "0.0005"
-key_env = "K"
-"#
-        );
-        let config = parse_config(&text, 18).unwrap();
-        let source = &config.pairs[0].source;
-        match source {
-            SourceSpec::Feed { feeds, delta } => {
-                assert_eq!(feeds, &Feeds::single_binance("ETHUSDC"));
-                // 5bp at 18 decimals.
-                assert_eq!(*delta, Some(U256::from_dec_str("500000000000000").unwrap()));
-            }
-            _ => panic!("expected a feed source"),
-        }
-        // The book's own half-spread is handed in and ignored: 5bp, not 5.02bp.
-        let book = parse_decimal_scaled("0.000002", 18).unwrap();
-        assert_eq!(
-            source.published_delta(book, spread_scale(18)).unwrap(),
-            parse_decimal_scaled("0.0005", 18).unwrap()
-        );
-    }
-
-    /// A stated `delta` is not reoriented for an inverted lane, exactly like a static
-    /// pair's: `(ask - bid) / (ask + bid)` is unchanged by inversion, so a fraction
-    /// standing in for it is too. Being a fraction it also means 5bp on any pair whatever
-    /// that pair trades at.
-    #[test]
-    fn a_feed_delta_is_not_reoriented_on_an_inverted_lane() {
-        let text = format!(
-            r#"
-target = "{TARGET}"
-[[pairs]]
-tokens  = ["{WETH}", "{USDC}"]
-symbol  = "ETHUSDC"
-delta   = "0.0005"
-key_env = "K"
-"#
-        );
-        let config = parse_config(&text, 18).unwrap();
-        assert!(config.pairs[0].invert, "WETH/USDC must invert");
-        match &config.pairs[0].source {
-            SourceSpec::Feed { delta, .. } => {
-                assert_eq!(*delta, Some(U256::from_dec_str("500000000000000").unwrap()))
-            }
-            _ => panic!("expected a feed source"),
-        }
-    }
-
-    /// A book wide enough to reach a whole unit must not be published: PropAMM subtracts
-    /// the spread from the mid fill, so the taker would get nothing, and past that
-    /// `_quote` reverts `SpreadTooWide` for every fill on the lane. Refusing routes it
-    /// through the unusable-price path instead, which withdraws the quote.
-    #[test]
-    fn a_book_half_spread_reaching_one_whole_unit_is_refused() {
-        let text = format!(
-            r#"
-target = "{TARGET}"
-[[pairs]]
-tokens  = ["{USDC}", "{USDT}"]
-symbol  = "USDCUSDT"
-key_env = "K"
-"#
-        );
-        let config = parse_config(&text, 18).unwrap();
-        let source = &config.pairs[0].source;
-        let scale = spread_scale(18);
-        let wide = parse_decimal_scaled("0.8", 18).unwrap();
-        assert_eq!(source.published_delta(wide, scale).unwrap(), wide);
-        assert!(source.published_delta(scale, scale).is_err());
-    }
-
-    /// A stated `delta` is bounded at parse time, so a book that gapes cannot make it
-    /// unusable at runtime: the book's number is discarded rather than compared against.
-    #[test]
-    fn a_stated_delta_ignores_a_gaping_book() {
-        let text = format!(
-            r#"
-target = "{TARGET}"
-[[pairs]]
-tokens  = ["{USDC}", "{USDT}"]
-symbol  = "USDCUSDT"
-delta   = "0.0005"
-key_env = "K"
-"#
-        );
-        let config = parse_config(&text, 18).unwrap();
-        let scale = spread_scale(18);
-        assert_eq!(
-            config.pairs[0]
-                .source
-                .published_delta(scale, scale)
-                .unwrap(),
-            parse_decimal_scaled("0.0005", 18).unwrap()
-        );
-    }
-
-    /// A static pair's `delta` is published exactly as declared, through the same function.
-    #[test]
-    fn a_static_delta_is_published_unchanged() {
-        let text = format!(
-            r#"
-target = "{TARGET}"
-[[pairs]]
-tokens  = ["{USDC}", "{USDT}"]
-mid     = "0.9998"
-delta   = "0.0005"
-key_env = "K"
-"#
-        );
-        let config = parse_config(&text, 18).unwrap();
-        assert_eq!(
-            config.pairs[0]
-                .source
-                .published_delta(U256::zero(), spread_scale(18))
-                .unwrap(),
-            parse_decimal_scaled("0.0005", 18).unwrap()
-        );
     }
 
     /// The shipped template must parse. `RawPair` is `deny_unknown_fields`, so a key
@@ -2350,10 +1781,10 @@ key_env = "K"
         let volatile = config
             .pairs
             .iter()
-            .find(|pair| matches!(pair.source, SourceSpec::Volatile { .. }))
+            .find(|pair| pair.pricing.kind == "volatile")
             .expect("one pair is volatile");
         assert_eq!(
-            volatile.source.feeds(),
+            volatile.feeds.as_ref(),
             Some(&Feeds::single_binance("ETHUSDC"))
         );
         assert!(volatile.breaker.is_some());
@@ -2372,7 +1803,7 @@ key_env = "K"
             .lines()
             .map(|line| format!("{}\n", line.strip_prefix("# ").unwrap_or(line)))
             .collect();
-        let live_start = text.find("\n[[pairs]]\n").unwrap() + 1;
+        let live_start = text.find("\n[[pairs]]\n# WETH, USDC.").unwrap() + 1;
         let live_end = live_start + text[live_start..].find("\n\n").unwrap();
         format!(
             "{}{}{}",
@@ -2395,21 +1826,19 @@ key_env = "K"
             "# A pair priced by a pricing kind a binary registered",
         );
         let config = parse_config(&with_custom, 18).expect("the custom example must parse");
-        let (kind, stanza, feeds) = config
+        let custom = config
             .pairs
             .iter()
-            .find_map(|pair| match &pair.source {
-                SourceSpec::Custom {
-                    kind,
-                    config,
-                    feeds,
-                } => Some((kind, config, feeds)),
-                _ => None,
-            })
+            .find(|pair| pair.pricing.kind == "skewed")
             .expect("one pair is custom");
-        assert_eq!(kind, "skewed");
-        assert_eq!(stanza.get("half_spread"), Some(&toml::Value::Float(0.0005)));
-        assert_eq!(feeds.as_ref(), Some(&Feeds::single_binance("ETHUSDC")));
+        assert_eq!(
+            custom.pricing.config.get("half_spread"),
+            Some(&toml::Value::Float(0.0005))
+        );
+        assert_eq!(
+            custom.feeds.as_ref(),
+            Some(&Feeds::single_binance("ETHUSDC"))
+        );
     }
 
     /// The writer's whole promise: what it renders, the loader reads back identically. A
@@ -2432,18 +1861,17 @@ disable_cross_region = true
 [[pairs]]
 tokens  = ["{WETH}", "{USDC}"]
 symbol  = "ETHUSDC"
-delta   = "0.0005"
 min_mid = "0.0001"
 max_mid = "0.001"
 max_deviation = "0.02"
 key_env = "K_WETH_USDC"
+pricing = {{ kind = "feed", delta = "0.0005" }}
 
 [[pairs]]
 tokens  = ["{USDC}", "{USDT}"]
-mid     = "1"
-delta   = "0"
 key_env = "K_USDC_USDT"
 allow_symbol_mismatch = true
+pricing = {{ kind = "fixed", mid = "1", delta = "0" }}
 
 [[builder]]
 name = "titan-eu"
@@ -2470,7 +1898,7 @@ disable_cross_region = false
     #[test]
     fn the_writer_omits_what_was_never_set() {
         let text = format!(
-            "target = \"{TARGET}\"\n\n[[pairs]]\ntokens = [\"{WETH}\", \"{USDC}\"]\nsymbol = \"ETHUSDC\"\nkey_env = \"K\"\n"
+            "target = \"{TARGET}\"\n\n[[pairs]]\ntokens = [\"{WETH}\", \"{USDC}\"]\nsymbol = \"ETHUSDC\"\nkey_env = \"K\"\npricing = {{ kind = \"feed\" }}\n"
         );
         let rendered = render_raw(&toml::from_str::<RawConfig>(&text).unwrap()).unwrap();
         for absent in [
@@ -2491,7 +1919,7 @@ disable_cross_region = false
     #[test]
     fn a_halted_pair_is_parsed_but_not_run() {
         let text = format!(
-            "target = \"{TARGET}\"\n\n[[pairs]]\ntokens = [\"{WETH}\", \"{USDC}\"]\nsymbol = \"ETHUSDC\"\nkey_env = \"A\"\nhalted = true\n\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nmid = \"1\"\ndelta = \"0\"\nkey_env = \"B\"\n"
+            "target = \"{TARGET}\"\n\n[[pairs]]\ntokens = [\"{WETH}\", \"{USDC}\"]\nsymbol = \"ETHUSDC\"\nkey_env = \"A\"\nhalted = true\npricing = {{ kind = \"feed\" }}\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nkey_env = \"B\"\npricing = {{ kind = \"fixed\", mid = \"1\", delta = \"0\" }}\n"
         );
         let config = parse_config(&text, 18).unwrap();
         assert_eq!(config.pairs.len(), 1);
@@ -2513,7 +1941,7 @@ disable_cross_region = false
     fn a_running_pairs_stale_halt_reason_restarts_nothing() {
         let stanza = |tail: &str| {
             format!(
-                "target = \"{TARGET}\"\n\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nmid = \"1\"\ndelta = \"0\"\nkey_env = \"B\"\n{tail}"
+                "target = \"{TARGET}\"\n\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nkey_env = \"B\"\n{tail}\npricing = {{ kind = \"fixed\", mid = \"1\", delta = \"0\" }}\n"
             )
         };
         let running = parse_config(&stanza("halt_reason = \"desk\"\n"), 18).unwrap();
@@ -2542,7 +1970,7 @@ disable_cross_region = false
     #[test]
     fn a_halted_pair_still_claims_its_lane() {
         let text = format!(
-            "target = \"{TARGET}\"\n\n[[pairs]]\ntokens = [\"{WETH}\", \"{USDC}\"]\nsymbol = \"ETHUSDC\"\nkey_env = \"A\"\nhalted = true\n\n[[pairs]]\ntokens = [\"{WETH}\", \"{USDC}\"]\nsymbol = \"ETHUSDC\"\nkey_env = \"B\"\n"
+            "target = \"{TARGET}\"\n\n[[pairs]]\ntokens = [\"{WETH}\", \"{USDC}\"]\nsymbol = \"ETHUSDC\"\nkey_env = \"A\"\nhalted = true\npricing = {{ kind = \"feed\" }}\n[[pairs]]\ntokens = [\"{WETH}\", \"{USDC}\"]\nsymbol = \"ETHUSDC\"\nkey_env = \"B\"\npricing = {{ kind = \"feed\" }}\n"
         );
         assert!(parse_config(&text, 18).is_err());
     }
@@ -2667,81 +2095,40 @@ disable_cross_region = false
                 format!("target = \"{TARGET}\"\npairs = []\n"),
             ),
             (
+                // Every pair prices through a kind; a pair that names none has no price.
+                "no pricing stanza",
+                format!(
+                    "target = \"{TARGET}\"\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nsymbol = \"X\"\nkey_env = \"K\"\n"
+                ),
+            ),
+            (
+                "pricing stanza without a kind",
+                format!(
+                    "target = \"{TARGET}\"\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nsymbol = \"X\"\nkey_env = \"K\"\npricing = {{ delta = \"0.0005\" }}\n"
+                ),
+            ),
+            (
                 "one token",
                 format!(
-                    "target = \"{TARGET}\"\n[[pairs]]\ntokens = [\"{USDC}\"]\nsymbol = \"X\"\nkey_env = \"K\"\n"
+                    "target = \"{TARGET}\"\n[[pairs]]\ntokens = [\"{USDC}\"]\nsymbol = \"X\"\nkey_env = \"K\"\npricing = {{ kind = \"feed\" }}\n"
                 ),
             ),
             (
                 "three tokens",
                 format!(
-                    "target = \"{TARGET}\"\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\", \"{WETH}\"]\nsymbol = \"X\"\nkey_env = \"K\"\n"
+                    "target = \"{TARGET}\"\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\", \"{WETH}\"]\nsymbol = \"X\"\nkey_env = \"K\"\npricing = {{ kind = \"feed\" }}\n"
                 ),
             ),
             (
                 "identical tokens",
                 format!(
-                    "target = \"{TARGET}\"\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDC}\"]\nsymbol = \"X\"\nkey_env = \"K\"\n"
+                    "target = \"{TARGET}\"\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDC}\"]\nsymbol = \"X\"\nkey_env = \"K\"\npricing = {{ kind = \"feed\" }}\n"
                 ),
             ),
             (
                 "duplicate lane across pairs (declared in opposite orders)",
                 format!(
-                    "target = \"{TARGET}\"\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nsymbol = \"A\"\nkey_env = \"K1\"\n[[pairs]]\ntokens = [\"{USDT}\", \"{USDC}\"]\nsymbol = \"B\"\nkey_env = \"K2\"\n"
-                ),
-            ),
-            (
-                "both symbol and mid",
-                format!(
-                    "target = \"{TARGET}\"\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nsymbol = \"X\"\nmid = \"1\"\ndelta = \"0\"\nkey_env = \"K\"\n"
-                ),
-            ),
-            (
-                "neither symbol nor mid",
-                format!(
-                    "target = \"{TARGET}\"\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nkey_env = \"K\"\n"
-                ),
-            ),
-            (
-                // A whole unit of spread leaves the taker nothing, and beyond it PropAMM
-                // reverts SpreadTooWide on every fill.
-                "feed delta of one whole unit",
-                format!(
-                    "target = \"{TARGET}\"\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nsymbol = \"X\"\ndelta = \"1\"\nkey_env = \"K\"\n"
-                ),
-            ),
-            (
-                "static delta of one whole unit",
-                format!(
-                    "target = \"{TARGET}\"\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nmid = \"1\"\ndelta = \"1\"\nkey_env = \"K\"\n"
-                ),
-            ),
-            (
-                "feed delta that is not a number",
-                format!(
-                    "target = \"{TARGET}\"\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nsymbol = \"X\"\ndelta = \"wide\"\nkey_env = \"K\"\n"
-                ),
-            ),
-            (
-                "mid without delta",
-                format!(
-                    "target = \"{TARGET}\"\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nmid = \"1\"\nkey_env = \"K\"\n"
-                ),
-            ),
-            (
-                "zero static mid",
-                format!(
-                    "target = \"{TARGET}\"\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nmid = \"0\"\ndelta = \"0\"\nkey_env = \"K\"\n"
-                ),
-            ),
-            (
-                // A valid mid isolates this from the zero-mid rule above: at
-                // price_decimals = 18, this delta scales to 1e66, which exceeds
-                // 2^216 (~1.05e65) — slot 0 shares its storage word with the
-                // timestamp and slot count, leaving only 216 bits for delta.
-                "delta exceeding 216 bits",
-                format!(
-                    "target = \"{TARGET}\"\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nmid = \"1\"\ndelta = \"1000000000000000000000000000000000000000000000000\"\nkey_env = \"K\"\n"
+                    "target = \"{TARGET}\"\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nsymbol = \"A\"\nkey_env = \"K1\"\npricing = {{ kind = \"feed\" }}\n[[pairs]]\ntokens = [\"{USDT}\", \"{USDC}\"]\nsymbol = \"B\"\nkey_env = \"K2\"\npricing = {{ kind = \"feed\" }}\n"
                 ),
             ),
             (
@@ -2749,7 +2136,7 @@ disable_cross_region = false
                 // deny_unknown_fields from any other rejection reason.
                 "unknown key",
                 format!(
-                    "target = \"{TARGET}\"\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nsymbol = \"X\"\nkey_env = \"K\"\nextra = 1\n"
+                    "target = \"{TARGET}\"\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nsymbol = \"X\"\nkey_env = \"K\"\nextra = 1\npricing = {{ kind = \"feed\" }}\n"
                 ),
             ),
             (
@@ -2758,13 +2145,13 @@ disable_cross_region = false
                 // rather than RawPair's (covered by "unknown key" above).
                 "unknown key at top level",
                 format!(
-                    "target = \"{TARGET}\"\nextra = 1\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nsymbol = \"X\"\nkey_env = \"K\"\n"
+                    "target = \"{TARGET}\"\nextra = 1\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nsymbol = \"X\"\nkey_env = \"K\"\npricing = {{ kind = \"feed\" }}\n"
                 ),
             ),
             (
                 "missing key_env",
                 format!(
-                    "target = \"{TARGET}\"\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nsymbol = \"X\"\n"
+                    "target = \"{TARGET}\"\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nsymbol = \"X\"\npricing = {{ kind = \"feed\" }}\n"
                 ),
             ),
             (
@@ -2773,40 +2160,32 @@ disable_cross_region = false
                 // deserialization.
                 "empty key_env",
                 format!(
-                    "target = \"{TARGET}\"\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nsymbol = \"X\"\nkey_env = \"\"\n"
+                    "target = \"{TARGET}\"\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nsymbol = \"X\"\nkey_env = \"\"\npricing = {{ kind = \"feed\" }}\n"
                 ),
             ),
             (
                 "lowercase key_env name",
                 format!(
-                    "target = \"{TARGET}\"\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nsymbol = \"X\"\nkey_env = \"k_usdc\"\n"
+                    "target = \"{TARGET}\"\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nsymbol = \"X\"\nkey_env = \"k_usdc\"\npricing = {{ kind = \"feed\" }}\n"
                 ),
             ),
             (
                 "duplicate key_env across pairs",
                 format!(
-                    "target = \"{TARGET}\"\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nsymbol = \"A\"\nkey_env = \"K\"\n[[pairs]]\ntokens = [\"{WBTC}\", \"{USDC}\"]\nsymbol = \"B\"\nkey_env = \"K\"\n"
+                    "target = \"{TARGET}\"\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nsymbol = \"A\"\nkey_env = \"K\"\npricing = {{ kind = \"feed\" }}\n[[pairs]]\ntokens = [\"{WBTC}\", \"{USDC}\"]\nsymbol = \"B\"\nkey_env = \"K\"\npricing = {{ kind = \"feed\" }}\n"
                 ),
             ),
             (
                 "bad target address",
                 format!(
-                    "target = \"0x123\"\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nsymbol = \"X\"\nkey_env = \"K\"\n"
+                    "target = \"0x123\"\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nsymbol = \"X\"\nkey_env = \"K\"\npricing = {{ kind = \"feed\" }}\n"
                 ),
             ),
             (
                 // Nothing could ever be published, so this can only be a transposition.
                 "min_mid above max_mid",
                 format!(
-                    "target = \"{TARGET}\"\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nsymbol = \"X\"\nmin_mid = \"2\"\nmax_mid = \"1\"\nkey_env = \"K\"\n"
-                ),
-            ),
-            (
-                // A fixed price its own band forbids would otherwise fail at run time, on
-                // every push, rather than at load.
-                "static mid outside its own band",
-                format!(
-                    "target = \"{TARGET}\"\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nmid = \"5\"\ndelta = \"0\"\nmin_mid = \"10\"\nkey_env = \"K\"\n"
+                    "target = \"{TARGET}\"\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nsymbol = \"X\"\nmin_mid = \"2\"\nmax_mid = \"1\"\nkey_env = \"K\"\npricing = {{ kind = \"feed\" }}\n"
                 ),
             ),
             (
@@ -2815,16 +2194,7 @@ disable_cross_region = false
                 // carries into a run.
                 "zero-address target",
                 format!(
-                    "target = \"0x0000000000000000000000000000000000000000\"\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nsymbol = \"X\"\nkey_env = \"K\"\n"
-                ),
-            ),
-            (
-                // An inverted lane publishes 1/mid, and a mid this far above the scale
-                // floors to zero — which PropAMM rejects. Declared WETH-first so it
-                // inverts; the same mid on the flipped pair is perfectly valid.
-                "static mid that inverts to zero",
-                format!(
-                    "target = \"{TARGET}\"\n[[pairs]]\ntokens = [\"{WETH}\", \"{USDC}\"]\nmid = \"100000000000000000000000\"\ndelta = \"0\"\nkey_env = \"K\"\n"
+                    "target = \"0x0000000000000000000000000000000000000000\"\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nsymbol = \"X\"\nkey_env = \"K\"\npricing = {{ kind = \"feed\" }}\n"
                 ),
             ),
             (
@@ -2832,7 +2202,7 @@ disable_cross_region = false
                 // parse_address on the token path instead.
                 "malformed token address",
                 format!(
-                    "target = \"{TARGET}\"\n[[pairs]]\ntokens = [\"0x123\", \"{USDT}\"]\nsymbol = \"X\"\nkey_env = \"K\"\n"
+                    "target = \"{TARGET}\"\n[[pairs]]\ntokens = [\"0x123\", \"{USDT}\"]\nsymbol = \"X\"\nkey_env = \"K\"\npricing = {{ kind = \"feed\" }}\n"
                 ),
             ),
         ];
@@ -2853,7 +2223,7 @@ disable_cross_region = false
 
         // With no inverted pair the looser existing cap applies.
         let direct = format!(
-            "target = \"{TARGET}\"\n[[pairs]]\ntokens = [\"{WBTC}\", \"{USDC}\"]\nsymbol = \"BTCUSDC\"\nkey_env = \"K\"\n"
+            "target = \"{TARGET}\"\n[[pairs]]\ntokens = [\"{WBTC}\", \"{USDC}\"]\nsymbol = \"BTCUSDC\"\nkey_env = \"K\"\npricing = {{ kind = \"feed\" }}\n"
         );
         assert!(parse_config(&direct, 39).is_ok());
     }
@@ -2886,10 +2256,10 @@ disable_cross_region = false
         assert_eq!(addresses.len(), 3);
         // The feed's orientation rides alongside the pair, for the feed it spawns.
         assert!(pairs[0].invert, "WETH/USDC inverts");
-        match &pairs[0].source {
-            SourceSpec::Feed { feeds, .. } => assert_eq!(feeds, &Feeds::single_binance("ETHUSDC")),
-            _ => panic!("expected a feed source"),
-        }
+        assert_eq!(
+            pairs[0].feeds.as_ref(),
+            Some(&Feeds::single_binance("ETHUSDC"))
+        );
     }
 
     #[test]
@@ -2967,8 +2337,7 @@ disable_cross_region = false
     /// One pair, with whatever breaker keys the test is about.
     fn breaker_toml(keys: &str) -> String {
         format!(
-            "target = \"{TARGET}\"\n\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\n\
-             symbol = \"USDCUSDT\"\nkey_env = \"K\"\n{keys}"
+            "target = \"{TARGET}\"\n\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nsymbol = \"USDCUSDT\"\nkey_env = \"K\"\n{keys}\npricing = {{ kind = \"feed\" }}\n"
         )
     }
 
@@ -2980,12 +2349,7 @@ disable_cross_region = false
     fn each_pair_carries_its_own_deviation_threshold() {
         let toml = format!(
             "target = \"{TARGET}\"\n\n\
-             [[pairs]]\ntokens = [\"{WBTC}\", \"{USDC}\"]\nsymbol = \"BTCUSDC\"\n\
-             key_env = \"K_WBTC\"\nmax_deviation = \"0.02\"\n\n\
-             [[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nsymbol = \"USDCUSDT\"\n\
-             key_env = \"K_USDC\"\nmax_deviation = \"0.002\"\n\n\
-             [[pairs]]\ntokens = [\"{WETH}\", \"{USDC}\"]\nsymbol = \"ETHUSDC\"\n\
-             key_env = \"K_WETH\"\n"
+             [[pairs]]\ntokens = [\"{WBTC}\", \"{USDC}\"]\nsymbol = \"BTCUSDC\"\nkey_env = \"K_WBTC\"\nmax_deviation = \"0.02\"\npricing = {{ kind = \"feed\" }}\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nsymbol = \"USDCUSDT\"\nkey_env = \"K_USDC\"\nmax_deviation = \"0.002\"\npricing = {{ kind = \"feed\" }}\n[[pairs]]\ntokens = [\"{WETH}\", \"{USDC}\"]\nsymbol = \"ETHUSDC\"\nkey_env = \"K_WETH\"\npricing = {{ kind = \"feed\" }}\n"
         );
         let config = parse_config(&toml, 6).unwrap();
 
@@ -3045,8 +2409,7 @@ disable_cross_region = false
     #[test]
     fn max_deviation_requires_a_streamed_price() {
         let toml = format!(
-            "target = \"{TARGET}\"\n\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\n\
-             mid = \"0.9998\"\ndelta = \"0.0005\"\nkey_env = \"K\"\nmax_deviation = \"0.02\"\n"
+            "target = \"{TARGET}\"\n\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nkey_env = \"K\"\nmax_deviation = \"0.02\"\npricing = {{ kind = \"fixed\", mid = \"0.9998\", delta = \"0.0005\" }}\n"
         );
         let err = parse_err(&toml, 6);
         assert!(err.contains("symbol"), "must say what to do instead: {err}");
@@ -3070,10 +2433,7 @@ disable_cross_region = false
     fn a_breaker_error_names_the_pair_it_came_from() {
         let toml = format!(
             "target = \"{TARGET}\"\n\n\
-             [[pairs]]\ntokens = [\"{WETH}\", \"{USDC}\"]\nsymbol = \"ETHUSDC\"\n\
-             key_env = \"K_WETH\"\n\n\
-             [[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nsymbol = \"USDCUSDT\"\n\
-             key_env = \"K_USDC\"\nmax_deviation = \"nope\"\n"
+             [[pairs]]\ntokens = [\"{WETH}\", \"{USDC}\"]\nsymbol = \"ETHUSDC\"\nkey_env = \"K_WETH\"\npricing = {{ kind = \"feed\" }}\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nsymbol = \"USDCUSDT\"\nkey_env = \"K_USDC\"\nmax_deviation = \"nope\"\npricing = {{ kind = \"feed\" }}\n"
         );
         let err = parse_err(&toml, 6);
         assert!(err.contains("pair 2"), "{err}");
@@ -3155,9 +2515,7 @@ disable_cross_region = false
     /// A feed pair with `guards` written after its keys, the way an operator would.
     fn with_guards(guards: &str) -> String {
         format!(
-            "target = \"{TARGET}\"\n\n[[pairs]]\ntokens = [\"{WETH}\", \"{USDC}\"]\n\
-             symbol = \"ETHUSDC\"\nkey_env = \"K_WETH_USDC\"\n{guards}\n\
-             [[builder]]\nname = \"b\"\nendpoint = \"wss://b.example/ws\"\napi_key = \"k\"\n"
+            "target = \"{TARGET}\"\n\n[[pairs]]\ntokens = [\"{WETH}\", \"{USDC}\"]\nsymbol = \"ETHUSDC\"\nkey_env = \"K_WETH_USDC\"\npricing = {{ kind = \"feed\" }}\n{guards}[[builder]]\nname = \"b\"\nendpoint = \"wss://b.example/ws\"\napi_key = \"k\"\n"
         )
     }
 
@@ -3267,28 +2625,73 @@ disable_cross_region = false
         );
     }
 
+    /// Every pair names its pricing kind in a `[pairs.pricing]` stanza, kept as written for
+    /// the kind table to read and a reload to diff; the kinds this crate ships are
+    /// configured like any other. The pair's market stays the pair's.
     #[test]
-    fn a_pricing_stanza_names_a_custom_kind_and_keeps_its_market() {
-        let config = parse_config(tests_support::CUSTOM, 18).expect("parses");
-        match &config.pairs[0].source {
-            SourceSpec::Custom {
-                kind,
-                config: table,
-                feeds,
-            } => {
-                assert_eq!(kind, "skewed");
-                assert_eq!(
-                    table.get("half_spread").and_then(|v| v.as_float()),
-                    Some(0.0005)
-                );
-                assert!(feeds.is_some(), "symbol stays the reference market");
-            }
-            other => panic!("{other:?}"),
-        }
+    fn a_pair_names_its_pricing_kind_and_keeps_the_stanza_as_written() {
+        let text = format!(
+            r#"
+target = "{TARGET}"
+[[pairs]]
+tokens  = ["{USDC}", "{USDT}"]
+key_env = "K"
+pricing = {{ kind = "fixed", mid = "0.9998", delta = "0.0005" }}
+"#
+        );
+        let config = parse_config(&text, 18).unwrap();
+        let pair = &config.pairs[0];
+        assert_eq!(pair.pricing.kind, "fixed");
+        assert_eq!(
+            pair.pricing.config.get("mid"),
+            Some(&toml::Value::String("0.9998".to_owned()))
+        );
+        assert!(pair.feeds.is_none(), "no symbol or sources: no market");
+
+        let streamed = parse_config(tests_support::CUSTOM, 18).unwrap();
+        assert_eq!(streamed.pairs[0].pricing.kind, "skewed");
+        assert_eq!(
+            streamed.pairs[0]
+                .pricing
+                .config
+                .get("half_spread")
+                .and_then(|v| v.as_float()),
+            Some(0.0005)
+        );
+        assert!(
+            streamed.pairs[0].feeds.is_some(),
+            "symbol stays the reference market"
+        );
     }
 
+    /// A volatile stanza streams like any pair with a symbol, so it may carry a breaker;
+    /// what its knobs mean is the kind's business (pricing/volatile.rs).
     #[test]
-    fn a_stanza_refuses_the_built_in_keys_and_the_built_in_kinds() {
+    fn a_volatile_stanza_streams_and_may_carry_a_breaker() {
+        let text = format!(
+            r#"
+target = "{TARGET}"
+[[pairs]]
+tokens  = ["{WETH}", "{USDC}"]
+symbol  = "ETHUSDC"
+key_env = "K"
+max_deviation = "0.02"
+pricing = {{ kind = "volatile", gamma = "0.1", k = "700", kappa = "1" }}
+"#
+        );
+        let config = parse_config(&text, 18).unwrap();
+        assert_eq!(config.pairs[0].pricing.kind, "volatile");
+        assert_eq!(
+            config.pairs[0].feeds.as_ref(),
+            Some(&Feeds::single_binance("ETHUSDC"))
+        );
+        assert!(config.pairs[0].breaker.is_some());
+    }
+
+    /// The pricing keys that used to sit on the pair are refused there with a pointer to
+    /// the stanza, and a stanza without a kind names what is missing.
+    #[test]
+    fn a_pairs_pricing_keys_live_in_its_stanza() {
         let mixed = tests_support::CUSTOM.replace(
             "key_env = \"UPDATER_KEY_WETH_USDC\"",
             "key_env = \"UPDATER_KEY_WETH_USDC\"\ndelta = \"0.001\"",
@@ -3298,15 +2701,6 @@ disable_cross_region = false
             err.contains("[pairs.pricing]") && err.contains("delta"),
             "{err}"
         );
-        for builtin in ["fixed", "feed", "volatile"] {
-            let err = format!(
-                "{:#}",
-                parse_config(&tests_support::custom(builtin), 18)
-                    .err()
-                    .expect("refused")
-            );
-            assert!(err.contains("built in"), "{builtin}: {err}");
-        }
         let err = format!(
             "{:#}",
             parse_config(

@@ -1387,9 +1387,8 @@ async fn drive(
                             live.metrics
                                 .published_mid
                                 .set(crate::feed::scaled_to_f64(quote.1, opts.price_decimals));
-                            // What went out and what it was priced from, for the recorder.
-                            // The gate can only publish this tick's price, so `priced` is
-                            // its working; a fixed-spread pair has none.
+                            // What went out and what it was priced from, for the recorder,
+                            // with the pricer's diagnostics as of this tick.
                             if let Some(recorder) = &opts.recorder {
                                 let to_f64 =
                                     |v: U256| crate::feed::scaled_to_f64(v, opts.price_decimals);
@@ -1405,9 +1404,6 @@ async fn drive(
                                     feed_mid: to_f64(feed_mid),
                                     published_mid: to_f64(quote.1),
                                     delta: to_f64(quote.0),
-                                    pricing: priced
-                                        .filter(|p| (p.delta, p.mid) == quote)
-                                        .and_then(|p| p.pricing),
                                     terms: crate::record::terms_from(&source.diagnostics_now()),
                                 });
                             }
@@ -1784,7 +1780,7 @@ mod tests {
     use super::*;
     use crate::{
         builder::mock,
-        config::{MidBand, Pair, SourceSpec, lane_of},
+        config::{MidBand, Pair, lane_of},
         feed::PriceSample,
         metrics::LandingResult,
         rpc_mock::MockRpc,
@@ -2227,16 +2223,7 @@ mod tests {
     /// A feed a test moves by hand, in the shape `connect_feed` hands a pair.
     fn feed() -> (watch::Sender<Option<PriceSample>>, ValueSource) {
         let (tx, rx) = watch::channel(None);
-        let values = ValueSource::feed_for_tests(
-            rx,
-            SourceSpec::Feed {
-                feeds: crate::config::Feeds::single_binance("TESTUSD"),
-                delta: None,
-            },
-            crate::config::spread_scale(18),
-            false,
-            18,
-        );
+        let values = ValueSource::feed_for_tests(rx, None, false, 18);
         (tx, values)
     }
 
@@ -3693,7 +3680,7 @@ mod tests {
     #[tokio::test]
     async fn a_trip_withdraws_at_every_builder_and_halts_the_pair() {
         use crate::{
-            config::{MidBand, Pair, SourceSpec},
+            config::{MidBand, Pair},
             feed::PriceSample,
             supervisor::shutdown_channel,
             update::ValueSource,
@@ -3731,16 +3718,7 @@ mod tests {
                     max: None,
                 },
             },
-            values: ValueSource::feed_for_tests(
-                rx,
-                SourceSpec::Feed {
-                    feeds: crate::config::Feeds::single_binance("USDCUSDT"),
-                    delta: None,
-                },
-                U256::exp10(6),
-                false,
-                6,
-            ),
+            values: ValueSource::feed_for_tests(rx, None, false, 6),
             latch: latch_of(&breaker),
             armed: true,
             guard_kinds: Vec::new(),
@@ -3924,7 +3902,7 @@ mod tests {
     #[tokio::test]
     async fn a_trip_that_happened_while_the_loop_was_away_halts_it_on_return() {
         use crate::{
-            config::{MidBand, Pair, SourceSpec},
+            config::{MidBand, Pair},
             feed::PriceSample,
             guard::{Cause, TripReason},
             supervisor::shutdown_channel,
@@ -3971,16 +3949,7 @@ mod tests {
                     max: None,
                 },
             },
-            values: ValueSource::feed_for_tests(
-                rx,
-                SourceSpec::Feed {
-                    feeds: crate::config::Feeds::single_binance("USDCUSDT"),
-                    delta: None,
-                },
-                U256::exp10(6),
-                false,
-                6,
-            ),
+            values: ValueSource::feed_for_tests(rx, None, false, 6),
             latch: latch.clone(),
             armed: false,
             guard_kinds: Vec::new(),
@@ -4087,7 +4056,7 @@ mod tests {
     #[tokio::test]
     async fn a_window_trip_withdraws_at_every_builder_and_halts_the_pair() {
         use crate::{
-            config::{MidBand, Pair, SourceSpec},
+            config::{MidBand, Pair},
             feed::PriceSample,
             supervisor::shutdown_channel,
             update::ValueSource,
@@ -4125,16 +4094,7 @@ mod tests {
                     max: None,
                 },
             },
-            values: ValueSource::feed_for_tests(
-                rx,
-                SourceSpec::Feed {
-                    feeds: crate::config::Feeds::single_binance("USDCUSDT"),
-                    delta: None,
-                },
-                U256::exp10(6),
-                false,
-                6,
-            ),
+            values: ValueSource::feed_for_tests(rx, None, false, 6),
             latch: latch_of(&breaker),
             armed: true,
             guard_kinds: Vec::new(),

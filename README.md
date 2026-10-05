@@ -81,7 +81,7 @@ sources and tests.
 
 ```bash
 make local          # anvil with the registry, the factory and one PropAMM deployed
-make price-service  # keep its price fresh with the library's built-in model, no code of yours
+make price-service  # keep its price fresh with a pricing kind the library ships, no code of yours
 make swap           # trade against it
 make local-down
 ```

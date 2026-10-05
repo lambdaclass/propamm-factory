@@ -1,5 +1,5 @@
 <label>
-  <span class=key>{{ field.name }}</span>
+  <span class=key>{{ field.label }}</span>
   <input type="{% if field.secret %}password{% else %}text{% endif %}"
          name="{{ field.name }}"
          value="{{ field.value }}"

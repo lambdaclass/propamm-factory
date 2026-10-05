@@ -24,13 +24,6 @@ use crate::{
     head::Head,
     pricing::{Diagnostics, Market, PairShape, Pricer, Refusal, TickCtx},
 };
-#[cfg(test)]
-use crate::{
-    config::SourceSpec,
-    metrics::PairMetrics,
-    volatile::{self, Inventory, PriceHistory, VolatileParams},
-};
-
 const UPDATE_STATE_SIG: &str = "updateState(address,uint256,uint32,uint256[])";
 
 /// Updates are stamped one mainnet block time ahead of the latest block.
@@ -157,13 +150,6 @@ pub enum UnusableKind {
     Stale,
     OutOfBand,
     DeltaOverflow,
-    /// A volatile pair without enough price history yet to measure σ from.
-    WarmingUp,
-    /// A volatile pair whose vault balance has not been read, or not recently enough.
-    NoInventory,
-    /// A pricer's mid further from the market than the core allows; see
-    /// `pricing::backstop`.
-    MidShift,
     /// The pricer panicked on this tick. The tick is withdrawn under this and the lane is
     /// tripped, so it is counted at most once per lane. Appended last: `ALL`'s order is
     /// the metric array's.
@@ -173,14 +159,11 @@ pub enum UnusableKind {
 impl UnusableKind {
     /// Declaration order is load-bearing: `metrics::PairMetrics` indexes its pre-bound
     /// children by `kind as usize`.
-    pub const ALL: [UnusableKind; 8] = [
+    pub const ALL: [UnusableKind; 5] = [
         UnusableKind::NoSample,
         UnusableKind::Stale,
         UnusableKind::OutOfBand,
         UnusableKind::DeltaOverflow,
-        UnusableKind::WarmingUp,
-        UnusableKind::NoInventory,
-        UnusableKind::MidShift,
         UnusableKind::Panic,
     ];
 
@@ -190,9 +173,6 @@ impl UnusableKind {
             UnusableKind::Stale => "stale",
             UnusableKind::OutOfBand => "out_of_band",
             UnusableKind::DeltaOverflow => "delta_overflow",
-            UnusableKind::WarmingUp => "warming_up",
-            UnusableKind::NoInventory => "no_inventory",
-            UnusableKind::MidShift => "mid_shift",
             UnusableKind::Panic => "panic",
         }
     }
@@ -289,7 +269,9 @@ impl std::error::Error for Unusable {}
 #[derive(Clone)]
 pub struct ValueSource {
     pricer: Arc<Mutex<Box<dyn Pricer>>>,
-    kind: PricingKind,
+    /// The registered name of the kind that prices the lane: what a trip, a panic and the
+    /// diagnostics label the pricer by.
+    kind: &'static str,
     /// The pair's reference market: `None` for a pair with no `symbol`/`sources`.
     market: Option<tokio::sync::watch::Receiver<Option<PriceSample>>>,
     pair: Arc<PairShape>,
@@ -300,23 +282,9 @@ pub struct ValueSource {
     /// reason: their state outlives a quote-loop restart.
     guards: Arc<Mutex<Vec<crate::guard::BoundQuoteGuard>>>,
     /// Where the quote loop reports each block's read-back, for the pricer's
-    /// `BuildCtx::landings` feed. A built-in's has no reader, and the report goes nowhere.
+    /// `BuildCtx::landings` feed. A pricer that never asked for it has no reader, and the
+    /// report goes nowhere.
     landings: tokio::sync::watch::Sender<Option<crate::pricing::LandingReport>>,
-}
-
-/// Which model a lane runs, for what reads a lane from outside its pricer (`adopt_metrics`).
-#[derive(Clone, Debug)]
-pub(crate) enum PricingKind {
-    Fixed,
-    Feed,
-    Volatile {
-        target_share: f64,
-    },
-    /// A registered kind, by the name it was registered under: what a trip and a panic
-    /// name the pricer by. Its `quote_updater_diagnostic` gauges were bound at build.
-    Custom {
-        kind: &'static str,
-    },
 }
 
 /// What a pricer's build declared, bound to its metric series, and the tasks it started.
@@ -329,13 +297,13 @@ pub(crate) struct Bound {
     /// the pricer's by.
     pub(crate) names: Vec<String>,
     pub(crate) refusals: Vec<prometheus::IntCounter>,
-    /// Where this kind's calls are timed; `None` for a built-in, whose code is the core's.
+    /// Where this kind's calls are timed; `None` where nothing was bound.
     pub(crate) duration: Option<prometheus::Histogram>,
     pub(crate) _tasks: crate::tasks::Tasks,
 }
 
 impl Bound {
-    /// A built-in's: it declares nothing and starts nothing.
+    /// Nothing bound: no diagnostics, no refusals, no tasks.
     pub(crate) fn none() -> Arc<Bound> {
         Arc::new(Bound::default())
     }
@@ -431,18 +399,6 @@ fn fresh_sample(
     Ok(sample)
 }
 
-/// The volatile pricing's working, for the row the recorder keeps per published update:
-/// the spread's three terms, σ they came from, and the skew applied to the mid. Plain
-/// fractions, orientation-free like `delta`.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Pricing {
-    pub sigma: f64,
-    pub hold: f64,
-    pub edge: f64,
-    pub stale: f64,
-    pub skew: f64,
-}
-
 /// What `current` decided: the `(delta, mid)` to publish, the feed mid it started from
 /// (equal to `mid` unless a skew moved it), and the volatile working when there was one.
 /// All in lane orientation, the scale the chain gets.
@@ -451,13 +407,12 @@ pub struct Priced {
     pub delta: U256,
     pub mid: U256,
     pub feed_mid: U256,
-    pub pricing: Option<Pricing>,
 }
 
 impl ValueSource {
     pub(crate) fn new(
         pricer: Box<dyn Pricer>,
-        kind: PricingKind,
+        kind: &'static str,
         market: Option<tokio::sync::watch::Receiver<Option<PriceSample>>>,
         pair: Arc<PairShape>,
         bound: Arc<Bound>,
@@ -526,18 +481,10 @@ impl ValueSource {
         &self.bound.names
     }
 
-    pub(crate) fn kind(&self) -> &PricingKind {
-        &self.kind
-    }
-
-    /// The pricer's kind by name, for a trip or a panic to name it by.
+    /// The registered name of the kind that prices the lane, for a trip or a panic to name
+    /// it by.
     fn kind_name(&self) -> &'static str {
-        match &self.kind {
-            PricingKind::Fixed => "fixed",
-            PricingKind::Feed => "feed",
-            PricingKind::Volatile { .. } => "volatile",
-            PricingKind::Custom { kind } => kind,
-        }
+        self.kind
     }
 
     /// Trips the lane, if nothing has yet, and records the transition once, as the
@@ -696,7 +643,6 @@ impl ValueSource {
             delta: priced.delta,
             mid: priced.mid,
             feed_mid: market.map_or(priced.mid, |market| market.mid),
-            pricing: out.terms,
         })
     }
 
@@ -725,7 +671,7 @@ impl ValueSource {
     pub(crate) fn fixed_for_tests(delta: U256, mid: U256, price_decimals: u32) -> Self {
         Self::new(
             Box::new(crate::pricing::FixedPricer { delta, mid }),
-            PricingKind::Fixed,
+            "fixed",
             None,
             Arc::new(test_shape(false, price_decimals)),
             Bound::none(),
@@ -737,48 +683,20 @@ impl ValueSource {
         &self.pair
     }
 
+    /// A `feed` lane: the market's mid at `delta`, or the book's own when `None`.
     #[cfg(test)]
     pub(crate) fn feed_for_tests(
         rx: tokio::sync::watch::Receiver<Option<PriceSample>>,
-        source: SourceSpec,
-        spread_scale: U256,
+        delta: Option<U256>,
         invert: bool,
         price_decimals: u32,
     ) -> Self {
         Self::new(
             Box::new(crate::pricing::FeedPricer {
-                source,
-                spread_scale,
+                delta,
+                spread_scale: crate::config::spread_scale(price_decimals),
             }),
-            PricingKind::Feed,
-            Some(rx),
-            Arc::new(test_shape(invert, price_decimals)),
-            Bound::none(),
-        )
-    }
-
-    #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn volatile_for_tests(
-        rx: tokio::sync::watch::Receiver<Option<PriceSample>>,
-        history: Arc<Mutex<PriceHistory>>,
-        inventory: tokio::sync::watch::Receiver<Inventory>,
-        params: VolatileParams,
-        invert: bool,
-        price_decimals: u32,
-        metrics: PairMetrics,
-    ) -> Self {
-        let target_share = params.target_share.get();
-        Self::new(
-            Box::new(crate::pricing::VolatilePricer {
-                history,
-                inventory: crate::pricing::InventoryFeed::from_receiver(inventory),
-                params,
-                invert,
-                price_decimals,
-                metrics,
-            }),
-            PricingKind::Volatile { target_share },
+            "feed",
             Some(rx),
             Arc::new(test_shape(invert, price_decimals)),
             Bound::none(),
@@ -797,6 +715,9 @@ fn test_shape(inverted: bool, price_decimals: u32) -> PairShape {
         inverted,
         price_decimals,
         target: Address::zero(),
+        sources: 1,
+        min_mid: None,
+        max_mid: None,
     }
 }
 
@@ -938,7 +859,7 @@ mod tests {
         fn refusing_source() -> ValueSource {
             ValueSource::new(
                 Box::new(Refusing),
-                PricingKind::Fixed,
+                "fixed",
                 None,
                 Arc::new(test_shape(false, 18)),
                 Bound::none(),
@@ -1058,17 +979,7 @@ mod tests {
             let (tx, rx) = tokio::sync::watch::channel(None);
             let seen = Arc::new(Mutex::new(Vec::new()));
             let latch = Latch::new();
-            let source = ValueSource::feed_for_tests(
-                rx,
-                SourceSpec::Feed {
-                    feeds: crate::config::Feeds::single_binance("ETHUSDC"),
-                    delta: None,
-                },
-                crate::config::spread_scale(18),
-                false,
-                18,
-            )
-            .with_guards(
+            let source = ValueSource::feed_for_tests(rx, None, false, 18).with_guards(
                 latch.clone(),
                 vec![bare(
                     "withdrawn",
@@ -1312,163 +1223,12 @@ mod tests {
         };
         // The sender is returned so the channel outlives the source.
         let (tx, rx) = tokio::sync::watch::channel(Some(sample));
-        (
-            tx,
-            ValueSource::feed_for_tests(
-                rx,
-                SourceSpec::Feed {
-                    feeds: crate::config::Feeds::single_binance("TESTUSD"),
-                    delta: None,
-                },
-                crate::config::spread_scale(18),
-                false,
-                18,
-            ),
-        )
+        (tx, ValueSource::feed_for_tests(rx, None, false, 18))
     }
 
     fn feed_of_empty() -> (tokio::sync::watch::Sender<Option<PriceSample>>, ValueSource) {
         let (tx, rx) = tokio::sync::watch::channel(None);
-        (
-            tx,
-            ValueSource::feed_for_tests(
-                rx,
-                SourceSpec::Feed {
-                    feeds: crate::config::Feeds::single_binance("TESTUSD"),
-                    delta: None,
-                },
-                U256::exp10(18),
-                false,
-                18,
-            ),
-        )
-    }
-
-    fn test_knobs() -> volatile::RawKnobs<'static> {
-        volatile::RawKnobs {
-            gamma: "0.1",
-            k: "700",
-            kappa: "1",
-            target_share: None,
-            hold_secs: None,
-            fill_delay_secs: None,
-            volatility_window_secs: None,
-            inventory_aversion: None,
-            inventory_band_lower: None,
-            inventory_band_upper: None,
-            inventory_aversion_hard: None,
-            inventory_band_hard_lower: None,
-            inventory_band_hard_upper: None,
-        }
-    }
-
-    /// A volatile source with everything it needs, on a direct lane at mid 4000: a history
-    /// of two minutes alternating ±0.1% per second, and a vault holding `held` WETH against
-    /// 4000 USDC (so 1 WETH is half and half).
-    fn volatile_of(
-        held: f64,
-        inventory_age: Duration,
-    ) -> (
-        tokio::sync::watch::Sender<Option<PriceSample>>,
-        tokio::sync::watch::Sender<Inventory>,
-        ValueSource,
-    ) {
-        let epoch = Instant::now() - Duration::from_secs(120);
-        let mut history = PriceHistory::new(epoch);
-        for s in 0..120u64 {
-            let mid = if s % 2 == 0 { 4000.0 } else { 4004.0 };
-            history.record(mid, epoch + Duration::from_secs(s));
-        }
-        volatile_on(held, inventory_age, history)
-    }
-
-    /// [`volatile_of`] over a history the test chose.
-    fn volatile_on(
-        held: f64,
-        inventory_age: Duration,
-        history: PriceHistory,
-    ) -> (
-        tokio::sync::watch::Sender<Option<PriceSample>>,
-        tokio::sync::watch::Sender<Inventory>,
-        ValueSource,
-    ) {
-        let mid = U256::from(4000u64) * U256::exp10(18);
-        let sample = PriceSample {
-            delta: U256::from(50_000_000_000_000u64),
-            mid,
-            at: Instant::now(),
-            wall: SystemTime::now(),
-        };
-        let (tx, rx) = tokio::sync::watch::channel(Some(sample));
-        let (inventory_tx, inventory) = tokio::sync::watch::channel(Inventory {
-            vault: Address::zero(),
-            base: held,
-            quote: 4000.0,
-            at: Instant::now() - inventory_age,
-        });
-        let params = VolatileParams::parse("p", test_knobs()).unwrap();
-        let metrics = crate::metrics::Metrics::new().unwrap().for_pair("VOL/TEST");
-        (
-            tx,
-            inventory_tx,
-            ValueSource::volatile_for_tests(
-                rx,
-                Arc::new(Mutex::new(history)),
-                inventory,
-                params,
-                false,
-                18,
-                metrics,
-            ),
-        )
-    }
-
-    /// The published pair is `volatile::price` on the measured σ, rendered at the price
-    /// scale: the delta is the half-spread and the mid is shifted by the tilt.
-    #[test]
-    fn a_volatile_source_publishes_the_computed_half_spread_and_the_tilted_mid() {
-        let (_tx, _inv, at_target) = volatile_of(1.0, Duration::ZERO);
-        let (delta, mid) = at_target.current(&MidBand::default()).unwrap();
-        let params = VolatileParams::parse("p", test_knobs()).unwrap();
-        let sigma = 1.001f64.ln();
-        let terms = volatile::price(&params, sigma, 0.5);
-        assert_eq!(delta, volatile::fraction_scaled(terms.delta, 18).unwrap());
-        assert!(delta > U256::zero());
-        // At target the tilt is zero and the mid is the feed's.
-        assert_eq!(terms.skew, 0.0);
-        assert_eq!(mid, U256::from(4000u64) * U256::exp10(18));
-
-        // Three WETH against the same USDC is 75% in WETH: the published mid drops, the
-        // delta is unchanged.
-        let (_tx, _inv, long) = volatile_of(3.0, Duration::ZERO);
-        let (delta_long, mid_long) = long.current(&MidBand::default()).unwrap();
-        assert_eq!(delta_long, delta);
-        assert!(mid_long < mid);
-        let expected = volatile::price(&params, sigma, 0.75);
-        assert!(expected.skew > 0.0);
-        assert_eq!(
-            mid_long,
-            volatile::shifted_mid(mid, expected.skew, false, 18).unwrap()
-        );
-    }
-
-    /// The two inputs a plain feed does not have each refuse the price with their own kind,
-    /// so the withdrawn reason on the block summary says which one is missing.
-    #[test]
-    fn a_volatile_source_refuses_without_history_or_a_fresh_inventory() {
-        let (_tx, _inv, stale_inventory) = volatile_of(1.0, volatile::MAX_INVENTORY_AGE * 2);
-        let err = stale_inventory.current(&MidBand::default()).unwrap_err();
-        assert_eq!(err.kind(), Some(UnusableKind::NoInventory));
-        assert!(err.to_string().contains("vault balance is"), "{err}");
-
-        let (_tx, _inv, source) =
-            volatile_on(1.0, Duration::ZERO, PriceHistory::new(Instant::now()));
-        let err = source.current(&MidBand::default()).unwrap_err();
-        assert_eq!(err.kind(), Some(UnusableKind::WarmingUp));
-        assert_eq!(
-            err.to_string(),
-            "0s of price history, σ needs 60s; warming up"
-        );
+        (tx, ValueSource::feed_for_tests(rx, None, false, 18))
     }
 
     /// The vault-drain case: an ETHUSDC feed wired (uninverted) onto a USDC/WETH lane
@@ -1539,16 +1299,7 @@ mod tests {
             wall: SystemTime::now() - Duration::from_secs(60),
         };
         let (_tx, rx) = tokio::sync::watch::channel(Some(sample));
-        let source = ValueSource::feed_for_tests(
-            rx,
-            SourceSpec::Feed {
-                feeds: crate::config::Feeds::single_binance("TESTUSD"),
-                delta: None,
-            },
-            U256::exp10(18),
-            false,
-            18,
-        );
+        let source = ValueSource::feed_for_tests(rx, None, false, 18);
         let err = source.current(&MidBand::default()).unwrap_err();
         assert_eq!(err.kind(), Some(UnusableKind::Stale));
         // The `{age:.0?}` prefix is a measured Duration and can differ by a millisecond
@@ -1607,9 +1358,6 @@ mod tests {
                 "stale",
                 "out_of_band",
                 "delta_overflow",
-                "warming_up",
-                "no_inventory",
-                "mid_shift",
                 "panic",
             ]
         );

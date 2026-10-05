@@ -82,7 +82,7 @@ pub struct TokenRow {
 
 /// The working behind one published update, as `ValueSource::current_detailed` decided it,
 /// in lane orientation and human units (`scaled_to_f64`; the exact integers are on chain in
-/// `price_updates`). `pricing` is `None` for a fixed-spread pair.
+/// `price_updates`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct QuoteRow {
     pub prop_amm: Address,
@@ -94,15 +94,14 @@ pub struct QuoteRow {
     pub feed_mid: f64,
     pub published_mid: f64,
     pub delta: f64,
-    pub pricing: Option<crate::update::Pricing>,
-    /// A registered pricer's declared diagnostics as of this update, by name: the row's
-    /// `terms` jsonb. `None` for the built-ins, whose volatile working has columns of its
-    /// own (`pricing`), so the data API falls back to those.
+    /// The pricer's declared diagnostics as of this update, by name: the row's `terms`
+    /// jsonb (the volatile kind's σ and its terms, a custom kind's own numbers). `None` for a
+    /// kind that declares none.
     pub terms: Option<serde_json::Value>,
 }
 
 /// The `terms` map for a row: a pricer's declared diagnostics by name, or `None` when it
-/// declared none, so a built-in's row carries `null` rather than `{}`. A diagnostic with no
+/// declared none, so such a row carries `null` rather than `{}`. A diagnostic with no
 /// reading (NaN: blanked when the lane was adopted, and not set by any tick since) is left
 /// out of the map rather than written as a `null` among the numbers.
 pub(crate) fn terms_from(diagnostics: &[(String, f64)]) -> Option<serde_json::Value> {
@@ -456,9 +455,7 @@ pub fn redacted_config(raw: &crate::config::RawConfig) -> serde_json::Value {
     // stanza takes a secret without holding it; this catches the ones typed in anyway.
     // Residual risk stays with a bare key under a name none of `CREDENTIAL_WORDS` is in.
     for pair in &mut raw.pairs {
-        if let Some(stanza) = &mut pair.pricing {
-            redact_secrets(stanza);
-        }
+        redact_secrets(&mut pair.pricing);
     }
     raw.settings.rpc_url = raw.settings.rpc_url.as_deref().map(host_only);
     raw.settings.rpc_ws_url = raw.settings.rpc_ws_url.as_deref().map(host_only);
@@ -939,35 +936,25 @@ async fn insert_quotes(
     let feed_mids: Vec<f64> = rows.iter().map(|r| r.feed_mid).collect();
     let published: Vec<f64> = rows.iter().map(|r| r.published_mid).collect();
     let deltas: Vec<f64> = rows.iter().map(|r| r.delta).collect();
-    let term = |pick: fn(&crate::update::Pricing) -> f64| -> Vec<Option<f64>> {
-        rows.iter().map(|r| r.pricing.as_ref().map(pick)).collect()
-    };
-    let skews = term(|p| p.skew);
-    let sigmas = term(|p| p.sigma);
-    let holds = term(|p| p.hold);
-    let edges = term(|p| p.edge);
-    let stales = term(|p| p.stale);
-    // A registered pricer's diagnostics, as one jsonb per row (`with-serde_json-1`).
+    // The pricer's diagnostics, as one jsonb per row (`with-serde_json-1`).
     let terms: Vec<Option<serde_json::Value>> = rows.iter().map(|r| r.terms.clone()).collect();
     let balance0: Vec<Option<f64>> = quotes.iter().map(|q| q.balance0).collect();
     let balance1: Vec<Option<f64>> = quotes.iter().map(|q| q.balance1).collect();
     let ref_mids: Vec<Option<f64>> = quotes.iter().map(|q| q.ref_mid).collect();
     client
         .execute(
-            "insert into feed.quotes (prop_amm, lane, label, block_number, ts, feed_mid, published_mid, delta, skew, sigma, hold, edge, stale, balance0, balance1, ref_mid, terms)
-               select p, l::numeric, n, b, t, f, m, d, k, s, h, e, a, b0, b1, r, j
-               from unnest($1::text[], $2::text[], $3::text[], $4::int8[], $5::int8[], $6::float8[], $7::float8[], $8::float8[], $9::float8[], $10::float8[], $11::float8[], $12::float8[], $13::float8[], $14::float8[], $15::float8[], $16::float8[], $17::jsonb[])
-                 as r(p, l, n, b, t, f, m, d, k, s, h, e, a, b0, b1, r, j)
+            "insert into feed.quotes (prop_amm, lane, label, block_number, ts, feed_mid, published_mid, delta, balance0, balance1, ref_mid, terms)
+               select p, l::numeric, n, b, t, f, m, d, b0, b1, r, j
+               from unnest($1::text[], $2::text[], $3::text[], $4::int8[], $5::int8[], $6::float8[], $7::float8[], $8::float8[], $9::float8[], $10::float8[], $11::float8[], $12::jsonb[])
+                 as r(p, l, n, b, t, f, m, d, b0, b1, r, j)
                on conflict (prop_amm, lane, block_number) do update
                  set label = excluded.label, ts = excluded.ts, feed_mid = excluded.feed_mid,
                      published_mid = excluded.published_mid, delta = excluded.delta,
-                     skew = excluded.skew, sigma = excluded.sigma, hold = excluded.hold,
-                     edge = excluded.edge, stale = excluded.stale,
                      balance0 = excluded.balance0, balance1 = excluded.balance1,
                      ref_mid = excluded.ref_mid, terms = excluded.terms",
             &[
-                &pools, &lanes, &labels, &blocks, &ts, &feed_mids, &published, &deltas, &skews,
-                &sigmas, &holds, &edges, &stales, &balance0, &balance1, &ref_mids, &terms,
+                &pools, &lanes, &labels, &blocks, &ts, &feed_mids, &published, &deltas, &balance0,
+                &balance1, &ref_mids, &terms,
             ],
         )
         .await?;
@@ -1124,7 +1111,6 @@ mod tests {
             feed_mid: mid,
             published_mid: mid,
             delta: 0.0005,
-            pricing: None,
             terms: None,
         };
         let stamp = |row: QuoteRow| Latest::default().stamp(row);
@@ -1181,7 +1167,6 @@ mod tests {
             feed_mid: 1.0,
             published_mid: 1.0,
             delta: 0.0005,
-            pricing: None,
             terms: None,
         };
         let r = Recorder::new();
@@ -1225,9 +1210,8 @@ mod tests {
         assert_eq!(usdt.ref_mid, Some(1.0002));
     }
 
-    /// A custom lane's declared diagnostics ride with its row as one JSON map, by name,
-    /// bound as `jsonb`; a lane that declared none (every built-in) sends `null`, and the
-    /// data API falls back to the volatile columns for it. The map is what the row queued
+    /// A lane's declared diagnostics ride with its row as one JSON map, by name, bound as
+    /// `jsonb`; a lane that declared none sends `null`. The map is what the row queued
     /// keeps, the newest per block winning as for every other column.
     #[test]
     fn a_custom_lanes_diagnostics_become_its_terms_json() {
@@ -1253,7 +1237,6 @@ mod tests {
             feed_mid: 1.0,
             published_mid: 1.0,
             delta: 0.0005,
-            pricing: None,
             terms,
         };
         let stamp = |row: QuoteRow| Latest::default().stamp(row);
@@ -1285,6 +1268,7 @@ rpc_ws_url = "wss://mainnet.infura.io/ws/v3/ws-key"
 tokens = ["0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"]
 symbol = "ETHUSDC"
 key_env = "K"
+pricing = { kind = "feed" }
 [[builder]]
 name = "titan"
 endpoint = "wss://x"
@@ -1507,6 +1491,7 @@ api_key = "{api_key}"
 tokens  = ["0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"]
 symbol  = "ETHUSDC"
 key_env = "L"
+pricing = {{ kind = "feed" }}
 [[builder]]
 name = "b"
 endpoint = "wss://b.example/ws"

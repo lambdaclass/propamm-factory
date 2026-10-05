@@ -31,8 +31,8 @@ fn main() -> std::process::ExitCode {
 }
 ```
 
-A pair opts in with a stanza; `symbol`/`sources` stay its reference market, and the
-built-in pricing keys (`mid`, `delta`, `gamma`, ...) are refused beside it:
+A pair names the kind in its `[pairs.pricing]` stanza, the same way it would name `feed`,
+`fixed` or `volatile`; `symbol`/`sources` stay its reference market:
 
 ```toml
 [[pairs]]
@@ -58,20 +58,10 @@ What to know:
   the reload partial. A panic in any of them counts as that failure, not as the process's.
 - **The core still decides.** A pricer can refuse (`Refusal::new`, counted under the reason
   it declared), and the core withdraws anything unpublishable whatever a pricer returns: a
-  spread of a whole unit or more, a zero mid, or a mid further from the market than the
-  volatile model ever moves its own: its tilt carried by its inventory charge, a factor of
-  about 0.487 to 1.539 of the market (`reason="mid_shift"`). No built-in model can produce
-  that last one, so the bundled alert rules do not watch for it; a binary running a custom kind
-  should, as `PusherMidOutOfBand` does for the band:
-
-  ```yaml
-  - alert: PusherMidShiftRefused
-    expr: rate(quote_updater_price_unusable_total{reason="mid_shift"}[5m]) > 0
-    for: 5m
-    labels: { severity: ticket }
-    annotations:
-      summary: "{{ $labels.pair }}: the pricer's mids are refused as too far from the market"
-  ```
+  spread of a whole unit or more, a zero mid, or a mid the contract cannot store (over 216
+  bits), each counted under its own `reason`. How far a mid may sit from the market is the
+  pair's `min_mid`/`max_mid` band, which applies to every kind alike; a kind with a bound
+  of its own checks it in `validate` or refuses the tick.
 - **Builds do not block.** A `pricer_fn` closure runs synchronously inside the lane's build,
   so a fetch there stalls startup or the reload, and the 30s build limit cannot interrupt
   it. A pricer that must fetch before it can price, or whose stanza needs checking against

@@ -1,5 +1,5 @@
-# my-propamm's config. The file format is the library's; only the [pairs.pricing] and
-# [[pairs.guards]] stanzas are ours (the kinds main.rs registers).
+# my-propamm's config. The file format is the library's; the kinds named in [pairs.pricing]
+# and [[pairs.guards]] are the ones main.rs registers, our own and the library's alike.
 
 # The PrioUpdateRegistry the quotes go to. Zero here: fill in your deployment's.
 target = "0x0000000000000000000000000000000000000000"
@@ -35,13 +35,14 @@ max_dispersion = 0.01
 kind      = "share_cap"         # quote guard: withdraws while the vault is lopsided
 max_share = 0.8
 
-# A second pair on a built-in model, untouched by our code, to show both coexist.
+# A second pair on a kind the library ships, untouched by our code, to show both coexist.
 [[pairs]]
 tokens  = ["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",   # USDC
            "0xdAC17F958D2ee523a2206206994597C13D831ec7"]   # USDT
 symbol  = "USDCUSDT"
 key_env = "UPDATER_KEY_USDC_USDT"
 max_deviation = "0.002"
+pricing = { kind = "feed" }
 
 [[builder]]
 name = "titan-eu"

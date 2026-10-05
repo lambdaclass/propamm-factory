@@ -65,6 +65,9 @@ pub fn pair_for(
         inverted,
         price_decimals,
         target,
+        sources: 1,
+        min_mid: None,
+        max_mid: None,
     }
 }
 
@@ -81,6 +84,9 @@ pub fn pair_with(inverted: bool, price_decimals: u32) -> PairShape {
         inverted,
         price_decimals,
         target: ethrex_common::Address::repeat_byte(3),
+        sources: 1,
+        min_mid: None,
+        max_mid: None,
     }
 }
 
@@ -196,9 +202,7 @@ pub fn tick_at<'a>(pair: &'a PairShape, market: Option<&'a Market>, now: Instant
 
 /// What the run does with a pricer's answer before it signs it: the core's backstop, the
 /// same function the lane calls after `price()`, over the tick's pair and market. A
-/// half-spread below one whole unit that fits its storage slot, a nonzero mid, and on a
-/// pair with a market a mid within 50% of the market's (the volatile model's skew limit,
-/// which the core holds every pricer to). `Err`
+/// half-spread below one whole unit that fits its storage slot, and a nonzero mid. `Err`
 /// is the withdrawal the run would make in place of publishing, as the line it logs. The
 /// pair's `min_mid`/`max_mid` band is the file's, not the pricer's, and is not applied.
 ///
@@ -209,9 +213,9 @@ pub fn tick_at<'a>(pair: &'a PairShape, market: Option<&'a Market>, now: Instant
 /// let pair = testing::pair();
 /// let market = testing::market(&pair, 4000.0, 0.0001);
 /// let tick = testing::tick(&pair, Some(&market));
-/// // Twice the market's mid: a pricer can compute it, the core will not publish it.
-/// let doubled = PricerOutput::new(U256::zero(), market.mid * 2);
-/// assert!(testing::backstop(doubled, &tick).is_err());
+/// // A half-spread of one whole unit: a pricer can compute it, the core will not publish it.
+/// let whole = PricerOutput::new(U256::exp10(18), market.mid);
+/// assert!(testing::backstop(whole, &tick).is_err());
 /// ```
 pub fn backstop(out: PricerOutput, tick: &TickCtx) -> eyre::Result<PricerOutput> {
     crate::pricing::backstop(out, tick.market().ok(), tick.pair())

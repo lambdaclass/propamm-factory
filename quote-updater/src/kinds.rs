@@ -15,10 +15,10 @@ use futures_util::FutureExt;
 use serde::de::DeserializeOwned;
 
 use crate::{
-    config::{Config, GuardStanza, SourceSpec},
+    config::{Config, GuardStanza, PricingSpec},
     guard::{BUILT_IN_GUARDS, BuiltGuard, GuardSide, MarketGuard, QuoteGuard},
     pricing::{
-        BUILT_IN_KINDS, BoxFuture, BuildCtx, Factory, MarketGuardFactory, PairShape, Pricer,
+        BoxFuture, BuildCtx, Factory, FormField, MarketGuardFactory, PairShape, Pricer,
         QuoteGuardFactory,
     },
 };
@@ -56,6 +56,9 @@ fn guarded<T>(kind: &str, doing: &str, f: impl FnOnce() -> Result<T>) -> Result<
 pub(crate) trait ErasedPricer: Send + Sync {
     fn check(&self, table: &toml::Table) -> Result<()>;
     fn validate(&self, table: &toml::Table, pair: &PairShape) -> Result<()>;
+    fn fields(&self) -> &'static [FormField];
+    fn form_help(&self) -> &'static str;
+    fn summary(&self, table: &toml::Table) -> Result<String>;
     fn build<'a>(
         &'a self,
         table: &'a toml::Table,
@@ -80,6 +83,19 @@ impl<F: Factory> ErasedPricer for F {
     fn validate(&self, table: &toml::Table, pair: &PairShape) -> Result<()> {
         let cfg = typed::<F::Config>(table)?;
         Factory::validate(self, &cfg, pair)
+    }
+
+    fn fields(&self) -> &'static [FormField] {
+        Factory::fields(self)
+    }
+
+    fn form_help(&self) -> &'static str {
+        Factory::form_help(self)
+    }
+
+    fn summary(&self, table: &toml::Table) -> Result<String> {
+        let cfg = typed::<F::Config>(table)?;
+        Ok(Factory::summary(self, &cfg))
     }
 
     fn build<'a>(
@@ -383,12 +399,51 @@ impl Kinds {
     pub(crate) fn pricer_name(&self, kind: &str) -> Option<&'static str> {
         self.pricers.get_key_value(kind).map(|(name, _)| *name)
     }
+    /// The registered pricing kinds, by name, in order: what the backoffice's form offers.
+    pub(crate) fn pricer_kinds(&self) -> Vec<&'static str> {
+        self.pricers.keys().copied().collect()
+    }
+
+    /// A registered kind's form fields, or `None` for a kind nobody registered.
+    pub(crate) fn pricer_fields(&self, kind: &str) -> Option<&'static [FormField]> {
+        self.pricers.get(kind).map(|factory| factory.fields())
+    }
+
+    /// A registered kind's form help, or `None` for a kind nobody registered.
+    pub(crate) fn pricer_form_help(&self, kind: &str) -> Option<&'static str> {
+        self.pricers.get(kind).map(|factory| factory.form_help())
+    }
+
+    /// One line for a pair's stanza: the kind, then its factory's summary of the stanza,
+    /// for the `--check` report and the backoffice's pair list. A stanza its kind cannot
+    /// read, or an unregistered kind, shows the kind alone.
+    pub(crate) fn pricer_summary(&self, spec: &PricingSpec) -> String {
+        let summary = self
+            .pricers
+            .get(spec.kind.as_str())
+            .and_then(|factory| {
+                guarded(&spec.kind, "summarizing", || factory.summary(&spec.config)).ok()
+            })
+            .unwrap_or_default();
+        if summary.is_empty() {
+            spec.kind.clone()
+        } else {
+            format!("{} {summary}", spec.kind)
+        }
+    }
+
+    /// The three pricing kinds this crate ships, registered the way a binary does.
+    #[cfg(test)]
+    pub(crate) fn shipped() -> Self {
+        let mut kinds = Self::default();
+        kinds.insert("fixed", Arc::new(crate::pricing::Fixed));
+        kinds.insert("feed", Arc::new(crate::pricing::Feed));
+        kinds.insert("volatile", Arc::new(crate::pricing::Volatile));
+        kinds
+    }
+
     pub(crate) fn insert(&mut self, kind: &'static str, factory: Arc<dyn ErasedPricer>) {
-        if BUILT_IN_KINDS.contains(&kind) {
-            self.errors.push(format!(
-                "pricing kind `{kind}` is built in and cannot be registered"
-            ));
-        } else if self.pricers.insert(kind, factory).is_some() {
+        if self.pricers.insert(kind, factory).is_some() {
             self.errors
                 .push(format!("pricing kind `{kind}` registered twice"));
         }
@@ -429,28 +484,26 @@ impl Kinds {
         for (number, spec, halted) in config.in_file_order() {
             // As `config.rs` numbers the file's `[[pairs]]` tables, halted ones included.
             let at = format!("pair {number}");
-            if let SourceSpec::Custom {
-                kind,
-                config: table,
-                ..
-            } = &spec.source
-            {
-                let factory = self.get(kind, &at)?;
-                // A config's `Deserialize` can be the binary's own code too.
-                guarded(kind, "reading its stanza", || factory.check(table))
-                    .wrap_err_with(|| format!("{at}: [pairs.pricing] `{kind}`"))?;
-                if halted {
-                    let shape = PairShape {
-                        label: crate::config::lane_label(spec.lane),
-                        tokens: spec.declared_base_quote(),
-                        lane: spec.lane,
-                        inverted: spec.invert,
-                        price_decimals: config.price_decimals(),
-                        target: config.target,
-                    };
-                    guarded(kind, "validating", || factory.validate(table, &shape))
-                        .wrap_err_with(|| format!("{at} (halted): [pairs.pricing] `{kind}`"))?;
-                }
+            let kind = &spec.pricing.kind;
+            let table = &spec.pricing.config;
+            let factory = self.get(kind, &at)?;
+            // A config's `Deserialize` can be the binary's own code too.
+            guarded(kind, "reading its stanza", || factory.check(table))
+                .wrap_err_with(|| format!("{at}: [pairs.pricing] `{kind}`"))?;
+            if halted {
+                let shape = PairShape {
+                    label: crate::config::lane_label(spec.lane),
+                    tokens: spec.declared_base_quote(),
+                    lane: spec.lane,
+                    inverted: spec.invert,
+                    price_decimals: config.price_decimals(),
+                    target: config.target,
+                    sources: spec.feeds.as_ref().map_or(0, |f| f.sources.len()),
+                    min_mid: spec.band.min,
+                    max_mid: spec.band.max,
+                };
+                guarded(kind, "validating", || factory.validate(table, &shape))
+                    .wrap_err_with(|| format!("{at} (halted): [pairs.pricing] `{kind}`"))?;
             }
             for stanza in &spec.guards {
                 let factory = self.get_guard(&stanza.kind, &at)?;
@@ -461,7 +514,7 @@ impl Kinds {
                 // reason `config.rs` refuses a breaker on a fixed mid. Here rather than at
                 // parse, because only the registry knows which side a kind judges.
                 ensure!(
-                    factory.side() != GuardSide::Market || spec.source.feeds().is_some(),
+                    factory.side() != GuardSide::Market || spec.feeds.is_some(),
                     "{at}: [[pairs.guards]] `{}` is a market guard, which judges the pair's \
                      streamed price, and this pair streams none, so it would never run; drop \
                      the stanza, or give the pair a symbol or sources",
@@ -480,27 +533,23 @@ impl Kinds {
     /// preflight resolved them.
     pub(crate) fn validate(
         &self,
-        pairs: &[(PairShape, &SourceSpec, &[GuardStanza])],
+        pairs: &[(PairShape, &PricingSpec, &[GuardStanza])],
     ) -> Result<()> {
-        for (shape, source, guards) in pairs {
-            self.validate_pricer(shape, source)?;
+        for (shape, pricing, guards) in pairs {
+            self.validate_pricer(shape, pricing)?;
             self.validate_guards(shape, guards)?;
         }
         Ok(())
     }
 
-    /// A custom pair's pricing stanza against the pair; nothing for a built-in's.
-    pub(crate) fn validate_pricer(&self, shape: &PairShape, source: &SourceSpec) -> Result<()> {
-        if let SourceSpec::Custom {
-            kind,
-            config: table,
-            ..
-        } = source
-        {
-            let factory = self.get(kind, &shape.label)?;
-            guarded(kind, "validating", || factory.validate(table, shape))
-                .wrap_err_with(|| format!("{}: [pairs.pricing] `{kind}`", shape.label))?;
-        }
+    /// A pair's pricing stanza against the pair.
+    pub(crate) fn validate_pricer(&self, shape: &PairShape, pricing: &PricingSpec) -> Result<()> {
+        let kind = &pricing.kind;
+        let factory = self.get(kind, &shape.label)?;
+        guarded(kind, "validating", || {
+            factory.validate(&pricing.config, shape)
+        })
+        .wrap_err_with(|| format!("{}: [pairs.pricing] `{kind}`", shape.label))?;
         Ok(())
     }
 
@@ -566,7 +615,7 @@ mod tests {
     }
 
     fn kinds() -> Kinds {
-        let mut r = Kinds::default();
+        let mut r = Kinds::shipped();
         r.insert("skewed", fn_factory(|_: Cfg, _: &mut BuildCtx| Ok(P)));
         r
     }
@@ -753,15 +802,11 @@ api_key = "k"
     }
 
     #[test]
-    fn a_kind_registered_twice_or_under_a_built_in_name_is_an_error_at_run() {
+    fn a_kind_registered_twice_is_an_error_at_run() {
         let mut r = kinds();
         r.insert("skewed", fn_factory(|_: Cfg, _: &mut BuildCtx| Ok(P)));
-        r.insert("volatile", fn_factory(|_: Cfg, _: &mut BuildCtx| Ok(P)));
         let err = format!("{:#}", r.errors().unwrap_err());
-        assert!(
-            err.contains("`skewed` registered twice") && err.contains("`volatile` is built in"),
-            "{err}"
-        );
+        assert!(err.contains("`skewed` registered twice"), "{err}");
         kinds().errors().expect("one kind, registered once");
     }
 
@@ -880,12 +925,12 @@ api_key = "k"
         let config =
             crate::config::parse_config(&crate::config::tests_support::guarded("dispersion"), 18)
                 .unwrap();
-        let err = format!("{:#}", Kinds::default().check(&config).unwrap_err());
+        let err = format!("{:#}", Kinds::shipped().check(&config).unwrap_err());
         assert!(
             err.contains("unknown guard kind `dispersion`") && err.contains("registers none"),
             "{err}"
         );
-        let mut kinds = Kinds::default();
+        let mut kinds = Kinds::shipped();
         kinds.insert_guard(
             "cap",
             quote_guard_fn(|_: Empty, _: &mut BuildCtx| Ok(AllowAll)),
@@ -925,7 +970,7 @@ api_key = "k"
             crate::config::tests_support::CUSTOM.replace("symbol  = \"ETHUSDC\"\n", "");
         let fixed = unstreamed.replace(
             "[pairs.pricing]\nkind = \"skewed\"\nhalf_spread = 0.0005\n",
-            "mid = \"1.0001\"\ndelta = \"0.0002\"\n",
+            "[pairs.pricing]\nkind = \"fixed\"\nmid = \"1.0001\"\ndelta = \"0.0002\"\n",
         );
         for file in [&unstreamed, &fixed] {
             let err = format!(
@@ -1064,10 +1109,9 @@ api_key = "k"
             "{err}"
         );
 
-        let source = SourceSpec::Custom {
+        let source = PricingSpec {
             kind: "fragile".to_owned(),
             config: stanza("validate"),
-            feeds: None,
         };
         let err = format!("{:#}", kinds.validate(&[(pair, &source, &[])]).unwrap_err());
         assert!(

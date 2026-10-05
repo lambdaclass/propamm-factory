@@ -102,7 +102,7 @@ pub fn plan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{MidBand, SourceSpec};
+    use crate::config::{MidBand, PricingSpec};
     use ethrex_common::Address;
 
     fn lane(n: u64) -> U256 {
@@ -116,10 +116,8 @@ mod tests {
             tokens: (Address::zero(), Address::zero()),
             lane: lane(lane_id),
             invert: false,
-            source: SourceSpec::Feed {
-                feeds: crate::config::Feeds::single_binance("ETHUSDC"),
-                delta: delta.map(U256::from),
-            },
+            pricing: PricingSpec::feed_for_tests(delta.map(|d| d.to_string()).as_deref()),
+            feeds: Some(crate::config::Feeds::single_binance("ETHUSDC")),
             band: MidBand::default(),
             breaker: None,
             guards: Vec::new(),

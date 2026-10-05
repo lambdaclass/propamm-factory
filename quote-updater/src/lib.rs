@@ -54,8 +54,8 @@ pub mod prelude {
         },
         observe::{BlockOutcome, Event, Observer, ReloadOutcome},
         pricing::{
-            BoxFuture, BuildCtx, Chain, DiagHandle, Diagnostics, EnvSecret, Factory, History,
-            Inventory, InventoryFeed, LandingFeed, LandingOutcome, LandingReport, Market,
+            BoxFuture, BuildCtx, Chain, DiagHandle, Diagnostics, EnvSecret, Factory, FormField,
+            History, Inventory, InventoryFeed, LandingFeed, LandingOutcome, LandingReport, Market,
             MarketGuardFactory, PairShape, Pricer, PricerOutput, QuoteGuardFactory, Refusal,
             RefusalHandle, TickCtx,
         },
@@ -83,6 +83,13 @@ pub mod output;
 mod pair;
 mod preflight;
 pub mod pricing;
+/// The pricing kinds this crate ships, each an ordinary [`pricing::Factory`] a binary
+/// registers by name (`Updater::builder().pricer("volatile", pricers::Volatile)`) and a
+/// pair picks with `[pairs.pricing] kind = "volatile"`: nothing distinguishes them from a
+/// kind of your own, and their source is the worked example of writing one.
+pub mod pricers {
+    pub use crate::pricing::{Feed, Fixed, Volatile};
+}
 mod pusher;
 mod quoting;
 mod record;

@@ -216,7 +216,6 @@ pub(crate) async fn push_update(
             feed_mid: to_f64(priced.feed_mid),
             published_mid: to_f64(mid),
             delta: to_f64(delta),
-            pricing: priced.pricing,
             terms: record::terms_from(&live.values.diagnostics_now()),
         });
     }
@@ -329,7 +328,7 @@ async fn confirm_and_verify(
 mod tests {
     use super::*;
     use crate::{
-        config::{self, Pair, ResolvedPair, SourceSpec},
+        config::{self, Pair, PricingSpec, ResolvedPair},
         metrics,
         pair::build_live,
         venue, volatile,
@@ -399,10 +398,8 @@ mod tests {
                     max: None,
                 },
             },
-            source: SourceSpec::Static {
-                delta: U256::one(),
-                mid: U256::exp10(18),
-            },
+            pricing: PricingSpec::fixed_for_tests("1", "0.000000000000000001"),
+            feeds: None,
             invert: false,
             breaker: None,
             guards: Vec::new(),
@@ -418,7 +415,7 @@ mod tests {
             &volatile::Histories::default(),
             &crate::vault::InventoryReaders::default(),
             None,
-            &crate::kinds::Kinds::default(),
+            &crate::kinds::Kinds::shipped(),
         )
         .await
         .unwrap()
@@ -469,22 +466,42 @@ mod tests {
                 lane: U256::from(9),
                 signer: Signer::from(LocalSigner::new(secret)),
                 label: "NODE/TEST".to_owned(),
-                // The mid below sits an order of magnitude under this floor. `config.rs`
-                // would refuse the combination at parse time; building `Live` directly is
-                // what makes the path reachable, as it is in the builder-mode twin.
+                // The mid below sits an order of magnitude under this floor. The fixed
+                // kind would refuse the combination when it is built, so the pair is priced
+                // by a kind that only produces the mid at tick time, as a kind reading a
+                // market does; building `Live` directly is what makes the path reachable,
+                // as it is in the builder-mode twin.
                 band: config::MidBand {
                     min: Some(U256::exp10(18)),
                     max: None,
                 },
             },
-            source: SourceSpec::Static {
-                delta: U256::one(),
-                mid: U256::exp10(17),
-            },
+            pricing: PricingSpec::for_tests("low", &[]),
+            feeds: None,
             invert: false,
             breaker: None,
             guards: Vec::new(),
         };
+        struct Low;
+        impl crate::pricing::Pricer for Low {
+            fn price(
+                &mut self,
+                _: &crate::pricing::TickCtx,
+                _: &mut crate::pricing::Diagnostics,
+            ) -> Result<crate::pricing::PricerOutput, crate::pricing::Refusal> {
+                Ok(crate::pricing::PricerOutput::new(
+                    U256::one(),
+                    U256::exp10(17),
+                ))
+            }
+        }
+        #[derive(Clone, serde::Deserialize)]
+        struct NoKeys {}
+        let mut kinds = crate::kinds::Kinds::default();
+        kinds.insert(
+            "low",
+            crate::kinds::fn_factory(|_: NoKeys, _: &mut crate::pricing::BuildCtx| Ok(Low)),
+        );
         let metrics = metrics::Metrics::new().unwrap();
         let client = EthClient::new(Url::parse("http://127.0.0.1:1").unwrap()).unwrap();
         let live = build_live(
@@ -496,7 +513,7 @@ mod tests {
             &volatile::Histories::default(),
             &crate::vault::InventoryReaders::default(),
             None,
-            &crate::kinds::Kinds::default(),
+            &kinds,
         )
         .await
         .unwrap()

@@ -89,8 +89,9 @@ A fuller example with a pricer that reads the vault, two guards and an observer 
 ## What you can plug in
 
 - **A pricing model** (`Pricer`): any math over the market price, your vault balances
-  (`ctx.inventory()`), chain reads (`ctx.chain()`), the price history, HTTP. Built-in:
-  `fixed`, `feed`, `volatile` (a volatility-scaled spread with an inventory tilt).
+  (`ctx.inventory()`), chain reads (`ctx.chain()`), the price history, HTTP. The library
+  ships three, registered in `main` exactly like yours: `fixed`, `feed`, `volatile` (a
+  volatility-scaled spread with an inventory tilt).
 - **Price sources**: one venue or several averaged by weight, per pair, in the config.
 - **Guards**: code that stops a pair. A market guard judges every incoming price, a quote
   guard judges every quote you are about to publish. Built-in: the deviation breaker.

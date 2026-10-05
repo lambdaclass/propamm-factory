@@ -41,124 +41,45 @@
   </div>
   <hr>
 
-  {% if let Some(kind) = custom_kind %}
-  {# A custom pricer's stanza is its own config, which this page has no form for. #}
-  <p class=explain>priced by <code>{{ kind }}</code>: edit its <code>[pairs.pricing]</code>
-  stanza in config.toml</p>
-  {% else %}
-  {# The two pricing sections. Which one shows follows the radio, in CSS alone: the radios
-     and the sections are siblings, and `:checked ~` picks the section. Both sections'
-     inputs are posted either way; the handler keeps the chosen one's. #}
+  {# One section per registered pricing kind. Which one shows follows the radio, in CSS
+     alone: the radios and the sections are siblings, and the `<style>` below, generated per
+     kind, shows the chosen one with `:checked ~`. Every section's inputs are posted either
+     way; the handler keeps the chosen kind's. #}
   <div class=pricing>
-    <input type=radio id=pricing-fixed name=pricing value=fixed {% if !volatile %}checked{% endif %}>
-    <input type=radio id=pricing-volatile name=pricing value=volatile {% if volatile %}checked{% endif %}>
+    {% for kind in kinds %}
+    <input type=radio id="pricing-{{ kind.name }}" name=pricing value="{{ kind.name }}" {% if kind.checked %}checked{% endif %}>
+    {% endfor %}
     <div class=pricing-choice>
       <span class=key>pricing</span>
-      <label for=pricing-fixed class=choice>
-        <span class=choice-name>fixed spread</span>
-        <span class=choice-hint>we send the same spread every time. For stablecoin pairs.</span>
+      {% for kind in kinds %}
+      <label for="pricing-{{ kind.name }}" class=choice>
+        <span class=choice-name>{{ kind.name }}</span>
       </label>
-      <label for=pricing-volatile class=choice>
-        <span class=choice-name>volatile</span>
-        <span class=choice-hint>we recompute the spread every block from how much the price
-        has moved lately and how much WETH the vault holds. For WETH/USDC.</span>
-      </label>
+      {% endfor %}
     </div>
-
-    <div class="pricing-section pricing-fixed">
+    {% for kind in kinds %}
+    <div class="pricing-section pricing-{{ kind.name }}">
+      {{ kind.help|safe }}
+      {% if kind.in_file %}
+      <p class=explain>priced by <code>{{ kind.name }}</code>: its stanza has no form here; edit
+      <code>[pairs.pricing]</code> in config.toml</p>
+      {% else %}
       <div class=grid>
-        {% let field = delta %}{% include "field.html" %}
+        {% for field in kind.fields %}{% include "field.html" %}{% endfor %}
       </div>
+      {% endif %}
     </div>
-
-    <div class="pricing-section pricing-volatile">
-      <p class=explain>This is the whole thing. Every block we compute two numbers and send them to the chain: the
-      spread, and the mid. The pool then sells at <code>mid + spread/2</code> and buys at <code>mid − spread/2</code>.</p>
-      <div class=equation>
-        <div class=eqrow>
-          <span class=eqlhs>spread =</span>
-          <span class=term><span class=formula>γ&thinsp;σ²&thinsp;τ</span><span class=termname>term 1</span></span>
-          <span class=op>+</span>
-          <span class=term><span class=formula>(2/γ)&thinsp;ln(1 + γ/k)</span><span class=termname>term 2</span></span>
-          <span class=op>+</span>
-          <span class=term><span class=formula>κ&thinsp;σ&thinsp;√Δ</span><span class=termname>term 3</span></span>
-          <span class=op>+</span>
-          <span class=term><span class=formula>λ&thinsp;σ&thinsp;√τ&thinsp;·&thinsp;q_out</span><span class=termname>charge, one side</span></span>
-        </div>
-        <div class=eqrow>
-          <span class=eqlhs>mid =</span>
-          <span class=term><span class=formula>mid · (1 − skew)</span></span>
-          <span class=op>,</span>
-          <span class=term><span class=formula>skew = q&thinsp;γ&thinsp;σ&thinsp;√τ</span><span class=termname>skew</span></span>
-        </div>
-      </div>
-      <p class=explain>q_out is how far the vault's WETH share is outside inventory_band_lower to inventory_band_upper,
-      divided by target_share. It is 0 inside that range. The charge only goes on the trade that pushes us further
-      off target; the other price stays where it would be without it. There are two nested bands: past the inner one
-      the charge grows at λ_soft (inventory_aversion); past the wider hard band [inventory_band_hard_lower,
-      inventory_band_hard_upper] it grows at λ_hard (inventory_aversion_hard), so it bites much harder deep in the tail.
-      A blank hard band edge turns that side's hard tier off; leave the hard fields blank to keep the old single-band
-      behaviour.</p>
-      <p class=explain>σ is how much the price has been moving: take the last 600 seconds of our mid, compute each
-      second's percentage change, take the standard deviation. For USDC/USDT it is basically 0, so term 1, term 3 and
-      the skew are 0 and the spread is term 2, a constant. That is a fixed spread.</p>
-      <div class=grid>
-        {% let field = volatility_window_secs %}{% include "field.html" %}
-      </div>
-
-      <div class=termblock>
-        <div class=termhead><span class=formula>γ&thinsp;σ²&thinsp;τ</span> term 1: we hold WETH for 12 seconds and it can drop</div>
-        <p class=explain>Someone sells us WETH at 2999. We cannot sell it until the next block, 12 seconds later, and by
-        then the price might be 2980. This term charges extra to cover that. σ²τ is how much the price typically moves
-        in 12 seconds. γ is how much of that to charge for; we pick it.</p>
-        <div class=grid>
-          {% let field = gamma %}{% include "field.html" %}
-          {% let field = hold_secs %}{% include "field.html" %}
-        </div>
-      </div>
-
-      <div class=termblock>
-        <div class=termhead><span class=formula>(2/γ)&thinsp;ln(1 + γ/k)</span> term 2: our profit</div>
-        <p class=explain>Terms 1 and 3 cover what we expect to lose. This one is what we earn. Charge more and fewer
-        people trade with us; charge less and more do. k is a guess for how fast people leave when we charge more. Pick
-        it from the spread you want: with gamma 0.1, k = 2000 gives 0.05% per side, k = 700 gives 0.14%.</p>
-        <div class=grid>
-          {% let field = k %}{% include "field.html" %}
-        </div>
-      </div>
-
-      <div class=termblock>
-        <div class=termhead><span class=formula>κ&thinsp;σ&thinsp;√Δ</span> term 3: the price already moved and a bot trades on our old price</div>
-        <p class=explain>We post "buy at 2999". Four seconds later the market drops to 2990. A bot sells us WETH at 2999
-        that is worth 2990; we lost 9. σ√Δ is how much the price typically moves in the Δ seconds between us posting
-        and someone trading. κ is how much of that to charge for; check it against how much the price actually moved
-        after our fills.</p>
-        <div class=grid>
-          {% let field = kappa %}{% include "field.html" %}
-          {% let field = fill_delay_secs %}{% include "field.html" %}
-        </div>
-      </div>
-
-      <div class=termblock>
-        <div class=termhead><span class=formula>skew = q&thinsp;γ&thinsp;σ&thinsp;√τ</span> skew: do not sit on a big pile of WETH while it is jumpy</div>
-        <p class=explain>Say the market is at 3000 and we sell WETH at 3003 and buy it at 2997. If we are holding too much
-        WETH and WETH is moving a lot, we lower both: sell at 3002, buy at 2996. People buy the cheap WETH from us and
-        stop selling us more, so we end up holding less of it. If we are holding too little, we raise both. "Too much"
-        means more than target_share of the vault's value is in WETH. If WETH is not moving, we do not do this, even if
-        the vault is lopsided.</p>
-        <div class=grid>
-          {% let field = target_share %}{% include "field.html" %}
-          {% let field = inventory_aversion %}{% include "field.html" %}
-          {% let field = inventory_band_lower %}{% include "field.html" %}
-          {% let field = inventory_band_upper %}{% include "field.html" %}
-          {% let field = inventory_aversion_hard %}{% include "field.html" %}
-          {% let field = inventory_band_hard_lower %}{% include "field.html" %}
-          {% let field = inventory_band_hard_upper %}{% include "field.html" %}
-        </div>
-      </div>
-    </div>
+    {% endfor %}
   </div>
-  {% endif %}
+  <style>
+    {% for kind in kinds %}
+    #pricing-{{ kind.name }}:checked ~ .pricing-choice .choice[for=pricing-{{ kind.name }}] {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+    }
+    #pricing-{{ kind.name }}:checked ~ .pricing-{{ kind.name }} { display: block; }
+    {% endfor %}
+  </style>
 
   <div class=actions>
     <label class=check>

@@ -104,7 +104,7 @@ async fn run_inner(
     quoting: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<Outcome> {
     refuse_panic_abort(cfg!(panic = "abort"))?;
-    // A kind registered twice, or under a built-in's name, or two observers under one
+    // A kind registered twice, a guard under the breaker's name, or two observers under one
     // name, is the binary's mistake: refused before anything else, whatever the config says.
     parts.registration_errors()?;
     let Parts {
@@ -371,7 +371,7 @@ async fn run_inner(
         .map(|pair| {
             (
                 crate::pair::shape_of(pair, args.flags.price_decimals, target),
-                &pair.source,
+                &pair.pricing,
                 pair.guards.as_slice(),
             )
         })
@@ -653,6 +653,7 @@ async fn run_inner(
                     client.clone(),
                     pair_states.clone(),
                     edits.clone(),
+                    Arc::clone(&kinds),
                 )
                 .await?;
                 tracing::info!("backoffice listening on http://{local}/");
@@ -927,9 +928,8 @@ rpc_url = "{rpc}"
 
 [[pairs]]
 tokens  = ["{usdc:#x}", "{usdt:#x}"]
-mid     = "1.0001"
-delta   = "0.0002"
 key_env = "QU_TEST_KEY"
+pricing = {{ kind = "fixed", mid = "1.0001", delta = "0.0002" }}
 {pair_tail}
 [[builder]]
 name = "mock"
@@ -994,11 +994,20 @@ api_key = "k"
             crate::Args::try_parse_from(argv).unwrap()
         }
 
-        /// The builder every run test uses: the fixture's key, nothing else registered.
+        /// The builder every run test uses: the fixture's key and the shipped pricing kinds,
+        /// nothing else registered.
         fn updater(&self) -> crate::UpdaterBuilder {
-            crate::Updater::builder()
+            shipped(crate::Updater::builder())
                 .key_lookup(|name| (name == "QU_TEST_KEY").then(|| ANVIL_KEY_0.to_owned()))
         }
+    }
+
+    /// `builder` with the three pricing kinds this crate ships registered, as a binary does.
+    fn shipped(builder: crate::UpdaterBuilder) -> crate::UpdaterBuilder {
+        builder
+            .pricer("fixed", crate::pricing::Fixed)
+            .pricer("feed", crate::pricing::Feed)
+            .pricer("volatile", crate::pricing::Volatile)
     }
 
     impl Drop for Fixture {
@@ -1643,7 +1652,7 @@ api_key = "k"
             "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
         let fx = Fixture::spawn("halt-partial").await;
         let ten = Duration::from_secs(10);
-        let handle = crate::Updater::builder()
+        let handle = shipped(crate::Updater::builder())
             .key_lookup(|name| match name {
                 "QU_TEST_KEY" => Some(ANVIL_KEY_0.to_owned()),
                 "QU_TEST_KEY_B" => Some(ANVIL_KEY_1.to_owned()),
@@ -1667,8 +1676,8 @@ api_key = "k"
                 "[[builder]]",
                 &format!(
                     "[[pairs]]\ntokens = [\"{weth:#x}\", \"{usdc}\"]\nsymbol = \"ETHUSDC\"\n\
-                     allow_symbol_mismatch = true\ngamma = \"0.1\"\nk = \"2000\"\nkappa = \"1\"\n\
-                     key_env = \"QU_TEST_KEY_B\"\n\n[[builder]]"
+                     allow_symbol_mismatch = true\n\
+                     key_env = \"QU_TEST_KEY_B\"\npricing = {{ kind = \"volatile\", gamma = \"0.1\", k = \"2000\", kappa = \"1\" }}\n\n[[builder]]"
                 ),
                 1,
             ),

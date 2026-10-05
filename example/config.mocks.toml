@@ -42,8 +42,9 @@ max_dispersion = 0.01
 kind      = "share_cap"
 max_share = 1.0
 
-# A built-in model on USDC/USDT beside it.
+# A kind the library ships on USDC/USDT beside it.
 [[pairs]]
 tokens  = ["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", "0xdAC17F958D2ee523a2206206994597C13D831ec7"]
 symbol  = "USDCUSDT"
 key_env = "UPDATER_KEY_USDC_USDT"
+pricing = { kind = "feed" }

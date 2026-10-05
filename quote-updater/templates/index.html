@@ -27,7 +27,7 @@
 {% else %}
   <table>
     <thead><tr>
-      <th>key_env<th>tokens<th>source<th>delta<th>band<th>breaker<th>
+      <th>key_env<th>tokens<th>source<th>pricing<th>band<th>breaker<th>
     </tr></thead>
     <tbody>
       {% for pair in pairs %}
@@ -40,7 +40,7 @@
           {% endfor %}
         </td>
         <td>{% if let Some(v) = pair.source %}<span class=val>{{ v }}</span>{% else %}<span class=unset>&ndash;</span>{% endif %}</td>
-        <td>{% if let Some(v) = pair.delta %}<span class=val>{{ v }}</span>{% else %}<span class=unset>&ndash;</span>{% endif %}</td>
+        <td><span class=val>{{ pair.pricing }}</span></td>
         <td>{% if let Some(v) = pair.band %}<span class=val>{{ v }}</span>{% else %}<span class=unset>&ndash;</span>{% endif %}</td>
         <td>{% if let Some(v) = pair.breaker %}<span class=val>{{ v }}</span>{% else %}<span class=unset>&ndash;</span>{% endif %}</td>
         <td class=rowactions>

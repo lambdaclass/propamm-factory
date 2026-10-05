@@ -270,6 +270,10 @@ fn main() -> std::process::ExitCode {
         .log_target(env!("CARGO_CRATE_NAME"))
         // Named in the operator hints ("systemctl --user reload my-propamm"). Optional.
         .systemd_unit("my-propamm")
+        // The three kinds the library ships, registered exactly like our own below.
+        .pricer("fixed", quote_updater::pricers::Fixed)
+        .pricer("feed", quote_updater::pricers::Feed)
+        .pricer("volatile", quote_updater::pricers::Volatile)
         .pricer("inventory_skew", InventorySkewFactory)
         .market_guard_fn("venue_spread", |cfg: VenueSpreadCfg, ctx: &mut BuildCtx| {
             eyre::ensure!(cfg.max_dispersion > 0.0, "max_dispersion must be positive");

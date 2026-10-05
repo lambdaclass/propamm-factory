@@ -24,18 +24,18 @@ use ethrex_common::{Address, U256};
 mod feed;
 mod fixed;
 mod inputs;
-#[cfg(test)]
-mod legacy;
 mod volatile;
 
 pub use self::inputs::{
     Chain, History, Inventory, InventoryFeed, LandingFeed, LandingOutcome, LandingReport,
 };
-pub(crate) use self::{feed::FeedPricer, fixed::FixedPricer, volatile::VolatilePricer};
+pub use self::{feed::Feed, fixed::Fixed, volatile::Volatile};
+#[cfg(test)]
+pub(crate) use self::{feed::FeedPricer, fixed::FixedPricer};
 
 use crate::{
     feed::{PriceSample, parse_decimal_scaled},
-    update::{Pricing, Unusable, UnusableKind},
+    update::{Unusable, UnusableKind},
     volatile::{fraction_scaled, shifted_mid},
 };
 
@@ -46,10 +46,30 @@ use crate::{
 /// guard reading a [`super::guard::SourceSample`]'s own `mid` and `delta`.
 pub use crate::feed::scaled_to_f64;
 
-/// The names of the built-in pricing models: a `[pairs.pricing]` stanza cannot name one,
-/// and a binary cannot register one. A slice, so a name added later (the deviation guard's,
-/// when guards become registrable) changes no type a binary names.
-pub const BUILT_IN_KINDS: &[&str] = &["fixed", "feed", "volatile"];
+/// One input of a pricing kind on the backoffice's pair form: the stanza key it writes, the
+/// placeholder the empty input shows, and the hint under it. A kind that declares its fields
+/// ([`Factory::fields`]) is editable from the page; one that declares none is edited in the
+/// config file, and the page says so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FormField {
+    /// The stanza key the input writes, e.g. `half_spread`.
+    pub name: &'static str,
+    /// What an empty input shows, e.g. `0.0005`.
+    pub placeholder: &'static str,
+    /// One or two sentences under the input: what the key means and what blank means.
+    pub hint: &'static str,
+}
+
+impl FormField {
+    /// A field, as a `const` so a kind declares its list as a `&'static [FormField]`.
+    pub const fn new(name: &'static str, placeholder: &'static str, hint: &'static str) -> Self {
+        FormField {
+            name,
+            placeholder,
+            hint,
+        }
+    }
+}
 
 /// The future a [`Factory`] builds in: boxed and `Send`, so building needs no
 /// `async-trait` crate and no dependency beyond this one.
@@ -121,6 +141,26 @@ pub trait Factory: Send + Sync + 'static {
     /// stanza rejects the whole file.
     fn validate(&self, _cfg: &Self::Config, _pair: &PairShape) -> eyre::Result<()> {
         Ok(())
+    }
+
+    /// The stanza's keys as inputs on the backoffice's pair form, in the order shown. The
+    /// page posts each as text and writes it into the stanza as a string, so a kind that
+    /// declares fields reads its config as strings (the kinds this crate ships do). Empty, the default,
+    /// means the stanza is edited in the file and the page says so.
+    fn fields(&self) -> &'static [FormField] {
+        &[]
+    }
+
+    /// HTML the pair form shows above this kind's fields: what the model does and how to
+    /// tune it. Empty by default.
+    fn form_help(&self) -> &'static str {
+        ""
+    }
+
+    /// One line describing a stanza for the `--check` report and the backoffice's pair
+    /// list, e.g. `mid 1.0001 delta 0.0002`. Empty by default, which shows the kind alone.
+    fn summary(&self, _cfg: &Self::Config) -> String {
+        String::new()
     }
 
     /// Builds the pricer, with I/O if it needs it, whenever the lane is built: at startup
@@ -202,9 +242,6 @@ pub const RESERVED_REASONS: &[&str] = &[
     "stale",
     "out_of_band",
     "delta_overflow",
-    "warming_up",
-    "no_inventory",
-    "mid_shift",
     "panic",
 ];
 
@@ -314,6 +351,15 @@ pub struct PairShape {
     pub price_decimals: u32,
     /// The PropAMM the lane quotes on.
     pub target: Address,
+    /// How many venues the pair's `symbol`/`sources` stream from: 0 for a pair with no
+    /// market, which a kind that reads one refuses in its `validate`.
+    pub sources: usize,
+    /// The pair's `min_mid`, in lane orientation, which the core holds every published mid
+    /// to; a kind whose mid is a setting checks it here, so a mistake fails the file instead
+    /// of every tick.
+    pub min_mid: Option<U256>,
+    /// The pair's `max_mid`, likewise.
+    pub max_mid: Option<U256>,
 }
 
 /// The pair's reference market this tick: the composite of its `symbol`/`sources`, fresh.
@@ -536,8 +582,6 @@ pub struct DiagHandle {
 #[derive(Debug)]
 pub struct Diagnostics {
     values: Vec<Option<f64>>,
-    /// The volatile model's working, for the recorder (built-ins only).
-    pub(crate) terms: Option<Pricing>,
     /// A line `--check` prints under this pair's row; see [`Diagnostics::note`].
     pub(crate) note: Option<String>,
 }
@@ -546,7 +590,6 @@ impl Diagnostics {
     pub(crate) fn new(len: usize) -> Diagnostics {
         Diagnostics {
             values: vec![None; len],
-            terms: None,
             note: None,
         }
     }
@@ -586,16 +629,11 @@ impl Diagnostics {
     }
 }
 
-/// The core's own bounds on any pricer's output (spec §4, step 11): a spread below one
-/// whole unit that fits the 216 bits its storage slot leaves it, a nonzero mid, and a mid no
-/// further from the market's than the volatile model reaches ([`crate::volatile::skew_reach`]:
-/// its ±SKEW_LIMIT tilt carried further by its inventory charge, a factor of ≈ 0.487 to
-/// ≈ 1.539 in market orientation). The built-ins make the spread checks first with their own
-/// messages and stay inside the mid bound by construction, so for them this fires only on a
-/// mid that truncates to zero (a tilt on a mid of one unit), which the code before it
-/// published and PropAMM rejects; the comparison grid in pricing/legacy.rs proves both. It
-/// exists for pricers the core did not write. Severity only goes up: this can withdraw a
-/// quote, never publish one.
+/// The core's own bounds on any pricer's output: a spread below one whole unit that fits
+/// the 216 bits its storage slot leaves it, and a nonzero mid. Every kind goes through it;
+/// the pair's band (`min_mid`/`max_mid`) is the operator's bound
+/// on the mid and is checked after it. Severity only goes up: this can withdraw a quote,
+/// never publish one.
 pub(crate) fn backstop(
     out: PricerOutput,
     market: Option<&Market>,
@@ -620,44 +658,7 @@ pub(crate) fn backstop(
             "the pricer's mid is zero; refusing to publish it".to_owned(),
         ));
     }
-    if let Some(market) = market {
-        // In market orientation, so an inverted lane gets the same bound as a direct one.
-        let lane_ratio = scaled_to_f64(out.mid, pair.price_decimals)
-            / scaled_to_f64(market.mid, pair.price_decimals);
-        let ratio = if pair.inverted {
-            1.0 / lane_ratio
-        } else {
-            lane_ratio
-        };
-        // Bounded by the two mids the volatile model reaches, computed the way it computes
-        // them: `shifted_mid` rounds its factor at the price decimals, so at 6 dp an extreme
-        // lands a few parts per million past the exact factor, and a bound on the f64 ratio
-        // alone would refuse the model's legitimate extreme. `shifted_mid` is monotone in
-        // the skew and the model clamps its skew to `skew_reach`, so its mid always lies
-        // between these two. The ratio is the fallback for mids too large for the bounds to
-        // be computed.
-        let (lowest, highest) = crate::volatile::skew_reach();
-        let bound =
-            |skew: f64| shifted_mid(market.mid, skew, pair.inverted, pair.price_decimals).ok();
-        let within = match (bound(highest), bound(lowest)) {
-            (Some(a), Some(b)) => a.min(b) <= out.mid && out.mid <= a.max(b),
-            _ => (1.0 - highest - 1e-9..=1.0 - lowest + 1e-9).contains(&ratio),
-        };
-        if !within {
-            return Err(Unusable::new(
-                UnusableKind::MidShift,
-                format!(
-                    "the pricer's mid {} is {:+.1}% from the market's {}, outside the {:+.1}% \
-                     to {:+.1}% the core allows; refusing to publish it",
-                    out.mid,
-                    (ratio - 1.0) * 100.0,
-                    market.mid,
-                    -highest * 100.0,
-                    -lowest * 100.0
-                ),
-            ));
-        }
-    }
+    let _ = market;
     Ok(())
 }
 
@@ -1119,17 +1120,11 @@ mod tests {
         assert_eq!(feed.next().await, None, "the lane is gone");
     }
 
-    /// Slices, not fixed-size arrays: a name added to either list must not change the type
-    /// of a public constant, which would break any binary that names it.
-    #[test]
-    fn the_public_name_lists_are_slices() {
-        const RESERVED: &[&str] = RESERVED_REASONS;
-        const KINDS: &[&str] = BUILT_IN_KINDS;
-        assert!(RESERVED.contains(&"mid_shift") && KINDS.contains(&"volatile"));
-    }
-
     fn pair(inverted: bool, price_decimals: u32) -> PairShape {
         PairShape {
+            sources: 1,
+            min_mid: None,
+            max_mid: None,
             label: "WETH/USDC".into(),
             tokens: (Address::repeat_byte(1), Address::repeat_byte(2)),
             lane: U256::from(7),
@@ -1248,167 +1243,11 @@ mod tests {
             )),
             Some(UnusableKind::OutOfBand)
         );
-        // The volatile model reaches 4000 × 1.53897 ≈ 6155.87 and 4000 × 0.48734 ≈ 1949.36.
-        let refused = backstop(at(U256::zero(), "6156"), Some(&market), &p).unwrap_err();
-        assert_eq!(refused.kind(), Some(UnusableKind::MidShift));
-        assert!(
-            refused.to_string().contains("+53.9% from the market's")
-                && refused.to_string().contains("outside the -51.3% to +53.9%"),
-            "{refused}"
-        );
-        assert_eq!(
-            kind(backstop(at(U256::zero(), "1949"), Some(&market), &p)),
-            Some(UnusableKind::MidShift)
-        );
-        backstop(at(U256::zero(), "6155"), Some(&market), &p).expect("inside the model's reach");
-        backstop(at(U256::zero(), "1950"), Some(&market), &p).expect("inside the model's reach");
-        backstop(at(U256::from(1), "123"), None, &p).expect("no market: no shift bound");
-        // An inverted lane gets the same bound, in market orientation.
-        let inverted = pair(true, 18);
-        let market = Market::from_sample(&sample("0.00025", "0", 18), &inverted);
-        assert_eq!(
-            kind(backstop(
-                at(U256::zero(), "0.0006"),
-                Some(&market),
-                &inverted
-            )),
-            Some(UnusableKind::MidShift),
-            "0.0006 lane is ~1667 market: 58% below 4000"
-        );
-        backstop(at(U256::zero(), "0.0003"), Some(&market), &inverted).expect("~3333: within");
-    }
-
-    /// The volatile model's mid reaches both ends of `skew_reach` (volatile.rs pins that), and
-    /// its tilt alone reaches ±SKEW_LIMIT; the backstop must let all of them through in both
-    /// orientations and at both scales, or a built-in at its extreme would be refused, and
-    /// must refuse a mid one unit past either end: the bound is the model's reach, no looser.
-    /// The inverted 6-dp lane mid is 250 units, where `shifted_mid`'s rounding is coarsest.
-    #[test]
-    fn the_backstop_passes_the_volatile_models_full_reach_and_nothing_past_it() {
-        use crate::volatile::{SKEW_LIMIT, skew_reach};
-        let (lowest, highest) = skew_reach();
-        for inverted in [false, true] {
-            for decimals in [6u32, 18] {
-                let p = pair(inverted, decimals);
-                let lane_mid = if inverted { "0.00025" } else { "4000" };
-                let market = Market::from_sample(&sample(lane_mid, "0", decimals), &p);
-                let at =
-                    |mid: U256| backstop(PricerOutput::new(U256::one(), mid), Some(&market), &p);
-                let reached: Vec<U256> = [lowest, -SKEW_LIMIT, 0.0, SKEW_LIMIT, highest]
-                    .into_iter()
-                    .map(|skew| shifted_mid(market.mid, skew, inverted, decimals).unwrap())
-                    .collect();
-                for mid in &reached {
-                    at(*mid).unwrap_or_else(|err| {
-                        panic!("inverted {inverted}, {decimals} dp, mid {mid}: {err}")
-                    });
-                }
-                let (min, max) = (reached.iter().min().unwrap(), reached.iter().max().unwrap());
-                for past in [*min - U256::one(), *max + U256::one()] {
-                    assert_eq!(
-                        at(past).unwrap_err().kind(),
-                        Some(UnusableKind::MidShift),
-                        "inverted {inverted}, {decimals} dp, mid {past}"
-                    );
-                }
-            }
-        }
-    }
-
-    /// The reviewer's case: the inventory charge moves the volatile model's mid past
-    /// ±SKEW_LIMIT by design (see `volatile::SKEW_LIMIT`), and the backstop must let it
-    /// through. γ = 10, k = 2000, κ = 1, λ = 1, a band of [0.25, 0.75] around a 0.5 target,
-    /// σ ≈ 0.08/√s and a vault 20% in the base (q = −0.6) price a half-spread of ≈ 0.4897 on
-    /// a market-orientation factor of ≈ 1.5035, which the code before the backstop published.
-    #[test]
-    fn a_vault_far_short_of_its_band_publishes_through_the_backstop() {
-        use std::{sync::Mutex, time::Duration};
-
-        use crate::{
-            config::MidBand,
-            update::ValueSource,
-            volatile::{Inventory, PriceHistory, RawKnobs, VolatileParams},
-        };
-
-        let params = VolatileParams::parse(
-            "test",
-            RawKnobs {
-                gamma: "10",
-                k: "2000",
-                kappa: "1",
-                target_share: Some("0.5"),
-                hold_secs: None,
-                fill_delay_secs: None,
-                volatility_window_secs: None,
-                inventory_aversion: Some("1"),
-                inventory_band_lower: Some("0.25"),
-                inventory_band_upper: Some("0.75"),
-                inventory_aversion_hard: None,
-                inventory_band_hard_lower: None,
-                inventory_band_hard_upper: None,
-            },
-        )
-        .unwrap();
-        let metrics = crate::metrics::Metrics::new()
-            .unwrap()
-            .for_pair("TEST/PAIR");
-        for inverted in [false, true] {
-            for decimals in [6u32, 18] {
-                let now = Instant::now();
-                // A log return of ±0.08 every second: σ = 0.08/√s.
-                let mut history = PriceHistory::new(now - Duration::from_secs(200));
-                for s in 0..120u64 {
-                    let wiggle = if s % 2 == 0 { 1.0 } else { 0.08f64.exp() };
-                    history.record(4000.0 * wiggle, now - Duration::from_secs(120 - s));
-                }
-                let history = Arc::new(Mutex::new(history));
-                // 1 base at 4000 against 16000 quote: 20% of the value in the base.
-                let (_inventory_tx, inventory) = tokio::sync::watch::channel(Inventory {
-                    vault: Address::zero(),
-                    base: 1.0,
-                    quote: 16_000.0,
-                    at: now,
-                });
-                let lane_mid = if inverted { "0.00025" } else { "4000" };
-                let (_tx, rx) =
-                    tokio::sync::watch::channel(Some(sample(lane_mid, "0.0001", decimals)));
-                let at = format!("inverted {inverted}, {decimals} dp");
-                let old = legacy::LegacyValueSource::Volatile {
-                    rx: rx.clone(),
-                    history: Arc::clone(&history),
-                    inventory: inventory.clone(),
-                    params: params.clone(),
-                    invert: inverted,
-                    price_decimals: decimals,
-                    metrics: metrics.clone(),
-                }
-                .current_detailed(&MidBand::default())
-                .unwrap_or_else(|err| panic!("{at}: the code before the backstop: {err}"));
-                let terms = old.pricing.unwrap();
-                assert!(
-                    (terms.skew + 0.5035).abs() < 1e-3,
-                    "{at}: skew {}",
-                    terms.skew
-                );
-                let new = ValueSource::volatile_for_tests(
-                    rx,
-                    history,
-                    inventory,
-                    params.clone(),
-                    inverted,
-                    decimals,
-                    metrics.clone(),
-                )
-                .current_detailed(&MidBand::default())
-                .unwrap_or_else(|err| panic!("{at}: withdrawn: {err}"));
-                assert_eq!(new, old, "{at}");
-                let half_spread = scaled_to_f64(new.delta, decimals);
-                assert!(
-                    (half_spread - 0.4897).abs() < 1e-3,
-                    "{at}: delta {half_spread}"
-                );
-            }
-        }
+        // No bound on the mid against the market: the pair's band is the operator's bound, and
+        // a kind is free to quote wherever its model says.
+        backstop(at(U256::zero(), "6156"), Some(&market), &p)
+            .expect("a far mid is the band's business");
+        backstop(at(U256::from(1), "123"), None, &p).expect("no market: nothing to compare");
     }
 
     #[test]

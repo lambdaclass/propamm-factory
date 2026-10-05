@@ -91,6 +91,8 @@ impl Factory for TiltedFactory {
 
 fn main() -> std::process::ExitCode {
     Updater::builder()
+        // The shipped `fixed` kind beside our own: the e2e's USDC/USDT pair uses it.
+        .pricer("fixed", quote_updater::pricers::Fixed)
         .pricer("tilted", TiltedFactory)
         .run_from_env()
 }

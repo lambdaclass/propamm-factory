@@ -80,19 +80,24 @@ fn the_cores_backstop_withdraws_what_the_pricer_would_publish() {
         "a 1% tilt is published"
     );
 
-    // A 75% tilt the pricer computes without complaint, and the core will not publish.
+    // A 75% tilt the pricer computes without complaint, and the core publishes: how far a
+    // mid may sit from the market is the pair's band, not the core's.
     let (mut wild, ctx) =
         testing::build_fn(make, "half_spread = 0.0005\ntilt = 0.75", &pair).unwrap();
     let out = wild
         .price(&tick, &mut testing::diagnostics(&ctx))
         .expect("the pricer itself prices it");
-    let err = format!("{:#}", testing::backstop(out, &tick).unwrap_err());
-    assert!(err.contains("the core allows"), "{err}");
+    assert_eq!(testing::backstop(out, &tick).unwrap(), out);
 
-    // Nor a half-spread of one whole unit, whatever the market.
+    // A half-spread of one whole unit is refused, whatever the market.
     let whole = PricerOutput::new(U256::exp10(18), market.mid);
     let err = format!("{:#}", testing::backstop(whole, &tick).unwrap_err());
     assert!(err.contains("one whole unit"), "{err}");
+
+    // And so is a zero mid.
+    let zero = PricerOutput::new(U256::one(), U256::zero());
+    let err = format!("{:#}", testing::backstop(zero, &tick).unwrap_err());
+    assert!(err.contains("zero"), "{err}");
 }
 
 #[test]

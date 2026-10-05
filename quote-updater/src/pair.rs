@@ -11,17 +11,14 @@ use std::sync::Arc;
 
 use crate::{
     composite,
-    config::{self, Pair, ResolvedPair, SourceSpec},
+    config::{self, Pair, ResolvedPair},
     feed,
     kinds::Kinds,
     metrics, preflight,
-    pricing::{
-        BuildCtx, Chain, Diagnostics, FeedPricer, FixedPricer, History, Market, PairShape, Pricer,
-        TickCtx, VolatilePricer,
-    },
+    pricing::{BuildCtx, Chain, Diagnostics, History, Market, PairShape, Pricer, TickCtx},
     record,
     tasks::Tasks,
-    update::{Bound, PricingKind, ValueSource},
+    update::{Bound, ValueSource},
     vault, venue, volatile,
 };
 
@@ -94,12 +91,6 @@ pub(crate) fn adopt_metrics(live: &Live, price_decimals: u32, metrics: &crate::m
     // the process, and this build's own would read the last build's values until its first
     // tick sets them. Before the gauges below, like every other initial value here.
     metrics.quiesce_diagnostics(&live.pair.label);
-    // A volatile pair's target share is a setting, not a reading: written here with the pair
-    // so the dashboard's target line survives a warm-up or a stale-inventory tick, when the
-    // pricing path that used to write it does not run. Non-volatile pairs get NaN below.
-    if let PricingKind::Volatile { target_share } = live.values.kind() {
-        m.pricing_target_share.set(*target_share);
-    }
     m.breaker_armed.set(if live.armed { 1.0 } else { 0.0 });
     for kind in &live.guard_kinds {
         m.guard(kind).set(1.0);
@@ -107,24 +98,6 @@ pub(crate) fn adopt_metrics(live: &Live, price_decimals: u32, metrics: &crate::m
     adopt_breaker_metrics(live);
     m.signer_runway_updates.set(f64::INFINITY);
     m.signer_balance_wei.set(f64::NAN);
-    // The volatile terms are written by every tick of a volatile pair and by nothing else;
-    // on any other pair a registered 0 would draw a spread of zero on the pricing panel.
-    if !matches!(live.values.kind(), PricingKind::Volatile { .. }) {
-        for gauge in [
-            &m.pricing_sigma,
-            &m.pricing_hold,
-            &m.pricing_edge,
-            &m.pricing_stale,
-            &m.pricing_inventory,
-            &m.pricing_target_share,
-            &m.pricing_skew,
-            &m.inventory_base,
-            &m.inventory_quote,
-            &m.inventory_base_share,
-        ] {
-            gauge.set(f64::NAN);
-        }
-    }
     match live.values.market_rx() {
         None => {
             m.feed_up.set(f64::NAN);
@@ -258,6 +231,9 @@ pub(crate) fn shape_of(resolved: &ResolvedPair, price_decimals: u32, target: Add
         inverted: resolved.invert,
         price_decimals,
         target,
+        sources: resolved.feeds.as_ref().map_or(0, |f| f.sources.len()),
+        min_mid: resolved.pair.band.min,
+        max_mid: resolved.pair.band.max,
     }
 }
 
@@ -300,15 +276,11 @@ pub(crate) async fn build_custom(
     watch_tasks(&mut tasks, &mut ctx, "pricing", name, metrics);
     let bound = Bound::for_build(&ctx, metrics, kind, tasks);
     let latch = ctx.latch();
-    Ok(ValueSource::new(
-        pricer,
-        PricingKind::Custom { kind: name },
-        market,
-        Arc::new(shape),
-        bound,
+    Ok(
+        ValueSource::new(pricer, name, market, Arc::new(shape), bound)
+            .with_latch(latch)
+            .with_landings(ctx.landings_sender()),
     )
-    .with_latch(latch)
-    .with_landings(ctx.landings_sender()))
 }
 
 /// One side's registered guards from the pair's stanzas, in file order, each built through
@@ -570,106 +542,32 @@ pub(crate) async fn build_live(
         history,
     };
     let quote_shape = Arc::clone(&shape);
-    let (values, venues) = match &resolved.source {
-        SourceSpec::Custom {
-            kind,
-            config: stanza,
-            feeds,
-        } => {
-            // The reference market first, as for a feed pair, so a wrong symbol fails before
-            // the pricer is built. Its σ history is recorded as a volatile pair's is, into
-            // the process-level store, so `ctx.history()` reads what a reload keeps: one
-            // f64 per second per market, whether or not the pricer ends up reading it.
-            let (market, venues, history) = match feeds {
-                Some(feeds) => {
-                    let history = histories.for_symbol(&feeds.history_key());
-                    let spawned = composite::connect(feeds, params(Some(history.clone()))).await?;
-                    (Some(spawned.rx), spawned.venues, Some(History(history)))
-                }
-                None => (None, Vec::new(), None),
-            };
-            let (client, target) = chain;
-            let values = build_custom(
-                kinds,
-                kind,
-                stanza,
-                (*shape).clone(),
-                market,
-                metrics,
-                Chain::new(client.clone(), target),
-                history,
-                latch.clone(),
-                readers,
-                endpoints.http(),
-            )
-            .await?;
-            (values, venues)
-        }
-        SourceSpec::Static { delta, mid } => (
-            ValueSource::new(
-                Box::new(FixedPricer {
-                    delta: *delta,
-                    mid: *mid,
-                }),
-                PricingKind::Fixed,
-                None,
-                shape,
-                Bound::none(),
-            ),
-            Vec::new(),
-        ),
-        SourceSpec::Feed { feeds, .. } => {
-            let spawned = composite::connect(feeds, params(None)).await?;
-            (
-                ValueSource::new(
-                    Box::new(FeedPricer {
-                        source: resolved.source.clone(),
-                        spread_scale: config::spread_scale(price_decimals),
-                    }),
-                    PricingKind::Feed,
-                    Some(spawned.rx),
-                    shape,
-                    Bound::none(),
-                ),
-                spawned.venues,
-            )
-        }
-        SourceSpec::Volatile {
-            feeds,
-            params: knobs,
-        } => {
-            let (client, target) = chain;
-            let (base, quote) = resolved.declared_base_quote();
-            // Read before the feeds are dialled, so a wrong target fails without a socket
-            // having been opened for it.
-            let inventory =
-                connect_inventory(readers, client, target, base, quote, &resolved.pair.label)
-                    .await?;
-            // The market's history, not this generation's: a reload that rebuilds the pair
-            // gets the samples the feeds it replaces collected, so σ needs no new warm-up.
+    // The reference market first, if the pair has one, so a wrong symbol fails before the
+    // pricer is built. Its σ history is the process-level store's, so `ctx.history()` reads
+    // what a reload keeps: one f64 per second per market, whether or not the kind reads it.
+    let (market, venues, history) = match &resolved.feeds {
+        Some(feeds) => {
             let history = histories.for_symbol(&feeds.history_key());
             let spawned = composite::connect(feeds, params(Some(history.clone()))).await?;
-            (
-                ValueSource::new(
-                    Box::new(VolatilePricer {
-                        history,
-                        inventory,
-                        params: knobs.clone(),
-                        invert: resolved.invert,
-                        price_decimals,
-                        metrics: pair_metrics.clone(),
-                    }),
-                    PricingKind::Volatile {
-                        target_share: knobs.target_share.get(),
-                    },
-                    Some(spawned.rx),
-                    shape,
-                    Bound::none(),
-                ),
-                spawned.venues,
-            )
+            (Some(spawned.rx), spawned.venues, Some(History(history)))
         }
+        None => (None, Vec::new(), None),
     };
+    let (client, target) = chain;
+    let values = build_custom(
+        kinds,
+        &resolved.pricing.kind,
+        &resolved.pricing.config,
+        (*shape).clone(),
+        market,
+        metrics,
+        Chain::new(client.clone(), target),
+        history,
+        latch.clone(),
+        readers,
+        endpoints.http(),
+    )
+    .await?;
     // The quote guards last, after the pricer, whose diagnostics a quote guard's build may
     // bind by name: the spec's build order (market, pricer, guards), so a failure here keeps
     // the old lane and reports the reload partial like any other build failure.
@@ -793,8 +691,8 @@ pub(crate) fn all_or_none<T>(results: Vec<(String, Result<T>)>) -> Result<Vec<T>
 
 /// One `--check` row from a pricer's `preview`: the `(delta, mid)` it would publish or why
 /// not, and the note it left for the row. `sample` is the pair's market, if it has one;
-/// `diagnostics` is how many its build declared (none for a built-in), so the buffer has the
-/// slots the run's has and a pricer reading back what it set sees the same here.
+/// `diagnostics` is how many its build declared, so the buffer has the slots the run's has
+/// and a pricer reading back what it set sees the same here.
 ///
 /// The preview goes through the core's backstop with the same market and shape the run's
 /// every tick does, so a row cannot pass what the run would withdraw.
@@ -899,152 +797,69 @@ pub(crate) async fn collect_prices(
                 inverted: spec.invert,
                 price_decimals,
                 target: chain.1,
-            };
-            let lost = || -> (Result<(U256, U256), String>, Option<String>) {
-                (
-                    Err("the feed reported a sample and then lost it".to_owned()),
-                    None,
-                )
+                sources: spec.feeds.as_ref().map_or(0, |f| f.sources.len()),
+                min_mid: spec.band.min,
+                max_mid: spec.band.max,
             };
             let mut venues = Vec::new();
-            // The diagnostics the pair's pricer declared, for its quote guards to bind to
-            // below: a custom pricer's from its build, none for a built-in, as in the run.
+            // The diagnostics the pair's pricer declared in its build, for its quote guards
+            // to bind to below, as in the run.
             let mut pricer_diagnostics: Vec<String> = Vec::new();
-            // Whether there is a pricer for a quote guard to bind to: a built-in always;
-            // a custom one only once its build ran and succeeded.
-            let mut pricer_built = true;
+            // Whether there is a pricer for a quote guard to bind to: only once its build
+            // ran and succeeded.
+            let mut pricer_built = false;
             // Every row goes through the pair's pricer's `preview` and the core's backstop,
             // so the report and the run cannot disagree about what a pair would publish. No
             // freshness gate and no band here, as before: the row shows the price, the
             // report judges it.
-            let (sample, note) = match &spec.source {
-                config::SourceSpec::Custom {
-                    kind,
-                    config: stanza,
-                    feeds,
-                } => {
-                    pricer_built = false;
-                    // The stanza against this pair first, as the run and a reload judge it,
-                    // so `--check` fails a file the run would refuse; and before the feed, so
-                    // a refused stanza does not wait out a market it will never price. The
-                    // guard stanzas are judged below, for every pair.
-                    let validated = kinds.validate_pricer(&shape, &spec.source);
-                    let sample = match (validated, feeds) {
-                        (Err(err), _) => Err(format!("{err:#}")),
-                        (Ok(()), Some(feeds)) => match composite::connect(feeds, params()).await {
-                            Ok(spawned) => {
-                                venues = venue_lines(&spawned);
-                                let sample = *spawned.rx.borrow();
-                                sample.map(Some).ok_or_else(|| {
-                                    "the feed reported a sample and then lost it".to_owned()
-                                })
-                            }
-                            Err(err) => Err(format!("{err:#}")),
-                        },
-                        (Ok(()), None) => Ok(None),
-                    };
-                    match sample {
-                        // Built and never run: `--check` sends nothing and starts none of
-                        // the pricer's tasks, which drop with its build context here. The
-                        // chain is the run's, so a vault the run would refuse fails here
-                        // first; the history is empty, as for the volatile row.
-                        Ok(sample) => {
-                            let (client, target) = chain;
-                            let mut ctx = BuildCtx::new(shape.clone())
-                                .with_chain(Chain::new(client.clone(), target))
-                                .with_http(endpoints.http());
-                            if feeds.is_some() {
-                                ctx = ctx.with_history(History::empty());
-                            }
-                            match kinds.build(kind, stanza, &mut ctx).await {
-                                Ok(mut pricer) => {
-                                    pricer_built = true;
-                                    pricer_diagnostics = ctx.diagnostic_names().to_vec();
-                                    preview_row(
-                                        pricer.as_mut(),
-                                        sample.as_ref(),
-                                        &shape,
-                                        pricer_diagnostics.len(),
-                                    )
-                                }
-                                Err(err) => (Err(format!("{err:#}")), None),
-                            }
-                        }
-                        Err(err) => (Err(err), None),
+            // The stanza against this pair first, as the run and a reload judge it, so
+            // `--check` fails a file the run would refuse; and before the feed, so a refused
+            // stanza does not wait out a market it will never price. The guard stanzas are
+            // judged below.
+            let kind = &spec.pricing.kind;
+            let validated = kinds.validate_pricer(&shape, &spec.pricing);
+            let sample = match (validated, &spec.feeds) {
+                (Err(err), _) => Err(format!("{err:#}")),
+                (Ok(()), Some(feeds)) => match composite::connect(feeds, params()).await {
+                    Ok(spawned) => {
+                        venues = venue_lines(&spawned);
+                        let sample = *spawned.rx.borrow();
+                        sample
+                            .map(Some)
+                            .ok_or_else(|| "the feed reported a sample and then lost it".to_owned())
                     }
-                }
-                config::SourceSpec::Static { delta, mid } => preview_row(
-                    &mut FixedPricer {
-                        delta: *delta,
-                        mid: *mid,
-                    },
-                    None,
-                    &shape,
-                    0,
-                ),
-                config::SourceSpec::Volatile {
-                    feeds,
-                    params: knobs,
-                } => {
+                    Err(err) => Err(format!("{err:#}")),
+                },
+                (Ok(()), None) => Ok(None),
+            };
+            let (sample, note) = match sample {
+                // Built and never run: `--check` sends nothing and starts none of the
+                // pricer's tasks, which drop with its build context here. The chain is the
+                // run's, so a vault the run would refuse fails here first; the history is
+                // empty, since the check does not wait the minute σ needs.
+                Ok(sample) => {
                     let (client, target) = chain;
-                    let (base, quote) = spec.declared_base_quote();
-                    let feed = composite::connect(feeds, params());
-                    // Its own registry: a check prices once and shares nothing.
-                    let readers = vault::InventoryReaders::default();
-                    let inventory =
-                        connect_inventory(&readers, client, target, base, quote, &label);
-                    match tokio::join!(feed, inventory) {
-                        (Ok(spawned), Ok(inventory)) => {
-                            venues = venue_lines(&spawned);
-                            let sample = *spawned.rx.borrow();
-                            match sample {
-                                // σ = 0 in the preview, so no history is read: an empty one
-                                // stands in for the market's.
-                                Some(sample) => preview_row(
-                                    &mut VolatilePricer {
-                                        history: Arc::new(std::sync::Mutex::new(
-                                            volatile::PriceHistory::new(std::time::Instant::now()),
-                                        )),
-                                        inventory,
-                                        params: knobs.clone(),
-                                        invert: spec.invert,
-                                        price_decimals,
-                                        metrics: metrics.for_pair(&label),
-                                    },
-                                    Some(&sample),
-                                    &shape,
-                                    0,
-                                ),
-                                None => lost(),
-                            }
-                        }
-                        (Err(err), _) | (_, Err(err)) => (Err(format!("{err:#}")), None),
+                    let mut ctx = BuildCtx::new(shape.clone())
+                        .with_chain(Chain::new(client.clone(), target))
+                        .with_http(endpoints.http());
+                    if spec.feeds.is_some() {
+                        ctx = ctx.with_history(History::empty());
                     }
-                }
-                config::SourceSpec::Feed { feeds, .. } => {
-                    match composite::connect(feeds, params()).await {
-                        Ok(spawned) => {
-                            venues = venue_lines(&spawned);
-                            let sample = *spawned.rx.borrow();
-                            match sample {
-                                // The default preview is `price`, which adds the 216-bit
-                                // check the old preview lacked; it cannot fire here, since a
-                                // feed's delta is below one whole unit, at most 10^38 < 2^216.
-                                Some(sample) => preview_row(
-                                    &mut FeedPricer {
-                                        source: spec.source.clone(),
-                                        spread_scale: config::spread_scale(price_decimals),
-                                    },
-                                    Some(&sample),
-                                    &shape,
-                                    0,
-                                ),
-                                None => lost(),
-                            }
+                    match kinds.build(kind, &spec.pricing.config, &mut ctx).await {
+                        Ok(mut pricer) => {
+                            pricer_built = true;
+                            pricer_diagnostics = ctx.diagnostic_names().to_vec();
+                            preview_row(
+                                pricer.as_mut(),
+                                sample.as_ref(),
+                                &shape,
+                                pricer_diagnostics.len(),
+                            )
                         }
                         Err(err) => (Err(format!("{err:#}")), None),
                     }
                 }
+                Err(err) => (Err(err), None),
             };
             // Every guard stanza, validated against the pair and built as the run does both
             // before the lane quotes, whatever prices the pair, with the pricer's declared
@@ -1237,16 +1052,7 @@ mod tests {
                 label: "FEED/TEST".to_owned(),
                 band: config::MidBand::default(),
             },
-            values: ValueSource::feed_for_tests(
-                rx,
-                SourceSpec::Feed {
-                    feeds: config::Feeds::single_binance("ETHUSDC"),
-                    delta: None,
-                },
-                config::spread_scale(18),
-                false,
-                18,
-            ),
+            values: ValueSource::feed_for_tests(rx, None, false, 18),
             latch: crate::guard::Latch::new(),
             armed: false,
             guard_kinds: Vec::new(),
@@ -1317,16 +1123,7 @@ mod tests {
                 label: "UP/TEST".to_owned(),
                 band: config::MidBand::default(),
             },
-            values: ValueSource::feed_for_tests(
-                rx.clone(),
-                SourceSpec::Feed {
-                    feeds: config::Feeds::single_binance("ETHUSDT"),
-                    delta: None,
-                },
-                config::spread_scale(18),
-                false,
-                18,
-            ),
+            values: ValueSource::feed_for_tests(rx.clone(), None, false, 18),
             latch: crate::guard::Latch::new(),
             armed: false,
             guard_kinds: Vec::new(),
@@ -1415,16 +1212,7 @@ mod tests {
                 label: "TRIP/TEST".to_owned(),
                 band: config::MidBand::default(),
             },
-            values: ValueSource::feed_for_tests(
-                rx,
-                SourceSpec::Feed {
-                    feeds: config::Feeds::single_binance("ETHUSDC"),
-                    delta: None,
-                },
-                config::spread_scale(18),
-                false,
-                18,
-            ),
+            values: ValueSource::feed_for_tests(rx, None, false, 18),
             latch,
             armed: true,
             guard_kinds: Vec::new(),
@@ -1494,16 +1282,7 @@ mod tests {
                 label: "RACE/TEST".to_owned(),
                 band: config::MidBand::default(),
             },
-            values: ValueSource::feed_for_tests(
-                rx,
-                SourceSpec::Feed {
-                    feeds: config::Feeds::single_binance("ETHUSDC"),
-                    delta: None,
-                },
-                config::spread_scale(18),
-                false,
-                18,
-            ),
+            values: ValueSource::feed_for_tests(rx, None, false, 18),
             latch: latch.clone(),
             armed: true,
             guard_kinds: Vec::new(),
@@ -1592,17 +1371,15 @@ mod tests {
                     max: None,
                 },
             },
-            source: SourceSpec::Static {
-                delta: U256::zero(),
-                mid: U256::one(),
-            },
+            pricing: config::PricingSpec::fixed_for_tests("1", "0"),
+            feeds: None,
             invert: false,
             breaker: None,
             guards: Vec::new(),
         };
         let metrics = metrics::Metrics::new().unwrap();
-        // binance_ws is never dialled on the Static path: build_live only reaches
-        // connect_feed inside the SourceSpec::Feed arm.
+        // binance_ws is never dialled for a pair without feeds: build_live only connects
+        // a market when the pair has one.
         let client = EthClient::new(Url::parse("http://127.0.0.1:1").unwrap()).unwrap();
         let built = build_live(
             resolved,
@@ -1613,7 +1390,7 @@ mod tests {
             &volatile::Histories::default(),
             &vault::InventoryReaders::default(),
             None,
-            &crate::kinds::Kinds::default(),
+            &crate::kinds::Kinds::shipped(),
         )
         .await
         .unwrap();
@@ -1663,20 +1440,20 @@ mod tests {
 
     /// `--check` judges a pricer's preview by the core's backstop, with the same market and
     /// shape the run's every tick gets, so its row cannot pass what the run would withdraw:
-    /// a pricer whose preview doubles the market is refused there as it would be here.
+    /// a pricer whose preview spreads a whole unit is refused there as it would be here.
     #[test]
     fn a_preview_the_backstop_would_withdraw_is_refused_in_the_check_row() {
         use crate::pricing::{PricerOutput, Refusal};
 
-        struct Doubles;
-        impl Pricer for Doubles {
+        struct WholeUnit;
+        impl Pricer for WholeUnit {
             fn price(
                 &mut self,
                 tick: &TickCtx,
                 _: &mut Diagnostics,
             ) -> Result<PricerOutput, Refusal> {
                 let market = tick.market()?;
-                Ok(PricerOutput::new(market.delta, market.mid * U256::from(2)))
+                Ok(PricerOutput::new(U256::exp10(18), market.mid))
             }
         }
         let shape = PairShape {
@@ -1686,6 +1463,9 @@ mod tests {
             inverted: false,
             price_decimals: 18,
             target: Address::zero(),
+            sources: 1,
+            min_mid: None,
+            max_mid: None,
         };
         let sample = feed::PriceSample {
             mid: U256::from(4000u64) * U256::exp10(18),
@@ -1693,12 +1473,9 @@ mod tests {
             at: std::time::Instant::now(),
             wall: std::time::SystemTime::now(),
         };
-        let (row, _) = preview_row(&mut Doubles, Some(&sample), &shape, 0);
+        let (row, _) = preview_row(&mut WholeUnit, Some(&sample), &shape, 0);
         let refused = row.unwrap_err();
-        assert!(
-            refused.contains("+100.0% from the market's") && refused.contains("the core allows"),
-            "{refused}"
-        );
+        assert!(refused.contains("not below one whole unit"), "{refused}");
     }
 
     /// A pricer's background task that panics is reported with its panic, so the lane's
@@ -1729,6 +1506,9 @@ mod tests {
 
         fn shape() -> PairShape {
             PairShape {
+                sources: 1,
+                min_mid: None,
+                max_mid: None,
                 label: "CUSTOM/TEST".into(),
                 tokens: (Address::repeat_byte(1), Address::repeat_byte(2)),
                 lane: U256::from(9),
@@ -2195,7 +1975,7 @@ mod tests {
                     crate::guard::Gate::Allow
                 }
             }
-            let mut kinds = Kinds::default();
+            let mut kinds = Kinds::shipped();
             kinds.insert_guard(
                 "share_band",
                 quote_guard_fn(|_: NoConfig, ctx: &mut BuildCtx| {
@@ -2207,7 +1987,7 @@ mod tests {
                         [[pairs]]\n\
                         tokens = [\"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48\", \
                         \"0xdAC17F958D2ee523a2206206994597C13D831ec7\"]\n\
-                        mid = \"1.0001\"\ndelta = \"0.0002\"\nkey_env = \"K\"\n\n\
+                        key_env = \"K\"\npricing = { kind = \"fixed\", mid = \"1.0001\", delta = \"0\" }\n\n\
                         [[pairs.guards]]\nkind = \"share_band\"\n";
             let config = crate::config::parse_config(toml, 18).unwrap();
             let metrics = metrics::Metrics::new().unwrap();
@@ -2278,7 +2058,7 @@ mod tests {
                     Box::pin(async { Ok(Allow) })
                 }
             }
-            let mut kinds = Kinds::default();
+            let mut kinds = Kinds::shipped();
             kinds.insert_guard(
                 "inverted_only",
                 crate::kinds::quote_guard_factory(InvertedOnly),
@@ -2287,7 +2067,7 @@ mod tests {
                         [[pairs]]\n\
                         tokens = [\"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48\", \
                         \"0xdAC17F958D2ee523a2206206994597C13D831ec7\"]\n\
-                        mid = \"1.0001\"\ndelta = \"0.0002\"\nkey_env = \"K\"\n\n\
+                        key_env = \"K\"\npricing = { kind = \"fixed\", mid = \"1.0001\", delta = \"0\" }\n\n\
                         [[pairs.guards]]\nkind = \"inverted_only\"\n";
             let config = crate::config::parse_config(toml, 18).unwrap();
             let metrics = metrics::Metrics::new().unwrap();
@@ -2371,7 +2151,7 @@ mod tests {
                         \"0xdAC17F958D2ee523a2206206994597C13D831ec7\"]\n\
                         key_env = \"K\"\n\n\
                         [pairs.pricing]\nkind = \"broken\"\n\n\
-                        [[pairs.guards]]\nkind = \"share_band\"\n";
+                        [[pairs.guards]]\nkind = \"share_band\"\npricing = { kind = \"feed\", delta = \"0.0002\" }\n";
             let config = crate::config::parse_config(toml, 18).unwrap();
             let metrics = metrics::Metrics::new().unwrap();
             let client = EthClient::new(Url::parse("http://127.0.0.1:1").unwrap()).unwrap();

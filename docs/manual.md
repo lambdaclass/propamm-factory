@@ -81,9 +81,9 @@ metrics_addr = "127.0.0.1:9464"
 
 [[pairs]]
 tokens  = ["0xC02aaA39...", "0xA0b86991..."]   # [base, quote], market orientation
-symbol  = "ETHUSDC"                            # one Binance market; or `sources`, or mid + delta
-delta   = "0.0005"                             # optional: the half-spread to publish
+symbol  = "ETHUSDC"                            # one Binance market; or `sources`
 key_env = "UPDATER_KEY_WETH_USDC"              # names this pair's key variable
+pricing = { kind = "feed", delta = "0.0005" }  # the pricing kind and its keys; delta optional
 ```
 
 ### Where the mid comes from: one venue or several
@@ -95,7 +95,7 @@ several markets, at one venue or many, and publish their weighted average:
 [[pairs]]
 tokens  = ["0xC02aaA39...", "0xA0b86991..."]
 key_env = "UPDATER_KEY_WETH_USDC"
-delta   = "0.0005"
+pricing = { kind = "feed", delta = "0.0005" }
 min_sources = "2"
 sources = [
   { venue = "binance",  symbol = "ETHUSDC", weight = "2" },
@@ -178,21 +178,27 @@ published. Each venue can be repointed (a mock, a regional endpoint) from
 
 ### What the updater charges a taker
 
-A `symbol` pair with no `delta` publishes the book's own half-spread,
+Every pair names how it is priced in its `pricing` table: a kind, and the keys that kind
+takes. The binary registers the kinds that exist; the library ships `feed`, `fixed` and
+`volatile`, and docs/building-your-own.md is how a binary adds its own. The rest of this
+section is about `feed` and `fixed`.
+
+A `feed` pair with no `delta` publishes the book's own half-spread,
 `(ask - bid) / (ask + bid)`. On a liquid market that is around 0.02bp, which is what a
 venue charges a taker it can quote away from in milliseconds. A published quote cannot be
 pulled that way: it stands for the whole block, and the maker wears every move that happens
 inside it. Quoting a book's spread on-chain therefore fills at close to mid and loses to
 adverse selection on average.
 
-Set `delta` on the pair and that number is published instead, with only the mid coming from
-the stream. It is the same key, in the same units, as on a static pair: a fraction of the
-mid, so `"0.0005"` is 5bp and means the same thing whatever the pair trades at. It is not
+Set `delta` in the pair's `pricing` table and that number is published instead, with only
+the mid coming from the stream. It is the same key, in the same units, as on a `fixed` pair:
+a fraction of the mid, so `"0.0005"` is 5bp and means the same thing whatever the pair
+trades at. It is not
 reoriented on an inverted lane, because `(ask - bid) / (ask + bid)` is unchanged by
 inversion and a fraction standing in for it is too.
 
-So `symbol` alone tracks the book's spread, `symbol` + `delta` takes the mid live and
-charges your own spread, and `mid` + `delta` fixes both. A `delta` at or above one whole
+So `feed` alone tracks the book's spread, `feed` with a `delta` takes the mid live and
+charges your own spread, and `fixed` with `mid` and `delta` fixes both. A `delta` at or above one whole
 unit is refused at parse time, and a *book* that gapes that wide is refused per sample:
 PropAMM subtracts the spread from the mid fill, so a whole unit leaves the taker nothing and
 beyond it `_quote` reverts `SpreadTooWide`. Refusing withdraws the quote rather than
@@ -203,7 +209,8 @@ runs through the same function the service publishes with.
 
 A fixed `delta` is right for USDC/USDT and wrong for WETH/USDC: the pool is stuck holding
 whatever it bought until the next block, 12 seconds later, and WETH moves in 12 seconds. For
-such a pair, set `gamma`, `k` and `kappa` (all three) instead of `delta`. Every block the
+such a pair, use the `volatile` kind: a `[pairs.pricing]` table with `kind = "volatile"`
+and `gamma`, `k` and `kappa` (all three). Every block the
 updater then computes two numbers and sends them to the chain, the spread and the mid, and
 the pool sells at `mid + spread/2` and buys at `mid − spread/2`:
 
@@ -339,10 +346,11 @@ and the dashboards see.
 What can stop a volatile pair from quoting, beyond what stops a plain feed: under 60 seconds
 of price history (`warming_up`), or a vault balance older than 60 seconds (`no_inventory`).
 Both withdraw the quote the same way a stale feed does. `--check` does not wait a minute for
-history, so it prints the spread at σ = 0 with a note saying so. Every term is exported:
-`quote_updater_pricing_{sigma,hold,edge,stale,inventory,skew}`,
-`quote_updater_inventory_{base,quote,base_share}`, so a spread that moved can be traced to
-the term that moved it.
+history, so it prints the spread at σ = 0 with a note saying so. Every term is exported as
+a diagnostic of the kind, `quote_updater_diagnostic{kind="volatile",name=...}`: `sigma`,
+`hold`, `edge`, `stale`, `inventory_penalty`, `q`, `skew`, `target_share`, `inventory_base`,
+`inventory_quote` and `inventory_base_share`, so a spread that moved can be traced to the
+term that moved it.
 
 Three things are derived rather than configured, so they cannot be set wrong:
 
@@ -918,20 +926,20 @@ never-recorded gauge case four of the alert rules depend on. See `deploy/README.
 ### Recording the feed
 
 With `RECORD_DB_URL` set (a Postgres URL; `.env` on the server, see `.env.example`), the
-updater writes into the indexer's database what nothing on chain has: the working behind
-every update it publishes (`feed.quotes`: the feed mid, the published mid and spread, a
-volatile pair's σ, terms and skew, a registered pricer's declared diagnostics as one
-`terms` jsonb map by name, and the vault holdings and Binance mid at that moment), every
-configuration it has run (`feed.config_changes`, secrets redacted: builder keys, a custom
+updater writes into a database what nothing on chain has: the working behind every update
+it publishes (`feed.quotes`: the feed mid, the published mid and spread, the pricing kind's
+declared diagnostics as one `terms` jsonb map by name, which for a volatile pair is its σ,
+terms, skew and inventory, and the vault holdings and Binance mid at that moment), every
+configuration it has run (`feed.config_changes`, secrets redacted: builder keys, a pricing
 stanza's credentials and any URL in it cut to its host; a row when it changes, even only
-inside a redacted value, and `feed.pairs`, one row per pair those configs ran), and the two series the P&L panels of the
-indexer dashboard need: the mid of every market it prices from, and each pair's vault
-balances. A Binance market is keyed by its bare symbol (`ETHUSDC`), the key the whole table
-used before venues were plural and the one the backfill still fills from Binance candles;
-any other venue is `VENUE:SYMBOL` (`KRAKEN:ETH/USD`), and each pair's composite is recorded
-under the pair's label. All of it goes into a `feed` schema the updater creates on first
-connect (`feed.mids`, `feed.vault_balances`, `feed.quotes`, `feed.config_changes`, `feed.pairs`), next to the indexer's own tables, which are
-what the panels join them against.
+inside a redacted value, and `feed.pairs`, one row per pair those configs ran), and the two
+series a P&L dashboard needs: the mid of every market it prices from, and each pair's vault
+balances. A Binance market is keyed by its bare symbol (`ETHUSDC`); any other venue is
+`VENUE:SYMBOL` (`KRAKEN:ETH/USD`), and each pair's composite is recorded under the pair's
+label. All of it goes into a `feed` schema the updater creates on first connect
+(`feed.mids`, `feed.vault_balances`, `feed.quotes`, `feed.config_changes`, `feed.pairs`).
+The schema's P&L functions join these against the tables of the PropAMM indexer, when the
+same database holds one.
 
 How: the feed task hands every tick to a recorder handle (a mutex around the latest book
 per symbol) and the vault exporter every reading; one writer task looks once a second and
@@ -940,21 +948,15 @@ balances), then writes the batch in one statement per table. Mids are stamped wi
 second they were seen; balances are read at one block, pinned, and stamped with that block
 and its timestamp, which is what the P&L join uses ("the inventory during a fill" is the
 newest row for that pair's vault at or before the fill's block). The tables, and the two SQL
-functions the panels are built on, are defined once in `indexer/backfill/feed.sql`, which
+functions the panels are built on, are defined once in `quote-updater/sql/feed.sql`, which
 the updater compiles in and runs on every connect; nothing else writes that schema, so
-Deploy Pusher is how a change to it reaches the database. About two million mid rows a month for two
-pairs, measured on the backfill; a few hundred balance rows.
+redeploying the updater is how a change to it reaches the database. Expect about a million
+mid rows a month per pair; a few hundred balance rows.
 
 What it can never do is slow quoting: the database is not on the quoting path, a refused
 connection or a failed write is a log line and a retry with backoff, and rows are kept in
 a bounded backlog meanwhile (an hour's worth; older ones are dropped and counted). Off
 under `--check` and `--once`, and without the variable, in which case the run says so once.
-The backfill for the time before recording existed is `npm run backfill` in `indexer/`;
-`indexer/readme.md` describes it and the two tables.
-
-All of it, with the swaps and price updates the indexer holds, is readable as JSON from the
-indexer's data API on the tailnet (`GET /api` on the indexer's address lists the routes; see
-`indexer/readme.md`, "The data API").
 
 ### End-to-end test against mocks
 
@@ -1014,6 +1016,7 @@ api_key  = "key-b"
 tokens  = ["0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"]
 symbol  = "ETHUSDC"
 key_env = "UPDATER_KEY_WETH_USDC"
+pricing = { kind = "feed" }
 ```
 
 The mock registry accepts any updater, so any key works; the e2e uses anvil's public dev
@@ -1049,9 +1052,8 @@ target = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
 
 [[pairs]]
 tokens  = ["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", "0xdAC17F958D2ee523a2206206994597C13D831ec7"]
-mid     = "5"
-delta   = "0"
 key_env = "UPDATER_KEY_USDC_USDT"
+pricing = { kind = "fixed", mid = "5", delta = "0" }
 
 [[builder]]
 name = "mock-a"
@@ -1090,4 +1092,22 @@ cd quote-updater && cat > mock-breaker.toml <<'TOML'
 target = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
 
 [[pairs]]
+tokens  = ["0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"]
+symbol  = "ETHUSDC"
+key_env = "UPDATER_KEY_WETH_USDC"
+pricing = { kind = "feed" }
+max_deviation = "0.00001"
+
+[[builder]]
+name = "mock-a"
+endpoint = "ws://127.0.0.1:8560/ws/sendquoteupdate"
+api_key = "test"
+TOML
+UPDATER_KEY_WETH_USDC=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
+  my-quote-updater --config mock-breaker.toml --rpc-url http://localhost:8545
+```
+
+The pair quotes for a few seconds, then the log reports the trip, the mock prints a
+`CANCEL` line, and the run keeps going with nothing to quote until ctrl-c. Resuming it is a
+reload (`SIGHUP`, or a save from the backoffice) once the feed is trusted again.
 

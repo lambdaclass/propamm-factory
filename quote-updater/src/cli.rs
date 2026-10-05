@@ -780,7 +780,7 @@ mod tests {
         let guarded = format!(
             "target = \"{TARGET}\"\n\n\
              [[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nsymbol = \"USDCUSDT\"\n\
-             key_env = \"K_USDC\"\n[[pairs.guards]]\nkind = \"cap\"\n"
+             key_env = \"K_USDC\"\npricing = {{ kind = \"feed\" }}\n[[pairs.guards]]\nkind = \"cap\"\n"
         );
         let config = config::parse_config(&guarded, 18).expect("config must parse");
         let err = refuse_breakers_in_node_mode(Mode::Node, &config)
@@ -800,9 +800,9 @@ mod tests {
         let armed = format!(
             "target = \"{TARGET}\"\n\n\
              [[pairs]]\ntokens = [\"{WBTC}\", \"{USDC}\"]\nsymbol = \"BTCUSDC\"\n\
-             key_env = \"K_WBTC\"\n\n\
+             key_env = \"K_WBTC\"\npricing = {{ kind = \"feed\" }}\n\n\
              [[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\nsymbol = \"USDCUSDT\"\n\
-             key_env = \"K_USDC\"\nmax_deviation = \"0.002\"\n"
+             key_env = \"K_USDC\"\nmax_deviation = \"0.002\"\npricing = {{ kind = \"feed\" }}\n"
         );
         let config = config::parse_config(&armed, 18).expect("config must parse");
 
@@ -825,7 +825,7 @@ mod tests {
         // And node mode is fine as long as no pair arms one.
         let unarmed = format!(
             "target = \"{TARGET}\"\n\n[[pairs]]\ntokens = [\"{USDC}\", \"{USDT}\"]\n\
-             symbol = \"USDCUSDT\"\nkey_env = \"K_USDC\"\n"
+             symbol = \"USDCUSDT\"\nkey_env = \"K_USDC\"\npricing = {{ kind = \"feed\" }}\n"
         );
         let unarmed = config::parse_config(&unarmed, 18).expect("config must parse");
         assert!(refuse_breakers_in_node_mode(Mode::Node, &unarmed).is_ok());

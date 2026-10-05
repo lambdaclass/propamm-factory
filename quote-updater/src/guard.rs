@@ -27,7 +27,7 @@ use crate::{
 };
 
 /// The names a `[[pairs.guards]]` stanza cannot use and a binary cannot register: the
-/// built-in guard, configured with its own keys. A slice, like `BUILT_IN_KINDS`.
+/// deviation breaker, configured with its own keys.
 pub const BUILT_IN_GUARDS: &[&str] = &["deviation"];
 
 /// Judges our quote, in the quote loop, after the pricer, the core's backstop and the

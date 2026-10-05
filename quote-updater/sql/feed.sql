@@ -1,7 +1,7 @@
 -- The `feed` schema: what the P&L dashboard needs and nothing on chain has. One file, one
 -- writer: the updater compiles it in (include_str! in quote-updater/src/record.rs) and runs it
--- on every connect, so Deploy Pusher is what applies a change here. The backfill only checks
--- the tables exist. Every statement is idempotent; Ponder never touches this schema.
+-- on every connect, so redeploying the updater is what applies a change here. Every statement
+-- is idempotent; the indexer never touches this schema.
 --
 -- Addresses are lowercase hex everywhere in here, and the check constraints make a writer
 -- that forgets so fail loudly instead of producing rows no join ever matches.
@@ -65,9 +65,8 @@ create index if not exists tokens_symbol on feed.tokens (upper(symbol));
 -- mid `feed_mid` and went out as `published_mid` with half-spread `delta`". Last, because
 -- builder mode re-sends a block's update whenever the feed moves inside its window; the
 -- builder includes whichever it held, so what landed is `public.price_updates`, and this
--- row is what we were quoting and why. A volatile pair
--- also records its σ, the three spread terms and the skew; a fixed-spread pair leaves them
--- null. Every value is in **lane orientation** and human units, the way `price_updates`
+-- row is what we were quoting and why. What the pricing kind was thinking is `terms`,
+-- below. Every value is in **lane orientation** and human units, the way `price_updates`
 -- carries them scaled: `published_mid` is that row's `mid / 10^price_decimals`. `label` is
 -- the pair's on-chain symbols at the time, for humans; `lane` is the key.
 create table if not exists feed.quotes (
@@ -79,19 +78,14 @@ create table if not exists feed.quotes (
   feed_mid double precision not null,
   published_mid double precision not null,
   delta double precision not null,
-  skew double precision,
-  sigma double precision,
-  hold double precision,
-  edge double precision,
-  stale double precision,
   primary key (prop_amm, lane, block_number)
 );
 create index if not exists quotes_lane_ts on feed.quotes (lane, ts);
--- A registered pricer's declared diagnostics at that update, by name (`{"edge": 0.25,
--- ...}`): what a custom model was thinking, where the three volatile columns above are
--- the built-in's. Null for a built-in pricer. Added after the table existed, so an
--- `alter` rather than a column above: `add column if not exists` keeps every connect
--- idempotent, like the `create table` it follows.
+-- The pricing kind's declared diagnostics at that update, by name (`{"edge": 0.25, ...}`):
+-- what the model was thinking. The volatile kind records its σ, the three spread terms, the
+-- skew and the inventory it read; a kind that declares none leaves this null. Added after
+-- the table existed, so an `alter` rather than a column above: `add column if not exists`
+-- keeps every connect idempotent, like the `create table` it follows.
 alter table feed.quotes add column if not exists terms jsonb;
 -- What a spread panel needs beside each quote, stamped by the updater when it
 -- signed it, so the panel is one read of `quotes_lane_ts` and joins nothing: `balance0` and
@@ -189,8 +183,8 @@ begin
   end if;
 end $$;
 
--- Grafana reads through the `grafana` role the host setup created with SELECT on `public`
--- only (deploy/ansible/setup-indexer-host.yml). Give it the same on `feed`, for these tables
+-- Grafana reads through a `grafana` role the host setup may have created with SELECT on
+-- `public` only. Give it the same on `feed`, for these tables
 -- and any added later. Skipped on a local database without that role.
 do $$ begin
   if exists (select from pg_roles where rolname = 'grafana') then

@@ -687,7 +687,7 @@ impl Service {
             .map(|pair| {
                 (
                     crate::pair::shape_of(pair, self.price_decimals, self.opts.target),
-                    &pair.source,
+                    &pair.pricing,
                     pair.guards.as_slice(),
                 )
             })
@@ -1495,7 +1495,6 @@ impl Attempts {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::SourceSpec;
     use url::Url;
 
     /// Every setting is consumed once, at startup, so a reload that quietly ignored a
@@ -1615,7 +1614,7 @@ mod tests {
             vault_pairs: tokio::sync::watch::channel(Vec::new()).0,
             pair_states: backoffice::PairStates::default(),
             key_lookup: Arc::new(config::env_lookup),
-            kinds: Arc::new(crate::kinds::Kinds::default()),
+            kinds: Arc::new(crate::kinds::Kinds::shipped()),
         }
     }
 
@@ -1654,10 +1653,8 @@ mod tests {
                     tokens: (Address::zero(), Address::zero()),
                     lane,
                     invert: false,
-                    source: SourceSpec::Static {
-                        delta: U256::zero(),
-                        mid: U256::one(),
-                    },
+                    pricing: config::PricingSpec::fixed_for_tests("0.000000000000000001", "0"),
+                    feeds: None,
                     band: config::MidBand::default(),
                     breaker: None,
                     guards: Vec::new(),
@@ -2083,11 +2080,13 @@ mod tests {
                       "0x000000000000000000000000000000000000000B"]
             symbol = "ETHUSDC"
             key_env = "UPDATER_KEY_PRESENT"
+pricing = { kind = "feed" }
             [[pairs]]
             tokens = ["0x000000000000000000000000000000000000000C",
                       "0x000000000000000000000000000000000000000D"]
             symbol = "BTCUSDC"
             key_env = "UPDATER_KEY_MISSING"
+pricing = { kind = "feed" }
         "#;
         let config = config::parse_config(toml, 18).expect("the fixture must parse");
 
@@ -2514,9 +2513,7 @@ api_key = "k"
             service
                 .running
                 .iter()
-                .find(|(_, pair)| {
-                    matches!(&pair.spec.source, SourceSpec::Custom { kind, .. } if kind == "a")
-                })
+                .find(|(_, pair)| pair.spec.pricing.kind == "a")
                 .map(|(lane, pair)| (*lane, pair.label.clone()))
                 .expect("lane A is running")
         }

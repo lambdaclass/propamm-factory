@@ -49,6 +49,8 @@ pub type PairStates = Arc<std::sync::Mutex<std::collections::BTreeMap<String, Ar
 struct Backoffice {
     config_path: PathBuf,
     states: PairStates,
+    /// The registered pricing kinds: what the pair form offers, with each kind's fields.
+    kinds: Arc<crate::kinds::Kinds>,
     reloads: tokio::sync::mpsc::Sender<ReloadRequest>,
     /// For the venue lookup (`discover.rs`): the node that reads the tokens' `symbol()`, the
     /// client that asks the exchanges, and where each exchange's API is.
@@ -83,6 +85,7 @@ pub async fn bind(
     client: ethrex_rpc::clients::eth::EthClient,
     states: PairStates,
     edits: Arc<tokio::sync::Mutex<()>>,
+    kinds: Arc<crate::kinds::Kinds>,
 ) -> Result<(SocketAddr, JoinHandle<()>)> {
     bind_with(
         addr,
@@ -91,6 +94,7 @@ pub async fn bind(
         client,
         states,
         edits,
+        kinds,
         crate::discover::Rest::default(),
     )
     .await
@@ -105,6 +109,7 @@ async fn bind_with(
     client: ethrex_rpc::clients::eth::EthClient,
     states: PairStates,
     edits: Arc<tokio::sync::Mutex<()>>,
+    kinds: Arc<crate::kinds::Kinds>,
     rest: crate::discover::Rest,
 ) -> Result<(SocketAddr, JoinHandle<()>)> {
     eyre::ensure!(
@@ -124,6 +129,7 @@ async fn bind_with(
     let state = Backoffice {
         config_path,
         states,
+        kinds,
         reloads,
         client,
         rest: Arc::new(rest),
@@ -410,8 +416,6 @@ struct AddPair {
     symbol: String,
     #[serde(flatten)]
     sources: SourcesForm,
-    mid: String,
-    delta: String,
     min_mid: String,
     max_mid: String,
     max_deviation: String,
@@ -424,38 +428,15 @@ struct AddPair {
     max_deviation_window_blocks: String,
     #[serde(default)]
     allow_symbol_mismatch: Option<String>,
-    /// "fixed" or "volatile": which pricing section the operator chose. Both sections'
-    /// inputs are posted whichever is showing, so this decides which set is kept.
-    /// Defaulted so a form rendered before it existed still posts.
+    /// The pricing kind the operator chose. Every kind's section is posted whichever is
+    /// showing, so this decides which kind's fields are kept. Defaulted so a form rendered
+    /// before it existed still posts; blank keeps the pair's stanza.
     #[serde(default)]
     pricing: String,
-    // Defaulted for the same reason; blank is absent either way.
-    #[serde(default)]
-    gamma: String,
-    #[serde(default)]
-    k: String,
-    #[serde(default)]
-    kappa: String,
-    #[serde(default)]
-    target_share: String,
-    #[serde(default)]
-    hold_secs: String,
-    #[serde(default)]
-    fill_delay_secs: String,
-    #[serde(default)]
-    volatility_window_secs: String,
-    #[serde(default)]
-    inventory_aversion: String,
-    #[serde(default)]
-    inventory_band_lower: String,
-    #[serde(default)]
-    inventory_band_upper: String,
-    #[serde(default)]
-    inventory_aversion_hard: String,
-    #[serde(default)]
-    inventory_band_hard_lower: String,
-    #[serde(default)]
-    inventory_band_hard_upper: String,
+    /// Every other posted input: the chosen kind's fields, named `pricing_<kind>_<field>`
+    /// by the form, which [`pricing_stanza`] reads for the chosen kind alone.
+    #[serde(flatten)]
+    kind_fields: std::collections::HashMap<String, String>,
 }
 
 /// A blank field means the key is absent, not set to `""`, which every one of them rejects.
@@ -464,104 +445,51 @@ fn optional(value: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
-/// The volatile knobs as posted, from either form.
-struct Knobs<'a> {
-    gamma: &'a str,
-    k: &'a str,
-    kappa: &'a str,
-    target_share: &'a str,
-    hold_secs: &'a str,
-    fill_delay_secs: &'a str,
-    volatility_window_secs: &'a str,
-    inventory_aversion: &'a str,
-    inventory_band_lower: &'a str,
-    inventory_band_upper: &'a str,
-    inventory_aversion_hard: &'a str,
-    inventory_band_hard_lower: &'a str,
-    inventory_band_hard_upper: &'a str,
-}
-
-impl<'a> Knobs<'a> {
-    fn from_add(form: &'a AddPair) -> Self {
-        Self {
-            gamma: &form.gamma,
-            k: &form.k,
-            kappa: &form.kappa,
-            target_share: &form.target_share,
-            hold_secs: &form.hold_secs,
-            fill_delay_secs: &form.fill_delay_secs,
-            volatility_window_secs: &form.volatility_window_secs,
-            inventory_aversion: &form.inventory_aversion,
-            inventory_band_lower: &form.inventory_band_lower,
-            inventory_band_upper: &form.inventory_band_upper,
-            inventory_aversion_hard: &form.inventory_aversion_hard,
-            inventory_band_hard_lower: &form.inventory_band_hard_lower,
-            inventory_band_hard_upper: &form.inventory_band_hard_upper,
+/// The `[pairs.pricing]` stanza a form describes: the chosen kind, and the values it posted
+/// for that kind's declared fields, each written as the string it was typed as and left out
+/// when blank. Every kind's section is posted whichever is showing, so only the chosen kind's
+/// inputs are read. A kind with no declared fields keeps the pair's stanza when it already
+/// prices it (the page cannot edit one, and says so) and otherwise gets a stanza naming it
+/// alone, for the operator to fill in the file. A blank choice (a form from before the
+/// choice existed) keeps the stanza as it is.
+fn pricing_stanza(
+    kinds: &crate::kinds::Kinds,
+    kind: &str,
+    existing: Option<&toml::Table>,
+    posted: &std::collections::HashMap<String, String>,
+) -> Result<toml::Table> {
+    let kind = kind.trim();
+    if kind.is_empty() {
+        return existing
+            .cloned()
+            .ok_or_else(|| eyre!("choose a pricing kind"));
+    }
+    let fields = kinds.pricer_fields(kind).ok_or_else(|| {
+        let registered = kinds.pricer_kinds();
+        if registered.is_empty() {
+            eyre!("unknown pricing kind {kind:?}; this binary registers none")
+        } else {
+            eyre!(
+                "unknown pricing kind {kind:?}; registered: {}",
+                registered.join(", ")
+            )
+        }
+    })?;
+    let existing_kind = existing
+        .and_then(|t| t.get("kind"))
+        .and_then(|k| k.as_str());
+    if fields.is_empty() && existing_kind == Some(kind) {
+        return Ok(existing.cloned().unwrap_or_default());
+    }
+    let mut table = toml::Table::new();
+    table.insert("kind".to_owned(), toml::Value::String(kind.to_owned()));
+    for field in fields {
+        let key = format!("pricing_{kind}_{}", field.name);
+        if let Some(value) = posted.get(&key).and_then(|v| optional(v)) {
+            table.insert(field.name.to_owned(), toml::Value::String(value));
         }
     }
-
-    fn from_edit(form: &'a EditPair) -> Self {
-        Self {
-            gamma: &form.gamma,
-            k: &form.k,
-            kappa: &form.kappa,
-            target_share: &form.target_share,
-            hold_secs: &form.hold_secs,
-            fill_delay_secs: &form.fill_delay_secs,
-            volatility_window_secs: &form.volatility_window_secs,
-            inventory_aversion: &form.inventory_aversion,
-            inventory_band_lower: &form.inventory_band_lower,
-            inventory_band_upper: &form.inventory_band_upper,
-            inventory_aversion_hard: &form.inventory_aversion_hard,
-            inventory_band_hard_lower: &form.inventory_band_hard_lower,
-            inventory_band_hard_upper: &form.inventory_band_hard_upper,
-        }
-    }
-}
-
-/// Writes the pricing section the operator chose and clears the other. The form posts
-/// both sections' inputs whichever is showing, so without this a pair switched back to a
-/// fixed spread would keep its old knobs, and `config.rs` would then refuse the file for
-/// setting both. A form from before the choice existed posts no `pricing`; it is read as
-/// whatever the knobs say, which is what it meant.
-fn apply_pricing(mut pair: RawPair, pricing: &str, delta: &str, knobs: &Knobs<'_>) -> RawPair {
-    let volatile = match pricing {
-        "volatile" => true,
-        "fixed" => false,
-        _ => optional(knobs.gamma).is_some(),
-    };
-    if volatile {
-        pair.delta = None;
-        pair.gamma = optional(knobs.gamma);
-        pair.k = optional(knobs.k);
-        pair.kappa = optional(knobs.kappa);
-        pair.target_share = optional(knobs.target_share);
-        pair.hold_secs = optional(knobs.hold_secs);
-        pair.fill_delay_secs = optional(knobs.fill_delay_secs);
-        pair.volatility_window_secs = optional(knobs.volatility_window_secs);
-        pair.inventory_aversion = optional(knobs.inventory_aversion);
-        pair.inventory_band_lower = optional(knobs.inventory_band_lower);
-        pair.inventory_band_upper = optional(knobs.inventory_band_upper);
-        pair.inventory_aversion_hard = optional(knobs.inventory_aversion_hard);
-        pair.inventory_band_hard_lower = optional(knobs.inventory_band_hard_lower);
-        pair.inventory_band_hard_upper = optional(knobs.inventory_band_hard_upper);
-    } else {
-        pair.delta = optional(delta);
-        pair.gamma = None;
-        pair.k = None;
-        pair.kappa = None;
-        pair.target_share = None;
-        pair.hold_secs = None;
-        pair.fill_delay_secs = None;
-        pair.volatility_window_secs = None;
-        pair.inventory_aversion = None;
-        pair.inventory_band_lower = None;
-        pair.inventory_band_upper = None;
-        pair.inventory_aversion_hard = None;
-        pair.inventory_band_hard_lower = None;
-        pair.inventory_band_hard_upper = None;
-    }
-    pair
+    Ok(table)
 }
 
 async fn add_pair(
@@ -570,8 +498,9 @@ async fn add_pair(
     Form(form): Form<AddPair>,
 ) -> Response {
     let what = format!("added pair {}/{}", form.token0, form.token1);
+    let kinds = Arc::clone(&state.kinds);
     apply(&state, peer, &what, move |config| {
-        let pair = pair_from_form(&form)?;
+        let pair = pair_from_form(&form, &kinds)?;
         if config
             .pairs
             .iter()
@@ -592,15 +521,13 @@ async fn add_pair(
 }
 
 /// The stanza an add form describes, every rule applied.
-fn pair_from_form(form: &AddPair) -> Result<RawPair> {
+fn pair_from_form(form: &AddPair, kinds: &crate::kinds::Kinds) -> Result<RawPair> {
     let mut pair = RawPair {
         tokens: vec![form.token0.trim().to_owned(), form.token1.trim().to_owned()],
         key_env: form.key_env.trim().to_owned(),
         symbol: None,
         sources: Vec::new(),
         min_sources: None,
-        mid: optional(&form.mid),
-        delta: optional(&form.delta),
         min_mid: optional(&form.min_mid),
         max_mid: optional(&form.max_mid),
         max_deviation: optional(&form.max_deviation),
@@ -609,29 +536,11 @@ fn pair_from_form(form: &AddPair) -> Result<RawPair> {
         allow_symbol_mismatch: form.allow_symbol_mismatch.is_some(),
         halted: false,
         halt_reason: None,
-        gamma: None,
-        k: None,
-        kappa: None,
-        target_share: None,
-        hold_secs: None,
-        fill_delay_secs: None,
-        volatility_window_secs: None,
-        inventory_aversion: None,
-        inventory_band_lower: None,
-        inventory_band_upper: None,
-        inventory_aversion_hard: None,
-        inventory_band_hard_lower: None,
-        inventory_band_hard_upper: None,
-        pricing: None,
+        pricing: pricing_stanza(kinds, &form.pricing, None, &form.kind_fields)?,
         guards: Vec::new(),
     };
     apply_sources(&mut pair, &form.sources, &form.symbol)?;
-    Ok(apply_pricing(
-        pair,
-        &form.pricing,
-        &form.delta,
-        &Knobs::from_add(form),
-    ))
+    Ok(pair)
 }
 
 /// A hash of the pair form's script, put in the URL the page loads it from. Cloudflare,
@@ -1280,14 +1189,6 @@ struct EditPair {
     symbol: String,
     #[serde(flatten)]
     sources: SourcesForm,
-    /// Optional to the parser only: a custom pair's page has no fixed mid or spread to post,
-    /// and the handler never reads these for one. A built-in pair's page always posts both,
-    /// blank or not, so the handler refuses a body for one that lacks them, as the form
-    /// extractor did before.
-    #[serde(default)]
-    mid: Option<String>,
-    #[serde(default)]
-    delta: Option<String>,
     min_mid: String,
     max_mid: String,
     max_deviation: String,
@@ -1300,38 +1201,15 @@ struct EditPair {
     max_deviation_window_blocks: String,
     #[serde(default)]
     allow_symbol_mismatch: Option<String>,
-    /// "fixed" or "volatile": which pricing section the operator chose. Both sections'
-    /// inputs are posted whichever is showing, so this decides which set is kept.
-    /// Defaulted so a form rendered before it existed still posts.
+    /// The pricing kind the operator chose. Every kind's section is posted whichever is
+    /// showing, so this decides which kind's fields are kept. Defaulted so a form rendered
+    /// before it existed still posts; blank keeps the pair's stanza.
     #[serde(default)]
     pricing: String,
-    // Defaulted for the same reason; blank is absent either way.
-    #[serde(default)]
-    gamma: String,
-    #[serde(default)]
-    k: String,
-    #[serde(default)]
-    kappa: String,
-    #[serde(default)]
-    target_share: String,
-    #[serde(default)]
-    hold_secs: String,
-    #[serde(default)]
-    fill_delay_secs: String,
-    #[serde(default)]
-    volatility_window_secs: String,
-    #[serde(default)]
-    inventory_aversion: String,
-    #[serde(default)]
-    inventory_band_lower: String,
-    #[serde(default)]
-    inventory_band_upper: String,
-    #[serde(default)]
-    inventory_aversion_hard: String,
-    #[serde(default)]
-    inventory_band_hard_lower: String,
-    #[serde(default)]
-    inventory_band_hard_upper: String,
+    /// Every other posted input: the chosen kind's fields, named `pricing_<kind>_<field>`
+    /// by the form, which [`pricing_stanza`] reads for the chosen kind alone.
+    #[serde(flatten)]
+    kind_fields: std::collections::HashMap<String, String>,
 }
 
 /// Keyed by `key_env`, not by index: the page may have been rendered before someone else
@@ -1342,6 +1220,7 @@ async fn edit_pair(
     Form(form): Form<EditPair>,
 ) -> Response {
     let what = format!("edited pair {}", form.key_env);
+    let kinds = Arc::clone(&state.kinds);
     apply(&state, peer, &what, move |config| {
         let pair = config
             .pairs
@@ -1354,38 +1233,19 @@ async fn edit_pair(
                     form.key_env
                 )
             })?;
-        // A pair priced by a custom kind keeps its stanza: this page cannot edit one, so it
-        // must neither touch it nor put a built-in model's keys beside it, whatever a stale
-        // page or a hand-made request posts (config.rs would refuse the mix at reload).
-        let custom = pair.pricing.is_some();
-        // Read only for a built-in pair, whose page always posts both.
-        let built_in = if custom {
-            None
-        } else {
-            match (&form.mid, &form.delta) {
-                (Some(mid), Some(delta)) => Some((mid, delta)),
-                _ => {
-                    return Err(eyre!(
-                        "the form posted no mid or no delta for a pair with no \
-                         [pairs.pricing] stanza; reload the page and save again"
-                    ));
-                }
-            }
-        };
         apply_sources(pair, &form.sources, &form.symbol)?;
-        if let Some((mid, delta)) = built_in {
-            pair.mid = optional(mid);
-            pair.delta = optional(delta);
-        }
+        pair.pricing = pricing_stanza(
+            &kinds,
+            &form.pricing,
+            Some(&pair.pricing),
+            &form.kind_fields,
+        )?;
         pair.min_mid = optional(&form.min_mid);
         pair.max_mid = optional(&form.max_mid);
         pair.max_deviation = optional(&form.max_deviation);
         pair.max_deviation_window = optional(&form.max_deviation_window);
         pair.max_deviation_window_blocks = optional(&form.max_deviation_window_blocks);
         pair.allow_symbol_mismatch = form.allow_symbol_mismatch.is_some();
-        if let Some((_, delta)) = built_in {
-            *pair = apply_pricing(pair.clone(), &form.pricing, delta, &Knobs::from_edit(&form));
-        }
         Ok(())
     })
     .await
@@ -1696,6 +1556,7 @@ async fn index(
             &state.config_path,
             &banner,
             &state.states,
+            &state.kinds,
         ))
         .into_response(),
         Err(response) => *response,
@@ -1704,7 +1565,7 @@ async fn index(
 
 async fn new_pair_page(State(state): State<Backoffice>) -> Response {
     match read_config(&state.config_path) {
-        Ok(_) => Html(render_pair_form(None)).into_response(),
+        Ok(_) => Html(render_pair_form(None, &state.kinds)).into_response(),
         Err(response) => *response,
     }
 }
@@ -1718,7 +1579,7 @@ async fn edit_pair_page(
         Err(response) => return *response,
     };
     match config.pairs.iter().find(|pair| pair.key_env == key_env) {
-        Some(pair) => Html(render_pair_form(Some(pair))).into_response(),
+        Some(pair) => Html(render_pair_form(Some(pair), &state.kinds)).into_response(),
         // A stale link, most likely. Back to the list rather than a bare 404.
         None => Outcome::failed(format!("no pair with key_env {key_env:?}")).redirect(),
     }
@@ -1777,7 +1638,10 @@ impl Field {
 /// A field and its value. Flat rather than holding a `&Field`, because `field.html` is
 /// included under the name `field` and `field.field.name` would read worse.
 struct Filled {
-    name: &'static str,
+    /// The input's `name`: the key it posts as.
+    name: String,
+    /// What the page shows beside it: the key as the config spells it.
+    label: &'static str,
     placeholder: &'static str,
     hint: &'static str,
     secret: bool,
@@ -1788,10 +1652,25 @@ struct Filled {
 impl Filled {
     fn new(field: &'static Field, value: Option<&str>) -> Self {
         Self {
-            name: field.name,
+            name: field.name.to_owned(),
+            label: field.name,
             placeholder: field.placeholder,
             hint: field.hint,
             secret: field.secret,
+            value: value.unwrap_or_default().to_owned(),
+            readonly: false,
+        }
+    }
+
+    /// A pricing kind's declared field, posted as `pricing_<kind>_<field>` so every kind's
+    /// section can be on the page at once ([`pricing_stanza`] reads the chosen kind's).
+    fn kind_field(kind: &str, field: &crate::pricing::FormField, value: Option<&str>) -> Self {
+        Self {
+            name: format!("pricing_{kind}_{}", field.name),
+            label: field.name,
+            placeholder: field.placeholder,
+            hint: field.hint,
+            secret: false,
             value: value.unwrap_or_default().to_owned(),
             readonly: false,
         }
@@ -1808,11 +1687,6 @@ impl Filled {
 /// The price source and its guards. Used by both the add form and the edit form, so the
 /// two cannot drift.
 const SOURCE_FIELDS: &[Field] = &[
-    Field::new(
-        "mid",
-        "1",
-        "fixed price, needs a fixed spread; blank when any venue below is filled in",
-    ),
     Field::new("min_mid", "0.0001", "refuse a published mid below this"),
     Field::new("max_mid", "0.001", "refuse a published mid above this"),
     Field::new(
@@ -1832,100 +1706,12 @@ const SOURCE_FIELDS: &[Field] = &[
     ),
 ];
 
-/// The one field of fixed-spread pricing.
-const DELTA_FIELD: Field = Field::new(
-    "delta",
-    "0.0005",
-    "the spread, as a fraction of the mid. 0.0005 means we sell at mid + 0.05% and buy at \
-     mid − 0.05%. Blank with a single venue: we copy that venue's spread",
-);
-
 /// How many venues must have a fresh price before the pair publishes.
 const MIN_SOURCES_FIELD: Field = Field::new(
     "min_sources",
     "1",
     "how many of the venues above must have a fresh price for us to publish at all. Blank \
      is 1: keep quoting as long as any one venue is up",
-);
-
-/// The knobs of volatile pricing, each rendered under the term of the equation it belongs
-/// to (see `templates/pair_form.html` and `volatile.rs`). Editable here because γ, k and κ
-/// are guesses to be tuned while watching what the pool makes.
-const GAMMA_FIELD: Field = Field::new(
-    "gamma",
-    "0.1",
-    "γ. Bigger charges more for term 1 and tilts harder. Start at 0.1 and move it.",
-);
-const HOLD_SECS_FIELD: Field = Field::new(
-    "hold_secs",
-    "12",
-    "τ. Seconds until the next block, when we can change our price. 12 on mainnet.",
-);
-const K_FIELD: Field = Field::new(
-    "k",
-    "2000",
-    "k. Bigger means people leave faster when we charge more, so we charge less. Pick it \
-     from the spread you want: with gamma 0.1, k = 2000 makes term 2 a 0.05% spread per \
-     side, k = 700 makes it 0.14%.",
-);
-const KAPPA_FIELD: Field = Field::new(
-    "kappa",
-    "1",
-    "κ. 1 charges the full typical move, 0 charges nothing for term 3.",
-);
-const FILL_DELAY_SECS_FIELD: Field = Field::new(
-    "fill_delay_secs",
-    "6",
-    "Δ. Seconds between us posting a price and someone trading on it. 6 is half a block.",
-);
-const TARGET_SHARE_FIELD: Field = Field::new(
-    "target_share",
-    "0.5",
-    "how much of the vault's value we want in WETH (the base token), 0 to 1. 0.5 is half \
-     WETH, half USDC. Blank is 0.5.",
-);
-const INVENTORY_AVERSION_FIELD: Field = Field::new(
-    "inventory_aversion",
-    "0",
-    "λ. Once the vault's WETH share leaves the band below, the trade that would push it further \
-     off gets more expensive. The trade that brings it back does not. 0 is off. Bigger charges \
-     more.",
-);
-const INVENTORY_BAND_LOWER_FIELD: Field = Field::new(
-    "inventory_band_lower",
-    "0.25",
-    "below this WETH share, the extra spread starts. Blank is half of target_share.",
-);
-const INVENTORY_BAND_UPPER_FIELD: Field = Field::new(
-    "inventory_band_upper",
-    "0.75",
-    "above this WETH share, the extra spread starts. Blank is twice target_share, which at \
-     0.5 or more is over 100% and never fires, so set it.",
-);
-const INVENTORY_AVERSION_HARD_FIELD: Field = Field::new(
-    "inventory_aversion_hard",
-    "",
-    "λ_hard. A second, stronger charge once the WETH share leaves the wider band below. Adds \
-     (λ_hard − λ_soft) on top of inventory_aversion past the hard edge. Must be ≥ \
-     inventory_aversion. Blank means equal to it, so the hard tier is off. It only acts on a side \
-     whose hard band edge below is set.",
-);
-const INVENTORY_BAND_HARD_LOWER_FIELD: Field = Field::new(
-    "inventory_band_hard_lower",
-    "0.1",
-    "below this WETH share, the stronger λ_hard charge starts. Must be ≤ inventory_band_lower. \
-     Blank turns the hard tier off on this side.",
-);
-const INVENTORY_BAND_HARD_UPPER_FIELD: Field = Field::new(
-    "inventory_band_hard_upper",
-    "0.9",
-    "above this WETH share, the stronger λ_hard charge starts. Must be ≥ inventory_band_upper. \
-     Blank turns the hard tier off on this side.",
-);
-const VOLATILITY_WINDOW_FIELD: Field = Field::new(
-    "volatility_window_secs",
-    "600",
-    "how many seconds of Binance prices σ is computed from. 60 to 3600.",
 );
 
 /// Locked on an edit: the lane and the signer are derived from these, so changing one is a
@@ -2027,15 +1813,17 @@ struct PairRow {
     status: &'static str,
     status_class: &'static str,
     tokens: Vec<ShortAddress>,
+    /// The venues the pair streams from, if any.
     source: Option<String>,
-    delta: Option<String>,
+    /// The kind that prices it, with its summary of the stanza.
+    pricing: String,
     band: Option<String>,
     breaker: Option<String>,
 }
 
 impl PairRow {
     /// `running` is the pair's breaker flag if the pusher has a task for it, `None` if not.
-    fn new(pair: &RawPair, running: Option<bool>) -> Self {
+    fn new(pair: &RawPair, running: Option<bool>, kinds: &crate::kinds::Kinds) -> Self {
         let (status, status_class) = match (pair.halted, running) {
             (true, _) => ("halted", "halted"),
             (false, Some(true)) => ("breaker tripped", "halted"),
@@ -2049,23 +1837,8 @@ impl PairRow {
             status,
             status_class,
             tokens: pair.tokens.iter().map(|t| ShortAddress::new(t)).collect(),
-            source: match (describe_sources(pair), &pair.mid, custom_kind(pair)) {
-                (Some(sources), _, Some(kind)) => Some(format!("{sources} ({kind})")),
-                (None, _, Some(kind)) => Some(kind.to_owned()),
-                (Some(sources), _, None) if pair.gamma.is_some() => {
-                    Some(format!("{sources} (volatile)"))
-                }
-                (Some(sources), _, None) => Some(sources),
-                (None, Some(mid), None) => Some(format!("fixed {mid}")),
-                (None, None, None) => None,
-            },
-            delta: match (custom_kind(pair), &pair.gamma, &pair.k, &pair.kappa) {
-                (Some(kind), ..) => Some(format!("computed by {kind}")),
-                (None, Some(gamma), Some(k), Some(kappa)) => {
-                    Some(format!("computed: γ={gamma} k={k} κ={kappa}"))
-                }
-                _ => pair.delta.clone(),
-            },
+            source: describe_sources(pair),
+            pricing: kinds.pricer_summary(&pricing_spec(pair)),
             band: match (&pair.min_mid, &pair.max_mid) {
                 (None, None) => None,
                 (min, max) => Some(format!(
@@ -2137,25 +1910,8 @@ struct PairFormPage {
     /// One row per venue the binary knows.
     sources: Vec<SourceRow>,
     min_sources: Filled,
-    /// Which pricing section opens: `true` when the pair has volatile knobs set.
-    volatile: bool,
-    /// The kind a custom-priced pair's stanza names: the page shows where to edit it in
-    /// place of the pricing sections, which cannot express it.
-    custom_kind: Option<String>,
-    delta: Filled,
-    gamma: Filled,
-    hold_secs: Filled,
-    k: Filled,
-    kappa: Filled,
-    fill_delay_secs: Filled,
-    target_share: Filled,
-    inventory_aversion: Filled,
-    inventory_band_lower: Filled,
-    inventory_band_upper: Filled,
-    inventory_aversion_hard: Filled,
-    inventory_band_hard_lower: Filled,
-    inventory_band_hard_upper: Filled,
-    volatility_window_secs: Filled,
+    /// One section per registered pricing kind, the pair's own checked.
+    kinds: Vec<KindSection>,
     allow_symbol_mismatch: bool,
 }
 
@@ -2198,7 +1954,13 @@ struct ConfigErrorPage {
     error: String,
 }
 
-fn render_index(config: &RawConfig, path: &Path, banner: &Banner, states: &PairStates) -> String {
+fn render_index(
+    config: &RawConfig,
+    path: &Path,
+    banner: &Banner,
+    states: &PairStates,
+    kinds: &crate::kinds::Kinds,
+) -> String {
     // A snapshot, so every row reads the same moment and the lock is not held while
     // rendering. A poisoned lock still holds a usable map.
     let states: std::collections::BTreeMap<String, bool> = states
@@ -2215,7 +1977,7 @@ fn render_index(config: &RawConfig, path: &Path, banner: &Banner, states: &PairS
         pairs: config
             .pairs
             .iter()
-            .map(|pair| PairRow::new(pair, states.get(&pair.key_env).copied()))
+            .map(|pair| PairRow::new(pair, states.get(&pair.key_env).copied(), kinds))
             .collect(),
         builders: config
             .builders
@@ -2231,12 +1993,31 @@ fn render_index(config: &RawConfig, path: &Path, banner: &Banner, states: &PairS
     .unwrap_or_else(render_failed)
 }
 
-/// The kind a pair's `[pairs.pricing]` stanza names, if it has one.
-fn custom_kind(pair: &RawPair) -> Option<&str> {
-    pair.pricing.as_ref()?.get("kind")?.as_str()
+/// The kind a pair's `[pairs.pricing]` stanza names, if it names one as a string.
+fn pricing_kind(pair: &RawPair) -> Option<&str> {
+    pair.pricing.get("kind")?.as_str()
 }
 
-fn render_pair_form(pair: Option<&RawPair>) -> String {
+/// The pair's stanza as the kind table reads it, for the summary a row shows.
+fn pricing_spec(pair: &RawPair) -> crate::config::PricingSpec {
+    crate::config::PricingSpec {
+        kind: pricing_kind(pair).unwrap_or("").to_owned(),
+        config: pair.pricing.clone(),
+    }
+}
+
+/// One pricing kind's section of the pair form: its radio, its help and its fields filled
+/// from the pair's stanza when the pair is priced by it.
+struct KindSection {
+    name: String,
+    checked: bool,
+    help: &'static str,
+    fields: Vec<Filled>,
+    /// A kind with no declared fields: the page says the stanza is edited in the file.
+    in_file: bool,
+}
+
+fn render_pair_form(pair: Option<&RawPair>, kinds: &crate::kinds::Kinds) -> String {
     let editing_key = pair.map(|pair| pair.key_env.clone());
     let editing = editing_key.is_some();
     let identity_values: Vec<Option<&str>> = match pair {
@@ -2249,7 +2030,6 @@ fn render_pair_form(pair: Option<&RawPair>) -> String {
     };
     let source_values: Vec<Option<&str>> = match pair {
         Some(pair) => vec![
-            pair.mid.as_deref(),
             pair.min_mid.as_deref(),
             pair.max_mid.as_deref(),
             pair.max_deviation.as_deref(),
@@ -2261,6 +2041,44 @@ fn render_pair_form(pair: Option<&RawPair>) -> String {
     let knob = |field: &'static Field, value: fn(&RawPair) -> Option<&str>| {
         Filled::new(field, pair.and_then(value))
     };
+    // Every registered kind, the pair's own first checked (a new pair starts on the first
+    // registered). A pair priced by a kind nobody registered still shows it, so its stanza
+    // is not lost on save.
+    let current = pair.and_then(pricing_kind);
+    let mut names: Vec<String> = kinds.pricer_kinds().iter().map(|k| k.to_string()).collect();
+    if let Some(current) = current
+        && !names.iter().any(|n| n == current)
+    {
+        names.push(current.to_owned());
+    }
+    let checked_kind = current
+        .map(str::to_owned)
+        .or_else(|| names.first().cloned());
+    let kind_sections: Vec<KindSection> = names
+        .iter()
+        .map(|name| {
+            let fields = kinds.pricer_fields(name).unwrap_or(&[]);
+            let mine = current == Some(name.as_str());
+            KindSection {
+                name: name.clone(),
+                checked: checked_kind.as_deref() == Some(name.as_str()),
+                help: kinds.pricer_form_help(name).unwrap_or(""),
+                fields: fields
+                    .iter()
+                    .map(|field| {
+                        let value = if mine {
+                            pair.and_then(|p| p.pricing.get(field.name))
+                                .and_then(|v| v.as_str())
+                        } else {
+                            None
+                        };
+                        Filled::kind_field(name, field, value)
+                    })
+                    .collect(),
+                in_file: fields.is_empty(),
+            }
+        })
+        .collect();
 
     PairFormPage {
         script_version: pair_script_version(),
@@ -2280,10 +2098,6 @@ fn render_pair_form(pair: Option<&RawPair>) -> String {
         source: SOURCE_FIELDS
             .iter()
             .zip(source_values)
-            // A custom pricer computes the mid, so a fixed one has no place on its page.
-            .filter(|(field, _)| {
-                !(field.name == "mid" && pair.is_some_and(|p| custom_kind(p).is_some()))
-            })
             .map(|(field, value)| Filled::new(field, value))
             .collect(),
         sources: VenueId::ALL
@@ -2317,36 +2131,7 @@ fn render_pair_form(pair: Option<&RawPair>) -> String {
             })
             .collect(),
         min_sources: knob(&MIN_SOURCES_FIELD, |p| p.min_sources.as_deref()),
-        volatile: pair.is_some_and(|pair| pair.gamma.is_some()),
-        custom_kind: pair.and_then(custom_kind).map(str::to_owned),
-        delta: knob(&DELTA_FIELD, |p| p.delta.as_deref()),
-        gamma: knob(&GAMMA_FIELD, |p| p.gamma.as_deref()),
-        hold_secs: knob(&HOLD_SECS_FIELD, |p| p.hold_secs.as_deref()),
-        k: knob(&K_FIELD, |p| p.k.as_deref()),
-        kappa: knob(&KAPPA_FIELD, |p| p.kappa.as_deref()),
-        fill_delay_secs: knob(&FILL_DELAY_SECS_FIELD, |p| p.fill_delay_secs.as_deref()),
-        target_share: knob(&TARGET_SHARE_FIELD, |p| p.target_share.as_deref()),
-        inventory_aversion: knob(&INVENTORY_AVERSION_FIELD, |p| {
-            p.inventory_aversion.as_deref()
-        }),
-        inventory_band_lower: knob(&INVENTORY_BAND_LOWER_FIELD, |p| {
-            p.inventory_band_lower.as_deref()
-        }),
-        inventory_band_upper: knob(&INVENTORY_BAND_UPPER_FIELD, |p| {
-            p.inventory_band_upper.as_deref()
-        }),
-        inventory_aversion_hard: knob(&INVENTORY_AVERSION_HARD_FIELD, |p| {
-            p.inventory_aversion_hard.as_deref()
-        }),
-        inventory_band_hard_lower: knob(&INVENTORY_BAND_HARD_LOWER_FIELD, |p| {
-            p.inventory_band_hard_lower.as_deref()
-        }),
-        inventory_band_hard_upper: knob(&INVENTORY_BAND_HARD_UPPER_FIELD, |p| {
-            p.inventory_band_hard_upper.as_deref()
-        }),
-        volatility_window_secs: knob(&VOLATILITY_WINDOW_FIELD, |p| {
-            p.volatility_window_secs.as_deref()
-        }),
+        kinds: kind_sections,
         allow_symbol_mismatch: pair.is_some_and(|pair| pair.allow_symbol_mismatch),
     }
     .render()
@@ -2419,6 +2204,39 @@ fn render_failed(err: askama::Error) -> String {
 mod tests {
     use super::*;
 
+    /// The kinds a test binary registers: the three shipped ones, and `skewed`, a kind with
+    /// no form fields, so its stanza is edited in the file.
+    fn test_kinds() -> Arc<crate::kinds::Kinds> {
+        #[derive(Clone, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Skewed {
+            #[allow(dead_code)]
+            half_spread: f64,
+        }
+        struct SkewedPricer;
+        impl crate::pricing::Pricer for SkewedPricer {
+            fn price(
+                &mut self,
+                tick: &crate::pricing::TickCtx,
+                _: &mut crate::pricing::Diagnostics,
+            ) -> Result<crate::pricing::PricerOutput, crate::pricing::Refusal> {
+                let market = tick.market()?;
+                Ok(crate::pricing::PricerOutput::new(market.delta, market.mid))
+            }
+        }
+        let mut kinds = crate::kinds::Kinds::default();
+        kinds.insert("fixed", Arc::new(crate::pricing::Fixed));
+        kinds.insert("feed", Arc::new(crate::pricing::Feed));
+        kinds.insert("volatile", Arc::new(crate::pricing::Volatile));
+        kinds.insert(
+            "skewed",
+            crate::kinds::fn_factory(|_: Skewed, _: &mut crate::pricing::BuildCtx| {
+                Ok(SkewedPricer)
+            }),
+        );
+        Arc::new(kinds)
+    }
+
     fn a_config() -> RawConfig {
         toml::from_str(
             r#"
@@ -2429,6 +2247,7 @@ tokens  = ["0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
            "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"]
 symbol  = "ETHUSDC"
 key_env = "UPDATER_KEY_WETH_USDC"
+pricing = { kind = "feed" }
 
 [[builder]]
 name = "titan-eu"
@@ -2480,6 +2299,7 @@ api_key = "k"
                     err: None,
                 },
                 states,
+                &test_kinds(),
             )
         };
 
@@ -2544,6 +2364,7 @@ api_key = "k"
             lookups: Arc::new(crate::discover::Cache::default()),
             preview_pages: Arc::new(tokio::sync::Semaphore::new(PREVIEW_PAGES)),
             edits: Arc::new(tokio::sync::Mutex::new(())),
+            kinds: test_kinds(),
         };
         (path, state, rx)
     }
@@ -2574,8 +2395,6 @@ api_key = "k"
                     symbol: Some("TESTUSDC".to_owned()),
                     sources: Vec::new(),
                     min_sources: None,
-                    mid: None,
-                    delta: None,
                     min_mid: None,
                     max_mid: None,
                     max_deviation: None,
@@ -2584,20 +2403,7 @@ api_key = "k"
                     allow_symbol_mismatch: false,
                     halted: false,
                     halt_reason: None,
-                    gamma: None,
-                    k: None,
-                    kappa: None,
-                    target_share: None,
-                    hold_secs: None,
-                    fill_delay_secs: None,
-                    volatility_window_secs: None,
-                    inventory_aversion: None,
-                    inventory_band_lower: None,
-                    inventory_band_upper: None,
-                    inventory_aversion_hard: None,
-                    inventory_band_hard_lower: None,
-                    inventory_band_hard_upper: None,
-                    pricing: None,
+                    pricing: toml::from_str("kind = \"feed\"").unwrap(),
                     guards: Vec::new(),
                 });
                 Ok(())
@@ -2704,6 +2510,7 @@ api_key = "k"
             test_client(),
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            test_kinds(),
         )
         .await
         .expect_err("an unspecified bind must be refused");
@@ -2734,6 +2541,7 @@ api_key = "k"
             test_client(),
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            test_kinds(),
         )
         .await
         .unwrap();
@@ -2753,10 +2561,10 @@ api_key = "k"
             let _ = request.reply.send(Ok("reload: 1 restarted".to_owned()));
         });
 
-        let body = "key_env=UPDATER_KEY_WETH_USDC&symbol=ETHUSDC&mid=&delta=0.0005\
+        let body = "key_env=UPDATER_KEY_WETH_USDC&symbol=ETHUSDC&pricing=feed\
+                    &pricing_feed_delta=0.0005&pricing_fixed_mid=&pricing_fixed_delta=\
                     &min_mid=&max_mid=&max_deviation=0.02&max_deviation_window=0.20\
-                    &max_deviation_window_blocks=1000&gamma=&k=&kappa=\
-                    &target_share=&hold_secs=&fill_delay_secs=&volatility_window_secs=";
+                    &max_deviation_window_blocks=1000&pricing_volatile_gamma=";
         let posted = http(
             local,
             &format!(
@@ -2774,7 +2582,14 @@ api_key = "k"
 
         // And the edit is on disk, which is the only thing that actually matters.
         let written = config::load_raw(&path).unwrap();
-        assert_eq!(written.pairs[0].delta.as_deref(), Some("0.0005"));
+        assert_eq!(
+            written.pairs[0].pricing.get("delta"),
+            Some(&toml::Value::String("0.0005".to_owned()))
+        );
+        assert_eq!(
+            written.pairs[0].pricing.get("kind"),
+            Some(&toml::Value::String("feed".to_owned()))
+        );
         assert_eq!(written.pairs[0].max_deviation.as_deref(), Some("0.02"));
         assert_eq!(
             written.pairs[0].max_deviation_window.as_deref(),
@@ -2784,10 +2599,11 @@ api_key = "k"
             written.pairs[0].max_deviation_window_blocks.as_deref(),
             Some("1000")
         );
-        // An empty form field is an absent key, not an empty string.
-        assert_eq!(written.pairs[0].mid, None);
+        // An empty form field is an absent key, not an empty string; another kind's
+        // inputs, blank or not, are not the chosen kind's.
         assert_eq!(written.pairs[0].min_mid, None);
-        assert_eq!(written.pairs[0].gamma, None);
+        assert_eq!(written.pairs[0].pricing.get("mid"), None);
+        assert_eq!(written.pairs[0].pricing.get("gamma"), None);
     }
 
     /// A POST of `body` to `route`, through the socket, answered with the banner the page
@@ -2836,6 +2652,7 @@ api_key = "k"
             test_client(),
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            test_kinds(),
         )
         .await
         .unwrap();
@@ -2891,6 +2708,7 @@ api_key = "k"
             test_client(),
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            test_kinds(),
         )
         .await
         .unwrap();
@@ -2912,10 +2730,8 @@ api_key = "k"
         // Two venues and a minimum: `sources`, weights kept as written, blank weight absent.
         let body = "key_env=UPDATER_KEY_WETH_USDC&symbol_binance=ETHUSDC&weight_binance=2\
                     &symbol_kraken=ETH%2FUSD&weight_kraken=&symbol_okx=&weight_okx=\
-                    &min_sources=2&mid=&delta=0.0005&min_mid=&max_mid=&max_deviation=\
-                    &max_deviation_window=&max_deviation_window_blocks=&pricing=fixed\
-                    &gamma=&k=&kappa=&target_share=&hold_secs=&fill_delay_secs=\
-                    &volatility_window_secs=";
+                    &min_sources=2&pricing=feed&pricing_feed_delta=0.0005&min_mid=&max_mid=\
+                    &max_deviation=&max_deviation_window=&max_deviation_window_blocks=";
         let posted = http(local, &post(body.to_owned())).await;
         assert!(posted.contains("location: /?ok="), "{posted}");
         let written = config::load_raw(&path).unwrap();
@@ -2965,10 +2781,8 @@ api_key = "k"
 
         // Back to one Binance row with no weight and no minimum: the short form.
         let body = "key_env=UPDATER_KEY_WETH_USDC&symbol_binance=ETHUSDC&weight_binance=\
-                    &min_sources=&mid=&delta=0.0005&min_mid=&max_mid=&max_deviation=\
-                    &max_deviation_window=&max_deviation_window_blocks=&pricing=fixed\
-                    &gamma=&k=&kappa=&target_share=&hold_secs=&fill_delay_secs=\
-                    &volatility_window_secs=";
+                    &min_sources=&pricing=feed&pricing_feed_delta=0.0005&min_mid=&max_mid=\
+                    &max_deviation=&max_deviation_window=&max_deviation_window_blocks=";
         let posted = http(local, &post(body.to_owned())).await;
         assert!(posted.contains("location: /?ok="), "{posted}");
         service.await.unwrap();
@@ -3034,6 +2848,7 @@ api_key = "k"
             ethrex_rpc::clients::eth::EthClient::new(url::Url::parse(&rpc.url).unwrap()).unwrap(),
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            test_kinds(),
             crate::discover::Rest::all_at(&format!("http://{exchanges}")),
         )
         .await
@@ -3210,6 +3025,7 @@ api_key = "k"
             test_client(),
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            test_kinds(),
         )
         .await
         .unwrap();
@@ -3482,6 +3298,7 @@ api_key = "k"
             test_client(),
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            test_kinds(),
         )
         .await
         .unwrap();
@@ -3515,6 +3332,7 @@ api_key = "k"
             test_client(),
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            test_kinds(),
         )
         .await
         .unwrap();
@@ -3526,9 +3344,12 @@ api_key = "k"
         // Deliberately omits max_deviation_window and max_deviation_window_blocks: a
         // browser holding this form open from before those keys existed posts exactly
         // this body, and it must still save rather than 422 on the two missing fields.
-        let body = "key_env=UPDATER_KEY_WETH_USDC&symbol=ETHUSDC&mid=&delta=\
-                    &min_mid=&max_mid=&max_deviation=&gamma=0.2&k=700&kappa=1\
-                    &target_share=0.6&hold_secs=&fill_delay_secs=&volatility_window_secs=300";
+        let body = "key_env=UPDATER_KEY_WETH_USDC&symbol=ETHUSDC&pricing=volatile\
+                    &min_mid=&max_mid=&max_deviation=&pricing_volatile_gamma=0.2\
+                    &pricing_volatile_k=700&pricing_volatile_kappa=1\
+                    &pricing_volatile_target_share=0.6&pricing_volatile_hold_secs=\
+                    &pricing_volatile_fill_delay_secs=&pricing_volatile_volatility_window_secs=300\
+                    &pricing_feed_delta=0.0005";
         let posted = http(
             local,
             &format!(
@@ -3544,116 +3365,145 @@ api_key = "k"
 
         let written = config::load_raw(&path).unwrap();
         let pair = &written.pairs[0];
-        assert_eq!(pair.gamma.as_deref(), Some("0.2"));
-        assert_eq!(pair.k.as_deref(), Some("700"));
-        assert_eq!(pair.kappa.as_deref(), Some("1"));
-        assert_eq!(pair.target_share.as_deref(), Some("0.6"));
-        assert_eq!(pair.volatility_window_secs.as_deref(), Some("300"));
-        assert_eq!(pair.hold_secs, None);
-        assert_eq!(pair.delta, None);
+        let knob = |name: &str| pair.pricing.get(name).and_then(|v| v.as_str());
+        assert_eq!(knob("kind"), Some("volatile"));
+        assert_eq!(knob("gamma"), Some("0.2"));
+        assert_eq!(knob("k"), Some("700"));
+        assert_eq!(knob("kappa"), Some("1"));
+        assert_eq!(knob("target_share"), Some("0.6"));
+        assert_eq!(knob("volatility_window_secs"), Some("300"));
+        assert_eq!(knob("hold_secs"), None, "a blank input is an absent key");
+        assert_eq!(
+            knob("delta"),
+            None,
+            "another kind's input is not this kind's"
+        );
         // And the file parses as a volatile pair.
         let text = std::fs::read_to_string(&path).unwrap();
         let parsed = config::parse_config(&text, 18).unwrap();
-        assert!(matches!(
-            parsed.pairs[0].source,
-            config::SourceSpec::Volatile { .. }
-        ));
-        // The index shows it as such, and the edit form opens on the volatile section.
+        assert_eq!(parsed.pairs[0].pricing.kind, "volatile");
+        // The index shows the kind and its summary, and the edit form opens on its section.
         let page = http(
             local,
             "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
         )
         .await;
-        assert!(page.contains("ETHUSDC (volatile)"), "{page}");
-        assert!(page.contains("computed: γ=0.2 k=700 κ=1"), "{page}");
-        let form = render_pair_form(Some(&written.pairs[0]));
+        assert!(page.contains("volatile γ=0.2 k=700 κ=1"), "{page}");
+        let form = render_pair_form(Some(&written.pairs[0]), &test_kinds());
         assert!(
-            form.contains("id=pricing-volatile name=pricing value=volatile checked"),
+            form.contains(r#"id="pricing-volatile" name=pricing value="volatile" checked"#),
             "{form}"
         );
         assert!(
-            form.contains("name=\"gamma\"\n         value=\"0.2\""),
+            form.contains("name=\"pricing_volatile_gamma\"\n         value=\"0.2\""),
             "{form}"
         );
     }
 
-    /// Both sections' inputs are posted whichever is showing, so choosing "fixed" has to
-    /// drop the knobs the hidden section still carried: left in place, `config.rs` would
-    /// refuse the file for setting a spread twice.
+    /// Every kind's inputs are posted whichever section is showing, so the stanza is built
+    /// from the chosen kind's alone; a blank choice keeps the stanza, an unknown kind is
+    /// refused, and a kind with no fields keeps a stanza it already prices.
     #[test]
-    fn the_pricing_choice_decides_which_section_is_kept() {
-        let mut pair = a_config().pairs[0].clone();
-        pair.gamma = Some("0.1".to_owned());
-        let knobs = Knobs {
-            gamma: "0.1",
-            k: "2000",
-            kappa: "1",
-            target_share: "",
-            hold_secs: "",
-            fill_delay_secs: "",
-            volatility_window_secs: "",
-            inventory_aversion: "",
-            inventory_band_lower: "",
-            inventory_band_upper: "",
-            inventory_aversion_hard: "",
-            inventory_band_hard_lower: "",
-            inventory_band_hard_upper: "",
+    fn the_pricing_choice_decides_which_kinds_fields_are_kept() {
+        let kinds = test_kinds();
+        let posted: std::collections::HashMap<String, String> = [
+            ("pricing_fixed_mid", "1.0001"),
+            ("pricing_fixed_delta", "0.0005"),
+            ("pricing_feed_delta", ""),
+            ("pricing_volatile_gamma", "0.1"),
+            ("pricing_volatile_k", "2000"),
+            ("pricing_volatile_kappa", "1"),
+            ("pricing_volatile_hold_secs", ""),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        let text = |table: &toml::Table, key: &str| {
+            table.get(key).and_then(|v| v.as_str()).map(str::to_owned)
         };
-        let fixed = apply_pricing(pair.clone(), "fixed", "0.0005", &knobs);
-        assert_eq!(fixed.delta.as_deref(), Some("0.0005"));
-        assert_eq!(fixed.gamma, None);
-        assert_eq!(fixed.target_share, None);
 
-        let volatile = apply_pricing(pair.clone(), "volatile", "0.0005", &knobs);
-        assert_eq!(volatile.delta, None);
-        assert_eq!(volatile.gamma.as_deref(), Some("0.1"));
-        assert_eq!(volatile.k.as_deref(), Some("2000"));
-        assert_eq!(volatile.hold_secs, None);
+        let fixed = pricing_stanza(&kinds, "fixed", None, &posted).unwrap();
+        assert_eq!(text(&fixed, "kind").as_deref(), Some("fixed"));
+        assert_eq!(text(&fixed, "mid").as_deref(), Some("1.0001"));
+        assert_eq!(text(&fixed, "delta").as_deref(), Some("0.0005"));
+        assert_eq!(fixed.get("gamma"), None);
 
-        // No choice posted: an older form. The knobs say what it meant.
+        let volatile = pricing_stanza(&kinds, "volatile", None, &posted).unwrap();
+        assert_eq!(text(&volatile, "gamma").as_deref(), Some("0.1"));
+        assert_eq!(text(&volatile, "k").as_deref(), Some("2000"));
+        assert_eq!(volatile.get("hold_secs"), None, "blank is absent");
+        assert_eq!(volatile.get("delta"), None);
+
+        let feed = pricing_stanza(&kinds, "feed", None, &posted).unwrap();
         assert_eq!(
-            apply_pricing(pair.clone(), "", "0.0005", &knobs).delta,
-            None
+            feed.len(),
+            1,
+            "a blank delta leaves only the kind: {feed:?}"
         );
-        let blank = Knobs { gamma: "", ..knobs };
+
+        // No choice posted: an older form. The stanza stays as it is.
+        let existing: toml::Table =
+            toml::from_str("kind = \"skewed\"\nhalf_spread = 0.0005").unwrap();
         assert_eq!(
-            apply_pricing(pair, "", "0.0005", &blank).delta.as_deref(),
-            Some("0.0005")
+            pricing_stanza(&kinds, "", Some(&existing), &posted).unwrap(),
+            existing
         );
+        assert!(pricing_stanza(&kinds, "", None, &posted).is_err());
+        // A kind with no fields keeps the stanza it already prices, and names itself alone
+        // on a pair it did not.
+        assert_eq!(
+            pricing_stanza(&kinds, "skewed", Some(&existing), &posted).unwrap(),
+            existing
+        );
+        let bare = pricing_stanza(&kinds, "skewed", None, &posted).unwrap();
+        assert_eq!(bare.len(), 1);
+        // A kind nobody registered names the ones that are.
+        let err = pricing_stanza(&kinds, "nope", None, &posted)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nope") && err.contains("volatile"), "{err}");
     }
 
-    /// The form opens on the fixed section for a pair without knobs, and carries the
-    /// equation the knobs are explained against.
+    /// The form opens on the section of the kind that prices the pair, offers every
+    /// registered kind, and carries each kind's help and fields under their posted names.
     #[test]
     fn the_pair_form_opens_on_the_pairs_pricing() {
-        let form = render_pair_form(Some(&a_config().pairs[0]));
+        let form = render_pair_form(Some(&a_config().pairs[0]), &test_kinds());
         assert!(
-            form.contains("id=pricing-fixed name=pricing value=fixed checked"),
+            form.contains(r#"id="pricing-feed" name=pricing value="feed" checked"#),
             "{form}"
         );
-        assert!(!form.contains("value=volatile checked"), "{form}");
+        assert!(!form.contains(r#"value="volatile" checked"#), "{form}");
         assert!(form.contains("ln(1 + γ/k)"), "{form}");
         for name in [
-            "gamma",
-            "k",
-            "kappa",
-            "target_share",
-            "hold_secs",
-            "fill_delay_secs",
-            "volatility_window_secs",
-            "inventory_aversion",
-            "inventory_band_lower",
-            "inventory_band_upper",
-            "inventory_aversion_hard",
-            "inventory_band_hard_lower",
-            "inventory_band_hard_upper",
-            "delta",
+            "pricing_volatile_gamma",
+            "pricing_volatile_k",
+            "pricing_volatile_kappa",
+            "pricing_volatile_target_share",
+            "pricing_volatile_hold_secs",
+            "pricing_volatile_fill_delay_secs",
+            "pricing_volatile_volatility_window_secs",
+            "pricing_volatile_inventory_aversion",
+            "pricing_volatile_inventory_band_lower",
+            "pricing_volatile_inventory_band_upper",
+            "pricing_volatile_inventory_aversion_hard",
+            "pricing_volatile_inventory_band_hard_lower",
+            "pricing_volatile_inventory_band_hard_upper",
+            "pricing_feed_delta",
+            "pricing_fixed_mid",
+            "pricing_fixed_delta",
         ] {
             assert!(
                 form.contains(&format!(r#"name="{name}""#)),
                 "{name} is missing from the form"
             );
         }
+        // A new pair starts on the first registered kind.
+        let new = render_pair_form(None, &test_kinds());
+        assert!(
+            new.contains(r#"id="pricing-feed" name=pricing value="feed" checked"#),
+            "{new}"
+        );
     }
 
     /// The two window fields are ordinary `SOURCE_FIELDS` entries, appended after
@@ -3665,7 +3515,7 @@ api_key = "k"
     fn the_window_fields_render_on_both_forms_and_edit_shows_the_current_value() {
         for name in ["max_deviation_window", "max_deviation_window_blocks"] {
             assert!(
-                render_pair_form(None).contains(&format!(r#"name="{name}""#)),
+                render_pair_form(None, &test_kinds()).contains(&format!(r#"name="{name}""#)),
                 "{name} is missing from the new-pair form"
             );
         }
@@ -3673,7 +3523,7 @@ api_key = "k"
         let mut config = a_config();
         config.pairs[0].max_deviation_window = Some("0.20".to_owned());
         config.pairs[0].max_deviation_window_blocks = Some("1000".to_owned());
-        let form = render_pair_form(Some(&config.pairs[0]));
+        let form = render_pair_form(Some(&config.pairs[0]), &test_kinds());
         assert!(
             form.contains("name=\"max_deviation_window\"\n         value=\"0.20\""),
             "{form}"
@@ -3908,7 +3758,7 @@ api_key = "k"
         // harder to check.
         assert_eq!(form.matches(r#"type="password""#).count(), 1, "{form}");
 
-        let pair = render_pair_form(None);
+        let pair = render_pair_form(None, &test_kinds());
         assert!(!pair.contains(r#"type="password""#), "{pair}");
     }
 
@@ -3925,6 +3775,7 @@ api_key = "k"
                 err: None,
             },
             &PairStates::default(),
+            &test_kinds(),
         );
         assert!(!html.contains("ti\"tan<eu>&"), "{html}");
         // askama's numeric entities, not the named ones a hand-rolled escaper would emit.
@@ -3982,6 +3833,7 @@ api_key = "k"
                 err: None,
             },
             &PairStates::default(),
+            &test_kinds(),
         );
         for target in [
             "action=/reload",
@@ -3995,9 +3847,9 @@ api_key = "k"
             assert!(index.contains(target), "the index has no {target}");
         }
 
-        let new_pair = render_pair_form(None);
+        let new_pair = render_pair_form(None, &test_kinds());
         assert!(new_pair.contains(r#"action="/pairs/add""#), "{new_pair}");
-        let edit_pair = render_pair_form(Some(&config.pairs[0]));
+        let edit_pair = render_pair_form(Some(&config.pairs[0]), &test_kinds());
         assert!(edit_pair.contains(r#"action="/pairs/edit""#), "{edit_pair}");
         assert!(render_builder_form().contains("action=/builders/add"));
     }
@@ -4019,8 +3871,8 @@ endpoint = "wss://eu.rpc.titanbuilder.xyz/ws/sendquoteupdate"
 api_key = "k"
 "#;
 
-    /// The backoffice cannot edit a custom pricer's stanza, so it must carry it through an
-    /// edit of anything else untouched, and must not bolt a built-in model's keys on.
+    /// The backoffice cannot edit the stanza of a kind that declares no fields, so it must
+    /// carry it through an edit of anything else untouched, and add no other kind's keys.
     #[tokio::test]
     async fn editing_a_custom_pair_keeps_its_stanza_and_adds_no_pricing_keys() {
         let (path, state, mut reloads) = config_on_disk("custom-stanza");
@@ -4033,6 +3885,7 @@ api_key = "k"
             test_client(),
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            test_kinds(),
         )
         .await
         .unwrap();
@@ -4040,11 +3893,11 @@ api_key = "k"
             let request = reloads.recv().await.expect("a reload must be requested");
             let _ = request.reply.send(Ok("reload: 1 restarted".to_owned()));
         });
-        // A stale page (from before the pair got its stanza) or a hand-made request can still
-        // post the built-in pricing inputs; they must not land beside the stanza.
-        let body = "key_env=UPDATER_KEY_WETH_USDC&symbol=ETHUSDC&mid=1&pricing=fixed&delta=0.001\
-                    &min_mid=0.0002&max_mid=&max_deviation=&gamma=0.1&k=700&kappa=1\
-                    &target_share=&hold_secs=&fill_delay_secs=&volatility_window_secs=";
+        // Every kind's inputs are posted; with the pair's own kind chosen, none of them is
+        // read and the stanza the page has no form for is kept as it was.
+        let body = "key_env=UPDATER_KEY_WETH_USDC&symbol=ETHUSDC&pricing=skewed\
+                    &pricing_fixed_mid=1&pricing_fixed_delta=0.001\
+                    &min_mid=0.0002&max_mid=&max_deviation=&pricing_volatile_gamma=0.1";
         let posted = http(
             local,
             &format!(
@@ -4061,14 +3914,6 @@ api_key = "k"
         let pair = &config::load_raw(&path).unwrap().pairs[0];
         assert_eq!(pair.pricing, before, "the stanza survives value-equal");
         assert_eq!(pair.min_mid.as_deref(), Some("0.0002"));
-        assert_eq!(
-            (
-                pair.mid.as_deref(),
-                pair.delta.as_deref(),
-                pair.gamma.as_deref()
-            ),
-            (None, None, None)
-        );
     }
 
     /// What a browser posts from the page's first form: every named `<input>`, a checkbox
@@ -4139,7 +3984,7 @@ api_key = "k"
         std::fs::write(&path, CUSTOM_PAIR).unwrap();
         let raw = config::load_raw(&path).unwrap();
         let before = raw.pairs[0].pricing.clone();
-        let mut fields = posted_fields(&render_pair_form(Some(&raw.pairs[0])));
+        let mut fields = posted_fields(&render_pair_form(Some(&raw.pairs[0]), &test_kinds()));
         assert!(
             fields.iter().any(|(name, _)| name == "key_env")
                 && !fields
@@ -4165,6 +4010,7 @@ api_key = "k"
             test_client(),
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            test_kinds(),
         )
         .await
         .unwrap();
@@ -4193,23 +4039,14 @@ api_key = "k"
             Some("ETHUSDC"),
             "its market is kept"
         );
-        assert_eq!(
-            (
-                pair.mid.as_deref(),
-                pair.delta.as_deref(),
-                pair.gamma.as_deref()
-            ),
-            (None, None, None)
-        );
     }
 
-    /// A built-in pair's page always posts `mid` and `delta`, blank or not; a body without
-    /// them (a hand-made request, a page from another binary) must not read as "clear both",
-    /// so it is refused before the file is touched.
+    /// A body with no pricing choice (a page from before the choice existed, a hand-made
+    /// request) keeps the pair's stanza as it is rather than reading as "clear it".
     #[tokio::test]
-    async fn a_built_in_pairs_edit_without_mid_or_delta_is_refused_not_cleared() {
-        let (path, state, _reloads) = config_on_disk("no-mid");
-        let before = std::fs::read_to_string(&path).unwrap();
+    async fn an_edit_without_a_pricing_choice_keeps_the_stanza() {
+        let (path, state, mut reloads) = config_on_disk("no-choice");
+        let before = config::load_raw(&path).unwrap().pairs[0].pricing.clone();
         let (local, _task) = bind(
             "127.0.0.1:0".parse().unwrap(),
             path.clone(),
@@ -4217,10 +4054,16 @@ api_key = "k"
             test_client(),
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            test_kinds(),
         )
         .await
         .unwrap();
-        let body = "key_env=UPDATER_KEY_WETH_USDC&symbol=ETHUSDC&min_mid=&max_mid=&max_deviation=";
+        let service = tokio::spawn(async move {
+            let request = reloads.recv().await.expect("a reload must be requested");
+            let _ = request.reply.send(Ok("reload: 1 restarted".to_owned()));
+        });
+        let body =
+            "key_env=UPDATER_KEY_WETH_USDC&symbol=ETHUSDC&min_mid=0.0002&max_mid=&max_deviation=";
         let posted = http(
             local,
             &format!(
@@ -4231,22 +4074,24 @@ api_key = "k"
             ),
         )
         .await;
-        assert!(
-            posted.contains("/?err=") && posted.contains("no+mid+or+no+delta"),
-            "{posted}"
-        );
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        service.await.unwrap();
+        assert!(posted.contains("303 See Other"), "{posted}");
+        let pair = &config::load_raw(&path).unwrap().pairs[0];
+        assert_eq!(pair.pricing, before);
+        assert_eq!(pair.min_mid.as_deref(), Some("0.0002"));
     }
 
     #[test]
     fn the_pair_form_says_where_a_custom_pairs_pricing_is_edited() {
         let config: config::RawConfig = toml::from_str(CUSTOM_PAIR).unwrap();
-        let form = render_pair_form(Some(&config.pairs[0]));
+        let form = render_pair_form(Some(&config.pairs[0]), &test_kinds());
         for expected in ["[pairs.pricing]", "config.toml", "skewed"] {
             assert!(form.contains(expected), "{expected}:\n{form}");
         }
-        for editable in [r#"name="delta""#, r#"name="gamma""#, r#"name="mid""#] {
-            assert!(!form.contains(editable), "{editable}:\n{form}");
-        }
+        assert!(
+            form.contains(r#"id="pricing-skewed" name=pricing value="skewed" checked"#),
+            "{form}"
+        );
+        assert!(!form.contains(r#"name="pricing_skewed_"#), "{form}");
     }
 }

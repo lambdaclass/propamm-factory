@@ -67,7 +67,7 @@ def config(ports, custom=False):
 kind        = "tilted"
 half_spread = {TILTED['half_spread']}
 tilt        = {TILTED['tilt']}
-""" if custom else ""
+""" if custom else 'pricing = { kind = "feed" }\n'
     builders = "".join(f"""
 [[builder]]
 name = "{name}"
@@ -88,9 +88,8 @@ coingecko = "http://127.0.0.1:{ports['rpc']}"
 
 [[pairs]]
 tokens  = ["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", "0xdAC17F958D2ee523a2206206994597C13D831ec7"]
-mid     = "1.0001"
-delta   = "0.0002"
 key_env = "UPDATER_KEY_USDC_USDT"
+pricing = {{ kind = "fixed", mid = "1.0001", delta = "0.0002" }}
 
 [[pairs]]
 tokens  = ["0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"]
