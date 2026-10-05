@@ -67,7 +67,6 @@ struct State {
     failing: HashSet<String>,
     /// `eth_call` selectors to answer with an error, for a failure one view call reaches
     /// while every other call (preflight's included) still answers.
-    failing_calls: HashSet<Vec<u8>>,
     /// Every request, by method, with the moment it arrived.
     calls: Vec<(String, Instant)>,
 }
@@ -95,7 +94,6 @@ impl MockRpc {
             decimals: HashMap::new(),
             delays: HashMap::new(),
             failing: HashSet::new(),
-            failing_calls: HashSet::new(),
             calls: Vec::new(),
         }));
         let served = state.clone();
@@ -243,16 +241,6 @@ impl MockRpc {
         }
     }
 
-    /// Makes every `eth_call` to the argument-less function `sig` (e.g. `"decimals()"`)
-    /// answer with a JSON-RPC error from now on, on any contract.
-    pub(crate) fn set_failing_call(&self, sig: &str) {
-        self.state
-            .lock()
-            .unwrap()
-            .failing_calls
-            .insert(selector(sig, 0));
-    }
-
     pub(crate) fn set_delay(&self, method: &str, delay: Duration) {
         self.state
             .lock()
@@ -365,13 +353,6 @@ impl State {
                     .or_else(|| params[0]["data"].as_str())
                     .unwrap_or("0x");
                 let data = hex::decode(data.strip_prefix("0x").unwrap_or(data)).unwrap_or_default();
-                if self
-                    .failing_calls
-                    .iter()
-                    .any(|failing| data.starts_with(failing))
-                {
-                    return None;
-                }
                 if let Some(pairs) = &self.target_pairs
                     && data.starts_with(&selector("getPairs()", 0))
                 {

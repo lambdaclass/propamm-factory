@@ -925,6 +925,9 @@ mod tests {
 
 [settings]
 rpc_url = "{rpc}"
+# A port nothing listens on: no test here streams a market, and one that named a symbol by
+# mistake must fail to dial rather than reach the real venue.
+binance_ws = "ws://127.0.0.1:1/ws"
 
 [[pairs]]
 tokens  = ["{usdc:#x}", "{usdt:#x}"]
@@ -1652,7 +1655,18 @@ api_key = "k"
             "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
         let fx = Fixture::spawn("halt-partial").await;
         let ten = Duration::from_secs(10);
+        // A kind whose stanza checks out and whose build never does: the one way a lane can
+        // fail its reload after the file was accepted, with no market dialled and no chain
+        // read.
+        #[derive(Clone, serde::Deserialize)]
+        struct NoKeys {}
         let handle = shipped(crate::Updater::builder())
+            .pricer_fn(
+                "unbuildable",
+                |_: NoKeys, _: &mut crate::pricing::BuildCtx| {
+                    Err::<crate::pricing::FixedPricer, _>(eyre::eyre!("this kind never builds"))
+                },
+            )
             .key_lookup(|name| match name {
                 "QU_TEST_KEY" => Some(ANVIL_KEY_0.to_owned()),
                 "QU_TEST_KEY_B" => Some(ANVIL_KEY_1.to_owned()),
@@ -1661,13 +1675,12 @@ api_key = "k"
             .start(fx.args(&[]));
         assert!(fx.builder.wait_for(1, ten).await, "the lane quotes first");
 
-        // A volatile lane added by hand whose vault cannot be read, so its build fails fast
-        // and the reload the halt asks for applies everywhere but there.
+        // A lane added by hand on that kind, so its build fails at once and the reload the
+        // halt asks for applies everywhere but there.
         let weth: Address = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
             .parse()
             .unwrap();
         fx.rpc.set_symbol(weth, "WETH");
-        fx.rpc.set_failing_call("decimals()");
         let text = std::fs::read_to_string(&fx.config).unwrap();
         let usdc = format!("{:#x}", fx.tokens.0);
         std::fs::write(
@@ -1675,9 +1688,8 @@ api_key = "k"
             text.replacen(
                 "[[builder]]",
                 &format!(
-                    "[[pairs]]\ntokens = [\"{weth:#x}\", \"{usdc}\"]\nsymbol = \"ETHUSDC\"\n\
-                     allow_symbol_mismatch = true\n\
-                     key_env = \"QU_TEST_KEY_B\"\npricing = {{ kind = \"volatile\", gamma = \"0.1\", k = \"2000\", kappa = \"1\" }}\n\n[[builder]]"
+                    "[[pairs]]\ntokens = [\"{weth:#x}\", \"{usdc}\"]\n\
+                     key_env = \"QU_TEST_KEY_B\"\npricing = {{ kind = \"unbuildable\" }}\n\n[[builder]]"
                 ),
                 1,
             ),
