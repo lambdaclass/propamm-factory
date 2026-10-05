@@ -12,3 +12,9 @@
 # Secrets.
 .env
 /quote-updater/config.toml
+
+# The production deployment's filled-in files (deploy/README.md).
+/deploy/.env
+/deploy/config/*
+!/deploy/config/.gitkeep
+/deploy/alertmanager/slack-webhook

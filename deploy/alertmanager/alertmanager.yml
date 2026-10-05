@@ -1,0 +1,63 @@
+# Where the rules in alerts/quote-updater.rules.yml go: one Slack channel, pages at once and
+# re-sent every 30 minutes while they fire, tickets batched and re-sent every 4 hours.
+# templates/propamm.tmpl renders the message from the rule's summary and description.
+global:
+  # The Slack incoming-webhook URL, one line, in deploy/alertmanager/slack-webhook
+  # (gitignored; copy slack-webhook.example and paste the URL).
+  slack_api_url_file: /etc/alertmanager/slack-webhook
+
+templates:
+  - /etc/alertmanager/templates/*.tmpl
+
+route:
+  group_by: [alertname, pair]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  receiver: ticket
+  routes:
+    - matchers: ['severity="page"']
+      receiver: page
+      group_wait: 0s
+      group_interval: 5m
+      repeat_interval: 30m
+    # A config change is a record, not a problem: sent once, never re-sent.
+    - matchers: ['alertname="PusherConfigChanged"']
+      receiver: audit
+
+# A symptom with a cause already paging is not sent on its own.
+inhibit_rules:
+  - source_matchers: ['alertname="PusherHeadStalled"']
+    target_matchers: ['alertname="PusherLandingUnverified"']
+  - source_matchers: ['alertname="PusherFeedDown"']
+    target_matchers: ['alertname="PusherFeedStale"']
+    equal: [pair]
+  - source_matchers: ['alertname="PusherPoolSeverelyImbalanced"']
+    target_matchers: ['alertname="PusherPoolImbalanced"']
+    equal: [pair]
+
+receivers:
+  - name: page
+    slack_configs:
+      - channel: '#propamm-alerts'
+        send_resolved: false
+        title: '{{ template "propamm.title" . }}'
+        title_link: '{{ (index .Alerts 0).GeneratorURL }}'
+        text: '{{ template "propamm.text" . }}'
+        color: danger
+  - name: ticket
+    slack_configs:
+      - channel: '#propamm-alerts'
+        send_resolved: true
+        title: '{{ template "propamm.title" . }}'
+        title_link: '{{ (index .Alerts 0).GeneratorURL }}'
+        text: '{{ template "propamm.text" . }}'
+        color: '{{ if eq .Status "firing" }}warning{{ else }}good{{ end }}'
+  - name: audit
+    slack_configs:
+      - channel: '#propamm-alerts'
+        send_resolved: false
+        title: '{{ template "propamm.audit.title" . }}'
+        title_link: '{{ (index .Alerts 0).GeneratorURL }}'
+        text: '{{ template "propamm.text" . }}'
+        color: '#5c6b80'

@@ -1,0 +1,20 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+# alerts/quote-updater.rules.yml, mounted by compose.yaml.
+rule_files:
+  - /etc/prometheus/rules/*.rules.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  - job_name: quote-updater
+    static_configs:
+      - targets: ["updater:9464"]
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

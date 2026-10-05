@@ -1,0 +1,39 @@
+# Copy to deploy/config/config.toml and fill it in. The updater's whole configuration except
+# the keys, which are in deploy/.env. quote-updater/config.example.toml documents every key;
+# this is the shape that fits the compose file.
+
+# The PropAMM every pair below belongs to.
+target = "0x0000000000000000000000000000000000000000"
+
+[settings]
+mode = "builder"
+# rpc_url is RPC_URL in deploy/.env (it beats this file).
+requote_ms = 50
+# Inside the container, on every interface of it: only the compose network reaches it, and
+# Prometheus scrapes it there. Not published on the host.
+metrics_addr = "0.0.0.0:9464"
+# The updater's fixed address on the compose network (compose.yaml); compose publishes it on
+# the host at BACKOFFICE_BIND:8088. The page edits this file and reloads the updater.
+backoffice_addr = "172.28.0.10:8088"
+
+[[builder]]
+name     = "titan-eu"
+endpoint = "wss://eu.rpc.titanbuilder.xyz/ws/sendquoteupdate"
+api_key  = "<your maker key>"
+
+# WETH/USDC from Binance's book, with a 5 bp half-spread, bounded to a plausible band (in
+# lane orientation, see quote-updater/config.example.toml) and a 2% breaker.
+[[pairs]]
+tokens  = ["0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"]
+symbol  = "ETHUSDC"
+key_env = "UPDATER_KEY_WETH_USDC"
+min_mid = "0.0001"
+max_mid = "0.001"
+max_deviation = "0.02"
+pricing = { kind = "feed", delta = "0.0005" }
+
+# USDC/USDT at a fixed price.
+[[pairs]]
+tokens  = ["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", "0xdAC17F958D2ee523a2206206994597C13D831ec7"]
+key_env = "UPDATER_KEY_USDC_USDT"
+pricing = { kind = "fixed", mid = "1.0001", delta = "0.0002" }

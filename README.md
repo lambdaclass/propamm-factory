@@ -17,6 +17,7 @@ example/          a complete quote updater built on the library, in one file
 e2e/              Python mocks of chain, builders and Binance, and the end-to-end run
 docs/             building-your-own.md (pricing models, guards, observers), manual.md (operating it)
 alerts/           Prometheus alert rules for the metrics the updater exposes
+deploy/           docker compose for a production server: updater, Postgres, Prometheus, Alertmanager, Grafana
 ```
 
 ## The whole thing on a laptop
@@ -71,6 +72,17 @@ sending anything. [`quote-updater/README.md`](quote-updater/README.md) is the fi
 version; [`docs/building-your-own.md`](docs/building-your-own.md) covers pricing models that
 read the vault or the chain, guards (code that stops a pair) and observers (code that is told
 what happened); [`example/`](example/README.md) uses all of them.
+
+## The whole thing on a server
+
+```bash
+cd deploy && cp .env.example .env && cp config.example.toml config/config.toml   # fill both in
+docker compose run --rm updater --check && docker compose up -d
+```
+
+One `docker compose` with the updater, Postgres for its recorder, Prometheus with the shipped
+alert rules, Alertmanager and Grafana. [`deploy/README.md`](deploy/README.md) walks through
+it, including how to build the image from a binary of your own.
 
 ## Contracts
 
