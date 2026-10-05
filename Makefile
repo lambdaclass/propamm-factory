@@ -1,0 +1,270 @@
+.PHONY: deps build test local local-down update-price swap deploy-factory price-service \
+	cargo-build cargo-test lint e2e mocks downstream
+
+RPC_URL := http://localhost:8545
+
+# anvil account 0. Well-known public test key shipped with anvil, not a secret. It deploys
+# everything, is the local trader, and is the price updater the first PropAMM authorizes.
+ANVIL_KEY := 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+ANVIL_ADDR := 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
+
+# PropAMM reads prices from the PUR (priority update registry). The address is per-instance
+# now (see src/PropAMM.sol), so this is the one `script/Deploy.s.sol` creates against and must
+# match its ORACLE constant. A plain anvil has no code there, so `make local` deploys the real
+# registry from $(PUR_REPO) and copies its runtime code into this address with anvil_setCode.
+PUR_ADDR := 0xDa7AfEeD021EAFC1c1Af9C362dE477DaD0396B81
+PUR_REPO := https://github.com/flashbots/priority-update-registry.git
+
+# Registry constructor arguments: how far an update's timestamp may lag/lead block.timestamp
+# at write time (seconds). Generous on purpose so local pushes never fail the write-time check;
+# the read-time window is PropAMM's own and is zero regardless of these: a price is only
+# readable in the block it was stamped for.
+PUR_MAX_UPDATE_AGE := 86400
+PUR_MAX_UPDATE_LEAD_TIME := 86400
+
+# Where the factory lands on a fresh anvil: the deployer is anvil account 0, the temporary
+# registry deploy takes nonce 0, and the factory deploy is nonce 1, which always creates at
+# this address. Verified against the chain below, not trusted.
+LOCAL_FACTORY := 0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512
+
+# The first PropAMM, created through the factory by the deploy script. PropAMM is UUPS, so an
+# instance is an ERC1967 proxy whose CREATE2 address derives from the proxy bytecode and its
+# initialize call, and so changes whenever the contract or its parameters do; it cannot be
+# pinned here, so recipes read it from the factory's registry at shell runtime.
+# (Deliberately not a make $(shell): make expands a whole recipe before executing any of its
+# lines, so it would run before the factory exists.)
+PROPAMM_LOOKUP = $$(cast call $(LOCAL_FACTORY) 'allPropAMMs(uint256)(address)' 0 --rpc-url $(RPC_URL))
+
+# The mainnet USDC/USDT addresses the first PropAMM registers as its pair, used below to
+# derive the pair's lane index and to sanity check a quote.
+USDC := 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48
+USDT := 0xdAC17F958D2ee523a2206206994597C13D831ec7
+
+# The pair's lane index in the registry: keccak256 of the two concatenated addresses.
+# Lazily expanded on purpose: the $$(...) must run in each recipe's shell.
+USDC_USDT_LANE = $$(cast keccak $$(cast concat-hex $(USDC) $(USDT)))
+
+# Extra tokens the multi-pair fork test quotes.
+WETH := 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2
+WBTC := 0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599
+
+# anvil's well-known development mnemonic. Index 0 derives exactly $(ANVIL_KEY) /
+# $(ANVIL_ADDR), so the three keys below are consistent with the single-pair targets
+# rather than a second, hardcoded set. Public test values, not secrets.
+ANVIL_MNEMONIC := test test test test test test test test test test test junk
+anvil_key = $$(cast wallet private-key --mnemonic '$(ANVIL_MNEMONIC)' --mnemonic-index $(1))
+
+# The USDC/USDT pair's vault, passed to the deploy script and so to createPropAMM as that pair's
+# PairConfig.vault: anvil account 1, deliberately not the trader (account 0) so swaps visibly
+# move tokens between two parties. Vaults are per pair; the first PropAMM has one pair, so one
+# vault. Its approval is sent via impersonation below, so overriding still works:
+# `make local VAULT_ADDRESS=0x...`. The owner is the deployer, anvil account 0.
+VAULT_ADDRESS ?= 0x70997970C51812dc3A010C7d01b50e0d17dc79C8
+
+# What updates publish, in human units: PropAMM reads slots = [delta, mid] with mid the
+# pair price at 1e18 (PRICE_SCALE) and delta the spread fraction discounted off it at
+# 1e18 (SPREAD_SCALE; 0.0005 = 5 basis points). PRICE and DELTA are plain decimals here;
+# recipes scale them with cast to-wei. amountOut ≈ amountIn * PRICE before the spread.
+PRICE ?= 1
+DELTA ?= 0
+
+
+# What `make swap` trades (USDC in, USDT out), and what `make local` mints to each party.
+AMOUNT ?= 100
+MINT_AMOUNT := 1000000000000000000000000
+
+# Foundry dependencies (forge-std, openzeppelin-contracts) live in contracts/lib as git
+# submodules, which a plain `git clone` leaves empty. Everything below depends on this.
+# The key the quote updater reads for the USDC/USDT pair, as `make price-service` names it.
+PUSHER_KEY_ENV := UPDATER_KEY_USDC_USDT
+INTERVAL ?= 12
+
+# $(1) = target address, $(2) = output path: a config for the local pair, fixed price or a
+# Binance symbol (SYMBOL=USDCUSDT streams the live mid and spread instead).
+define write_updater_config
+mkdir -p .local; \
+{ \
+  echo '# Generated by make; rewritten every run. Edit the Makefile, not this file.'; \
+  echo "target = \"$(1)\""; \
+  echo ''; \
+  echo '[[pairs]]'; \
+  echo 'tokens  = ["$(USDC)", "$(USDT)"]'; \
+  echo 'key_env = "$(PUSHER_KEY_ENV)"'; \
+  if [ -n "$(SYMBOL)" ]; then \
+    echo 'symbol  = "$(SYMBOL)"'; \
+  else \
+    echo 'mid     = "$(PRICE)"'; \
+    echo 'delta   = "$(DELTA)"'; \
+  fi; \
+} > $(2)
+endef
+
+deps:
+	@test -d contracts/lib/forge-std/src || git submodule update --init --recursive
+
+build: deps
+	cd contracts && forge build
+
+test: build
+	cd contracts && forge test
+
+.local/priority-update-registry:
+	mkdir -p .local
+	git clone --depth 1 --recurse-submodules --shallow-submodules $(PUR_REPO) $@
+
+local: local-down test .local/priority-update-registry
+	mkdir -p .local
+	@# no-mining: transactions queue in the pool and only land when a block is explicitly
+	@# mined with anvil_mine. fifo executes them in arrival order (default is by gas price),
+	@# so an update queued before a swap lands first in the block, like the real builder does.
+	anvil --order fifo --no-mining >.local/anvil.log 2>&1 &
+	until cast block-number --rpc-url $(RPC_URL) >/dev/null 2>&1; do sleep 0.2; done
+	@# The setup below (forge script/create, cast send) waits for receipts that no-mining
+	@# never produces on its own, so automine is switched on for the setup transactions and
+	@# back off at the end, leaving the chain in no-mining mode for actual use.
+	cast rpc anvil_setAutomine true --rpc-url $(RPC_URL)
+	@# Registry first: PropAMM's initialize authorizes each of its price updaters by calling
+	@# addUpdater on the registry it is created against, so that registry's code must be there
+	@# before any PropAMM is created. Deploy it normally, then copy its runtime code
+	@# (constructor immutables baked in) onto that address. The original sits unused.
+	set -e; PUR_TMP=$$(cd .local/priority-update-registry && forge create \
+		src/PrioUpdateRegistry.sol:PrioUpdateRegistry --broadcast \
+		--rpc-url $(RPC_URL) --private-key $(ANVIL_KEY) \
+		--constructor-args $(PUR_MAX_UPDATE_AGE) $(PUR_MAX_UPDATE_LEAD_TIME) \
+		| awk '/Deployed to:/ {print $$3}'); \
+	cast rpc anvil_setCode $(PUR_ADDR) "$$(cast code $$PUR_TMP --rpc-url $(RPC_URL))" \
+		--rpc-url $(RPC_URL)
+	@# Deploy the factory and create the first PropAMM through it: vault, anvil account 0 as
+	@# the price updater, USDC/USDT as the pair.
+	cd contracts && VAULT_ADDRESS=$(VAULT_ADDRESS) UPDATER_ADDRESS=$(ANVIL_ADDR) \
+		forge script script/Deploy.s.sol:Deploy \
+		--rpc-url $(RPC_URL) --private-key $(ANVIL_KEY) --broadcast
+	@# A non-fresh anvil puts the factory at a different address, which otherwise only
+	@# surfaces as unexplained reverts when calling $(LOCAL_FACTORY).
+	@test "$$(cast code $(LOCAL_FACTORY) --rpc-url $(RPC_URL))" != "0x" || { \
+		echo "No code at $(LOCAL_FACTORY): anvil was probably not fresh. Re-run 'make local'."; \
+		exit 1; }
+	@# Swaps move real tokens, so put a mintable mock ERC20 at both mainnet token addresses,
+	@# give the trader (account 0) USDC and the vault USDT, and set the one approval swap's
+	@# transferFrom needs: the vault lets PropAMM push USDT to the recipient. The input side
+	@# needs no approval: swaps are push-payment (the trader transfers tokenIn to PropAMM
+	@# before calling swap, which forwards it to the vault) — see `make swap`.
+	cast rpc anvil_setCode $(USDC) \
+		$$(cd contracts && forge inspect MockERC20 deployedBytecode) --rpc-url $(RPC_URL)
+	cast rpc anvil_setCode $(USDT) \
+		$$(cd contracts && forge inspect MockERC20 deployedBytecode) --rpc-url $(RPC_URL)
+	cast send $(USDC) 'mint(address,uint256)' $(ANVIL_ADDR) $(MINT_AMOUNT) \
+		--private-key $(ANVIL_KEY) --rpc-url $(RPC_URL)
+	cast send $(USDT) 'mint(address,uint256)' $(VAULT_ADDRESS) $(MINT_AMOUNT) \
+		--private-key $(ANVIL_KEY) --rpc-url $(RPC_URL)
+	cast rpc anvil_impersonateAccount $(VAULT_ADDRESS) --rpc-url $(RPC_URL)
+	cast rpc anvil_setBalance $(VAULT_ADDRESS) 0xDE0B6B3A7640000 --rpc-url $(RPC_URL)
+	cast send $(USDT) 'approve(address,uint256)' $(PROPAMM_LOOKUP) $$(cast max-uint) \
+		--unlocked --from $(VAULT_ADDRESS) --rpc-url $(RPC_URL)
+	cast rpc anvil_stopImpersonatingAccount $(VAULT_ADDRESS) --rpc-url $(RPC_URL)
+	cast rpc anvil_setAutomine false --rpc-url $(RPC_URL)
+	$(MAKE) update-price
+	@# Sanity checks through the real registry: isActive and quote both require the stored
+	@# timestamp to equal block.timestamp exactly, which the update above was stamped for.
+	@set -e; PROP=$(PROPAMM_LOOKUP); \
+	test "$$(cast call $$PROP 'isActive(address,address)(bool)' \
+		$(USDC) $(USDT) --rpc-url $(RPC_URL))" = "true" || { \
+		echo "isActive() is false: the pushed update's timestamp does not match chain time."; \
+		exit 1; }; \
+	test "$$(cast call $$PROP 'quote(address,address,uint256)(uint256)' \
+		$(USDC) $(USDT) 100 --rpc-url $(RPC_URL))" = "100" || { \
+		echo "quote() through the registry did not return the expected value."; exit 1; }
+	@# End-to-end swap: the trader starts with USDC only, so after swapping 100 at price 1
+	@# their USDT balance is exactly 100.
+	$(MAKE) swap AMOUNT=100
+	@test "$$(cast call $(USDT) 'balanceOf(address)(uint256)' $(ANVIL_ADDR) --rpc-url $(RPC_URL))" = "100" || { \
+		echo "swap did not credit the trader the expected USDT."; exit 1; }
+	@echo "Done. Factory at $(LOCAL_FACTORY), first PropAMM at $(PROPAMM_LOOKUP), vault: $(VAULT_ADDRESS)."
+	@echo "Chain: $(RPC_URL) (id 31337). Create more PropAMMs with createPropAMM on the factory."
+	@echo "The price goes stale once newer blocks are mined; refresh it with 'make update-price'."
+	@echo "anvil runs in the background; logs: .local/anvil.log"
+
+update-price:
+	set -e; PROP=$(PROPAMM_LOOKUP); \
+	MID=$$(cast to-wei $(PRICE) ether); D=$$(cast to-wei $(DELTA) ether); \
+	TS=$$(( $$(cast block latest -f timestamp --rpc-url $(RPC_URL)) + 12 )); \
+	cast rpc evm_setNextBlockTimestamp $$TS --rpc-url $(RPC_URL); \
+	cast send $(PUR_ADDR) 'updateState(address,uint256,uint32,uint256[])' \
+		$$PROP \
+		$(USDC_USDT_LANE) \
+		$$TS "[$$D,$$MID]" \
+		--async --private-key $(ANVIL_KEY) --rpc-url $(RPC_URL); \
+	cast rpc anvil_mine --rpc-url $(RPC_URL)
+
+swap:
+	set -e; PROP=$(PROPAMM_LOOKUP); \
+	MID=$$(cast to-wei $(PRICE) ether); D=$$(cast to-wei $(DELTA) ether); \
+	TS=$$(( $$(cast block latest -f timestamp --rpc-url $(RPC_URL)) + 12 )); \
+	NONCE=$$(cast nonce $(ANVIL_ADDR) --rpc-url $(RPC_URL)); \
+	cast rpc evm_setNextBlockTimestamp $$TS --rpc-url $(RPC_URL); \
+	cast send $(PUR_ADDR) 'updateState(address,uint256,uint32,uint256[])' \
+		$$PROP $(USDC_USDT_LANE) $$TS "[$$D,$$MID]" \
+		--async --nonce $$NONCE --private-key $(ANVIL_KEY) --rpc-url $(RPC_URL); \
+	cast send $(USDC) 'transfer(address,uint256)' $$PROP $(AMOUNT) \
+		--async --nonce $$(( NONCE + 1 )) --private-key $(ANVIL_KEY) --rpc-url $(RPC_URL); \
+	cast send $$PROP 'swap(address,address,uint256,uint256,address,uint256)' \
+		$(USDC) $(USDT) $(AMOUNT) 0 $(ANVIL_ADDR) $$(( TS + 3600 )) \
+		--async --nonce $$(( NONCE + 2 )) --gas-limit 300000 \
+		--private-key $(ANVIL_KEY) --rpc-url $(RPC_URL); \
+	cast rpc anvil_mine --rpc-url $(RPC_URL)
+	@echo "trader USDC balance: $$(cast call $(USDC) 'balanceOf(address)(uint256)' $(ANVIL_ADDR) --rpc-url $(RPC_URL))"
+	@echo "trader USDT balance: $$(cast call $(USDT) 'balanceOf(address)(uint256)' $(ANVIL_ADDR) --rpc-url $(RPC_URL))"
+
+deploy-factory:
+	cd contracts && forge script script/DeployFactory.s.sol:DeployFactory \
+		--rpc-url $(DEPLOY_RPC_URL) --private-key "$$PRIVATE_KEY" --broadcast \
+		$(if $(VERIFY),--verify --etherscan-api-key "$$ETHERSCAN_API_KEY")
+local-down:
+	-pkill -f '^anvil'
+	@# pkill returns before the old anvil exits; wait for it (bounded at ~5s) so an
+	@# immediately following anvil start does not race the dying one for :8545.
+	@for i in $$(seq 1 50); do pgrep -f '^anvil' >/dev/null || break; sleep 0.1; done
+
+
+
+# Keep the local pair's price fresh with the library's built-in models (no code of yours):
+# one updateState transaction per INTERVAL seconds, mining a block each (`--mine`).
+#   make price-service                  push PRICE (default 1) for USDC/USDT every 12s
+#   make price-service SYMBOL=USDCUSDT  stream Binance's live mid and spread instead
+price-service:
+	@test -n "$$(cast code $(LOCAL_FACTORY) --rpc-url $(RPC_URL) 2>/dev/null | grep -v '^0x$$')" || { \
+		echo "No factory at $(RPC_URL): run 'make local' first."; exit 1; }
+	@$(call write_updater_config,$(PROPAMM_LOOKUP),.local/local.toml)
+	$(PUSHER_KEY_ENV)=$(ANVIL_KEY) cargo run -q -p quote-updater --example minimal -- --mode node \
+		--config .local/local.toml --rpc-url $(RPC_URL) --registry $(PUR_ADDR) --interval $(INTERVAL) --mine
+
+## QUOTE UPDATER LIBRARY ##
+cargo-build:
+	cargo build --workspace --examples
+
+# fmt, clippy with warnings denied and every test, as CI runs them.
+lint:
+	cargo fmt --all --check
+	cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+cargo-test:
+	cargo test --locked --workspace
+
+# The library's custom-pricing path through Python mocks of everything a quote updater talks
+# to (a chain that also answers getPairs() and stands in for CoinGecko, two builders,
+# Binance): runs quote-updater/examples/tilted.rs for ~30s and checks 31 things. Nothing
+# leaves 127.0.0.1. Needs python3 with aiohttp and websockets (pip install -r
+# e2e/requirements.txt) and foundry's cast.
+e2e:
+	cargo build -q -p quote-updater --example tilted
+	python3 e2e/run.py --binary target/debug/examples/tilted --custom
+
+# The same mocks on fixed ports, kept up for a binary of your own (chain :8545 mining every
+# 3s, Binance :8546, builders :8547 and :8548). Ctrl-c stops them. See example/README.md.
+mocks:
+	cd e2e && python3 mocks.py '{"rpc_port": 8545, "binance_port": 8546, "mine_every": 3, "prices": {"ETHUSDC": ["4000.00", "4000.20"], "USDCUSDT": ["0.9998", "1.0000"]}, "builders": [{"name": "mock-a", "api_key": "key-a", "port": 8547}, {"name": "mock-b", "api_key": "key-b", "port": 8548}]}'
+
+# A crate outside the workspace built against the library, the way another repository would.
+downstream:
+	cargo build --locked --manifest-path e2e/downstream/Cargo.toml
+	./e2e/downstream/target/debug/downstream --help | head -1

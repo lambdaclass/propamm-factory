@@ -1,0 +1,14 @@
+# Local chain state and generated configs (make local, make price-service, quickstart.sh).
+/.local/
+/.quickstart-*.log
+/example/.local.toml
+
+# Rust build output: the workspace, the example binary and the e2e's downstream crate.
+/target/
+/example/target/
+/e2e/downstream/target/
+/e2e/__pycache__/
+
+# Secrets.
+.env
+/quote-updater/config.toml
