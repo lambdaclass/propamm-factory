@@ -1,0 +1,50 @@
+# my-propamm's config. The file format is the library's; the kinds named in [pairs.pricing]
+# and [[pairs.guards]] are the ones main.rs registers, our own and the library's alike.
+
+# The PrioUpdateRegistry the quotes go to. Zero here: fill in your deployment's.
+target = "0x0000000000000000000000000000000000000000"
+
+[settings]
+mode = "builder"
+rpc_url = "http://127.0.0.1:8545"
+requote_ms = 50
+metrics_addr = "127.0.0.1:9464"
+disable_cross_region = false
+
+# A pair priced by our own model, judged by our own guards.
+[[pairs]]
+tokens  = ["0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",   # WETH
+           "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"]   # USDC
+symbol  = "ETHUSDC"             # the reference market the feeds stream
+key_env = "UPDATER_KEY_WETH_USDC"
+min_mid = "0.0001"              # the band: the library withdraws anything outside it
+max_mid = "0.001"
+max_deviation = "0.02"          # the library's built-in deviation breaker, still available
+
+[pairs.pricing]
+kind        = "inventory_skew"  # registered in main.rs
+half_spread = 0.0005            # 5 bp
+strength    = 0.02              # a 100% base vault pushes the mid 1% down
+max_inventory_age_secs = 60
+
+[[pairs.guards]]
+kind           = "venue_spread" # market guard: trips when venues disagree
+max_dispersion = 0.01
+
+[[pairs.guards]]
+kind      = "share_cap"         # quote guard: withdraws while the vault is lopsided
+max_share = 0.8
+
+# A second pair on a kind the library ships, untouched by our code, to show both coexist.
+[[pairs]]
+tokens  = ["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",   # USDC
+           "0xdAC17F958D2ee523a2206206994597C13D831ec7"]   # USDT
+symbol  = "USDCUSDT"
+key_env = "UPDATER_KEY_USDC_USDT"
+max_deviation = "0.002"
+pricing = { kind = "feed" }
+
+[[builder]]
+name = "titan-eu"
+endpoint = "wss://eu.rpc.titanbuilder.xyz/ws/sendquoteupdate"
+api_key = "your-maker-key"

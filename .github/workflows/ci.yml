@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contracts:
+    name: Contracts (build / format / tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      # The Foundry dependencies in contracts/lib are git submodules, empty without this.
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: foundry-rs/foundry-toolchain@v1
+      - run: forge build
+      - run: forge fmt --check
+      - run: forge test
+
+  quote-updater:
+    name: Quote updater (format / clippy / tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # No submodules: the Rust crate needs none, and contracts/lib is a slow checkout.
+      - uses: actions/checkout@v4
+      # Pinned rather than `stable`: with -D warnings a new Rust release landing on the
+      # runners would turn every open PR red at once. Move it deliberately, in a PR that
+      # passes on it. rust-toolchain.toml pins the same version for local builds.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+          components: rustfmt, clippy
+      # The pinned ethrex crates come from git and pull ~460 packages, so a cold build
+      # dominates this job. Keyed on Cargo.lock, which the pinned rev makes stable.
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      # --all-targets so the test modules are linted too; --locked so a Cargo.lock that no
+      # longer matches the manifests fails here instead of being re-resolved on the runner.
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      # builder_mock_server and metrics_fixture_server are #[ignore]d (they serve forever).
+      - run: cargo test --locked --workspace
+
+  downstream:
+    name: Downstream crate (builds against the library)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # e2e/downstream depends on the library by path the way another repository would by
+    # git: proves the ethrex pins resolve through the library and the public API is enough
+    # for examples/tilted.rs, which its main.rs is byte for byte.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: e2e/downstream
+      - run: cargo build --locked --manifest-path e2e/downstream/Cargo.toml
+      - shell: bash
+        run: |
+          help=$(./e2e/downstream/target/debug/downstream --help)
+          printf '%s\n' "$help" | head -1
+
+  alert-rules:
+    name: Alert rules (promtool)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      # The rules encode thresholds that mirror Rust constants (quote-updater/src/landing.rs
+      # asserts they match); this checks the PromQL parses and the fixture fires.
+      - name: Install promtool
+        env:
+          PROMTOOL_VERSION: "3.14.0"
+          PROMTOOL_SHA256: "f665c6da19eb7ba399c915d30c7d9793c9b417bf8a749b504bc470678631478d"
+        run: |
+          set -euo pipefail
+          TARBALL="prometheus-${PROMTOOL_VERSION}.linux-amd64.tar.gz"
+          curl -fsSLO "https://github.com/prometheus/prometheus/releases/download/v${PROMTOOL_VERSION}/${TARBALL}"
+          echo "${PROMTOOL_SHA256}  ${TARBALL}" | sha256sum -c -
+          tar -xzf "${TARBALL}" --strip-components=1 -C /usr/local/bin \
+            "prometheus-${PROMTOOL_VERSION}.linux-amd64/promtool"
+      - run: promtool check rules alerts/quote-updater.rules.yml
+      - run: promtool test rules alerts/quote-updater.rules.test.yml

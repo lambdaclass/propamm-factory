@@ -1,0 +1,12 @@
+# The quote updater library and its examples. A binary built on it is a package of its own
+# that depends on `quote-updater` (see examples/ and the README).
+[workspace]
+members = ["quote-updater"]
+resolver = "3"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+debug = "line-tables-only"
+# Not panic = "abort": the library catches a pair's panic and halts that pair; aborting
+# would take every pair down.

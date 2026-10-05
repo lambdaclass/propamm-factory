@@ -1,0 +1,11 @@
+<label>
+  <span class=key>{{ field.label }}</span>
+  <input type="{% if field.secret %}password{% else %}text{% endif %}"
+         name="{{ field.name }}"
+         value="{{ field.value }}"
+         placeholder="{{ field.placeholder }}"
+         spellcheck=false
+                  autocomplete="{% if field.secret %}new-password{% else %}off{% endif %}"
+         {% if field.readonly %}readonly{% endif %}>
+  <span class=fieldhint>{{ field.hint }}</span>
+</label>

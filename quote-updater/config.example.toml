@@ -1,0 +1,419 @@
+# Template for a run: copy, set `target`, and point each pair's `key_env` at an environment
+# variable holding that pair's updater key (see .env.example).
+#
+# This is the updater's whole configuration: the target, the settings, the pairs and the
+# builders. The one thing that is not here is the updater keys, which stay in the
+# environment and are named, never valued, by each pair's `key_env`. The builder API keys
+# ARE here, so a filled-in copy of this file is a secret: keep it 0600 and out of git.
+#
+#   set -a && . ./.env && set +a
+#   <binary> --config config.toml --check     # inspect, send nothing
+#   <binary> --config config.toml
+#
+# Anything under [settings] can also be given as a flag or an environment variable, and one
+# that is actually given wins over this file. That is what lets the local `make` targets
+# drive everything from the command line against a file with no settings table at all,
+# while on a server the unit passes only `--config` and the file decides.
+#
+# This file is the desired state of a running updater, not just its startup input. Send it a
+# SIGHUP (`systemctl --user reload <unit>`) and it re-reads this file and converges:
+# a pair added here is started, one deleted is withdrawn at every builder and stopped, one
+# whose stanza changed is restarted from it, and a pair you did not touch keeps quoting
+# throughout. A reload that fails to validate changes nothing at all, so run `--check`
+# against the edited file first.
+#
+# A reload also brings back a pair halted by its circuit breaker — that lane is exactly a
+# lane this file says should be quoting and which is not. Do it once you trust the feed
+# again; see deploy/systemd/README.md.
+#
+# It does not bring back a pair with `halted = true`: that one is kept, with every setting,
+# and not run until the flag is cleared (the backoffice's Resume, or a binary's
+# `UpdaterHandle::resume`). A binary's `UpdaterHandle::halt` sets the flag with a
+# `halt_reason` beside it, which the backoffice shows and the reload logs. A halt with a
+# reason is a kill switch: the backoffice's "Restart halted pairs" resumes only the pairs
+# halted without one (its own Halt writes none) and names the rest, which only their own
+# Resume clears.
+#
+# `target` below is NOT reloadable, because every lane's identity is derived from it: the
+# updater refuses the reload and asks for a restart. Neither is a `key_env` naming a variable
+# that was not in the environment when the process started, since systemd reads .env only
+# at exec.
+
+# The PropAMM every lane below belongs to. All pairs share one target.
+target = "0x0000000000000000000000000000000000000000"
+
+# Everything that is not a pair, a builder or a secret. Every key is optional and falls
+# back to the same default its flag has; a key given here is overridden by the flag or the
+# environment variable of the same name, if one was actually passed.
+#
+# None of these is reloadable. They are read once, at startup, so changing one is a
+# restart: the updater refuses the reload and says which key it was.
+[settings]
+
+# Where updates go. "builder" (the default) signs each pair's per-block update and streams
+# it to every [[builder]] below; "node" submits updateState transactions over rpc_url
+# instead, which is what the local anvil targets use.
+mode = "builder"
+
+# JSON-RPC endpoint. Reads only (latest block, per-block nonce, base fee), but on the hot
+# loop: each requote has a ~50ms budget, so endpoint latency shows up directly.
+rpc_url = "https://your-mainnet-rpc.example"
+
+# WebSocket JSON-RPC endpoint for a newHeads subscription; builder mode only. Without it
+# the head is polled over rpc_url; with it the node pushes each new header as it has it.
+# rpc_ws_url = "wss://your-mainnet-rpc.example"
+
+# Milliseconds between requotes of the current block's update (builder mode). A quote left
+# idle is evicted (~400ms in Titan's protocol), so keep this well under that.
+requote_ms = 50
+
+# Serve Prometheus metrics here. Unset disables the exporter, which is the default. The
+# endpoint is unauthenticated plaintext and exposes lane prices and signer balances, so
+# bind loopback or a private interface and let the scraper reach it there.
+metrics_addr = "127.0.0.1:9464"
+
+# Keep builder quote updates in the region they were submitted to. A per-builder
+# disable_cross_region below overrides this for that builder.
+disable_cross_region = false
+
+# The PrioUpdateRegistry. Defaults to the mainnet deployment PropAMM reads from since
+# 2026-09-15; the first one (0xDa7AfeeD01fe…8C5F) has a known vulnerability, do not point
+# this back at it.
+# registry = "0xDa7AfEeD021EAFC1c1Af9C362dE477DaD0396B81"
+
+# Decimal places the published mid and delta are scaled by. PropAMM reads both at 1e18,
+# which is the default. Capped at 38 when any pair inverts, because inverting squares it.
+# price_decimals = 18
+
+# Binance WebSocket base endpoint; override for binance.us or a mock. The older spelling
+# of `endpoints.binance` below, and equivalent to it.
+# binance_ws = "wss://stream.binance.com:9443/ws"
+
+# Per-venue endpoint overrides, keyed by venue name (see `sources` under [[pairs]]). A
+# venue not listed here is dialled at its default. Must come after every plain key of
+# [settings], because it is a sub-table.
+# [settings.endpoints]
+# binance = "wss://stream.binance.com:9443/ws"
+# coinbase = "wss://ws-feed.exchange.coinbase.com"
+# kucoin = "https://api.kucoin.com"        # the REST host its socket URL is fetched from
+# mexc = "https://api.mexc.com"            # polled
+# coingecko = "https://api.coingecko.com/api/v3"  # not a venue: where vault USD prices come from
+
+# Seconds between pushes in node mode. No effect in builder mode.
+# interval = 12
+
+# Serve the backoffice here: a small web page for adding and removing pairs and builders,
+# editing bands, and resuming a pair halted on its breaker, without a deploy. Unset
+# disables it, which is the default.
+#
+# It has no login of its own. Bind it to this host's *tailnet* address, so reaching it at
+# all means being on the tailnet and past its ACL; binding 0.0.0.0 is refused rather than
+# warned about, because unlike the metrics endpoint this one writes: anything that can
+# reach it can repoint a pair's price source.
+#
+# Every change it makes is written to this file and then reloaded. If the reload is
+# rejected the previous file is put back, so what is on disk always describes what is
+# running.
+#
+# Builder mode only. The reload it drives belongs to the per-lane service builder mode
+# runs, so setting this under mode = "node" is refused at startup rather than bound and
+# left inert.
+#
+# Setting it also lets the updater start with no pairs and no builders, which is what makes
+# a fresh host bootable from a config file holding nothing but a target and this address:
+# everything else is then added through the page. Without a backoffice an empty [[pairs]]
+# stays refused, because a updater quoting nothing is normally a file that failed to say
+# what it meant.
+# backoffice_addr = "100.64.1.2:8088"
+
+# `tokens` is [base, quote] in market orientation — the order a human says the pair in.
+# The lane is keccak256 of the two address-sorted tokens, matching PropAMM._pairKey, and
+# whether the feed must be inverted is derived from whether sorting flipped the order.
+# There is deliberately no `invert` key: it cannot be set wrong if it is never stated.
+
+[[pairs]]
+# WETH, USDC. Sorts to USDC/WETH (0xA0b8… < 0xC02a…), so the lane carries USDC priced in
+# WETH and the feed is inverted automatically.
+tokens  = ["0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+           "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"]
+symbol  = "ETHUSDC"
+key_env = "UPDATER_KEY_WETH_USDC"
+# How this pair turns its market into the [delta, mid] it publishes. Every pair names a
+# pricing kind, and the binary decides which kinds exist by registering them (README,
+# "What you can plug in"); the three this crate ships are `feed`, `fixed` and `volatile`, and a
+# binary may register its own beside them. `feed` publishes the streamed mid with the
+# book's own half-spread, or with `delta` as the half-spread:
+# pricing = { kind = "feed", delta = "0.0005" }. Any key the kind takes goes in the same
+# table, and only that kind reads and checks it.
+pricing = { kind = "feed" }
+# The band this pair's published mid must fall inside. Nothing else catches a corrupt book,
+# and one would otherwise put an arbitrary price on chain that the next fill prices against.
+# A mid outside the band is refused: the RPC service skips the push, and Titan mode
+# withdraws the live quote. Set it to a range the pair cannot plausibly leave.
+#
+# In **lane** orientation — the number this lane publishes, which is what `--check`'s mid
+# column prints, so a band can be read straight off that report. This lane carries USDC in
+# WETH, so ~1/4000 with room either side, not ~4000. Both keys are optional and either may
+# be given alone; startup warns for a feed with neither.
+min_mid = "0.0001"
+max_mid = "0.001"
+# Trips this pair's circuit breaker when the streamed mid jumps more than this fraction
+# away from the mid observed before it (2% here): the live quote is withdrawn from every
+# builder and this lane stops quoting. It does not come back on a timer; resuming is an
+# operator reloading this file once they trust the feed. Other pairs keep quoting throughout.
+#
+# The band above catches a price that is absurd; this catches one that is merely
+# impossible to have arrived at honestly in one tick. Unset, the pair has no breaker.
+max_deviation = "0.02"
+#
+# The same breaker, measured over a trailing window instead of tick to tick: trips when the
+# mid is more than this fraction away from where it was `max_deviation_window_blocks` ago.
+# What `max_deviation` above bounds is a single jump; this bounds the *speed* of a move that
+# arrives in small steps, which no other guard catches — `min_mid`/`max_mid` bounds only
+# where the price may end up. Both keys are needed together; unset, the pair has no window.
+#
+# The anchor slides, so this is "20% within any 1000-block span", not "20% from where we
+# started": a move slow enough that no 1000-block span sees 20% never trips.
+#
+# The window is measured in wall-clock seconds, converted here at 12s a block, and can cover
+# slightly fewer than 1000 blocks: missed slots stretch 1000 real blocks past that many
+# seconds, and bucketing can add up to a second more. That makes the guard marginally more
+# permissive than the block count suggests, not stricter.
+#
+# A reload re-anchors the window, so a pair resumed after a halt starts measuring from the
+# price it resumes at. That is what resuming means: an operator has looked at the feed and
+# accepted the current price.
+max_deviation_window = "0.20"
+max_deviation_window_blocks = "1000"
+
+# The same pair priced as a volatile one: instead of copying Binance's spread or sending a
+# fixed `delta`, we recompute the spread every block from how much the price has been moving
+# and how much of the vault's value is in WETH (see docs/manual.md, "Volatile pairs"). `gamma`, `k`
+# and `kappa` come as a set; the four below them have defaults. All seven are editable from
+# the backoffice, which is where γ, k and κ get tuned: they are guesses, nothing measures
+# them. A kind's keys live in its `[pairs.pricing]` table, which in TOML comes after the
+# pair's own keys.
+#
+# [[pairs]]
+# tokens  = ["0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+#            "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"]
+# symbol  = "ETHUSDC"
+# key_env = "UPDATER_KEY_WETH_USDC"
+# min_mid = "0.0001"
+# max_mid = "0.001"
+# max_deviation = "0.02"
+# [pairs.pricing]
+# kind = "volatile"
+# # γ. Bigger charges more for holding WETH while it can drop, and skews harder.
+# gamma = "0.1"
+# # k. Bigger means people leave faster when we charge more, so we charge less. Pick it from
+# # the spread you want: with gamma 0.1, k = 2000 makes term 2 a 0.05% spread per side
+# # (the same as delta = "0.0005"), k = 700 makes it 0.14%.
+# k = "2000"
+# # κ. 1 charges the full typical price move between us posting and someone trading on it.
+# kappa = "1"
+# # How much of the vault's value we want in WETH, 0 to 1. Above it the skew lowers both
+# # prices so WETH gets bought off us; below it, raises them. Default 0.5.
+# # target_share = "0.5"
+# # Seconds until the next block, when we can change our price. Default 12.
+# # hold_secs = "12"
+# # Seconds between us posting a price and someone trading on it. Default 6.
+# # fill_delay_secs = "6"
+# # Seconds of Binance prices σ is computed from, 60 to 3600. Default 600.
+# # volatility_window_secs = "600"
+# # Inventory charge (see docs/manual.md, "Volatile pairs"). λ: once the WETH share leaves the
+# # band below, the trade that pushes it further off gets λ·σ·√τ·(distance past the edge)
+# # worse; the trade that brings it back is priced as if the charge were off. 0 (default) is
+# # off, so pricing is unchanged. It has its own coefficient because one γ cannot drive both
+# # the tilt and this charge; a charge that bites needs a much larger value than the tilt.
+# # inventory_aversion = "0"
+# # Band edges as base shares (WETH share of the sub-book's value). The charge is zero inside
+# # [lower, upper] and both must bracket target_share. Defaults are ½·target_share and
+# # 2·target_share; with target_share ≥ 0.5 the default upper is ≥ 1 and never fires, so set it.
+# # inventory_band_lower = "0.20"
+# # inventory_band_upper = "0.55"
+# # A second, stronger tier: past a wider band [inventory_band_hard_lower,
+# # inventory_band_hard_upper] the charge grows at inventory_aversion_hard (λ_hard ≥ λ) instead
+# # of λ, adding (λ_hard − λ)·σ·√τ·(distance past the hard edge). Continuous at both edges. A
+# # blank hard edge turns the hard tier off on that side; a blank λ_hard equals λ, so the tier
+# # is off. Both must be set for the tier to do anything.
+# # inventory_aversion_hard = "40"
+# # inventory_band_hard_lower = "0.10"
+# # inventory_band_hard_upper = "0.90"
+
+[[pairs]]
+# WBTC, USDC. Already in sorted order, so the stream is used as-is.
+tokens  = ["0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599",
+           "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"]
+symbol  = "BTCUSDC"
+key_env = "UPDATER_KEY_WBTC_USDC"
+pricing = { kind = "feed" }
+
+[[pairs]]
+# USDC, USDT.
+tokens  = ["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+           "0xdAC17F958D2ee523a2206206994597C13D831ec7"]
+symbol  = "USDCUSDT"
+key_env = "UPDATER_KEY_USDC_USDT"
+pricing = { kind = "feed" }
+# Why the threshold is per pair and not one setting for the run: on a stablecoin, the 2%
+# above is a depeg the breaker exists to catch, while on ETHUSDC it is an ordinary hour.
+# A single process-wide number would have to be loose enough for the loosest pair.
+#
+# Set it to the move you would want to be woken up for, because that is what it means:
+# tripping stops this lane until a human has looked at the feed and reloaded.
+max_deviation = "0.002"
+
+# `symbol` is the short form of one Binance market. A pair can instead average the mid of
+# several markets, at one venue or many, each with a weight. The venues, and how each
+# spells a market:
+#
+#   binance    ETHUSDC         bybit      ETHUSDC        gate       ETH_USDC
+#   coinbase   ETH-USD         kucoin     ETH-USDC       mexc       ETHUSDC (polled, 1s)
+#   kraken     ETH/USD         bitget     ETHUSDC
+#   okx        ETH-USDC
+#
+# The published mid is
+# Σ weight·mid / Σ weight over the sources whose latest price is fresh (under 30s old);
+# a source that goes quiet drops out and its weight is spread over the rest, and the pair
+# stops publishing (its quote is withdrawn, like a stalled feed) when fewer than
+# `min_sources` are fresh. Weights are relative: 2 and 1 mean the same as 0.667 and 0.333;
+# blank is 1. `min_sources` defaults to 1. A `feed` pair with more than one source needs a
+# `delta`: there is no single book whose spread it could copy.
+#
+# The startup symbol cross-check runs per source, spelled the way each venue spells its
+# markets. A USDC or USDT pair may read the base's USDC, USDT or USD market at any venue
+# (a warning, not a failure); any other difference needs `allow_symbol_mismatch = true`.
+#
+# [[pairs]]
+# tokens  = ["0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+#            "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"]
+# key_env = "UPDATER_KEY_WETH_USDC"
+# pricing = { kind = "feed", delta = "0.0005" }
+# min_sources = "1"
+# sources = [
+#   { venue = "binance", symbol = "ETHUSDC", weight = "2" },
+#   { venue = "binance", symbol = "ETHUSDT", weight = "1" },
+# ]
+
+# A pair priced by a pricing kind a binary registered (docs/building-your-own.md),
+# the same way `feed`, `fixed` and `volatile` are. A stanza naming a kind its
+# binary did not register is refused at startup, so a binary that registers none refuses
+# every pair. The `[pairs.pricing]` table names the kind and holds its settings, which only
+# that kind reads and checks. `symbol` (or `sources`) is still the pair's market, and the
+# freshness gate, the band and the core's bounds on what any pricer publishes still apply.
+# A secret goes in as `{ env = "NAME" }`, never as the value itself: with recording on, the
+# config is written to Postgres.
+#
+# [[pairs]]
+# tokens  = ["0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+#            "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"]
+# symbol  = "ETHUSDC"
+# key_env = "UPDATER_KEY_WETH_USDC"
+# min_mid = "0.0001"
+# max_mid = "0.001"
+#
+# [pairs.pricing]
+# kind        = "skewed"
+# half_spread = 0.0005
+# skew        = 0.001
+
+# A pair can also run guards a binary registered, `[[pairs.guards]]` stanzas in the order
+# they judge, after the built-in deviation guard (which keeps its own keys, `max_deviation`
+# and `max_deviation_window`, and cannot be named here). A guard only ever makes the lane
+# more cautious: it withdraws the quote or halts the lane, never publishes. Builder mode
+# only, like `max_deviation`: node mode has no live quote for a guard to withdraw. A market
+# guard judges the streamed price, so like `max_deviation` it is refused on a pair that
+# streams none (a fixed `mid`, or a pricing kind with no `symbol` or `sources`); a quote
+# guard runs on any pair.
+#
+# [[pairs.guards]]
+# kind       = "dispersion"
+# max_spread = "0.003"
+
+# Instead of `symbol`, a pair can publish a fixed price: the `fixed` kind, with `mid` and
+# `delta` as decimal strings in whole-token units. Used by the end-to-end make targets so
+# their assertions do not depend on a live Binance book:
+#
+# [[pairs]]
+# tokens  = ["0xA0b8…", "0xdAC1…"]
+# key_env = "UPDATER_KEY_USDC_USDT"
+# pricing = { kind = "fixed", mid = "0.9998", delta = "0.0005" }
+#
+# `mid` is in the SAME market orientation as `tokens` — the price of one whole `tokens[0]`
+# in `tokens[1]`, the number a human says out loud — exactly like the price a `symbol`
+# stream delivers. On a pair whose tokens sort the other way (the WETH/USDC example above)
+# the updater publishes the reciprocal on the lane; you never write it. So for WETH, USDC
+# you write `mid = "4000"` (USDC per WETH) and the lane receives 0.00025. `--check` prints
+# both: the published value, and the `≈` line reading it back in market direction.
+#
+# `delta` is NOT reoriented, and that is not an oversight: it is the half-spread as a
+# fraction of the mid, and (ask - bid) / (ask + bid) is unchanged by inverting a book.
+#
+# `min_mid` / `max_mid` bound the published mid; see the WETH/USDC pair above. They are the
+# only guard against a corrupt feed reaching the chain, so a feed-priced pair without them
+# is warned about at startup.
+#
+# `max_deviation` arms this pair's price circuit breaker; see the WETH/USDC and USDC/USDT
+# pairs above. Tripping stops the lane for good until a human intervenes: it withdraws its
+# quote and stops, and only a reload brings it back. Builder mode only — node mode sends
+# updateState straight to the RPC and has no live quote to withdraw, so a config that arms
+# a breaker is refused under `--mode node` rather than quietly running unprotected. It
+# applies to a `symbol` pair only: a fixed `mid` cannot deviate, and setting one is an
+# error. It is a *fraction*, not a percentage: 0.02 is 2%, and a value of 1 or more is
+# refused because it would leave the pair effectively unguarded.
+#
+# Measured on the mid **this lane publishes**, like `min_mid`/`max_mid` and for the same
+# reason. On an inverted lane that makes the threshold slightly asymmetric in market terms,
+# because a reciprocal compresses one direction and stretches the other: with 0.02, a market
+# move of -2.00% trips (it is +2.04% inverted) while +2.00% does not (it is -1.96%), and the
+# up-side needs +2.04% to fire. The gap is second-order and does not matter for picking a
+# round number, but it is why the two directions are not exactly equal.
+#
+# `--check` prints a `breaker` column with each pair's threshold (or `-`), so a row that
+# was meant to be guarded and is not shows up before anything is published.
+#
+# `allow_symbol_mismatch = true` opts a pair out of the startup check that its stream
+# matches its tokens. Required only when pricing a pair off a deliberately different
+# market, e.g. quoting WETH/USDC from ETHUSDT.
+
+# ---------------------------------------------------------------------------
+# Builders
+# ---------------------------------------------------------------------------
+# The builders quoted in builder mode, one [[builder]] each. Previously their own
+# builders.toml; they live here now so the whole configuration is one file, which is also
+# what makes a reload a single atomic read.
+#
+# Every configured builder is quoted with the same signed update, each over its own
+# connection and its own API key. One block's update is signed exactly once and sent
+# byte-identical to all of them: the same nonce and the same transaction hash mean at most
+# one of them can ever include it, however many hold the quote.
+#
+# At least one must connect at startup or the updater refuses to run, since a config where
+# nothing connects is nearly always a typo or a revoked key. After that nothing is fatal: a
+# builder that goes down is redialed every 2s while the others keep quoting.
+#
+# Changing this list reloads, but unlike a pair edit it restarts every lane: each builder
+# connection is opened inside a pair's own quoting loop, so a lane cannot pick up a new list
+# without being rebuilt. The reload dials the new list first and refuses the whole thing,
+# touching nothing, unless at least one of them connects.
+#
+# Regional endpoints are just separate entries: add titan-ap and titan-us alongside this
+# one to fan out across regions.
+
+[[builder]]
+# How this builder appears in the logs. Must be unique across the file.
+name = "titan-eu"
+# The maker WebSocket endpoint: ws:// or wss://.
+endpoint = "wss://eu.rpc.titanbuilder.xyz/ws/sendquoteupdate"
+# Sent verbatim as the Authorization header. Comes from the builder's onboarding, and is
+# why a filled-in copy of this file is a secret.
+api_key = "your-maker-key"
+
+# [[builder]]
+# name = "buildernet"
+# endpoint = "wss://relay.buildernet.org/ws/sendquoteupdate"
+# api_key = "your-other-maker-key"
+# # Optional per-builder override of the [settings] disable_cross_region. Builders differ
+# # in whether they run regions at all, and one that does not simply ignores this.
+# disable_cross_region = true

@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+{% block body %}
+<header>
+  <a class=back href="/">&larr; all pairs</a>
+  <h1>{% if let Some(key) = editing %}Edit {{ key }}{% else %}New pair{% endif %}</h1>
+</header>
+
+{% if editing.is_none() %}
+  <p class=warn>Its <code>key_env</code> has to be in the environment already. The unit
+  reads <code>.env</code> once, at start, so a brand new key needs a redeploy.</p>
+{% endif %}
+
+<form method=post action="{% if editing.is_some() %}/pairs/edit{% else %}/pairs/add{% endif %}" class=card>
+    {% if let Some(key) = editing %}<input type=hidden name=key_env value="{{ key }}">{% endif %}
+
+  <div class=grid>
+    {% for field in identity %}{% include "field.html" %}{% endfor %}
+  </div>
+  <hr>
+  <div class=sources>
+    <span class=key>mid sources</span>
+    <p class=explain>A venue that goes quiet drops out of the average until it is back. Leave every venue
+    unticked for a fixed mid.</p>
+    <table class=venues>
+      <thead><tr><th>venue<th>symbol<th>weight<th></tr></thead>
+      <tbody>
+      {% for row in sources %}
+        <tr>
+          <td class=mono>{{ row.venue }}</td>
+          <td><input type=text name="symbol_{{ row.venue }}" value="{{ row.symbol }}" placeholder="{{ row.example }}" spellcheck=false autocomplete=off></td>
+          <td><input type=text name="weight_{{ row.venue }}" value="{{ row.weight }}" placeholder="1" spellcheck=false autocomplete=off></td>
+          <td class=note>{{ row.note }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <div class=grid>
+      {% let field = min_sources %}{% include "field.html" %}
+      {% for field in source %}{% include "field.html" %}{% endfor %}
+    </div>
+  </div>
+  <hr>
+
+  {# One section per registered pricing kind. Which one shows follows the radio, in CSS
+     alone: the radios and the sections are siblings, and the `<style>` below, generated per
+     kind, shows the chosen one with `:checked ~`. Every section's inputs are posted either
+     way; the handler keeps the chosen kind's. #}
+  <div class=pricing>
+    {% for kind in kinds %}
+    <input type=radio id="pricing-{{ kind.name }}" name=pricing value="{{ kind.name }}" {% if kind.checked %}checked{% endif %}>
+    {% endfor %}
+    <div class=pricing-choice>
+      <span class=key>pricing</span>
+      {% for kind in kinds %}
+      <label for="pricing-{{ kind.name }}" class=choice>
+        <span class=choice-name>{{ kind.name }}</span>
+      </label>
+      {% endfor %}
+    </div>
+    {% for kind in kinds %}
+    <div class="pricing-section pricing-{{ kind.name }}">
+      {{ kind.help|safe }}
+      {% if kind.in_file %}
+      <p class=explain>priced by <code>{{ kind.name }}</code>: its stanza has no form here; edit
+      <code>[pairs.pricing]</code> in config.toml</p>
+      {% else %}
+      <div class=grid>
+        {% for field in kind.fields %}{% include "field.html" %}{% endfor %}
+      </div>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+  <style>
+    {% for kind in kinds %}
+    #pricing-{{ kind.name }}:checked ~ .pricing-choice .choice[for=pricing-{{ kind.name }}] {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+    }
+    #pricing-{{ kind.name }}:checked ~ .pricing-{{ kind.name }} { display: block; }
+    {% endfor %}
+  </style>
+
+  <div class=actions>
+    <label class=check>
+      <input type=checkbox name=allow_symbol_mismatch {% if allow_symbol_mismatch %}checked{% endif %}>
+      allow_symbol_mismatch
+    </label>
+    <a class=btn href="/">Cancel</a>
+    <button class=primary>{% if editing.is_some() %}Save{% else %}Add pair{% endif %}</button>
+  </div>
+</form>
+
+<script src="/static/pair.js?v={{ script_version }}" defer></script>
+
+{% if let Some(key) = editing %}
+<form method=post action=/pairs/remove class=removal
+      onsubmit="return confirm('Remove {{ key }}? Its quote is withdrawn at every builder.')">
+  <input type=hidden name=key_env value="{{ key }}">
+  <button class=danger>Delete this pair</button>
+</form>
+{% endif %}
+{% endblock %}

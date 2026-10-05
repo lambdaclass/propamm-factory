@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block body %}
+<header><a class=back href="/">&larr; all builders</a><h1>New builder</h1></header>
+<form method=post action=/builders/add class=card>
+  <div class=grid>
+    {% for field in fields %}{% include "field.html" %}{% endfor %}
+  </div>
+  <div class=actions>
+    <label class=check><input type=checkbox name=disable_cross_region> disable_cross_region</label>
+    <a class=btn href="/">Cancel</a>
+    <button class=primary>Add builder</button>
+  </div>
+</form>
+{% endblock %}

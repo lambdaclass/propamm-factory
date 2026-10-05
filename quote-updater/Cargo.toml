@@ -1,0 +1,84 @@
+[package]
+name = "quote-updater"
+version = "0.1.0"
+edition = "2024"
+
+# The library only: what a downstream binary assembles a quote updater from. It has no
+# binary target of its own; a binary is a package that depends on this one.
+# Doctests run: the public API's examples compile and pass with the tests.
+[lib]
+name = "quote_updater"
+path = "src/lib.rs"
+
+[dependencies]
+clap = { version = "4.6.6", features = ["derive", "env"] }
+eyre = "0.6.13"
+futures-util = "0.3"
+hex = "0.4.3"
+# Same version the ethrex tree already locks, so this adds no new crates to the build.
+rand = "0.8"
+# Must match the secp256k1 version of the pinned ethrex rev: SecretKey crosses the API boundary.
+secp256k1 = "0.30.0"
+serde = { version = "1", features = ["derive"] }
+# `raw_value` keeps a JSON number as the text the venue sent (kraken.rs, coingecko.rs).
+serde_json = { version = "1", features = ["raw_value"] }
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+# Same version axum's ws feature already pulls in via ethrex-rpc, so this adds no new tree.
+#
+# native-tls and not rustls, deliberately. rustls here would not replace native-tls, it
+# would sit beside it: ethrex's workspace pins reqwest with default features on, so
+# `default-tls` -> hyper-tls -> native-tls is already in the graph for EthClient's HTTP
+# calls, and Cargo features are additive, so nothing on this side can switch it off.
+# Measured cost of switching: +1.4 MB of binary for a second TLS stack and no OpenSSL
+# removed. Revisit only if ethrex takes reqwest with default-features = false.
+tokio-tungstenite = { version = "0.29", features = ["native-tls"] }
+# Human-editable pair and builder configs. Measured cost in Cargo.lock: three new package
+# entries (toml, toml_writer, toml_parser); serde_spanned, toml_datetime and winnow all
+# resolve to versions the ethrex build tree already locks.
+toml = "1.1.4"
+url = "2"
+# Metrics registry and text encoding. Measured cost in Cargo.lock: zero new package
+# entries — prometheus is already compiled into this binary via ethrex-sdk ->
+# ethrex-blockchain -> ethrex-metrics, so declaring it direct only adds this crate's own
+# dependency line. Pinned to the version that tree already locks.
+prometheus = "0.14.0"
+# The /metrics listener. Same measured cost: axum is already pulled in (with default
+# features) by ethrex-rpc via axum-extra, so this adds no package and no feature.
+axum = { version = "0.8.9", features = ["ws"] }
+
+# ethrex has no standalone lightweight client crate yet, so the client (EthClient, calldata
+# encoding, signer) comes from the node's workspace crates. Pinned to one rev so the five
+# crates always resolve to the same source tree.
+ethrex-common = { git = "https://github.com/lambdaclass/ethrex", rev = "73318b686fdc2c3951a67cea9721eb5378855ada" }
+ethrex-l2-common = { git = "https://github.com/lambdaclass/ethrex", rev = "73318b686fdc2c3951a67cea9721eb5378855ada" }
+ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex", rev = "73318b686fdc2c3951a67cea9721eb5378855ada" }
+ethrex-l2-rpc = { git = "https://github.com/lambdaclass/ethrex", rev = "73318b686fdc2c3951a67cea9721eb5378855ada" }
+ethrex-rpc = { git = "https://github.com/lambdaclass/ethrex", rev = "73318b686fdc2c3951a67cea9721eb5378855ada" }
+ethrex-sdk = { git = "https://github.com/lambdaclass/ethrex", rev = "73318b686fdc2c3951a67cea9721eb5378855ada" }
+# The backoffice's HTML templates. Four new entries in Cargo.lock, all askama's own.
+askama = { version = "0.16.0", default-features = false, features = ["derive", "std", "urlencode"] }
+# The feed recorder's database client (record.rs): the Binance mid and the vault balances
+# into the indexer's Postgres, off the quoting path through one writer task. Measured cost
+# in Cargo.lock: 19 new package entries (tokio-postgres, postgres-protocol, postgres-types,
+# phf, stringprep, md-5, whoami and their leaves), six of which are Windows or macOS only
+# and never compile on the server. Plain TCP (`NoTls`): the database is on the same host.
+# `with-serde_json-1` lets a `serde_json::Value` bind as a jsonb parameter (the config
+# snapshots); serde_json is already a dependency, so the feature adds no package.
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+# The venues that have no stream (MEXC's is protobuf-only, CoinGecko is an HTTP API) are
+# polled, and KuCoin hands out its WebSocket URL over HTTP. Already in the tree with
+# default features through ethrex-rpc's EthClient, so this adds no package to Cargo.lock.
+reqwest = "0.12"
+# The library reports through `tracing` and never prints (see output.rs). Both crates are
+# already in this build's Cargo.lock through ethrex, axum and hyper, which emit tracing
+# events of their own: zero new package entries. `registry` and `std` only; every other
+# feature (fmt, env-filter, ansi) is a binary's choice, not the library's.
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry", "std"] }
+
+[dev-dependencies]
+# Only for tokio's paused clock (`#[tokio::test(start_paused = true)]`), which lets a
+# waited duration (a restart backoff, quoting.rs's shutdown bound) be asserted without
+# waiting it out. test-util = ["rt", "sync", "time"], all already enabled, so this adds
+# no package to Cargo.lock and nothing to the binary.
+tokio = { version = "1.53.1", features = ["test-util"] }

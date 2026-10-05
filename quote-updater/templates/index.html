@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block body %}
+<header>
+  <h1>quote-updater</h1>
+  <dl class=meta>
+    <dt>target<dd class=mono>{{ target }}</dd>
+    <dt>config<dd class=mono>{{ config_path }}</dd>
+  </dl>
+  <div class=reload>
+    <form method=post action=/pairs/halt-all
+          onsubmit="return confirm('Halt every pair? Each quote is withdrawn at every builder until someone restarts them.')">
+      <button class=danger>Halt all pairs</button>
+    </form>
+    <form method=post action=/reload>
+      <button class=primary title="Resumes the pairs halted from this page and re-arms tripped breakers. A pair halted with a reason (a binary's kill switch) resumes only from its own row.">Restart halted pairs</button>
+    </form>
+    <a class=btn href="/settings">Settings</a>
+  </div>
+</header>
+
+{% if let Some(message) = ok %}<p class=banner-ok>{{ message }}</p>{% endif %}
+{% if let Some(message) = err %}<p class=banner-err>{{ message }}</p>{% endif %}
+
+<div class=sectionhead><h2>Pairs</h2><a class=btn href="/pairs/new">New pair</a></div>
+{% if pairs.is_empty() %}
+  <p class=empty>No pairs configured.</p>
+{% else %}
+  <table>
+    <thead><tr>
+      <th>key_env<th>tokens<th>source<th>pricing<th>band<th>breaker<th>
+    </tr></thead>
+    <tbody>
+      {% for pair in pairs %}
+      <tr>
+        <td class=mono>{{ pair.key_env }} <span class="status {{ pair.status_class }}">{{ pair.status }}</span>{% if let Some(reason) = pair.halt_reason %} <span class=unset title="why it was halted">{{ reason }}</span>{% endif %}</td>
+        <td class=addr>
+          {% for token in pair.tokens %}
+            {% if !loop.first %}<span class=slash>/</span>{% endif %}
+            <code title="{{ token.full }}">{{ token.short }}</code>
+          {% endfor %}
+        </td>
+        <td>{% if let Some(v) = pair.source %}<span class=val>{{ v }}</span>{% else %}<span class=unset>&ndash;</span>{% endif %}</td>
+        <td><span class=val>{{ pair.pricing }}</span></td>
+        <td>{% if let Some(v) = pair.band %}<span class=val>{{ v }}</span>{% else %}<span class=unset>&ndash;</span>{% endif %}</td>
+        <td>{% if let Some(v) = pair.breaker %}<span class=val>{{ v }}</span>{% else %}<span class=unset>&ndash;</span>{% endif %}</td>
+        <td class=rowactions>
+          <a class=btn href="/pairs/edit/{{ pair.key_env }}">Edit</a>
+          {% if pair.halted %}
+          <form method=post action=/pairs/resume
+                onsubmit="return confirm('Resume {{ pair.key_env }}? It starts quoting again at every builder.')">
+            <input type=hidden name=key_env value="{{ pair.key_env }}">
+            <button>Resume</button>
+          </form>
+          {% else %}
+          <form method=post action=/pairs/halt
+                onsubmit="return confirm('Halt {{ pair.key_env }}? Its quote is withdrawn at every builder, and it keeps its settings.')">
+            <input type=hidden name=key_env value="{{ pair.key_env }}">
+            <button>Halt</button>
+          </form>
+          {% endif %}
+          <form method=post action=/pairs/remove
+                onsubmit="return confirm('Remove {{ pair.key_env }}? Its quote is withdrawn at every builder.')">
+            <input type=hidden name=key_env value="{{ pair.key_env }}">
+            <button class=danger>Delete</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+
+<div class=sectionhead><h2>Builders</h2><a class=btn href="/builders/new">New builder</a></div>
+{% if builders.is_empty() %}
+  <p class=empty>No builders configured.</p>
+{% else %}
+  <table>
+    <thead><tr><th>name<th>endpoint<th>region<th></tr></thead>
+    <tbody>
+      {% for builder in builders %}
+      <tr>
+        <td class=mono>{{ builder.name }}</td>
+        <td class=addr><code>{{ builder.endpoint }}</code></td>
+        <td>{% if let Some(v) = builder.region %}<span class=val>{{ v }}</span>{% else %}<span class=unset>&ndash;</span>{% endif %}</td>
+        <td class=rowactions>
+          <form method=post action=/builders/remove
+                onsubmit="return confirm('Remove {{ builder.name }}? Every pair restarts onto the new list.')">
+            <input type=hidden name=name value="{{ builder.name }}">
+            <button class=danger>Delete</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+{% endblock %}

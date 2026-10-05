@@ -1,0 +1,50 @@
+# The same binary pointed at the repo's fake chain, fake Binance and fake builders
+# (`make mocks` from the repo root). Nothing leaves 127.0.0.1.
+target = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
+
+[settings]
+mode         = "builder"
+rpc_url      = "http://127.0.0.1:8545"
+metrics_addr = "127.0.0.1:9464"
+binance_ws   = "ws://127.0.0.1:8546/ws"
+
+[settings.endpoints]
+coingecko = "http://127.0.0.1:8545"
+
+[[builder]]
+name     = "mock-a"
+endpoint = "ws://127.0.0.1:8547/ws/sendquoteupdate"
+api_key  = "key-a"
+
+[[builder]]
+name     = "mock-b"
+endpoint = "ws://127.0.0.1:8548/ws/sendquoteupdate"
+api_key  = "key-b"
+
+# Our model and our guards on WETH/USDC.
+[[pairs]]
+tokens  = ["0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"]
+symbol  = "ETHUSDC"
+key_env = "UPDATER_KEY_WETH_USDC"
+
+[pairs.pricing]
+kind        = "inventory_skew"
+half_spread = 0.0005
+strength    = 0.02
+
+[[pairs.guards]]
+kind           = "venue_spread"
+max_dispersion = 0.01
+
+# The mock vault holds almost no base (base share 0.000), so a cap of 0.8 would withdraw every
+# tick; set it to 0.8 to watch the guard do exactly that.
+[[pairs.guards]]
+kind      = "share_cap"
+max_share = 1.0
+
+# A kind the library ships on USDC/USDT beside it.
+[[pairs]]
+tokens  = ["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", "0xdAC17F958D2ee523a2206206994597C13D831ec7"]
+symbol  = "USDCUSDT"
+key_env = "UPDATER_KEY_USDC_USDT"
+pricing = { kind = "feed" }

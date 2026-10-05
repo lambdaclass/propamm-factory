@@ -1,0 +1,31 @@
+# A quote updater of your own, built on the quote-updater library in this repo.
+#
+# The empty [workspace] table keeps this crate out of any parent workspace: it has its own
+# Cargo.lock and its own target/, exactly like a separate repository would.
+[workspace]
+
+[package]
+name = "my-propamm"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "my-propamm"
+path = "src/main.rs"
+
+[dependencies]
+# By path, since this crate lives next to the library. From another repository:
+#   quote-updater = { git = "https://github.com/lambdaclass/propamm-factory", rev = "<commit>" }
+quote-updater = { path = "../quote-updater" }
+serde = { version = "1", features = ["derive"] }
+# For the observer's log lines. The library renders them when `log_target` names this crate.
+tracing = "0.1"
+
+# The same release profile as the root Cargo.toml: Cargo reads the release profile from the binary's
+# own workspace, never from a dependency's. No panic = "abort": the library refuses to start
+# with it, since one pair's panic would then kill every pair.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+debug = "line-tables-only"
