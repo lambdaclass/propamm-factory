@@ -1,0 +1,140 @@
+# promtool unit tests for quote-updater.rules.yml.
+#
+# Named `.rules.test.yml` rather than `.rules.yml` deliberately: prometheus.yml globs
+# `/etc/prometheus/rules/*.rules.yml` and the ansible play ships `../prometheus/*.rules.yml`,
+# and neither should ever load a file of fixtures as live rules.
+#
+# Scoped to PusherSignerNearlyDry and its level check PusherSignerDry. The first is a `predict_linear`, which is the only
+# expression in the file whose *silence* is a designed behaviour rather than a side effect of
+# a comparison coming out false: one NaN sample anywhere in the range suppresses it entirely,
+# and that is what stops a failed eth_getBalance paging an operator about a key that is fine.
+# Nothing else proves that, and `promtool check rules` cannot — it parses, it does not
+# evaluate.
+#
+# Every `interval` here is 10m, which is not a convenience: it is
+# RUNWAY_CHECK_BLOCKS * BLOCK_TIME_SECS, the cadence `runway_check` actually rewrites this
+# gauge on. So a 2h window holds twelve samples in these fixtures for the same reason it holds
+# twelve in production, and `alert_rule_thresholds_still_match_the_constants` pins that number
+# from the Rust side.
+rule_files:
+  - quote-updater.rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  # The rule's two halves: a key the current burn empties inside a week pages, and one that
+  # lasts far longer does not. Both drain at the same 1 wei per reading — only the tank
+  # differs, which is the point. The rule reads the slope against what is left, not the level
+  # on its own, and that is exactly what the old `< 1000` could not do.
+  - interval: 10m
+    name: a key a week from dry pages, a key a long way from dry does not
+    input_series:
+      - series: 'quote_updater_signer_balance_wei{pair="DRAINING"}'
+        values: "1000-1x30"
+      - series: 'quote_updater_signer_balance_wei{pair="COMFORTABLE"}'
+        values: "100000-1x30"
+    alert_rule_test:
+      # Inside `for: 30m`. The condition is already true; the alert is pending, not firing.
+      - eval_time: 20m
+        alertname: PusherSignerNearlyDry
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: PusherSignerNearlyDry
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              pair: DRAINING
+            exp_annotations:
+              summary: "DRAINING: signer is under a week from dry at the current burn"
+              description: "Extrapolating this key's balance over the last 2 hours puts it at zero inside seven days. A key that runs dry stops one lane while the process still looks healthy. Check quote_updater_signer_runway_updates for how many updates are left at today's base fee, then top the key up — the page clears once a top-up moves the slope."
+
+  # The load-bearing one. `runway_check` writes NaN to this gauge whenever eth_getBalance
+  # fails, and `adopt_metrics` seeds it NaN when the service takes a pair on. A single NaN
+  # sample in the range makes predict_linear return nothing at all, so neither can page.
+  - interval: 10m
+    name: a balance nothing could read never pages
+    input_series:
+      # An RPC that has never answered for this pair.
+      - series: 'quote_updater_signer_balance_wei{pair="UNREADABLE"}'
+        values: "NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN"
+      # The post-reload blind spot, written down as a test rather than left as a claim in a
+      # comment. The pair is adopted with a NaN and then drains hard enough to page. It stays
+      # silent while that NaN is inside the 2h window and pages only once it has aged out.
+      - series: 'quote_updater_signer_balance_wei{pair="JUST_ADOPTED"}'
+        values: "NaN NaN 1000-1x30"
+    promql_expr_test:
+      - expr: predict_linear(quote_updater_signer_balance_wei[2h], 7 * 24 * 3600) < 0
+        eval_time: 60m
+        exp_samples: []
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: PusherSignerNearlyDry
+        exp_alerts: []
+      # The seeding NaN leaves the window at 130m, so the rule sees the drain for the first
+      # time there and pages 30m later. Until then a draining key is invisible — the cost of
+      # asking a regression rather than a threshold, and the reason the window is 2h and not
+      # the 6h that would otherwise fit the slope better.
+      - eval_time: 170m
+        alertname: PusherSignerNearlyDry
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              pair: JUST_ADOPTED
+            exp_annotations:
+              summary: "JUST_ADOPTED: signer is under a week from dry at the current burn"
+              description: "Extrapolating this key's balance over the last 2 hours puts it at zero inside seven days. A key that runs dry stops one lane while the process still looks healthy. Check quote_updater_signer_runway_updates for how many updates are left at today's base fee, then top the key up — the page clears once a top-up moves the slope."
+
+  # Two ways of not being a drain. A lane that is not landing updates spends nothing, so there
+  # is no slope and nothing runs out; a key topped up inside the window has a rising one.
+  # Neither should page, and the second is how this alert is meant to resolve.
+  - interval: 10m
+    name: an idle lane and a topped-up key do not page
+    input_series:
+      - series: 'quote_updater_signer_balance_wei{pair="IDLE"}'
+        values: "1000x30"
+      - series: 'quote_updater_signer_balance_wei{pair="TOPPED_UP"}'
+        values: "1000-1x6 500000+0x18"
+    promql_expr_test:
+      - expr: predict_linear(quote_updater_signer_balance_wei[2h], 7 * 24 * 3600) < 0
+        eval_time: 120m
+        exp_samples: []
+    alert_rule_test:
+      - eval_time: 120m
+        alertname: PusherSignerNearlyDry
+        exp_alerts: []
+
+  # The case the slope rule cannot see, written down as a test: a key already at zero has no
+  # slope, so PusherSignerNearlyDry stays quiet on it, and PusherSignerDry is what pages. The
+  # draining key next to it is still above zero and pages only under the slope rule.
+  #
+  # `interval: 1m` here, not 10m: this fixture stands for scrapes, not gauge rewrites. In
+  # production the gauge holds its value between rewrites and every scrape sees it, so
+  # `<= 0` stays true for 5 minutes straight. A 10m fixture would leave 5-minute holes with
+  # no sample at all, the `for` timer would reset in each one, and the alert would sit in
+  # pending forever, which is a fact about the fixture and not about the rule.
+  - interval: 1m
+    name: a key already at zero pages under the level check, not the slope
+    input_series:
+      - series: 'quote_updater_signer_balance_wei{pair="EMPTY"}'
+        values: "0x300"
+      - series: 'quote_updater_signer_balance_wei{pair="DRAINING"}'
+        values: "1000-0.1x300"
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: PusherSignerNearlyDry
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              pair: DRAINING
+            exp_annotations:
+              summary: "DRAINING: signer is under a week from dry at the current burn"
+              description: "Extrapolating this key's balance over the last 2 hours puts it at zero inside seven days. A key that runs dry stops one lane while the process still looks healthy. Check quote_updater_signer_runway_updates for how many updates are left at today's base fee, then top the key up — the page clears once a top-up moves the slope."
+      - eval_time: 60m
+        alertname: PusherSignerDry
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              pair: EMPTY
+            exp_annotations:
+              summary: "EMPTY: signer has no ETH left"
+              description: "The key that signs this pair's updates has a zero balance, so nothing it signs can land and the lane is dead until someone tops it up. PusherSignerNearlyDry cannot say this: a balance that is already flat at zero extrapolates to zero, not below it."

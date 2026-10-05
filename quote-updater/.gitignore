@@ -1,0 +1,8 @@
+# Holds UPDATER_KEY_*, live private keys: never commit it.
+.env
+# The config file holds the builder API keys, so a filled-in one is a secret. Both the name
+# the docs use and the older split names, so an existing checkout does not start leaking
+# one on the first `git add`.
+config.toml
+pairs.toml
+builders.toml

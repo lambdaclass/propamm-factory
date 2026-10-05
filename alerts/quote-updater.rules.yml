@@ -1,0 +1,552 @@
+# Alert rules for the PropAMM quote updater.
+#
+# `up == 1` is deliberately NOT the primary health signal. The updater stays running when
+# every pair has halted on its circuit breaker — exiting would be read by systemd as
+# "restart me", which clears the very state a human is meant to look at, and it is also what
+# a reload needs to find in order to bring the lane back — and the unit is Restart=on-failure.
+# A fully halted updater is therefore a green process quoting nothing.
+# The page-severity rules below are about quoting, not liveness.
+#
+# Thresholds mirror Rust constants and are pinned by a test in quote-updater/src/landing.rs.
+groups:
+  - name: quote-updater-page
+    rules:
+      - alert: PusherBreakerTripped
+        expr: quote_updater_breaker_tripped == 1
+        for: 0m
+        labels: { severity: page }
+        annotations:
+          summary: "{{ $labels.pair }}: circuit breaker latched; the lane is not quoting"
+          description: >-
+            The lane tripped and the quote was withdrawn from every builder: with the built-in
+            guard, the feed moved further in one tick than this pair's max_deviation allows;
+            quote_updater_trip_source{pair,source,cause} says what tripped it and how (a
+            registered guard, a panic, an external trip). It does NOT come back on its own.
+            Verify the feed, then reload the config (SIGHUP) — which brings this
+            lane back without disturbing the others or clearing their breakers.
+            This alert resolves when someone reloads or restarts, which means someone acted
+            — not that the feed is fixed.
+
+      - alert: PusherNothingQuoting
+        expr: >-
+          quote_updater_pairs_halted + quote_updater_pairs_in_backoff
+            >= quote_updater_pairs_total
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: "No pair is quoting"
+          description: >-
+            {{ $value }} of the configured pairs are halted or waiting to restart.
+            Halted pairs need a human; pairs in backoff are already retrying.
+
+      # The shared failure the per-lane rules cannot name. One watcher polls the chain head
+      # on behalf of every pair (quote-updater/src/head.rs), and no pair can quote for a new
+      # target block until it publishes one — so a watcher that stops publishing stops every
+      # lane at once, and says so only as PusherLandingUnverified firing for each of them in
+      # turn, none of which points at the cause.
+      #
+      # `changes`, not `increase` or `delta`: head_number is a gauge, and the question is
+      # whether the value moved at all, which is exactly what `changes` counts. The other two
+      # are counter functions that extrapolate over the window edges, and neither has an
+      # answer worth trusting on a series that never resets.
+      #
+      # `for: 2m` rather than the `for: 0m` PusherSignerRunwayUnknown gets away with, and not
+      # as a debounce: `changes` over a window holding a SINGLE sample is also 0, so the
+      # expression alone cannot tell a frozen head from one that has only just been scraped
+      # for the first time. Verified with promtool, which fires this at t=0 on a healthy
+      # advancing series. Without the `for` it would page on every process start and after
+      # every scrape gap. 2m is what the other process-wide page rules here use.
+      #
+      # Time to page is therefore ~7 minutes: five for the last change to leave the window,
+      # two more for the `for`. That is the same order as PusherLandingUnverified's 50 blocks,
+      # which is the symptom this explains — deliberately, so the cause cannot arrive after
+      # the symptom it is supposed to account for.
+      #
+      # Fires for a genuinely halted chain too, which is correct rather than a false positive:
+      # nothing can quote either way, and an operator holding a lane needs to know.
+      #
+      # Silent under --mode node, which starts no watcher: `register_head` is never called
+      # there, so the series is absent rather than zero and this returns no data instead of
+      # firing forever.
+      - alert: PusherHeadStalled
+        expr: changes(quote_updater_head_number[5m]) == 0
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: "The chain head has not moved in 5 minutes; no lane can quote"
+          description: >-
+            Every pair waits on the shared head watcher to publish a block before it can
+            quote the next target, so nothing is quoting at all. Either the RPC endpoint
+            stopped answering — check quote_updater_head_poll_errors_total and the poll
+            latency beside it — or the chain itself has halted.
+
+      # A block with no update in it is normal: a builder includes the update only when a
+      # swap hits the lane in that block. What this counts is blocks where the updater could
+      # not read the lane back at all, so it does not know whether anything landed.
+      - alert: PusherLandingUnverified
+        expr: quote_updater_consecutive_landing_misses >= 50
+        for: 0m
+        labels: { severity: page }
+        annotations:
+          summary: "{{ $labels.pair }}: cannot read the lane back"
+          description: >-
+            50 consecutive target blocks (~10 minutes) where getState on the registry failed
+            or returned nothing, so the updater cannot tell whether its updates land. Check
+            the RPC: quote_updater_rpc_errors_total{call="eth_call"} and its latency.
+
+      # Node mode's answer to PusherLandingUnverified, which cannot see it: that rule reads
+      # consecutive_landing_misses, and `--mode node` runs no quote loop and no landing
+      # tracker — it submits updateState and classifies the receipt. So the lane could be
+      # pushing into reverts indefinitely with every page-severity rule silent.
+      #
+      # "Pushes are happening and none of them landed", rather than a rate of failures: a
+      # push that reverts once is ordinary (a missed slot, a lost race), and what matters is
+      # whether anything is getting through. The second half is what keeps it quiet on a
+      # paused updater rather than firing on the absence of work.
+      #
+      # Absent in builder mode, which records no node_pushes_total at all, so this returns no
+      # data there rather than firing on a zero.
+      - alert: PusherNodePushesNotLanding
+        expr: >-
+          sum by (pair) (increase(quote_updater_node_pushes_total{result="landed"}[15m])) == 0
+            and on (pair)
+          sum by (pair) (increase(quote_updater_node_pushes_total[15m])) > 0
+        for: 0m
+        labels: { severity: page }
+        annotations:
+          summary: "{{ $labels.pair }}: node-mode pushes are landing none of the time"
+          description: >-
+            Every updateState submitted in the last 15 minutes failed, reverted, or read back
+            wrong. Check the `result` label for which: `reverted` points at the registry (a
+            stale stamp, an unauthorized updater), `failed` at the RPC or the signer's gas,
+            and `mismatch` at another updater winning the lane.
+
+      - alert: PusherPairHasNoBuilder
+        expr: sum by (pair) (quote_updater_builder_up) == 0
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: "{{ $labels.pair }}: quoting to nobody"
+          description: "Every configured builder connection for this pair is down."
+
+      # The escalation of PusherPoolImbalanced in the ticket group, on the same metric and
+      # the same guard, at the threshold where the pool stops being a two-sided market.
+      # 0.6 is a base share outside 20–80% at the default target_share of 0.5 — read
+      # relative to target, exactly like its sibling, so the band widens proportionally on a
+      # pair configured elsewhere.
+      #
+      # `for: 0m`, and unlike PusherHeadStalled's `for: 2m` that is not a decision this rule
+      # is getting away with: q is a level, not a windowed function, so there is no window
+      # edge to produce a false reading, and it is written from a balance no older than
+      # MAX_INVENTORY_AGE (60s) — a lane whose reading goes older than that stops publishing
+      # and stops updating this gauge rather than reporting a stale extreme. The remaining
+      # way to read a spurious q is a corrupt market mid, and a mid wrong enough to move the
+      # share from balanced to 80/20 is already the business of min_mid/max_mid and the
+      # circuit breaker.
+      #
+      # Page rather than ticket because it is meant to arrive at once, which is the whole
+      # point of asking for it: at 80/20 the vault is nearly a single asset, every further
+      # fill takes it further, and the tilt has run out of room to argue — the skew is
+      # capped at ±delta so a side never crosses the market mid, and past that cap the
+      # pricing cannot lean harder however far the pool drifts.
+      #
+      # Note this is the one page-severity rule here about a lane that IS quoting. The rest
+      # of this group is about not quoting at all (see the header). What justifies it is
+      # that the position is the exposure: nothing stops getting worse on its own, and the
+      # answer is a human rebalancing or widening the pair, not a restart.
+      - alert: PusherPoolSeverelyImbalanced
+        expr: >-
+          abs(quote_updater_pricing_inventory) > 0.6
+            and on (pair)
+          (quote_updater_inventory_base > 0 or quote_updater_inventory_quote > 0)
+        for: 0m
+        labels: { severity: page }
+        annotations:
+          summary: "{{ $labels.pair }}: vault is {{ $value | humanizePercentage }} off its target share"
+          description: >-
+            The pool has passed 80/20 and is close to holding a single asset. The inventory
+            tilt cannot correct this on its own past here — the skew is clamped at ±delta so a
+            side never crosses the market mid, and quote_updater_pricing_skew sitting on that
+            cap means further drift changes the quote by nothing. Check
+            quote_updater_inventory_base_share for the direction, then rebalance the vault or
+            widen the pair. PusherPoolImbalanced is suppressed while this fires.
+
+      # "A week of ETH left", asked of the ETH itself rather than of a count of updates.
+      #
+      # This was `signer_runway_updates < 1000`, and the number it compared was not a
+      # duration: `preflight::runway_updates` divides the balance by
+      # `UPDATE_GAS_LIMIT * base_fee`, so 1000 is a thousand *updates*, and how long those
+      # last depends entirely on how often the lane lands one. A pair filling every other
+      # block burned through them inside a morning; a quiet pair sat on the same thousand for
+      # weeks. One threshold cannot mean the same thing on both — and a duration is what an
+      # operator reads it as meaning anyway, which is the gap this closes.
+      #
+      # `predict_linear` fits the observed drain and extrapolates a week out, so this fires
+      # when the key is seven days from empty at the rate the lane is really spending. The
+      # rate is measured rather than assumed. A top-up inside the window flattens the slope
+      # and the page resolves, which is correct rather than a missed alert: it did get topped
+      # up.
+      #
+      # The balance, not the runway, even though the runway is the series with the base fee
+      # already divided into it. Two reasons. `signer_balance_wei` is written on the same
+      # RUNWAY_CHECK_BLOCKS cadence in BOTH modes — `drive`'s check and `push_update`'s — so
+      # this covers node mode, where every push spends gas and a draining key is the least
+      # hypothetical. And a base fee that doubles halves the runway in a single step: a cliff
+      # a linear fit reads as a drain orders of magnitude faster than any real one, paging on
+      # a key nobody has touched.
+      #
+      # NaN is load-bearing here rather than incidental. A single NaN sample anywhere in the
+      # range makes `predict_linear` return no sample at all (verified with promtool, which
+      # also confirms an *absent* start behaves differently and does fire). `runway_check`
+      # writes NaN to this gauge whenever eth_getBalance fails, so an RPC that cannot answer
+      # takes the page off the table instead of paging on an hour-old balance — the same trade
+      # the old rule made through +Inf, with PusherSignerRunwayUnknown still covering the gap
+      # it leaves. `quiesce` NaNs it too, so a pair a reload removed cannot latch this.
+      #
+      # The cost of that, stated plainly: `adopt_metrics` seeds this gauge to NaN when the
+      # service takes a pair on, so the rule is silent for one window-length after every start
+      # and every reload. Bounding that is half of why the window is 2h. It is a real blind
+      # spot and it is proportionate — what this detects moves over days, and a key does not
+      # drain while the process is restarting.
+      #
+      # The other half: 2h holds 12 readings at the RUNWAY_CHECK_BLOCKS cadence, and that is
+      # what the test in landing.rs pins. `predict_linear` over a window holding fewer than two
+      # points returns nothing, so a slower cadence would not loosen this rule — it would
+      # switch it off, and silently, which is the failure mode that pin exists for.
+      #
+      # `for: 30m`, not the 5m this carried as a runway comparison, and not as a debounce: the
+      # balance is only rewritten every 10 minutes, so a 5m `for` was satisfied by re-scrapes
+      # of a single reading and held back nothing at all. 30m spans three fresh ones.
+      #
+      # preflight::LOW_RUNWAY (1000 updates) deliberately does NOT move with this and no
+      # longer mirrors it. Preflight has one balance and one base fee at startup and no rate
+      # to extrapolate from, so a count of updates is the only thing it can honestly report.
+      - alert: PusherSignerNearlyDry
+        expr: predict_linear(quote_updater_signer_balance_wei[2h], 7 * 24 * 3600) < 0
+        for: 30m
+        labels: { severity: page }
+        annotations:
+          summary: "{{ $labels.pair }}: signer is under a week from dry at the current burn"
+          description: >-
+            Extrapolating this key's balance over the last 2 hours puts it at zero inside seven
+            days. A key that runs dry stops one lane while the process still looks healthy.
+            Check quote_updater_signer_runway_updates for how many updates are left at today's
+            base fee, then top the key up — the page clears once a top-up moves the slope.
+
+      # PusherSignerNearlyDry reads the slope, and a balance already flat at zero has no
+      # slope: it extrapolates to zero, and zero is not below zero, so the page above clears
+      # at the exact moment the key dies. This is the level check for that case. A zero here
+      # is a real reading (a failed eth_getBalance writes NaN, never 0), so one is enough,
+      # and `for: 5m` only rides out a scrape or two.
+      - alert: PusherSignerDry
+        expr: quote_updater_signer_balance_wei <= 0
+        for: 5m
+        labels: { severity: page }
+        annotations:
+          summary: "{{ $labels.pair }}: signer has no ETH left"
+          description: >-
+            The key that signs this pair's updates has a zero balance, so nothing it signs can
+            land and the lane is dead until someone tops it up. PusherSignerNearlyDry cannot say
+            this: a balance that is already flat at zero extrapolates to zero, not below it.
+
+      - alert: PusherScrapeDown
+        expr: up{job="quote-updater"} == 0
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: "The quote updater is not being scraped"
+          description: "The process or host is gone, or the metrics listener is not bound."
+
+  - name: quote-updater-ticket
+    rules:
+      # The failure mode a file-authoritative config introduces. `pairs.toml` is the desired
+      # state and a reload converges the running pairs onto it — but a reload that fails to
+      # validate applies nothing at all, deliberately, so the pairs carry on quoting the
+      # previous config perfectly well. Nothing else in the process says otherwise: every
+      # other series stays exactly as healthy as it was. The gap is only in what the operator
+      # believes, having just edited the file, and this counter is the one thing that can see
+      # it.
+      #
+      # `increase(...) > 0` over an hour rather than a `for:` on a level: a rejection is an
+      # instant, not a state, so there is no condition to sit in for five minutes.
+      #
+      # Ticket, not page: nothing is broken and no quote is wrong. Someone's intent simply
+      # has not taken effect, which needs looking at before the next incident, not at 3am.
+      - alert: PusherConfigReloadFailed
+        expr: increase(quote_updater_config_reloads_total{result="rejected"}[1h]) > 0
+        for: 0m
+        labels: { severity: ticket }
+        annotations:
+          summary: "A config reload was rejected; the running pairs are not what pairs.toml says"
+          description: >-
+            The updater re-read its config, refused it, and changed nothing — so every pair is
+            still running the previous config while the file on disk says something else.
+            The journal names the reason. Fix the file, check it with
+            `quote-updater --check`, and reload again.
+
+      # The other half of the same gap, and the worse half. A reload validates whole but
+      # cannot know whether a feed will come up without dialling it, so a lane whose symbol
+      # is wrong is reported and skipped while every other lane moves onto the new file.
+      # `rejected` at least leaves the pairs consistent with each other on the old config;
+      # this leaves a mixture, which is why it is counted apart from `applied` rather than
+      # folded into it, and why `quote_updater_config_generation` does not advance for it.
+      - alert: PusherConfigReloadPartial
+        expr: increase(quote_updater_config_reloads_total{result="partial"}[1h]) > 0
+        for: 0m
+        labels: { severity: ticket }
+        annotations:
+          summary: "A config reload only partly applied; some pairs are on the old config"
+          description: >-
+            The updater accepted pairs.toml but at least one pair's feed would not come up, so
+            that pair is still quoting its previous config (or was never started) while the
+            rest moved onto the new one. Nothing is mispriced and no quote is wrong — the
+            pairs that failed are named in the journal, usually a wrong symbol or a blocked
+            endpoint. Fix them, check with `quote-updater --check`, and reload again.
+
+      # Not a fault. The only rule in this file that fires on something working, and it is
+      # here because a change to a live lane's pricing is otherwise invisible: the two rules
+      # above catch a reload that was *refused* or that half-applied, and a reload that
+      # succeeds cleanly says nothing at all. `config.toml` is edited by hand over ssh and by
+      # the backoffice, which does the edit-and-reload on an operator's behalf and — per
+      # deploy/systemd/README.md — has no login, only a tailnet address. So delta, max_deviation
+      # or a band can change on a quoting lane with no trace outside the journal.
+      #
+      # What it buys is adjacency. When a page arrives twenty minutes after someone widened a
+      # band, the two land in the same channel in the right order, and nobody has to go and
+      # ask who touched what.
+      #
+      # `config_generation` rather than `config_reloads_total{result="applied"}`: the gauge
+      # advances only when every configured pair made it onto the new file, which is exactly
+      # the event worth announcing. A partial apply deliberately does not move it and has
+      # PusherConfigReloadPartial of its own.
+      #
+      # The `unless` is what keeps this honest rather than noisy. A restart resets the gauge
+      # to 0, and a drop from 3 to 0 is a change like any other to `changes()` — so without
+      # it every deploy and every `systemctl restart` posts "the config changed", which is
+      # the fastest way to teach a channel to ignore an audit line. `start_time_seconds`
+      # moves on exactly those restarts and on nothing else, and the two windows are the same
+      # width so the suppression covers precisely the window the restart is inside of.
+      #
+      # Fires for about ten minutes and then resolves on its own, which is what a window
+      # function does rather than an oversight: there is no state to sit in, only an event
+      # that ages out of the window.
+      - alert: PusherConfigChanged
+        expr: >-
+          changes(quote_updater_config_generation[10m]) > 0
+            unless
+          changes(quote_updater_start_time_seconds[10m]) > 0
+        for: 0m
+        labels: { severity: ticket }
+        annotations:
+          summary: "Config reloaded: every pair moved onto a new config.toml"
+          description: >-
+            A reload validated and applied in full, so every configured pair is now quoting the
+            shape the file describes — a delta, a band, a max_deviation or a pricing knob may
+            have changed on a lane that never stopped quoting. Nothing is wrong; this is here
+            so the change is visible beside whatever it may explain. The journal names what was
+            applied, per pair.
+
+      - alert: PusherBreakerApproaching
+        expr: max_over_time(quote_updater_breaker_deviation_ratio[30m]) > 0.6
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.pair }}: tick-to-tick moves reaching {{ $value | humanizePercentage }} of the breaker limit"
+          description: >-
+            The only warning available before a guard that latches and needs a human to
+            clear. Either the market got livelier or max_deviation is set too tight.
+
+      # The other half of PusherSignerNearlyDry. That rule reads a gauge the updater writes
+      # NaN to whenever eth_getBalance fails, so an RPC that cannot answer takes the page
+      # off the table rather than paging on an hour-old balance (see `runway_check` in
+      # landing.rs). Something still has to say the runway is unknown, and this is it —
+      # otherwise the fix trades a wrong number for a silent gap.
+      #
+      # That gap got wider when PusherSignerNearlyDry became a `predict_linear` over a
+      # window: one NaN sample suppresses the whole range, so the page stays silent until
+      # the last failed read ages out — up to 2h after the RPC recovers, not just while it
+      # is sick. This rule is the only thing covering that stretch, which is the reason its
+      # window and this one's should be read together rather than tuned apart.
+      #
+      # Keyed on the error counter rather than on the NaN: testing a gauge for NaN in PromQL
+      # means `x != x`, which is both obscure and easy to break, while `call="get_balance"`
+      # is written at exactly one site — `drive`'s runway check — so its error count *is* the
+      # count of failed checks.
+      #
+      # Ticket, not page: this says "we cannot see the key", not "the key is empty". An RPC
+      # sick enough to lose eth_getBalance for half an hour will be paging through
+      # PusherLandingUnverified or PusherPairHasNoBuilder anyway.
+      #
+      # Builder-mode only, like the gauge it covers: node mode's push_update makes no timed
+      # RPC calls, so this counter never moves there.
+      - alert: PusherSignerRunwayUnknown
+        expr: increase(quote_updater_rpc_errors_total{call="get_balance"}[45m]) >= 3
+        for: 0m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.pair }}: signer runway has not been priced in ~30 minutes"
+          description: >-
+            Three or more balance reads have failed, so quote_updater_signer_balance_wei is
+            NaN and PusherSignerNearlyDry cannot fire for this pair — and will not until the
+            NaN leaves its 2h window, so the silence outlasts the outage. The key may be
+            fine; nothing here knows. Check the RPC endpoint, then the balance by hand.
+
+      # `drive` logs a signing failure, retries forever, and quotes nothing meanwhile, so the
+      # lane goes quiet with the cause visible only on stderr. PusherLandingUnverified pages on
+      # the consequence ~10 minutes later, pointing at builders and inclusion; this names the
+      # actual fault first, which is the whole reason it is a separate rule rather than a
+      # panel.
+      #
+      # Any signing failure at all, not a rate above some floor: signing is local, pure and
+      # deterministic — a key, a chain id, an RLP encode — so unlike an RPC call there is no
+      # such thing as a transient one. The `for` is what separates a real fault from a blip.
+      - alert: PusherSigningFailing
+        expr: rate(quote_updater_sign_errors_total[5m]) > 0
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.pair }}: updates are failing to sign"
+          description: >-
+            Nothing is being published for this pair and no builder has been told anything is
+            wrong. Signing depends on the pair's key, the chain id fetched at startup, and the
+            update's own encoding, none of which recover on their own — check the updater's
+            stderr for the error itself.
+
+      - alert: PusherFeedStale
+        expr: time() - quote_updater_feed_last_tick_timestamp_seconds > 30
+        for: 1m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.pair }}: no accepted sample for over 30s"
+          description: "Past MAX_PRICE_AGE, so the updater is refusing to publish and the lane is withdrawn."
+
+      - alert: PusherFeedDown
+        expr: quote_updater_feed_up == 0
+        for: 2m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.pair }}: fewer than min_sources venues have a fresh price"
+          description: >-
+            The pair's composite has too few fresh venue prices to publish, so the lane is
+            withdrawn. With one venue this is that venue's stream being down; with several,
+            enough of them are down or stale at once. The per-venue series say which:
+            quote_updater_venue_feed_up and quote_updater_venue_feed_last_tick_timestamp_seconds.
+
+      - alert: PusherVenueFeedDown
+        expr: quote_updater_venue_feed_up == 0
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.pair }}: {{ $labels.venue }} has been disconnected for 5 minutes"
+          description: >-
+            One venue of the pair's average is not delivering. The pair keeps quoting from the
+            rest while at least min_sources are fresh, so this is a ticket, not a page; it
+            becomes PusherFeedDown if the rest go too. A venue that has been renamed or
+            delisted looks exactly like this.
+
+      - alert: PusherFeedSampleNotCurrent
+        expr: quote_updater_feed_sample_current == 0
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.pair }}: the held sample no longer describes the live book"
+          description: >-
+            A one-sided or crossed book has been rejected and the retained sample is being
+            allowed to age out. The lane goes quiet for a correct reason; this makes it
+            distinguishable from a dead socket.
+
+      - alert: PusherMidOutOfBand
+        expr: rate(quote_updater_price_unusable_total{reason="out_of_band"}[5m]) > 0
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.pair }}: mids are falling outside min_mid/max_mid"
+          description: >-
+            The band is the only thing between a corrupt book and an arbitrary on-chain
+            price the next fill is priced against. Either the book is wrong or the band is.
+
+      # The vault drifting away from the share it is configured to hold. Nothing else in
+      # this file reads the inventory series at all: they arrived with volatile pricing and
+      # were alerted on by nothing.
+      #
+      # Reads `pricing_inventory` (q), not the raw share, because the updater has already
+      # divided by the pair's own `target_share` (`volatile.rs`). One threshold therefore
+      # means the same thing on a pair meant to hold half its value in base and on one meant
+      # to hold a fifth: 0.4 is "40% away from target, relative to target", which at the
+      # default `target_share` of 0.5 is a base share outside roughly 30–70%, and a
+      # proportionally wider band on a pair configured lower.
+      #
+      # Ticket, not page: the tilt is doing its job while this fires. Leaning the quote so
+      # the market rebalances the pool is the entire purpose of the skew term, and nothing
+      # is mispriced. What the alert says is that it has not worked *fast enough* — a
+      # judgement about gamma, target_share or the market, not an outage.
+      #
+      # The `and on (pair)` guard is not defensive padding. `Inventory::base_share` returns
+      # 0.5 for an empty vault by construction ("an empty vault has no share and reads as
+      # balanced"), so q on a drained pool reads `(0.5 − target_share) / target_share`: 0 on
+      # a pair targeting half, but 1.5 on one targeting 0.2. Without the guard this rule is
+      # blind to the drained pool it should care about most and fires forever on the empty
+      # one it cannot help. Only the balances can tell an empty vault from a balanced one;
+      # q cannot. A genuinely one-sided vault still fires, because the surviving side is
+      # `> 0` — which is the case the guard must not swallow.
+      #
+      # Silent on stable pairs without a mode clause: `adopt_metrics` writes NaN to all
+      # three of these gauges on any pair whose kind is not `PricingKind::Volatile`, and
+      # both the comparison and the guard are false against NaN.
+      - alert: PusherPoolImbalanced
+        expr: >-
+          abs(quote_updater_pricing_inventory) > 0.4
+            and on (pair)
+          (quote_updater_inventory_base > 0 or quote_updater_inventory_quote > 0)
+        for: 15m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.pair }}: vault is {{ $value | humanizePercentage }} off its target share"
+          description: >-
+            The quote has been tilted to correct this for fifteen minutes and the pool has not
+            come back. Check quote_updater_inventory_base_share for which way it is leaning and
+            quote_updater_pricing_skew for whether the tilt has hit its cap — the skew is
+            clamped at ±delta so a side never crosses the market mid, and a skew sitting on
+            that cap means the pricing has stopped responding to further drift.
+
+      - alert: PusherPairRestarting
+        expr: rate(quote_updater_pair_restarts_total[15m]) > 0
+        for: 10m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.pair }}: quote loop has restarted"
+          description: "Backoff caps at 60s, so a deterministic failure shows as a steady restart loop."
+
+      - alert: PusherBuilderRejecting
+        expr: rate(quote_updater_builder_rejections_total[5m]) > 0
+        for: 10m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.builder }} is rejecting {{ $labels.pair }}'s quotes"
+          description: "Usually a pool or asset_pairs the builder does not recognise."
+
+      - alert: PusherBuilderDown
+        expr: quote_updater_builder_up == 0
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.builder }} is down for {{ $labels.pair }}"
+          description: "Other builders keep quoting; redials run every 2s."
+
+      - alert: PusherAckLatencyNearEviction
+        expr: >-
+          histogram_quantile(0.99, sum by (le, pair, builder) (
+            rate(quote_updater_builder_ack_latency_seconds_bucket[5m]))) > 0.4
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.builder }}: p99 ack latency past the ~400ms eviction window"
+
+      - alert: PusherRpcSlow
+        expr: >-
+          histogram_quantile(0.95, sum by (le, pair, call) (
+            rate(quote_updater_rpc_duration_seconds_bucket[5m]))) > 0.05
+        for: 10m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.pair }}: {{ $labels.call }} p95 past the 50ms requote budget"

@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block body %}
+<header><a class=back href="/">&larr; back</a><h1>Settings</h1></header>
+<p class=warn>Read once at startup. Saving writes the file; a restart applies it.</p>
+<form method=post action=/settings/save class=card>
+  <div class=grid>
+    {% for field in fields %}{% include "field.html" %}{% endfor %}
+  </div>
+  <hr>
+  <div class=sources>
+    <span class=key>venue endpoints</span>
+    <p class=explain>Where each venue is dialled. Blank is the venue's own endpoint, shown grey; set one for a
+    regional endpoint or a mock. Polled venues and kucoin take an http(s) address, the rest ws(s).</p>
+    <table class=venues>
+      <thead><tr><th>venue<th>endpoint</tr></thead>
+      <tbody>
+      {% for row in endpoints %}
+        <tr>
+          <td class=mono>{{ row.venue }}</td>
+          <td><input type=text name="endpoint_{{ row.venue }}" value="{{ row.value }}" placeholder="{{ row.placeholder }}" spellcheck=false autocomplete=off></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class=actions>
+    <label class=check>
+      <input type=checkbox name=disable_cross_region {% if disable_cross_region %}checked{% endif %}>
+      disable_cross_region
+    </label>
+    <a class=btn href="/">Cancel</a>
+    <button class=primary>Save</button>
+  </div>
+</form>
+{% endblock %}
