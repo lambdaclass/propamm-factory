@@ -380,6 +380,9 @@ mod tests {
             inventory_aversion: None,
             inventory_band_lower: None,
             inventory_band_upper: None,
+            inventory_aversion_hard: None,
+            inventory_band_hard_lower: None,
+            inventory_band_hard_upper: None,
         };
         let raw = match knobs {
             Knobs::Calm => calm,

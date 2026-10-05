@@ -221,6 +221,14 @@ max_deviation_window_blocks = "1000"
 # # 2·target_share; with target_share ≥ 0.5 the default upper is ≥ 1 and never fires, so set it.
 # # inventory_band_lower = "0.20"
 # # inventory_band_upper = "0.55"
+# # A second, stronger tier: past a wider band [inventory_band_hard_lower,
+# # inventory_band_hard_upper] the charge grows at inventory_aversion_hard (λ_hard ≥ λ) instead
+# # of λ, adding (λ_hard − λ)·σ·√τ·(distance past the hard edge). Continuous at both edges. A
+# # blank hard edge turns the hard tier off on that side; a blank λ_hard equals λ, so the tier
+# # is off. Both must be set for the tier to do anything.
+# # inventory_aversion_hard = "40"
+# # inventory_band_hard_lower = "0.10"
+# # inventory_band_hard_upper = "0.90"
 
 [[pairs]]
 # WBTC, USDC. Already in sorted order, so the stream is used as-is.

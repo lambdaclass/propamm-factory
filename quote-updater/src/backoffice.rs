@@ -450,6 +450,12 @@ struct AddPair {
     inventory_band_lower: String,
     #[serde(default)]
     inventory_band_upper: String,
+    #[serde(default)]
+    inventory_aversion_hard: String,
+    #[serde(default)]
+    inventory_band_hard_lower: String,
+    #[serde(default)]
+    inventory_band_hard_upper: String,
 }
 
 /// A blank field means the key is absent, not set to `""`, which every one of them rejects.
@@ -470,6 +476,9 @@ struct Knobs<'a> {
     inventory_aversion: &'a str,
     inventory_band_lower: &'a str,
     inventory_band_upper: &'a str,
+    inventory_aversion_hard: &'a str,
+    inventory_band_hard_lower: &'a str,
+    inventory_band_hard_upper: &'a str,
 }
 
 impl<'a> Knobs<'a> {
@@ -485,6 +494,9 @@ impl<'a> Knobs<'a> {
             inventory_aversion: &form.inventory_aversion,
             inventory_band_lower: &form.inventory_band_lower,
             inventory_band_upper: &form.inventory_band_upper,
+            inventory_aversion_hard: &form.inventory_aversion_hard,
+            inventory_band_hard_lower: &form.inventory_band_hard_lower,
+            inventory_band_hard_upper: &form.inventory_band_hard_upper,
         }
     }
 
@@ -500,6 +512,9 @@ impl<'a> Knobs<'a> {
             inventory_aversion: &form.inventory_aversion,
             inventory_band_lower: &form.inventory_band_lower,
             inventory_band_upper: &form.inventory_band_upper,
+            inventory_aversion_hard: &form.inventory_aversion_hard,
+            inventory_band_hard_lower: &form.inventory_band_hard_lower,
+            inventory_band_hard_upper: &form.inventory_band_hard_upper,
         }
     }
 }
@@ -527,6 +542,9 @@ fn apply_pricing(mut pair: RawPair, pricing: &str, delta: &str, knobs: &Knobs<'_
         pair.inventory_aversion = optional(knobs.inventory_aversion);
         pair.inventory_band_lower = optional(knobs.inventory_band_lower);
         pair.inventory_band_upper = optional(knobs.inventory_band_upper);
+        pair.inventory_aversion_hard = optional(knobs.inventory_aversion_hard);
+        pair.inventory_band_hard_lower = optional(knobs.inventory_band_hard_lower);
+        pair.inventory_band_hard_upper = optional(knobs.inventory_band_hard_upper);
     } else {
         pair.delta = optional(delta);
         pair.gamma = None;
@@ -539,6 +557,9 @@ fn apply_pricing(mut pair: RawPair, pricing: &str, delta: &str, knobs: &Knobs<'_
         pair.inventory_aversion = None;
         pair.inventory_band_lower = None;
         pair.inventory_band_upper = None;
+        pair.inventory_aversion_hard = None;
+        pair.inventory_band_hard_lower = None;
+        pair.inventory_band_hard_upper = None;
     }
     pair
 }
@@ -598,6 +619,9 @@ fn pair_from_form(form: &AddPair) -> Result<RawPair> {
         inventory_aversion: None,
         inventory_band_lower: None,
         inventory_band_upper: None,
+        inventory_aversion_hard: None,
+        inventory_band_hard_lower: None,
+        inventory_band_hard_upper: None,
         pricing: None,
         guards: Vec::new(),
     };
@@ -1302,6 +1326,12 @@ struct EditPair {
     inventory_band_lower: String,
     #[serde(default)]
     inventory_band_upper: String,
+    #[serde(default)]
+    inventory_aversion_hard: String,
+    #[serde(default)]
+    inventory_band_hard_lower: String,
+    #[serde(default)]
+    inventory_band_hard_upper: String,
 }
 
 /// Keyed by `key_env`, not by index: the page may have been rendered before someone else
@@ -1872,6 +1902,26 @@ const INVENTORY_BAND_UPPER_FIELD: Field = Field::new(
     "above this WETH share, the extra spread starts. Blank is twice target_share, which at \
      0.5 or more is over 100% and never fires, so set it.",
 );
+const INVENTORY_AVERSION_HARD_FIELD: Field = Field::new(
+    "inventory_aversion_hard",
+    "",
+    "λ_hard. A second, stronger charge once the WETH share leaves the wider band below. Adds \
+     (λ_hard − λ_soft) on top of inventory_aversion past the hard edge. Must be ≥ \
+     inventory_aversion. Blank means equal to it, so the hard tier is off. It only acts on a side \
+     whose hard band edge below is set.",
+);
+const INVENTORY_BAND_HARD_LOWER_FIELD: Field = Field::new(
+    "inventory_band_hard_lower",
+    "0.1",
+    "below this WETH share, the stronger λ_hard charge starts. Must be ≤ inventory_band_lower. \
+     Blank turns the hard tier off on this side.",
+);
+const INVENTORY_BAND_HARD_UPPER_FIELD: Field = Field::new(
+    "inventory_band_hard_upper",
+    "0.9",
+    "above this WETH share, the stronger λ_hard charge starts. Must be ≥ inventory_band_upper. \
+     Blank turns the hard tier off on this side.",
+);
 const VOLATILITY_WINDOW_FIELD: Field = Field::new(
     "volatility_window_secs",
     "600",
@@ -2102,6 +2152,9 @@ struct PairFormPage {
     inventory_aversion: Filled,
     inventory_band_lower: Filled,
     inventory_band_upper: Filled,
+    inventory_aversion_hard: Filled,
+    inventory_band_hard_lower: Filled,
+    inventory_band_hard_upper: Filled,
     volatility_window_secs: Filled,
     allow_symbol_mismatch: bool,
 }
@@ -2281,6 +2334,15 @@ fn render_pair_form(pair: Option<&RawPair>) -> String {
         }),
         inventory_band_upper: knob(&INVENTORY_BAND_UPPER_FIELD, |p| {
             p.inventory_band_upper.as_deref()
+        }),
+        inventory_aversion_hard: knob(&INVENTORY_AVERSION_HARD_FIELD, |p| {
+            p.inventory_aversion_hard.as_deref()
+        }),
+        inventory_band_hard_lower: knob(&INVENTORY_BAND_HARD_LOWER_FIELD, |p| {
+            p.inventory_band_hard_lower.as_deref()
+        }),
+        inventory_band_hard_upper: knob(&INVENTORY_BAND_HARD_UPPER_FIELD, |p| {
+            p.inventory_band_hard_upper.as_deref()
         }),
         volatility_window_secs: knob(&VOLATILITY_WINDOW_FIELD, |p| {
             p.volatility_window_secs.as_deref()
@@ -2532,6 +2594,9 @@ api_key = "k"
                     inventory_aversion: None,
                     inventory_band_lower: None,
                     inventory_band_upper: None,
+                    inventory_aversion_hard: None,
+                    inventory_band_hard_lower: None,
+                    inventory_band_hard_upper: None,
                     pricing: None,
                     guards: Vec::new(),
                 });
@@ -3530,6 +3595,9 @@ api_key = "k"
             inventory_aversion: "",
             inventory_band_lower: "",
             inventory_band_upper: "",
+            inventory_aversion_hard: "",
+            inventory_band_hard_lower: "",
+            inventory_band_hard_upper: "",
         };
         let fixed = apply_pricing(pair.clone(), "fixed", "0.0005", &knobs);
         assert_eq!(fixed.delta.as_deref(), Some("0.0005"));
@@ -3576,6 +3644,9 @@ api_key = "k"
             "inventory_aversion",
             "inventory_band_lower",
             "inventory_band_upper",
+            "inventory_aversion_hard",
+            "inventory_band_hard_lower",
+            "inventory_band_hard_upper",
             "delta",
         ] {
             assert!(

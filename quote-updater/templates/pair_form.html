@@ -94,7 +94,11 @@
       </div>
       <p class=explain>q_out is how far the vault's WETH share is outside inventory_band_lower to inventory_band_upper,
       divided by target_share. It is 0 inside that range. The charge only goes on the trade that pushes us further
-      off target; the other price stays where it would be without it.</p>
+      off target; the other price stays where it would be without it. There are two nested bands: past the inner one
+      the charge grows at λ_soft (inventory_aversion); past the wider hard band [inventory_band_hard_lower,
+      inventory_band_hard_upper] it grows at λ_hard (inventory_aversion_hard), so it bites much harder deep in the tail.
+      A blank hard band edge turns that side's hard tier off; leave the hard fields blank to keep the old single-band
+      behaviour.</p>
       <p class=explain>σ is how much the price has been moving: take the last 600 seconds of our mid, compute each
       second's percentage change, take the standard deviation. For USDC/USDT it is basically 0, so term 1, term 3 and
       the skew are 0 and the spread is term 2, a constant. That is a fixed spread.</p>
@@ -147,6 +151,9 @@
           {% let field = inventory_aversion %}{% include "field.html" %}
           {% let field = inventory_band_lower %}{% include "field.html" %}
           {% let field = inventory_band_upper %}{% include "field.html" %}
+          {% let field = inventory_aversion_hard %}{% include "field.html" %}
+          {% let field = inventory_band_hard_lower %}{% include "field.html" %}
+          {% let field = inventory_band_hard_upper %}{% include "field.html" %}
         </div>
       </div>
     </div>

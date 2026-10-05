@@ -129,6 +129,23 @@ pub struct VolatileParams {
     /// unchanged unless set. Note the default can exceed 1.0 (when target ≥ 0.5) and is then
     /// unreachable, as before; set this to a reachable value (e.g. 0.75) to arm the upper side.
     pub inventory_band_upper: Knob,
+    /// λ_hard, the aversion of the second, stronger inventory tier. The charge has two nested
+    /// bands: the inner (soft) band [`inventory_band_lower`, `inventory_band_upper`] with
+    /// `inventory_aversion` (λ_soft), and a wider outer (hard) band
+    /// [`inventory_band_hard_lower`, `inventory_band_hard_upper`]. Past the inner edge the
+    /// charge grows at λ_soft; past the outer edge it grows at λ_hard, i.e. an extra
+    /// `λ_hard − λ_soft` on the distance beyond the outer edge. Must be ≥ `inventory_aversion`,
+    /// so the hard tier adds rather than subtracts. Default: equal to `inventory_aversion`, so
+    /// the outer tier contributes exactly zero and pricing is byte-identical to the single-band
+    /// behaviour unless configured.
+    pub inventory_aversion_hard: Knob,
+    /// Lower edge of the outer (hard) band, as a base-share fraction. Must be ≤
+    /// `inventory_band_lower` (the outer band is at least as wide as the inner one). `None`
+    /// (unset) turns the lower hard tier off, whatever λ_hard is.
+    pub inventory_band_hard_lower: Option<Knob>,
+    /// Upper edge of the outer (hard) band, as a base-share fraction. Must be ≥
+    /// `inventory_band_upper`. `None` (unset) turns the upper hard tier off, whatever λ_hard is.
+    pub inventory_band_hard_upper: Option<Knob>,
     /// How far back σ is measured over.
     pub volatility_window: Duration,
 }
@@ -147,6 +164,9 @@ pub struct RawKnobs<'a> {
     pub inventory_aversion: Option<&'a str>,
     pub inventory_band_lower: Option<&'a str>,
     pub inventory_band_upper: Option<&'a str>,
+    pub inventory_aversion_hard: Option<&'a str>,
+    pub inventory_band_hard_lower: Option<&'a str>,
+    pub inventory_band_hard_upper: Option<&'a str>,
 }
 
 impl VolatileParams {
@@ -213,6 +233,48 @@ impl VolatileParams {
             inventory_band_upper.get(),
             target_share.get()
         );
+        let inventory_aversion = knob("inventory_aversion", raw.inventory_aversion.unwrap_or("0"))?;
+        // The outer (hard) band and its aversion. An unset edge turns that side's hard tier
+        // off, and an unset λ_hard equals λ_soft, so the second tier's coefficient
+        // (λ_hard − λ_soft) is exactly 0.0. Unconfigured, the charge is byte-identical to the
+        // single-band behaviour. Set them to widen the second tier and make it stronger.
+        let inventory_band_hard_lower = raw
+            .inventory_band_hard_lower
+            .map(|text| knob("inventory_band_hard_lower", text))
+            .transpose()?;
+        let inventory_band_hard_upper = raw
+            .inventory_band_hard_upper
+            .map(|text| knob("inventory_band_hard_upper", text))
+            .transpose()?;
+        let inventory_aversion_hard = match raw.inventory_aversion_hard {
+            Some(text) => knob("inventory_aversion_hard", text)?,
+            None => inventory_aversion,
+        };
+        if let Some(hard_lower) = inventory_band_hard_lower {
+            ensure!(
+                hard_lower.get() <= inventory_band_lower.get(),
+                "{at}: inventory_band_hard_lower {} must be at most inventory_band_lower {}, so \
+                 the hard band is at least as wide as the soft one (both base-share fractions)",
+                hard_lower.get(),
+                inventory_band_lower.get()
+            );
+        }
+        if let Some(hard_upper) = inventory_band_hard_upper {
+            ensure!(
+                inventory_band_upper.get() <= hard_upper.get(),
+                "{at}: inventory_band_hard_upper {} must be at least inventory_band_upper {}, so \
+                 the hard band is at least as wide as the soft one (both base-share fractions)",
+                hard_upper.get(),
+                inventory_band_upper.get()
+            );
+        }
+        ensure!(
+            inventory_aversion_hard.get() >= inventory_aversion.get(),
+            "{at}: inventory_aversion_hard {} must be at least inventory_aversion {}, since the \
+             hard tier adds an extra (λ_hard − λ_soft) charge on top of the soft one",
+            inventory_aversion_hard.get(),
+            inventory_aversion.get()
+        );
         Ok(Self {
             // γ divides in the edge term, so zero is not a value it can take.
             gamma: positive("gamma", raw.gamma)?,
@@ -221,9 +283,12 @@ impl VolatileParams {
             hold_secs: knob("hold_secs", raw.hold_secs.unwrap_or("12"))?,
             fill_delay_secs: knob("fill_delay_secs", raw.fill_delay_secs.unwrap_or("6"))?,
             target_share,
-            inventory_aversion: knob("inventory_aversion", raw.inventory_aversion.unwrap_or("0"))?,
+            inventory_aversion,
             inventory_band_lower,
             inventory_band_upper,
+            inventory_aversion_hard,
+            inventory_band_hard_lower,
+            inventory_band_hard_upper,
             volatility_window,
         })
     }
@@ -306,22 +371,42 @@ pub fn price(params: &VolatileParams, sigma: f64, base_share: f64) -> Terms {
     let q = (base_share - params.target_share.get()) / params.target_share.get();
     let move_over_hold = variance.sqrt();
 
-    // The inventory charge. Inside the base-share band [inventory_band_lower,
-    // inventory_band_upper] it is zero and pricing is unchanged. The band edges are configured
-    // as base shares (default [½·target, 2·target]) and converted to q here, keeping q_excess
-    // in the same q units as before so λ tunes the same magnitude: q_lower = (lower − t)/t and
-    // q_upper = (upper − t)/t, which for the defaults are −0.5 and +1.0. Past the band the
-    // charge worsens the harmful side's price by λ·σ·√τ per unit of q beyond the edge, so
-    // pushing the vault further off target costs the taker progressively more. σ·√τ, not σ²·τ, so it is
-    // not numerically dead; its own coefficient λ, independent of γ (see VolatileParams).
-    // Capped at MAX_DELTA so an extreme inventory quotes very wide rather than tripping the
-    // one-whole-unit refuse guard and quoting nothing at all.
+    // The inventory charge, in two nested tiers. The inner (soft) band [inventory_band_lower,
+    // inventory_band_upper] with aversion λ_soft, and a wider outer (hard) band
+    // [inventory_band_hard_lower, inventory_band_hard_upper] with aversion λ_hard ≥ λ_soft.
+    // Inside the inner band the charge is zero and pricing is unchanged. Once base share leaves
+    // the inner band the charge grows at λ_soft per unit of q past the inner edge; once it also
+    // leaves the outer band an extra (λ_hard − λ_soft) per unit past the outer edge is added, so
+    // the charge is piecewise-linear, monotone and continuous at both edges, and much stronger
+    // deep in the tail. An unset outer edge turns that side's hard tier off. The band edges are
+    // configured as base shares (default inner band [½·target, 2·target]) and converted to q
+    // here, keeping the excess in the same q units as before so λ tunes the same magnitude:
+    // q = (share − t)/t. Both λ scale σ·√τ, not σ²·τ, so the charge is not numerically dead;
+    // each has its own coefficient, independent of γ (see VolatileParams). Capped at MAX_DELTA
+    // so an extreme inventory quotes very wide rather than tripping the one-whole-unit refuse
+    // guard and quoting nothing at all.
+    //
+    // The two-tier form is factored so that when the outer band is unset (excess_outer is 0.0)
+    // or λ_hard equals λ_soft (the defaults) the outer term is exactly zero, which adds a
+    // bit-for-bit zero: the whole expression then reduces to the old single-band charge,
+    // `λ_soft · move_over_hold · excess_inner`, evaluated in the same operation order.
     let target = params.target_share.get();
     let q_lower = (params.inventory_band_lower.get() - target) / target;
     let q_upper = (params.inventory_band_upper.get() - target) / target;
-    let q_excess = (q - q_upper).max(0.0) + (q_lower - q).max(0.0);
-    let inventory_penalty =
-        (params.inventory_aversion.get() * move_over_hold * q_excess).min(MAX_DELTA);
+    let excess_inner = (q - q_upper).max(0.0) + (q_lower - q).max(0.0);
+    let q_hard_lower = params
+        .inventory_band_hard_lower
+        .map(|l| (l.get() - target) / target);
+    let q_hard_upper = params
+        .inventory_band_hard_upper
+        .map(|u| (u.get() - target) / target);
+    let excess_outer = q_hard_upper.map_or(0.0, |edge| (q - edge).max(0.0))
+        + q_hard_lower.map_or(0.0, |edge| (edge - q).max(0.0));
+    let lambda_soft = params.inventory_aversion.get();
+    let lambda_hard = params.inventory_aversion_hard.get();
+    let inventory_penalty = (lambda_soft * move_over_hold * excess_inner
+        + (lambda_hard - lambda_soft) * move_over_hold * excess_outer)
+        .min(MAX_DELTA);
     // The half-spread before the charge. No cap here: capping it would chop the volatility
     // spread (hold + stale) in a crash, exactly when it should widen. The pusher's
     // refuse-to-publish guard (a half-spread reaching one whole unit) in `update.rs` is the
@@ -620,6 +705,9 @@ mod tests {
             inventory_aversion: None,
             inventory_band_lower: None,
             inventory_band_upper: None,
+            inventory_aversion_hard: None,
+            inventory_band_hard_lower: None,
+            inventory_band_hard_upper: None,
         }
     }
 
@@ -677,6 +765,9 @@ mod tests {
             inventory_aversion: Some(aversion),
             inventory_band_lower: lower,
             inventory_band_upper: upper,
+            inventory_aversion_hard: None,
+            inventory_band_hard_lower: None,
+            inventory_band_hard_upper: None,
         };
         let off = VolatileParams::parse("p", raw("0", None, None)).unwrap();
         // Small enough that the charge stays below the MAX_DELTA cap, so the formula is exact.
@@ -711,6 +802,226 @@ mod tests {
         assert!((above.inventory_penalty - expected_above).abs() < 1e-12);
     }
 
+    /// Builds params with both inventory tiers set explicitly, for the two-range tests.
+    /// target_share is 0.5, so a base share `s` maps to `q = (s − 0.5)/0.5 = 2s − 1`.
+    fn two_range(
+        lambda_soft: &'static str,
+        lambda_hard: &'static str,
+        inner_lower: &'static str,
+        inner_upper: &'static str,
+        outer_lower: &'static str,
+        outer_upper: &'static str,
+    ) -> VolatileParams {
+        VolatileParams::parse(
+            "p",
+            RawKnobs {
+                gamma: "0.1",
+                k: "700",
+                kappa: "1",
+                target_share: Some("0.5"),
+                hold_secs: None,
+                fill_delay_secs: None,
+                volatility_window_secs: None,
+                inventory_aversion: Some(lambda_soft),
+                inventory_band_lower: Some(inner_lower),
+                inventory_band_upper: Some(inner_upper),
+                inventory_aversion_hard: Some(lambda_hard),
+                inventory_band_hard_lower: Some(outer_lower),
+                inventory_band_hard_upper: Some(outer_upper),
+            },
+        )
+        .unwrap()
+    }
+
+    // Two nested tiers: inner (soft) band shares [0.25, 0.75] → q ∈ [−0.5, +0.5] with λ_soft,
+    // outer (hard) band shares [0.1, 0.9] → q ∈ [−0.8, +0.8] with λ_hard.
+
+    #[test]
+    fn two_range_inside_the_inner_band_has_no_charge_and_prices_unchanged() {
+        // (a) Inside the inner band the charge is zero and pricing matches the no-charge path.
+        let on = two_range("10", "40", "0.25", "0.75", "0.1", "0.9");
+        let off = two_range("0", "0", "0.25", "0.75", "0.1", "0.9");
+        // share 0.6 → q = 0.2, inside the inner band.
+        let inside = price(&on, 0.001, 0.6);
+        let bare = price(&off, 0.001, 0.6);
+        assert_eq!(inside.inventory_penalty, 0.0);
+        assert_eq!(inside.delta, bare.delta);
+        assert_eq!(inside.skew, bare.skew);
+    }
+
+    #[test]
+    fn two_range_between_the_edges_charges_only_the_soft_tier() {
+        // (b) Past the inner edge but inside the outer band: penalty is λ_soft·excess_inner·σ√τ.
+        let on = two_range("10", "40", "0.25", "0.75", "0.1", "0.9");
+        let mov = (0.001 * 0.001 * 12.0f64).sqrt();
+        // share 0.8 → q = 0.6: past the inner upper edge (q = 0.5), before the outer (q = 0.8).
+        let t = price(&on, 0.001, 0.8);
+        let excess_inner = t.q - 0.5;
+        assert!(excess_inner > 0.0 && t.q < 0.8);
+        let expected = 10.0 * mov * excess_inner;
+        assert!((t.inventory_penalty - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn two_range_past_the_outer_edge_adds_the_hard_tier() {
+        // (c) Past the outer edge: penalty is (λ_soft·excess_inner + (λ_hard−λ_soft)·excess_outer)·σ√τ.
+        let on = two_range("10", "40", "0.25", "0.75", "0.1", "0.9");
+        let mov = (0.001 * 0.001 * 12.0f64).sqrt();
+        // share 0.95 → q = 0.9: past the outer upper edge (q = 0.8).
+        let t = price(&on, 0.001, 0.95);
+        let excess_inner = t.q - 0.5;
+        let excess_outer = t.q - 0.8;
+        assert!(excess_outer > 0.0);
+        let expected = 10.0 * mov * excess_inner + (40.0 - 10.0) * mov * excess_outer;
+        assert!(
+            t.inventory_penalty < MAX_DELTA,
+            "should be below the cap for this test"
+        );
+        assert!((t.inventory_penalty - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn two_range_collapses_to_the_old_single_band_when_unset() {
+        // (d) Backwards compatibility: with the hard knobs unset the outer tier is off and λ_hard
+        // defaults to λ_soft, so the charge is byte-identical to the single band.
+        let single = VolatileParams::parse(
+            "p",
+            RawKnobs {
+                gamma: "0.1",
+                k: "700",
+                kappa: "1",
+                target_share: Some("0.5"),
+                hold_secs: None,
+                fill_delay_secs: None,
+                volatility_window_secs: None,
+                inventory_aversion: Some("10"),
+                inventory_band_lower: Some("0.25"),
+                inventory_band_upper: Some("0.75"),
+                inventory_aversion_hard: None,
+                inventory_band_hard_lower: None,
+                inventory_band_hard_upper: None,
+            },
+        )
+        .unwrap();
+        // Same knobs, but the hard band spelled out as equal to the inner one and λ_hard = λ_soft.
+        let collapsed = two_range("10", "10", "0.25", "0.75", "0.25", "0.75");
+        for &share in &[0.05, 0.1, 0.3, 0.5, 0.7, 0.9, 0.95] {
+            let a = price(&single, 0.001, share);
+            let b = price(&collapsed, 0.001, share);
+            assert_eq!(a.inventory_penalty, b.inventory_penalty, "share {share}");
+            assert_eq!(a.delta, b.delta, "share {share}");
+            assert_eq!(a.skew, b.skew, "share {share}");
+        }
+        // And it equals the explicit old single-band formula, evaluated in the old operation order.
+        let mov = (0.001 * 0.001 * 12.0f64).sqrt();
+        let t = price(&single, 0.001, 0.05); // q = −0.9, past the inner lower edge (q = −0.5).
+        let q_lower = (0.25 - 0.5f64) / 0.5;
+        let q_upper = (0.75 - 0.5f64) / 0.5;
+        let q_excess = (t.q - q_upper).max(0.0) + (q_lower - t.q).max(0.0);
+        let old = (10.0 * mov * q_excess).min(MAX_DELTA);
+        assert_eq!(t.inventory_penalty, old);
+    }
+
+    /// λ_soft 10 and λ_hard 40 on the inner band [0.25, 0.75], with each hard edge set or blank.
+    /// `λ_hard` None gives the soft-only reference.
+    fn hard_edges(
+        lambda_hard: Option<&'static str>,
+        outer_lower: Option<&'static str>,
+        outer_upper: Option<&'static str>,
+    ) -> VolatileParams {
+        VolatileParams::parse(
+            "p",
+            RawKnobs {
+                gamma: "0.1",
+                k: "700",
+                kappa: "1",
+                target_share: Some("0.5"),
+                hold_secs: None,
+                fill_delay_secs: None,
+                volatility_window_secs: None,
+                inventory_aversion: Some("10"),
+                inventory_band_lower: Some("0.25"),
+                inventory_band_upper: Some("0.75"),
+                inventory_aversion_hard: lambda_hard,
+                inventory_band_hard_lower: outer_lower,
+                inventory_band_hard_upper: outer_upper,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn two_range_blank_hard_bands_turn_the_hard_tier_off() {
+        // λ_hard set but both hard edges blank: no hard tier, priced exactly like soft-only.
+        let soft = hard_edges(None, None, None);
+        let blank = hard_edges(Some("40"), None, None);
+        for &share in &[0.02, 0.1, 0.3, 0.5, 0.7, 0.9, 0.98] {
+            let a = price(&soft, 0.001, share);
+            let b = price(&blank, 0.001, share);
+            assert_eq!(a.inventory_penalty, b.inventory_penalty, "share {share}");
+            assert_eq!(a.delta, b.delta, "share {share}");
+            assert_eq!(a.skew, b.skew, "share {share}");
+        }
+    }
+
+    #[test]
+    fn two_range_each_hard_edge_is_independent() {
+        // Only one hard edge set: that side gets the hard tier, the other side is soft-only.
+        let soft = hard_edges(None, None, None);
+        let upper_only = hard_edges(Some("40"), None, Some("0.9"));
+        let lower_only = hard_edges(Some("40"), Some("0.1"), None);
+        // share 0.95 → q = 0.9, past the outer upper edge; share 0.05 → q = −0.9, past the
+        // outer lower edge.
+        assert!(
+            price(&upper_only, 0.001, 0.95).inventory_penalty
+                > price(&soft, 0.001, 0.95).inventory_penalty
+        );
+        assert_eq!(
+            price(&upper_only, 0.001, 0.05).inventory_penalty,
+            price(&soft, 0.001, 0.05).inventory_penalty
+        );
+        assert!(
+            price(&lower_only, 0.001, 0.05).inventory_penalty
+                > price(&soft, 0.001, 0.05).inventory_penalty
+        );
+        assert_eq!(
+            price(&lower_only, 0.001, 0.95).inventory_penalty,
+            price(&soft, 0.001, 0.95).inventory_penalty
+        );
+    }
+
+    #[test]
+    fn two_range_charge_is_capped_at_max_delta() {
+        // (e) A big σ drives the charge past the cap; it lands exactly on MAX_DELTA.
+        let on = two_range("10", "40", "0.25", "0.75", "0.1", "0.9");
+        let t = price(&on, 0.05, 0.95);
+        assert_eq!(t.inventory_penalty, MAX_DELTA);
+    }
+
+    #[test]
+    fn two_range_penalty_is_continuous_at_both_edges() {
+        // (f) Piecewise-linear and continuous: the one-sided values agree at the inner and outer
+        // edges (and their lower mirrors).
+        let on = two_range("10", "40", "0.25", "0.75", "0.1", "0.9");
+        let pen = |share: f64| price(&on, 0.001, share).inventory_penalty;
+        // Straddle each edge by eps. The penalty is piecewise-linear, so the one-sided values
+        // differ only by the slopes times eps (here O(1e-8)); a real jump at a kink would leave an
+        // O(1e-2) gap (the whole charge at the outer edge), so 1e-6 separates continuity from a
+        // discontinuity by four orders of magnitude.
+        let eps = 1e-7;
+        for &edge in &[0.75, 0.9, 0.25, 0.1] {
+            let left = pen(edge - eps);
+            let right = pen(edge + eps);
+            assert!(
+                (left - right).abs() < 1e-6,
+                "discontinuity at share {edge}: {left} vs {right}"
+            );
+        }
+        // Exactly zero at the inner edges, where the charge joins the no-charge region.
+        assert_eq!(pen(0.75), 0.0);
+        assert_eq!(pen(0.25), 0.0);
+    }
+
     /// Our two prices as fractions of the market mid, the way PropAMM computes them from
     /// what we publish.
     fn buy_and_sell(t: &Terms) -> (f64, f64) {
@@ -733,6 +1044,9 @@ mod tests {
             inventory_aversion: Some(aversion),
             inventory_band_lower: Some("0.25"),
             inventory_band_upper: Some("0.75"),
+            inventory_aversion_hard: None,
+            inventory_band_hard_lower: None,
+            inventory_band_hard_upper: None,
         };
         let off = VolatileParams::parse("p", raw("0")).unwrap();
         let on = VolatileParams::parse("p", raw("10")).unwrap();

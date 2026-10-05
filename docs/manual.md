@@ -300,6 +300,20 @@ fires, so set it to a reachable value (e.g. 0.55). The charge is capped at 5%, b
 refuse-to-publish guard, so an extreme inventory quotes very wide rather than stranding by
 refusing.
 
+A second, stronger tier can sit outside the first. Past a wider band
+[`inventory_band_hard_lower`, `inventory_band_hard_upper`] the charge grows at
+`inventory_aversion_hard` (λ_hard, which must be at least λ) instead of λ:
+
+```
+inventory_penalty = min( λ · σ·√τ · q_excess + (λ_hard − λ) · σ·√τ · q_excess_hard , 5% )
+```
+
+`q_excess_hard` is the distance past the hard edge, in the same units. The charge is
+continuous at both edges and the inner band's behaviour is unchanged. A blank hard edge turns
+the hard tier off on that side, and a blank `inventory_aversion_hard` equals λ, which also
+turns it off: both must be set for the tier to do anything. Leave all three blank for the
+single-band charge above.
+
 #### Why the contract does not change
 
 With two deltas we would send `[δ_ask, δ_bid, mid]`, three numbers, and the contract would

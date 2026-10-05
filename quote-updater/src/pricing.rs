@@ -1343,6 +1343,9 @@ mod tests {
                 inventory_aversion: Some("1"),
                 inventory_band_lower: Some("0.25"),
                 inventory_band_upper: Some("0.75"),
+                inventory_aversion_hard: None,
+                inventory_band_hard_lower: None,
+                inventory_band_hard_upper: None,
             },
         )
         .unwrap();

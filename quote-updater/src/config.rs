@@ -293,6 +293,12 @@ pub struct RawPair {
     pub inventory_band_lower: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inventory_band_upper: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory_aversion_hard: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory_band_hard_lower: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory_band_hard_upper: Option<String>,
     /// A custom pricer's stanza: `kind` names a pricer the binary registered, and the rest
     /// is that kind's own config. Kept as the table it was written as, so the backoffice's
     /// round-trip preserves a stanza it cannot interpret, and reload compares it as written.
@@ -718,6 +724,9 @@ fn parse_volatile(raw: &RawPair, at: &str) -> Result<Option<VolatileParams>> {
             inventory_aversion: raw.inventory_aversion.as_deref(),
             inventory_band_lower: raw.inventory_band_lower.as_deref(),
             inventory_band_upper: raw.inventory_band_upper.as_deref(),
+            inventory_aversion_hard: raw.inventory_aversion_hard.as_deref(),
+            inventory_band_hard_lower: raw.inventory_band_hard_lower.as_deref(),
+            inventory_band_hard_upper: raw.inventory_band_hard_upper.as_deref(),
         },
     )
     .map(Some)
