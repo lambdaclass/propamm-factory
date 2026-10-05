@@ -1,0 +1,4 @@
+# For e2e/run.py (`make e2e`). websockets 13 is the first with the asyncio server API
+# mocks.py uses.
+aiohttp>=3.8
+websockets>=13

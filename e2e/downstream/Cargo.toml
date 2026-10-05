@@ -1,0 +1,22 @@
+# A crate outside the workspace, depending on the library the way another repository would.
+# What it proves, on every CI run: the six ethrex git pins resolve transitively through the
+# library, a downstream needs no workspace of ours (no shared Cargo.lock, no release profile
+# of ours), and the public API is enough for the `tilted` example, whose source this crate's
+# main.rs is byte for byte (`quote-updater/tests/downstream_matches_example.rs` keeps it so).
+# By path rather than by git, because a git dependency needs a pushed commit; the resolution
+# is the same.
+#
+# The empty `[workspace]` table is what keeps it out of the root workspace. A root-level
+# `exclude` would not: cargo counts every manifest under a listed member's directory as an
+# explicit member, and explicit membership beats `exclude`.
+[workspace]
+
+[package]
+name = "downstream"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+quote-updater = { path = "../../quote-updater" }
+serde = { version = "1", features = ["derive"] }

@@ -1,0 +1,23 @@
+# my-propamm against a local chain (anvil) with the PropAMM contracts deployed by
+# `make -C ../propamm-contracts local`. No builders here: `--mode node` sends updateState
+# transactions straight to the chain and mines a block per push (`--mine`).
+#
+# `target` is the PropAMM the factory created; quickstart.sh fills it in from the chain.
+target = "__PROPAMM__"
+
+[settings]
+mode = "node"
+rpc_url = "http://127.0.0.1:8545"
+metrics_addr = "127.0.0.1:9464"
+
+# The one pair the local deploy creates: USDC/USDT, priced by our own rule from Binance's
+# live USDCUSDT book. Guards are builder-mode only, so none here.
+[[pairs]]
+tokens  = ["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", "0xdAC17F958D2ee523a2206206994597C13D831ec7"]
+symbol  = "USDCUSDT"
+key_env = "UPDATER_KEY_USDC_USDT"
+
+[pairs.pricing]
+kind        = "inventory_skew"
+half_spread = 0.0002
+strength    = 0.004
