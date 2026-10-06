@@ -172,7 +172,7 @@ mod tests {
     /// The port `metrics_fixture_server` binds, from METRICS_FIXTURE_PORT. Kept pure so it
     /// is testable without touching the environment, which every test in this binary shares.
     fn fixture_port(raw: Option<&str>) -> u16 {
-        // 9464 is the port deploy/prometheus/prometheus.yml scrapes and the one the README
+        // 9464 is the port deploy/prometheus/prometheus.yml scrapes and the one the docs
         // and .env.example use in their --metrics-addr examples.
         raw.and_then(|value| value.parse().ok()).unwrap_or(9464)
     }
@@ -417,7 +417,7 @@ mod tests {
     ///     cargo test metrics_fixture_server -- --ignored --nocapture
     ///
     /// It exists because the dashboard and the alert rules were authored against no
-    /// running Grafana at all (see deploy/grafana/README.md) and there was no way to see
+    /// running Grafana at all and there was no way to see
     /// either of them resolve. `make price-service` is the higher-fidelity check but a
     /// strictly narrower one: it runs `--mode node`, which has no builders, so it cannot
     /// light up the ack-latency, rejection or seq series at all.

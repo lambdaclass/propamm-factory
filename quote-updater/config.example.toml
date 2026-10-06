@@ -24,7 +24,7 @@
 #
 # A reload also brings back a pair halted by its circuit breaker — that lane is exactly a
 # lane this file says should be quoting and which is not. Do it once you trust the feed
-# again; see deploy/systemd/README.md.
+# again; see docs/manual.md, "Circuit breaker".
 #
 # It does not bring back a pair with `halted = true`: that one is kept, with every setting,
 # and not run until the flag is cleared (the backoffice's Resume, or a binary's

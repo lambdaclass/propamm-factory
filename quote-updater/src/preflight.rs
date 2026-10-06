@@ -80,9 +80,9 @@ pub enum TargetKind {
     /// No code. A target need not be a contract at all — any address can be one, it only
     /// has to call `addUpdater` — so this skips rather than fails.
     ///
-    /// Note this is *not* what `make fork-test` hits, despite its target being an anvil
-    /// account: on a real mainnet fork that address (anvil index 1) carries a 7702
-    /// delegation, so it classifies as `DelegatedEoa` below. Verified by running the target.
+    /// Note this is *not* what a run against a mainnet fork with an anvil account as its
+    /// target hits: on a real mainnet fork that address (anvil index 1) carries a 7702
+    /// delegation, so it classifies as `DelegatedEoa` below. Verified by running one.
     Eoa,
     /// EIP-7702: an EOA carrying the 23-byte `0xef0100 ‖ address` delegation designator.
     DelegatedEoa,
@@ -121,8 +121,8 @@ pub fn classify_target(code: Option<&[u8]>) -> TargetKind {
 /// Every kind except `Contract` skips those checks, and every skip has to say so. The
 /// three reasons are not interchangeable: `Unknown` means the RPC failed and the target may
 /// be a perfectly good PropAMM, `DelegatedEoa` means it has code that is not its own, and
-/// `Eoa` means there is no code at all — deliberate for `make fork-test`, but also what a
-/// mistyped or not-yet-deployed address looks like. Reporting nothing for `Eoa` left the one
+/// `Eoa` means there is no code at all — deliberate when a test run names a plain account
+/// as its target, but also what a mistyped or not-yet-deployed address looks like. Reporting nothing for `Eoa` left the one
 /// case an operator is most likely to hit by accident reading as a clean report.
 pub fn target_warning(target: Address, kind: TargetKind) -> Option<String> {
     let skipped = "so the target-side checks (registered pair, vault balance) were skipped";
@@ -736,7 +736,8 @@ pub async fn build_report(
     // non-contract target skips them rather than failing — but each reason for skipping is
     // reported, so "not a contract" is never confused with "the RPC failed" or with the
     // EIP-7702 case, where the target has code and still is not a contract. That last one is
-    // what `make fork-test` actually hits against mainnet state; see `target_warning`.
+    // what a run on a mainnet fork with an anvil account as its target actually hits; see
+    // `target_warning`.
     let target_code = client
         .get_code(config.target, BlockIdentifier::Tag(BlockTag::Latest))
         .await;
@@ -1158,8 +1159,8 @@ mod tests {
     }
 
     /// Every kind but `Contract` skips the target-side checks, and every skip must say so
-    /// — `Eoa` included, which is both `make fork-test`'s deliberate shape and what a
-    /// mistyped or not-yet-deployed PropAMM address looks like. Reporting nothing for it
+    /// — `Eoa` included, which is both the deliberate shape of a test run targeting a plain
+    /// account and what a mistyped or not-yet-deployed PropAMM address looks like. Reporting nothing for it
     /// left a report with two un-run checks looking identical to a clean one.
     #[test]
     fn every_target_that_skips_the_chain_checks_says_why() {

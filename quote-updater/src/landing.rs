@@ -191,7 +191,7 @@ impl LandingTracker {
 /// for the same reason. `PusherSignerNearlyDry` is a `predict_linear` over
 /// `signer_balance_wei`, and one NaN sample anywhere in its window makes the whole range
 /// return nothing, so the page falls silent and `PusherSignerRunwayUnknown` fires instead —
-/// see `deploy/prometheus/quote-updater.rules.yml`. Note the silence now outlasts the
+/// see `alerts/quote-updater.rules.yml`. Note the silence now outlasts the
 /// outage: the NaN suppresses until it ages out of the window, not just while the read is
 /// failing, which is the cost of asking a regression rather than a threshold.
 ///
