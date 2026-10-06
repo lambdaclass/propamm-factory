@@ -13,8 +13,8 @@ import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 /// configured Binance stream against its tokens. Against `make local` both reads come back
 /// empty, so pairs are labelled by lane (`lane 0x4aafb6…`) instead of `USDC/USDT` and the
 /// stream cross-check reports that it could not run. Both are warnings, not failures, so the
-/// local flow works — but it does mean `make local` cannot exercise either feature. Use
-/// `make fork-test-multi`, which forks mainnet and reads the real tokens, for that.
+/// local flow works — but it does mean `make local` cannot exercise either feature. An
+/// anvil fork of mainnet, which reads the real tokens, does.
 contract MockERC20 is ERC20 {
     constructor() ERC20("Mock", "MOCK") {}
 
