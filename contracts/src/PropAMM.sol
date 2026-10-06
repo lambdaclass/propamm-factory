@@ -8,8 +8,10 @@ import "@openzeppelin/contracts/utils/math/Math.sol";
 import "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/introspection/ERC165Upgradeable.sol";
 import {IPrioUpdateRegistry} from "./interfaces/IPrioUpdateRegistry.sol";
 import {IPropAMM} from "./interfaces/IPropAMM.sol";
+import {IPropAMMFillable} from "./interfaces/IPropAMMFillable.sol";
 
 error Expired();
 error InsufficientOutput(uint256 expectedOutput, uint256 receivedAmount);
@@ -24,7 +26,15 @@ error InsufficientVaultBalance(address token, uint256 needed, uint256 available)
 /// from, because that account is also what registers it (see `pairVaults`).
 error NoVault(address token0, address token1);
 
-contract PropAMM is IPropAMM, PausableUpgradeable, Ownable2StepUpgradeable, UUPSUpgradeable {
+/// @dev `ERC165Upgradeable` holds no state, so adding it moved no storage slot.
+contract PropAMM is
+    IPropAMM,
+    IPropAMMFillable,
+    ERC165Upgradeable,
+    PausableUpgradeable,
+    Ownable2StepUpgradeable,
+    UUPSUpgradeable
+{
     using SafeERC20 for IERC20;
 
     /// @notice A pair and the vault it fills from, as given to `initialize` and to the factory.
@@ -35,6 +45,16 @@ contract PropAMM is IPropAMM, PausableUpgradeable, Ownable2StepUpgradeable, UUPS
         address token0;
         address token1;
         address vault;
+    }
+
+    /// @notice What `_pricing` reads for one pair in one direction, for `_amountOut` to price with.
+    /// @dev A fill's worth at mid, in tokenOut units, is `amountIn * midNum / midDen`.
+    struct Pricing {
+        address vault;
+        uint256 vaultBalance;
+        uint256 delta;
+        uint256 midNum;
+        uint256 midDen;
     }
 
     /// @dev Every pair mutation announces itself, in canonical token order, so pair and vault
@@ -161,6 +181,47 @@ contract PropAMM is IPropAMM, PausableUpgradeable, Ownable2StepUpgradeable, UUPS
         return realAmountOut;
     }
 
+    /// @inheritdoc IPropAMMFillable
+    /// @dev Lets `PropAMMRouter.swapSplitV1` take the part of an order the vault can fill. Without
+    /// it the router probes `quote` at the order and at half of it, and `quote` reverts once a fill
+    /// outgrows the vault, so an order over about twice the vault's depth would skip this instance.
+    ///
+    /// Capacity is what `swap` can move out of the pair's vault: the lesser of its tokenOut
+    /// balance and its allowance to this instance. `quote` checks only the balance. Here the
+    /// allowance counts too, because the router builds a leg around the answer, and a leg that
+    /// reverts sends its input to the Uniswap remainder, which has no minimum output of its own.
+    ///
+    /// Reverts wherever `quote` does for any reason but size (paused, unlisted pair, stale or
+    /// malformed oracle data, empty vault), and for a `delta` so close to one that even the
+    /// best-paying fill spreads past it. The router reads a revert as no candidate.
+    function quoteFillable(address tokenIn, address tokenOut, uint256 amountIn)
+        external
+        view
+        override
+        whenNotPaused
+        returns (uint256 fillableAmountIn, uint256 amountOut)
+    {
+        Pricing memory p = _pricing(tokenIn, tokenOut);
+        uint256 capacity = Math.min(p.vaultBalance, IERC20(tokenOut).allowance(p.vault, address(this)));
+        uint256 midCap = _midCap(p, capacity);
+
+        // Compared at mid before converting the cap back to tokenIn. The conversion overflows for
+        // a vault worth more than 2^256 wei of tokenIn, which any order fits inside; past this
+        // comparison the cap is below `amountIn`, so it fits a word. Rounded up, so an order
+        // taken whole is worth at most `midCap` exactly, not just after flooring.
+        fillableAmountIn = Math.mulDiv(amountIn, p.midNum, p.midDen, Math.Rounding.Ceil) <= midCap
+            ? amountIn
+            : Math.mulDiv(midCap, p.midDen, p.midNum);
+        amountOut = _amountOut(p, tokenOut, fillableAmountIn);
+    }
+
+    /// @notice ERC-165. `PropAMMRouter` checks for `IPropAMMFillable` here before pricing this
+    /// instance through `quoteFillable`. `IPropAMM` is reported too, for off-chain discovery.
+    function supportsInterface(bytes4 interfaceId) public view override returns (bool) {
+        return interfaceId == type(IPropAMMFillable).interfaceId || interfaceId == type(IPropAMM).interfaceId
+            || super.supportsInterface(interfaceId);
+    }
+
     /// @notice The vault a pair fills from.
     /// @dev Reverts `UnsupportedPair` for a pair the instance does not list. Off-chain readers
     /// use this, in either token order, instead of a per-instance vault getter; `pairVaults`
@@ -218,35 +279,69 @@ contract PropAMM is IPropAMM, PausableUpgradeable, Ownable2StepUpgradeable, UUPS
     /// @param amountIn The amount of tokens being sent.
     /// @return amountOut The amount of tokens that will be received.
     function _quote(address tokenIn, address tokenOut, uint256 amountIn) internal view returns (uint256 amountOut) {
-        (address vault, uint256 pairKey) = _vaultFor(tokenIn, tokenOut);
+        return _amountOut(_pricing(tokenIn, tokenOut), tokenOut, amountIn);
+    }
+
+    /// @notice Reads what pricing a fill on a pair, in one direction, needs from outside this
+    /// contract: the pair's vault and its tokenOut balance, the oracle's `delta`, and `mid`
+    /// folded together with both tokens' decimals into one tokenIn-to-tokenOut conversion.
+    /// @dev Kept apart from `_amountOut` so `quoteFillable` can price two sizes off one read.
+    function _pricing(address tokenIn, address tokenOut) internal view returns (Pricing memory p) {
+        uint256 pairKey;
+        (p.vault, pairKey) = _vaultFor(tokenIn, tokenOut);
 
         (, uint256[] memory slots) = oracle.getState(pairKey, uint32(block.timestamp), uint32(block.timestamp));
         require(slots.length >= 2, InsufficientOracleData(pairKey, slots.length));
 
-        uint256 delta = slots[0];
+        p.delta = slots[0];
         uint256 mid = slots[1];
         require(mid != 0, InvalidMid(pairKey));
 
         uint256 decimalsMultiplierIn = 10 ** IERC20Metadata(tokenIn).decimals();
         uint256 decimalsMultiplierOut = 10 ** IERC20Metadata(tokenOut).decimals();
 
-        uint256 vaultBalance = IERC20(tokenOut).balanceOf(vault);
-        require(vaultBalance != 0, EmptyVault(tokenOut));
+        p.vaultBalance = IERC20(tokenOut).balanceOf(p.vault);
+        require(p.vaultBalance != 0, EmptyVault(tokenOut));
 
-        // What the fill is worth at mid, before any spread. `mid` prices one whole token0 in
-        // whole token1, so selling token0 multiplies by it and buying token0 divides by it.
-        uint256 midAmountOut = tokenIn < tokenOut
-            ? Math.mulDiv(amountIn, mid * decimalsMultiplierOut, PRICE_SCALE * decimalsMultiplierIn)
-            : Math.mulDiv(amountIn, PRICE_SCALE * decimalsMultiplierOut, mid * decimalsMultiplierIn);
+        // `mid` prices one whole token0 in whole token1, so selling token0 multiplies by it and
+        // buying token0 divides by it.
+        (p.midNum, p.midDen) = tokenIn < tokenOut
+            ? (mid * decimalsMultiplierOut, PRICE_SCALE * decimalsMultiplierIn)
+            : (PRICE_SCALE * decimalsMultiplierOut, mid * decimalsMultiplierIn);
+    }
+
+    /// @notice Prices `amountIn` against what `_pricing` read.
+    function _amountOut(Pricing memory p, address tokenOut, uint256 amountIn)
+        internal
+        pure
+        returns (uint256 amountOut)
+    {
+        // What the fill is worth at mid, before any spread.
+        uint256 midAmountOut = Math.mulDiv(amountIn, p.midNum, p.midDen);
 
         // The taker pays the spread either way, as a fraction taken off the mid fill, so both
         // directions are discounted identically and a round trip costs exactly (1 - spread)^2.
-        uint256 spread = delta + _priceImpact(midAmountOut, vaultBalance);
+        uint256 spread = p.delta + _priceImpact(midAmountOut, p.vaultBalance);
         require(spread < SPREAD_SCALE, SpreadTooWide(spread));
 
-        amountOut = Math.mulDiv(midAmountOut, SPREAD_SCALE - spread, SPREAD_SCALE);
+        // Rounded once: amountIn * midNum * (S - spread) / (midDen * S), floored, rather than
+        // flooring `midAmountOut` and then the spread off it. Flooring twice loses up to a wei
+        // whatever the fill's size, and a router that floors a partial leg at its pro-rata share
+        // of this quote (`PropAMMRouter.swapSplitV1`) can then find the smaller leg a wei short.
+        // Floored once, the output is a non-increasing rate times the size, and no smaller fill
+        // falls under its share.
+        //
+        // Taken in two steps so no product past `amountIn * midNum` (which mulDiv holds in 512
+        // bits) has to fit a word: multiplying `midNum` by the spread's scale first would overflow
+        // for prices 1e18 times smaller than `_pricing` accepts. With amountIn * midNum =
+        // midAmountOut * midDen + rem, the exact value is midAmountOut * c / S plus
+        // rem * c / (midDen * S), and the second term, under c / S <= 1, adds one unit at most.
+        uint256 c = SPREAD_SCALE - spread;
+        amountOut = Math.mulDiv(midAmountOut, c, SPREAD_SCALE);
+        uint256 rem = mulmod(amountIn, p.midNum, p.midDen);
+        if (mulmod(midAmountOut, c, SPREAD_SCALE) + Math.mulDiv(rem, c, p.midDen) >= SPREAD_SCALE) amountOut += 1;
 
-        require(amountOut <= vaultBalance, InsufficientVaultBalance(tokenOut, amountOut, vaultBalance));
+        require(amountOut <= p.vaultBalance, InsufficientVaultBalance(tokenOut, amountOut, p.vaultBalance));
     }
 
     /// @notice Prices the impact a fill has, on top of the oracle's spread.
@@ -259,6 +354,38 @@ contract PropAMM is IPropAMM, PausableUpgradeable, Ownable2StepUpgradeable, UUPS
     /// @return impact The fraction to discount the fill by, at `SPREAD_SCALE`.
     function _priceImpact(uint256 midAmountOut, uint256 vaultBalance) internal pure returns (uint256 impact) {
         return Math.mulDiv(IMPACT_FACTOR, midAmountOut, vaultBalance);
+    }
+
+    /// @notice The most a fill may be worth at mid, in tokenOut wei, for it and every smaller fill
+    /// to price at no more than `capacity`: the largest such worth, short of rounding.
+    /// @dev Inverts `_amountOut`. With S = SPREAD_SCALE, B the vault balance and u a fill's exact,
+    /// unrounded worth at mid (`amountIn * midNum / midDen`), `_amountOut` never exceeds the
+    /// concave quadratic
+    ///     f(u) = (a*u - IMPACT_FACTOR*u^2/B) / S,    a = S - delta + 1 + ceil(IMPACT_FACTOR/B)
+    /// The extra terms in `a` cover `_priceImpact` flooring a floored `midAmountOut`, which can
+    /// charge up to 1 + IMPACT_FACTOR/B units of spread less than the exact curve would. f rises
+    /// to a peak at u = a*B / (2*IMPACT_FACTOR), and past it a larger fill pays less.
+    ///
+    /// When the peak is above `capacity`, the cap is the smaller root of f(u) = capacity, written as
+    ///     u = 2*capacity*S / (a + sqrt(a^2 - 4*IMPACT_FACTOR*S*capacity/B))
+    /// rather than the textbook (a - sqrt(...))*B / (2*IMPACT_FACTOR), which subtracts two nearly
+    /// equal numbers and loses most of its precision doing it. When it is not (only for a `delta`
+    /// within about 2% of S), no fill can overdraw, and the cap is the peak itself: the most the
+    /// pair can pay. A cap past it would pay less than a smaller fill, and far enough past, take
+    /// the spread over one.
+    ///
+    /// Either way the cap is on f's rising side, so every smaller fill is under `capacity` too:
+    /// the router can trim the leg to whatever its better-ranked venues left over and it still
+    /// fits. Every step rounds toward a smaller cap.
+    function _midCap(Pricing memory p, uint256 capacity) internal pure returns (uint256) {
+        require(p.delta < SPREAD_SCALE, SpreadTooWide(p.delta));
+        uint256 a = SPREAD_SCALE - p.delta + 1 + Math.ceilDiv(IMPACT_FACTOR, p.vaultBalance);
+        // 4*IMPACT_FACTOR*S*capacity/B, at most 4e32 since capacity <= B. Floored, which keeps the
+        // peak test exact (a^2 is an integer) and only grows the root below.
+        uint256 k = Math.mulDiv(4 * IMPACT_FACTOR * SPREAD_SCALE, capacity, p.vaultBalance);
+        if (a * a <= k) return Math.mulDiv(a, p.vaultBalance, 2 * IMPACT_FACTOR);
+        uint256 root = Math.sqrt(a * a - k, Math.Rounding.Ceil);
+        return Math.mulDiv(capacity, 2 * SPREAD_SCALE, a + root);
     }
 
     //------------------------------

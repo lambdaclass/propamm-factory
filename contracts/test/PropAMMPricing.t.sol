@@ -144,6 +144,40 @@ contract PropAMMPricingTest is Test {
         assertEq(propAmm.quote(WETH, USDT, 1e18), 1_599_199_840);
     }
 
+    /// The output is rounded once, from amountIn, not once for the mid value and again for the
+    /// spread. A wei of WETH under 1 WETH is worth a fraction of a USDT wei, so it pays what 1 WETH
+    /// pays; rounding twice paid a wei less (1_599_199_839). That second loss did not shrink with
+    /// the fill, which left `PropAMMRouter`'s partial legs a wei under their pro-rata floor.
+    function test_quote_roundsTheOutputOnce() public {
+        _setPrice(1600e18, 5e14);
+        _fundVault(USDT, 1_600_000e6);
+
+        assertEq(propAmm.quote(WETH, USDT, 1e18), 1_599_199_840);
+        assertEq(propAmm.quote(WETH, USDT, 1e18 - 1), 1_599_199_840);
+    }
+
+    /// The rounding's boundary case: an output that is exactly whole, reached through a remainder.
+    /// A wei of USDT at 3 USDT per WETH is worth 1e12/3 WETH wei at mid, and a 25% spread leaves
+    /// exactly 2.5e11 of it. Taking the floor in two steps has to carry the remainder's share into
+    /// the result even when it lands exactly on a whole wei; floored without it, this is 1 short.
+    function test_quote_isExactWhenTheOutputIsWhole() public {
+        _setPrice(3e18, 2.5e17);
+        _fundVault(WETH, 1e26); // deep enough that impact rounds to zero
+
+        assertEq(propAmm.quote(USDT, WETH, 1), 250_000_000_000);
+    }
+
+    /// Rounding once must not cost range: any price whose mid and decimals fit a word still
+    /// quotes. A whole WETH at 1e42 USDT is absurd on purpose; multiplying the conversion by the
+    /// spread's scale before dividing would overflow here (and for prices 1e18 times smaller).
+    function test_quote_pricesAtTheTopOfThePriceDomain() public {
+        _setPrice(1e60, 0);
+        _fundVault(USDT, 1e50);
+
+        // 1e48 USDT wei at mid, less an impact of 1e48/1e50 of IMPACT_FACTOR.
+        assertEq(propAmm.quote(WETH, USDT, 1e18), 999_999e42);
+    }
+
     //------------------------------
     // Symmetry
     //------------------------------

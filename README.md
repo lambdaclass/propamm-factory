@@ -79,6 +79,15 @@ creates instances with `createPropAMM(owner, oracle, updaters, pairs)`, each pai
 vault it fills from and the keys allowed to set its price. [`contracts/`](contracts/) has the
 sources and tests.
 
+Instances also implement `IPropAMMFillable`, advertised through ERC-165, which
+`PropAMMRouter`'s split routing (`swapSplitV1`) prices a venue with in one call:
+`quoteFillable(tokenIn, tokenOut, amountIn)` answers with how much of the order the pair's vault
+can fill (the lesser of its output-token balance and its allowance to the instance) and what that
+part pays, so an order larger than the vault still routes its fillable part here. The router
+reads every capacity before any leg fills, so two instances it lists must not fill the same
+output token from the same vault: when one instance replaces another, take the old one off the
+router's venue list first.
+
 ```bash
 make local          # anvil with the registry, the factory and one PropAMM deployed
 make price-service  # keep its price fresh with a pricing kind the library ships, no code of yours
