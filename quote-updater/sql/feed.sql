@@ -87,6 +87,23 @@ create index if not exists quotes_lane_ts on feed.quotes (lane, ts);
 -- the table existed, so an `alter` rather than a column above: `add column if not exists`
 -- keeps every connect idempotent, like the `create table` it follows.
 alter table feed.quotes add column if not exists terms jsonb;
+-- An earlier schema kept the volatile kind's terms as five columns of their own (`skew`,
+-- `sigma`, `hold`, `edge`, `stale`). A database that has them gets those rows folded into
+-- `terms`, so every reader looks in one place; a database created by this file never had
+-- the columns and skips this. Idempotent: a folded row has `terms` and is not matched again.
+do $$ begin
+  if exists (
+    select from information_schema.columns
+    where table_schema = 'feed' and table_name = 'quotes' and column_name = 'hold'
+  ) then
+    update feed.quotes
+    set terms = jsonb_strip_nulls(jsonb_build_object(
+      'skew', skew, 'sigma', sigma, 'hold', hold, 'edge', edge, 'stale', stale))
+    where terms is null
+      and (skew is not null or sigma is not null or hold is not null
+           or edge is not null or stale is not null);
+  end if;
+end $$;
 -- What a spread panel needs beside each quote, stamped by the updater when it
 -- signed it, so the panel is one read of `quotes_lane_ts` and joins nothing: `balance0` and
 -- `balance1` are the pair's vault holdings of token0 and token1 (address order, whole
