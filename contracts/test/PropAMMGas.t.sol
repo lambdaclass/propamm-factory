@@ -76,9 +76,11 @@ contract PropAMMGasTest is Test {
         assertTrue(ERC165Checker.supportsInterface(address(propAmm), type(IPropAMMFillable).interfaceId));
     }
 
-    /// The router's blind probe takes at least two quotes in one transaction, at the order and at
-    /// half of it, and up to eight more when it has to search downwards. The one call it takes
-    /// instead must cost less than the cheapest probe.
+    /// The router's blind probe quotes the order and half of it in one transaction. It searches
+    /// further down only when both quotes return the same output, the mark of a venue that keeps
+    /// what it cannot fill. Past its vault this one reverts instead, which the router reads as a
+    /// dead point, so the probe here is always those two quotes. The one call it takes instead
+    /// must cost less than both.
     function test_gas_quoteFillableIsCheaperThanTheBlindProbe() public {
         uint256 cold = vm.snapshotState();
         propAmm.quoteFillable(WETH, USDT, 500e18);
