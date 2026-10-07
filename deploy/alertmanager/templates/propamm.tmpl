@@ -1,0 +1,56 @@
+{{/*
+  Slack rendering for both receivers in ../alertmanager.yml.
+
+  Alertmanager's built-in slack.default.* templates title a message with the alert name and
+  the group labels, and leave the body as `{{ .CommonAnnotations.summary }}`. The rules file
+  puts real operator instructions in `description` — what latched, what to check, which
+  command brings the lane back — so the default rendering drops the only part of an alert a
+  person needs at 3am. These two templates exist to put it in the message.
+*/}}
+
+{{/*
+  "FIRING ×3 · WETH/USDC: circuit breaker latched; the lane is not quoting"
+
+  CommonAnnotations only holds an annotation when every alert in the group agrees on it, and
+  most summaries here interpolate {{ $labels.pair }} — which is exactly why ../alertmanager.yml
+  groups by pair as well as alertname. When it is empty anyway (a group spanning pairs, or a
+  rule with no summary), the alert name is a worse title but never a wrong one.
+*/}}
+{{ define "propamm.title" -}}
+{{ .Status | toUpper }}
+{{- if and (eq .Status "firing") (gt (len .Alerts.Firing) 1) }} ×{{ len .Alerts.Firing }}{{ end }} ·
+{{- if .CommonAnnotations.summary }} {{ .CommonAnnotations.summary }}
+{{- else }} {{ .GroupLabels.alertname }}{{ end }}
+{{- end }}
+
+{{/*
+  One block per alert in the group: the rule that fired, the labels that say which lane and
+  which builder, and the description.
+
+  The description fallback is not defensive padding — three rules genuinely have no
+  `description` (PusherFeedDown, PusherAckLatencyNearEviction, PusherRpcSlow), because their
+  summary already says the whole thing. Without the fallback those three notify as a bare
+  alert name over an empty line.
+*/}}
+{{ define "propamm.text" -}}
+{{ range .Alerts -}}
+*{{ .Labels.alertname }}*
+{{- if .Labels.pair }} · `{{ .Labels.pair }}`{{ end }}
+{{- if .Labels.builder }} · `{{ .Labels.builder }}`{{ end }}
+{{ if .Annotations.description }}{{ .Annotations.description }}{{ else }}{{ .Annotations.summary }}{{ end }}
+
+{{ end -}}
+{{- end }}
+
+{{/*
+  The audit receiver's title. Same body as everything else, but no "FIRING ×N ·" prefix:
+  PusherConfigChanged reports a reload that worked, and leading with the word this file uses
+  for outages reads as an incident to anyone scanning the channel. There is also never more
+  than one of it — config_generation is process-wide — so the count the other title carries
+  would always be ×1.
+*/}}
+{{ define "propamm.audit.title" -}}
+{{ if .CommonAnnotations.summary }}{{ .CommonAnnotations.summary }}
+{{- else }}{{ .GroupLabels.alertname }}{{ end }}
+{{- end }}
+

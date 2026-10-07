@@ -866,7 +866,7 @@ Five series are worth watching ahead of everything else the registry exposes:
   back from the registry to see whether its update got in. Most blocks it did not, and that
   is normal: a builder includes the update only when a swap hits the lane in that block.
   What this counts is blocks where the read-back itself failed, so the updater cannot tell;
-  the `PusherLandingUnverified` alert in `deploy/prometheus/` pages on it.
+  the `PusherLandingUnverified` alert in `deploy/alerts/` pages on it.
 - the gap between `quote_updater_feed_mid` and `quote_updater_published_mid` — that gap *is*
   withdrawn time. A stale price, an out-of-band print or a tripped breaker withdraws the
   published quote while the feed keeps moving underneath it, and watching the two series
@@ -904,24 +904,23 @@ on the previous config while the config file says something else. No other serie
 nothing is unhealthy — the gap is only between the file and what is running.
 `quote_updater_config_generation` counts the reloads that did apply.
 
-Alert rules and a Grafana dashboard for all of this live in `deploy/prometheus/` and
-`deploy/grafana/` — see their READMEs for the scrape config, the thresholds (pinned to the
-same Rust constants the updater itself enforces at startup), and how to load the dashboard.
+The alert rules for all of this live in `deploy/alerts/` (their thresholds are pinned to the same
+Rust constants the updater itself enforces at startup, and `make`'s promtool test checks they
+fire), and `deploy/` has the Prometheus scrape config, the Alertmanager routing and a Grafana
+dashboard, provisioned by its compose file.
 
-To look at any of it locally, `deploy/compose.yaml` is a Prometheus and a Grafana already
-wired to a updater on the host:
+To look at any of it with invented numbers and no chain, keys or venue, `metrics_fixture_server`
+is an `#[ignore]`d test in `quote-updater/src/exporter.rs` that drives the real registry
+through the real exporter on port 9464:
 
 ```bash
-make observability-up     # Prometheus :9090, Grafana :3000 (admin/admin), dashboard loaded
-make metrics-fixture      # something to scrape: no chain, no keys, no Binance
-make observability-down
+cd quote-updater && cargo test metrics_fixture_server -- --ignored --nocapture
 ```
 
-`make metrics-fixture` is `metrics_fixture_server`, an `#[ignore]`d test in
-`quote-updater/src/exporter.rs` that drives the real registry through the real exporter with
-invented numbers. It covers what a local chain cannot: `--mode node` has no builders, so
-`make price-service` leaves every builder series empty, and neither path easily produces the
-never-recorded gauge case four of the alert rules depend on. See `deploy/README.md`.
+It covers what a local chain cannot: `--mode node` has no builders, so `make price-service`
+leaves every builder series empty, and neither path easily produces the never-recorded gauge
+case four of the alert rules depend on. Point a Prometheus at it, or run the stack in
+`deploy/` against it with `updater:9464` swapped for the host in its scrape config.
 
 ### Recording the feed
 

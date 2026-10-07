@@ -7,7 +7,7 @@ bounds on any price, reload, the builders, metrics, and this manual.
 
 ```toml
 [dependencies]
-quote-updater = { git = "https://github.com/lambdaclass/propamm-quote-updater", rev = "<commit>" }
+quote-updater = { git = "https://github.com/lambdaclass/propamm-factory", rev = "<commit>" }
 serde = { version = "1", features = ["derive"] }   # a stanza's `Deserialize`
 # For `run(args)`/`start(args)` in a runtime of your own, and for an observer that logs:
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

@@ -308,8 +308,8 @@ groups:
       # here because a change to a live lane's pricing is otherwise invisible: the two rules
       # above catch a reload that was *refused* or that half-applied, and a reload that
       # succeeds cleanly says nothing at all. `config.toml` is edited by hand over ssh and by
-      # the backoffice, which does the edit-and-reload on an operator's behalf and — per
-      # deploy/systemd/README.md — has no login, only a tailnet address. So delta, max_deviation
+      # the backoffice, which does the edit-and-reload on an operator's behalf and has no
+      # login, only a tailnet address (deploy/README.md). So delta, max_deviation
       # or a band can change on a quoting lane with no trace outside the journal.
       #
       # What it buys is adjacency. When a page arrives twenty minutes after someone widened a

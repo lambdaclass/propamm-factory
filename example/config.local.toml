@@ -1,17 +1,33 @@
 # my-propamm against a local chain (anvil) with the PropAMM contracts deployed by
-# `make -C ../propamm-contracts local`. No builders here: `--mode node` sends updateState
-# transactions straight to the chain and mines a block per push (`--mine`).
+# `make local`, quoting through the repo's two fake builders (e2e/mocks.py), which include
+# each block's update in the block they mine on anvil. Prices come from the real exchange.
 #
-# `target` is the PropAMM the factory created; quickstart.sh fills it in from the chain.
+# `target` is the PropAMM the factory created; `make quickstart` fills it in from the chain.
 target = "__PROPAMM__"
 
 [settings]
-mode = "node"
+mode = "builder"
 rpc_url = "http://127.0.0.1:8545"
 metrics_addr = "127.0.0.1:9464"
+# The page for adding pairs, changing their settings and halting them.
+backoffice_addr = "127.0.0.1:8088"
+
+# Where the vault's tokens get a USD price: the mocks' stand-in, not the real API.
+[settings.endpoints]
+coingecko = "http://127.0.0.1:8549"
+
+[[builder]]
+name     = "mock-a"
+endpoint = "ws://127.0.0.1:8547/ws/sendquoteupdate"
+api_key  = "key-a"
+
+[[builder]]
+name     = "mock-b"
+endpoint = "ws://127.0.0.1:8548/ws/sendquoteupdate"
+api_key  = "key-b"
 
 # The one pair the local deploy creates: USDC/USDT, priced by our own rule from Binance's
-# live USDCUSDT book. Guards are builder-mode only, so none here.
+# live USDCUSDT book.
 [[pairs]]
 tokens  = ["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", "0xdAC17F958D2ee523a2206206994597C13D831ec7"]
 symbol  = "USDCUSDT"

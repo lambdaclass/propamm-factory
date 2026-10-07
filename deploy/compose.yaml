@@ -1,0 +1,167 @@
+# One server, the whole thing: the quote updater, the Postgres it records into, Prometheus
+# with the shipped alert rules, Alertmanager, and Grafana with a dashboard of the updater's
+# metrics. deploy/README.md is the walk-through; deploy/.env and deploy/config/config.toml
+# are the two files to fill.
+#
+# Only the backoffice and Grafana are published on a host address you choose (your tailnet
+# address; 127.0.0.1 by default). Prometheus and Alertmanager are published on 127.0.0.1 for
+# a look from an ssh session; Postgres and the metrics port stay inside the compose network.
+name: propamm
+
+services:
+  updater:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: propamm/quote-updater:local
+    container_name: propamm-updater
+    # Every variable in deploy/.env reaches the process: the UPDATER_KEY_* the config names,
+    # RPC_URL (an environment variable beats the file's [settings]), and compose's own.
+    env_file: .env
+    environment:
+      CONFIG: /config/config.toml
+      RECORD_DB_URL: postgresql://quote_updater:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}@postgres:5432/quote_updater
+    volumes:
+      # Read and written: the backoffice rewrites config.toml in place, and the updater
+      # reloads it.
+      - ./config:/config
+    # An RPC node or a builder running on this host is `host.docker.internal` from inside.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      # The backoffice. It refuses to bind every interface, so the config binds the fixed
+      # address below and compose publishes it on the host address you choose. The page has
+      # no login: publish it on your tailnet address, never a public one.
+      - "${BACKOFFICE_BIND:-127.0.0.1}:8088:8088"
+    networks:
+      propamm:
+        ipv4_address: 172.28.0.10
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://127.0.0.1:9464/metrics"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+    # A stop cancels the live quote at every builder before exiting; give it the time.
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:17
+    container_name: propamm-postgres
+    environment:
+      POSTGRES_USER: quote_updater
+      POSTGRES_DB: quote_updater
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U quote_updater -d quote_updater"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    networks: [propamm]
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.14.0
+    container_name: propamm-prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # The rules the repo ships and tests, mounted straight from deploy/alerts/.
+      - ./alerts/quote-updater.rules.yml:/etc/prometheus/rules/quote-updater.rules.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=90d
+      - --web.enable-lifecycle
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    networks: [propamm]
+    restart: unless-stopped
+
+  alertmanager:
+    image: prom/alertmanager:v0.34.0
+    container_name: propamm-alertmanager
+    ports:
+      - "127.0.0.1:9093:9093"
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - ./alertmanager/templates:/etc/alertmanager/templates:ro
+      # The Slack incoming-webhook URL, one line, gitignored. See deploy/README.md.
+      - ./alertmanager/slack-webhook:/etc/alertmanager/slack-webhook:ro
+      - alertmanager-data:/alertmanager
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9093/-/healthy"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    networks: [propamm]
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:12.2.0
+    container_name: propamm-grafana
+    ports:
+      - "${GRAFANA_BIND:-127.0.0.1}:3000:3000"
+    depends_on:
+      prometheus:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in deploy/.env}
+      # Read by the provisioning files (grafana/provisioning), which `make quickstart`
+      # also uses, pointed at localhost.
+      PROMETHEUS_URL: http://prometheus:9090
+      RECORDER_ADDR: postgres:5432
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}
+      GRAFANA_DASHBOARDS: /var/lib/grafana/dashboards
+      GF_USERS_DEFAULT_THEME: dark
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/quote-updater.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/quote-updater.json:/var/lib/grafana/dashboards/quote-updater.json:ro
+      - grafana-data:/var/lib/grafana
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    networks: [propamm]
+    restart: unless-stopped
+
+networks:
+  propamm:
+    driver: bridge
+    ipam:
+      config:
+        # Fixed so the updater's backoffice has an address to bind (see `updater` above).
+        - subnet: 172.28.0.0/24
+
+volumes:
+  postgres-data:
+  prometheus-data:
+  alertmanager-data:
+  grafana-data:

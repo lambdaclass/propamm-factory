@@ -14,6 +14,12 @@
   a builder, dump what happened.
 
 Listens on 127.0.0.1 only. Run by scenario.py with its ports as a JSON argument.
+
+With `anvil_rpc` in the argument (`make quickstart`), the chain is a real anvil instead: the
+builders still collect updates, and every `mine_every` seconds the latest one per quote for
+anvil's next block is sent to anvil and a block is mined with the timestamp those updates
+were signed for, the way a builder that won the block would include them. `binance_port` is
+optional there, so the updater can read the real exchange.
 """
 
 import asyncio
@@ -22,6 +28,7 @@ import json
 import sys
 import time
 
+import aiohttp
 import websockets
 from aiohttp import web
 from websockets.asyncio.server import serve
@@ -360,6 +367,55 @@ async def auto_mine(every):
         W.mine()
 
 
+async def mine_on_anvil(url, every):
+    """`auto_mine` against a real anvil (`--no-mining`): every `every` seconds, the updates
+    the builders hold for anvil's next block are sent to it and a block is mined stamped with
+    the timestamp they were signed for (the parent's plus 12s, as the updater computes it),
+    so the registry's read-side check passes and `isActive` is true in that block. A block
+    with no update is mined the same way, so the chain keeps moving and the updater keeps
+    quoting the block after."""
+    async def call(session, method, *params):
+        async with session.post(url, json={"jsonrpc": "2.0", "id": 1, "method": method,
+                                           "params": list(params)}) as r:
+            body = await r.json()
+            if "error" in body:
+                raise RuntimeError(f"{method}: {body['error']}")
+            return body["result"]
+
+    async with aiohttp.ClientSession() as session:
+        while True:
+            await asyncio.sleep(every)
+            head = await call(session, "eth_getBlockByNumber", "latest", False)
+            n = int(head["number"], 16)
+            next_ts = int(head["timestamp"], 16) + 12
+            # Updates for blocks that already passed are stale: the builder would drop them.
+            for stale in [b for b in W.pending if b <= n]:
+                W.pending.pop(stale)
+            raws = sorted(set(W.pending.pop(n + 1, {}).values()))
+            if raws:
+                tx = json.loads(cast("decode-tx", raws[0]))
+                w = words(bytes.fromhex(tx["input"][2:])[4:])
+                next_ts = int.from_bytes(w[2], "big")
+            # Whatever else is waiting in anvil's pool (a swap from `make swap`) goes after
+            # the updates, as a builder orders its block: the pool is emptied and refilled,
+            # updates first, each sender's own transactions in nonce order.
+            pool = await call(session, "txpool_content")
+            waiting = []
+            for sender in pool.get("pending", {}).values():
+                for nonce in sorted(sender, key=int):
+                    waiting.append(await call(session, "eth_getRawTransactionByHash", sender[nonce]["hash"]))
+            await call(session, "anvil_dropAllTransactions")
+            await call(session, "evm_setNextBlockTimestamp", next_ts)
+            included = []
+            for raw in raws + waiting:
+                try:
+                    included.append(await call(session, "eth_sendRawTransaction", raw))
+                except RuntimeError as err:
+                    W.event("anvil_rejected", block=n + 1, error=str(err))
+            await call(session, "anvil_mine")
+            W.event("mined", block=n + 1, ts=next_ts, included=included)
+
+
 async def main():
     cfg = json.loads(sys.argv[1])
     W.prices.update({s: tuple(p) for s, p in cfg["prices"].items()})
@@ -372,10 +428,14 @@ async def main():
     await web.TCPSite(runner, "127.0.0.1", cfg["rpc_port"]).start()
     for b in cfg["builders"]:
         await serve(builder(b["name"], b["api_key"]), "127.0.0.1", b["port"])
-    await serve(binance, "127.0.0.1", cfg["binance_port"])
+    if cfg.get("binance_port"):
+        await serve(binance, "127.0.0.1", cfg["binance_port"])
     print("READY", flush=True)
-    if cfg.get("mine_every"):
-        W.miner = asyncio.create_task(auto_mine(cfg["mine_every"]))  # held: the loop keeps a weak ref
+    if cfg.get("mine_every"):  # held: the loop keeps a weak ref
+        if cfg.get("anvil_rpc"):
+            W.miner = asyncio.create_task(mine_on_anvil(cfg["anvil_rpc"], cfg["mine_every"]))
+        else:
+            W.miner = asyncio.create_task(auto_mine(cfg["mine_every"]))
     await asyncio.Future()
 
 

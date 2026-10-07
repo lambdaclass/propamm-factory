@@ -8,8 +8,8 @@
 //!   price disagree by more than a limit. Runs on every composite sample.
 //! - A quote guard, `share_cap`: withdraws our quote while the vault is more lopsided than a
 //!   cap, and halts the lane if the pricer reports a share that cannot exist.
-//! - An observer, `block_log`: logs one line per block and per lifecycle event. Watches,
-//!   never decides.
+//! - An observer, `block_log`: logs lifecycle events (a lane starting, stopping, tripping,
+//!   a reload) and withdrawn blocks with the pricer's diagnostics. Watches, never decides.
 //!
 //! Everything else is the library's: config file and reload, the price feeds, the builders,
 //! `--check`, metrics, the backoffice, the deviation breaker and the core's bounds.
@@ -64,7 +64,10 @@ impl Pricer for InventorySkew {
         if reading.age(tick.now()) > max_age {
             return Err(Refusal::new(
                 &self.stale_inventory,
-                format!("vault reading older than {}s", self.cfg.max_inventory_age_secs),
+                format!(
+                    "vault reading older than {}s",
+                    self.cfg.max_inventory_age_secs
+                ),
             ));
         }
 
@@ -85,8 +88,43 @@ impl Pricer for InventorySkew {
 
 struct InventorySkewFactory;
 
+/// What the backoffice shows for a pair priced by this kind: one input per knob, written
+/// into the stanza as numbers since the config reads `f64` and `u64`.
+const FIELDS: &[FormField] = &[
+    FormField::number(
+        "half_spread",
+        "0.0005",
+        "the spread, as a fraction of the mid. 0.0005 means we sell at mid + 0.05% and buy at \
+         mid − 0.05%.",
+    ),
+    FormField::number(
+        "strength",
+        "0.02",
+        "how far the mid moves per unit of imbalance. 0.02: a vault that is all base pushes \
+         the mid 1% down.",
+    ),
+    FormField::number(
+        "max_inventory_age_secs",
+        "60",
+        "a vault reading older than this many seconds stops the pair quoting. Blank is 60.",
+    ),
+];
+
 impl Factory for InventorySkewFactory {
     type Config = InventorySkewCfg;
+
+    fn fields(&self) -> &'static [FormField] {
+        FIELDS
+    }
+
+    fn form_help(&self) -> &'static str {
+        "<p class=explain>A fixed spread, with the mid moved toward the token the vault holds \
+         too much of, so fills rebalance it.</p>"
+    }
+
+    fn summary(&self, cfg: &InventorySkewCfg) -> String {
+        format!("half_spread {} strength {}", cfg.half_spread, cfg.strength)
+    }
     type Pricer = InventorySkew;
 
     /// Runs at startup, on reload and under `--check`, before anything is built.
@@ -207,7 +245,10 @@ impl QuoteGuard for ShareCap {
         if share > self.cfg.max_share || share < lo {
             return Gate::Withdraw(Refusal::new(
                 &self.lopsided,
-                format!("base share {share:.3} outside [{lo:.2}, {:.2}]", self.cfg.max_share),
+                format!(
+                    "base share {share:.3} outside [{lo:.2}, {:.2}]",
+                    self.cfg.max_share
+                ),
             ));
         }
         Gate::Allow
@@ -229,29 +270,42 @@ impl Observer for BlockLog {
         Box::pin(async move {
             // Every enum here is #[non_exhaustive]: match fields with `..` and keep a `_` arm.
             match event {
-                Event::LaneStarted { pair, .. } => tracing::info!("[{pair}] observer: lane started"),
-                Event::LaneStopped { pair, .. } => tracing::info!("[{pair}] observer: lane stopped"),
-                Event::Tripped { pair, source, cause, .. } => {
-                    tracing::warn!("[{pair}] observer: tripped by `{source}` ({})", cause.as_str())
+                Event::LaneStarted { pair, .. } => {
+                    tracing::info!("[{pair}] observer: lane started")
+                }
+                Event::LaneStopped { pair, .. } => {
+                    tracing::info!("[{pair}] observer: lane stopped")
+                }
+                Event::Tripped {
+                    pair,
+                    source,
+                    cause,
+                    ..
+                } => {
+                    tracing::warn!(
+                        "[{pair}] observer: tripped by `{source}` ({})",
+                        cause.as_str()
+                    )
                 }
                 Event::Rearmed { pair, .. } => tracing::info!("[{pair}] observer: re-armed"),
-                Event::Block { pair, block, outcome, diagnostics, .. } => {
-                    let diag: Vec<String> =
-                        diagnostics.iter().map(|(k, v)| format!("{k}={v:.4}")).collect();
-                    match outcome {
-                        BlockOutcome::Quoted { delta, mid, .. } => tracing::info!(
-                            "[{pair}] observer: block {block} quoted mid={mid} delta={delta} {}",
-                            diag.join(" ")
-                        ),
-                        BlockOutcome::Withdrawn { reason, .. } => tracing::info!(
-                            "[{pair}] observer: block {block} withdrawn: {reason} {}",
-                            diag.join(" ")
-                        ),
-                        _ => {}
-                    }
-                }
-                Event::Landing { pair, block, outcome, .. } => {
-                    tracing::info!("[{pair}] observer: block {block} landing {outcome:?}")
+                // A block that was withdrawn, with the diagnostics the pricer set that tick:
+                // the one per-block case worth a line. Quoted blocks and landings are
+                // already in the library's own log.
+                Event::Block {
+                    pair,
+                    block,
+                    outcome: BlockOutcome::Withdrawn { reason, .. },
+                    diagnostics,
+                    ..
+                } => {
+                    let diag: Vec<String> = diagnostics
+                        .iter()
+                        .map(|(k, v)| format!("{k}={v:.4}"))
+                        .collect();
+                    tracing::info!(
+                        "[{pair}] observer: block {block} withdrawn: {reason} {}",
+                        diag.join(" ")
+                    )
                 }
                 Event::Reload { outcome, .. } => tracing::info!("observer: reload {outcome:?}"),
                 _ => {}

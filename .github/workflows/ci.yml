@@ -94,5 +94,42 @@ jobs:
           echo "${PROMTOOL_SHA256}  ${TARBALL}" | sha256sum -c -
           tar -xzf "${TARBALL}" --strip-components=1 -C /usr/local/bin \
             "prometheus-${PROMTOOL_VERSION}.linux-amd64/promtool"
-      - run: promtool check rules alerts/quote-updater.rules.yml
-      - run: promtool test rules alerts/quote-updater.rules.test.yml
+      - run: promtool check rules deploy/alerts/quote-updater.rules.yml
+      - run: promtool test rules deploy/alerts/quote-updater.rules.test.yml
+      # The Alertmanager config in deploy/ routes those rules; amtool parses it and its
+      # templates the way the running Alertmanager will.
+      - name: Install amtool
+        env:
+          ALERTMANAGER_VERSION: "0.34.0"
+          ALERTMANAGER_SHA256: "19c75a11d8c03dc4ade7abdbddfb3a8f28c9e7b000d0849cda0cd71dffd74a03"
+        run: |
+          set -euo pipefail
+          TARBALL="alertmanager-${ALERTMANAGER_VERSION}.linux-amd64.tar.gz"
+          curl -fsSLO "https://github.com/prometheus/alertmanager/releases/download/v${ALERTMANAGER_VERSION}/${TARBALL}"
+          echo "${ALERTMANAGER_SHA256}  ${TARBALL}" | sha256sum -c -
+          tar -xzf "${TARBALL}" --strip-components=1 -C /usr/local/bin \
+            "alertmanager-${ALERTMANAGER_VERSION}.linux-amd64/amtool"
+      # The config names the template and webhook files at their in-container paths, so it
+      # is checked from a tree laid out that way.
+      - run: |
+          mkdir -p /tmp/am/templates
+          cp deploy/alertmanager/alertmanager.yml /tmp/am/
+          cp deploy/alertmanager/templates/*.tmpl /tmp/am/templates/
+          cp deploy/alertmanager/slack-webhook.example /tmp/am/slack-webhook
+          sed -i 's|/etc/alertmanager/|/tmp/am/|g' /tmp/am/alertmanager.yml
+          amtool check-config /tmp/am/alertmanager.yml
+
+  deploy:
+    name: Deployment (compose resolves, image builds)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      # With the example env and config in place the compose file must resolve, and the
+      # updater image must build from the example crate.
+      - run: |
+          cp deploy/.env.example deploy/.env
+          cp deploy/config.example.toml deploy/config/config.toml
+          cp deploy/alertmanager/slack-webhook.example deploy/alertmanager/slack-webhook
+          docker compose -f deploy/compose.yaml config --quiet
+      - run: docker compose -f deploy/compose.yaml build updater

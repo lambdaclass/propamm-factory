@@ -1,0 +1,11 @@
+# The updater image (deploy/Dockerfile) builds a Rust crate; nothing else goes in.
+.git
+.local
+target
+example/target
+e2e/downstream/target
+e2e/__pycache__
+contracts
+deploy/.env
+deploy/config
+deploy/alertmanager/slack-webhook
