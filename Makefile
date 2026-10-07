@@ -1,5 +1,41 @@
 .PHONY: deps build test local local-down update-price swap deploy-factory price-service quickstart \
-	cargo-build cargo-test lint e2e mocks downstream
+	cargo-build cargo-test lint e2e mocks downstream install-nix shell default
+
+# Every target runs inside the shell flake.nix defines: foundry, the Rust version in
+# rust-toolchain.toml, python with the packages the mocks need. Outside that shell, with
+# nix installed, make re-enters itself through `nix develop`, so on a fresh machine
+# `make install-nix` and then any target is all it takes. Without nix the targets run with
+# whatever the host has on PATH.
+ifndef IN_NIX_SHELL
+NIX := $(shell command -v nix 2>/dev/null)
+endif
+
+ifneq ($(NIX),)
+
+default:
+	@$(NIX) develop --command $(MAKE) --no-print-directory
+
+$(filter-out install-nix shell,$(MAKECMDGOALS)):
+	@$(NIX) develop --command $(MAKE) --no-print-directory $@
+
+shell:
+	$(NIX) develop
+
+install-nix:
+	@echo "nix is already installed: $$($(NIX) --version)"
+
+else
+
+install-nix:
+	@if command -v nix >/dev/null 2>&1; then \
+		echo "nix is already installed: $$(nix --version)"; \
+	else \
+		curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix | sh -s -- install; \
+		echo "nix installed; open a new terminal and run make again"; \
+	fi
+
+shell:
+	@echo "nix is not installed; run 'make install-nix' first"; exit 1
 
 RPC_URL := http://localhost:8545
 
@@ -276,3 +312,5 @@ mocks:
 downstream:
 	cargo build --locked --manifest-path e2e/downstream/Cargo.toml
 	./e2e/downstream/target/debug/downstream --help | head -1
+
+endif
