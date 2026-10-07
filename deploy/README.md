@@ -65,13 +65,10 @@ the pairs and builders that changed; `target` and `[settings]` are read once at 
 is `.env`. [docs/manual.md](../docs/manual.md) covers the config file, the reload, the
 backoffice, the breaker, the metrics and the recorder.
 
-## Your own binary
+## Your own pricing models
 
-The image builds `example/` unless `.env` says otherwise. Once you have a crate of your own
-(docs/building-your-own.md), put it in this repository beside `example/` with its
-`Cargo.lock` committed, set `CRATE` to its directory and `BIN` to its binary name in `.env`,
-and `docker compose build`. Its config is the same file; only the `[pairs.pricing]` kinds it
-registers differ.
+The image builds `example/`. To run a pricing model of your own, add it to
+`example/src/main.rs` (docs/building-your-own.md) and `docker compose build`.
 
 ## Notes
 

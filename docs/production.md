@@ -91,8 +91,6 @@ Edit the three files:
   - `BACKOFFICE_BIND` and `GRAFANA_BIND`: the IP of this server the backoffice (port 8088)
     and Grafana (port 3000) listen on. Neither has a login, so use a private IP such as the
     server's tailnet address. `127.0.0.1` keeps them reachable only from the server itself.
-  - `CRATE` and `BIN`: which crate in the repo the updater image is built from and the name
-    of its binary. `example` and `my-propamm` as shipped; your own once you write one.
 - `config/config.toml`: the PropAMM address, the builders with their API keys, and the
   pairs. Pairs can also be added later from the backoffice.
 - `alertmanager/slack-webhook`: the Slack webhook URL alerts go to.

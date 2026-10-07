@@ -1,18 +1,15 @@
-# The quote updater binary, built from a crate in this repo. By default that is `example/`
-# (the binary `my-propamm`); a binary of your own is a crate directory beside it, named by
-# the CRATE and BIN build arguments (deploy/.env sets them for compose). The build context is
-# the repository root, so the crate's `path = "../quote-updater"` dependency resolves.
+# The quote updater binary: the crate in example/, which is the updater this deployment
+# runs. Your own pricing models go in its main.rs. The build context is the repository
+# root, so its `path = "../quote-updater"` dependency resolves.
 ARG RUST_VERSION=1.98.1
 
 FROM rust:${RUST_VERSION}-bookworm AS build
-ARG CRATE=example
-ARG BIN=my-propamm
 WORKDIR /src
 COPY . .
-# --locked: the crate's Cargo.lock decides every version, so two builds of one commit are
-# the same binary. A crate of your own needs its Cargo.lock committed for this to pass.
-RUN cargo build --release --locked --manifest-path "${CRATE}/Cargo.toml" --target-dir /build \
- && install -m 0755 "/build/release/${BIN}" /quote-updater
+# --locked: example/Cargo.lock decides every version, so two builds of one commit are the
+# same binary.
+RUN cargo build --release --locked --manifest-path example/Cargo.toml --target-dir /build \
+ && install -m 0755 /build/release/my-propamm /quote-updater
 
 FROM debian:bookworm-slim
 # ca-certificates and libssl3 for the TLS the venue and builder websockets use; curl for the

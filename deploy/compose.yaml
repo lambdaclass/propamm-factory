@@ -13,9 +13,6 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
-      args:
-        CRATE: ${CRATE:-example}
-        BIN: ${BIN:-my-propamm}
     image: propamm/quote-updater:local
     container_name: propamm-updater
     # Every variable in deploy/.env reaches the process: the UPDATER_KEY_* the config names,
