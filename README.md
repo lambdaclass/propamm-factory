@@ -39,3 +39,4 @@ builders, signer balance).
 
 - [Deep dive into the internals](docs/components.md)
 - [Deploying to production](docs/production.md)
+- [Pricing models: the shipped ones, and writing your own](docs/pricing.md)

@@ -16,7 +16,7 @@ make deploy-factory DEPLOY_RPC_URL=https://... PRIVATE_KEY=0x...
 
 Note: on Ethereum mainnet the current factory's address is `0x7625E38581124da157586759466E87601416172c`.
 
-Create the PropAMM by calling `createPropAMM` on the factory:
+Create your PropAMM contract by calling `createPropAMM` on the factory:
 
 ```bash
 cast send $FACTORY "createPropAMM(address,address,address[],(address,address,address)[])" \
@@ -114,3 +114,10 @@ If you add a new pair (and thus a new updater), the new updater key goes in `.en
 
 Grafana is at `http://<IP from .env>:3000`. Day-to-day commands (reload, logs, updates) are in
 [`deploy/README.md`](../deploy/README.md).
+
+## Next steps
+
+The pairs quote with the pricing models the library ships. To tune their settings, change
+them from the backoffice. To change the pricing itself, write your own model or adjust the
+example one: [pricing.md](pricing.md) covers what the shipped models do, how to write one,
+and what the library gives you to do it.
