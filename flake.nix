@@ -28,6 +28,9 @@
             rust
             # e2e/: the mocks of the chain, the builders and the exchange.
             (pkgs.python3.withPackages (ps: [ ps.aiohttp ps.websockets ]))
+            # `make quickstart` runs both natively, with the production dashboard and rules.
+            pkgs.prometheus
+            pkgs.grafana
             pkgs.git
             pkgs.gnumake
             pkgs.curl

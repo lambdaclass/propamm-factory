@@ -290,17 +290,33 @@ price-service:
 		--config .local/local.toml --rpc-url $(RPC_URL) --registry $(PUR_ADDR) --interval $(INTERVAL) --mine
 
 # The whole thing on a laptop: `make local`, then the two fake builders from e2e/ (they
-# include each block's update in the block they mine on anvil, every 12s), then example/
-# quoting the USDC/USDT pair from Binance's live price through them, in builder mode, with
-# the backoffice at http://127.0.0.1:8088. Ctrl-c stops the updater and the builders;
-# `make local-down` stops the chain.
+# include each block's update in the block they mine on anvil, every 12s), Prometheus and
+# Grafana with the production dashboard and rules, then example/ quoting the USDC/USDT pair
+# from Binance's live price through the builders, in builder mode, with the backoffice at
+# http://127.0.0.1:8088 and Grafana at http://127.0.0.1:3000. Ctrl-c stops all of it but
+# the chain; `make local-down` stops that.
+GRAFANA_ENV := GF_PATHS_DATA=$(CURDIR)/.local/grafana GF_PATHS_LOGS=$(CURDIR)/.local/grafana/log \
+	GF_PATHS_PLUGINS=$(CURDIR)/.local/grafana/plugins GF_PATHS_PROVISIONING=$(CURDIR)/deploy/grafana/provisioning \
+	GF_SERVER_HTTP_ADDR=127.0.0.1 GF_SERVER_HTTP_PORT=3000 GF_LOG_LEVEL=warn \
+	GF_AUTH_ANONYMOUS_ENABLED=true GF_AUTH_ANONYMOUS_ORG_ROLE=Admin GF_SECURITY_ADMIN_PASSWORD=admin \
+	GF_USERS_DEFAULT_THEME=dark GF_ANALYTICS_REPORTING_ENABLED=false GF_ANALYTICS_CHECK_FOR_UPDATES=false \
+	GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES=false GF_NEWS_NEWS_FEED_ENABLED=false \
+	GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=$(CURDIR)/deploy/grafana/quote-updater.json \
+	PROMETHEUS_URL=http://127.0.0.1:9090 RECORDER_ADDR=127.0.0.1:5432 POSTGRES_PASSWORD=none \
+	GRAFANA_DASHBOARDS=$(CURDIR)/deploy/grafana
 QUICKSTART_MOCKS := {"rpc_port": 8549, "anvil_rpc": "$(RPC_URL)", "mine_every": $(INTERVAL), "prices": {}, \
 	"builders": [{"name": "mock-a", "api_key": "key-a", "port": 8547}, {"name": "mock-b", "api_key": "key-b", "port": 8548}]}
 quickstart: local
 	cd example && sed "s/__PROPAMM__/$(PROPAMM_LOOKUP)/" config.local.toml > .local.toml && cargo build -q
 	@set -e; (cd e2e && exec python3 mocks.py '$(QUICKSTART_MOCKS)') > .local/mocks.log 2>&1 & \
-	MOCKS=$$!; echo $$MOCKS > .local/mocks.pid; trap 'kill $$MOCKS 2>/dev/null; rm -f $(CURDIR)/.local/mocks.pid' EXIT; \
+	MOCKS=$$!; echo $$MOCKS > .local/mocks.pid; \
+	prometheus --config.file=deploy/prometheus/local.yml --storage.tsdb.path=.local/prometheus \
+	  --web.listen-address=127.0.0.1:9090 > .local/prometheus.log 2>&1 & PROM=$$!; \
+	mkdir -p .local/grafana/plugins; $(GRAFANA_ENV) grafana server \
+	  --homepath "$$(dirname "$$(command -v grafana)")/../share/grafana" > .local/grafana.log 2>&1 & GRAF=$$!; \
+	trap 'kill $$MOCKS $$PROM $$GRAF 2>/dev/null; rm -f $(CURDIR)/.local/mocks.pid' EXIT; \
 	until grep -q READY .local/mocks.log 2>/dev/null; do sleep 0.2; done; \
+	echo "backoffice http://127.0.0.1:8088   grafana http://127.0.0.1:3000   prometheus http://127.0.0.1:9090"; \
 	cd example && $(PUSHER_KEY_ENV)=$(ANVIL_KEY) ./target/debug/my-propamm --config .local.toml --registry $(PUR_ADDR) --check && \
 	$(PUSHER_KEY_ENV)=$(ANVIL_KEY) ./target/debug/my-propamm --config .local.toml --registry $(PUR_ADDR)
 
