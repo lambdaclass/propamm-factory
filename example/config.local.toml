@@ -2,7 +2,7 @@
 # `make -C ../propamm-contracts local`. No builders here: `--mode node` sends updateState
 # transactions straight to the chain and mines a block per push (`--mine`).
 #
-# `target` is the PropAMM the factory created; quickstart.sh fills it in from the chain.
+# `target` is the PropAMM the factory created; `make quickstart` fills it in from the chain.
 target = "__PROPAMM__"
 
 [settings]

@@ -1,4 +1,4 @@
-.PHONY: deps build test local local-down update-price swap deploy-factory price-service \
+.PHONY: deps build test local local-down update-price swap deploy-factory price-service quickstart \
 	cargo-build cargo-test lint e2e mocks downstream
 
 RPC_URL := http://localhost:8545
@@ -237,6 +237,14 @@ price-service:
 	@$(call write_updater_config,$(PROPAMM_LOOKUP),.local/local.toml)
 	$(PUSHER_KEY_ENV)=$(ANVIL_KEY) cargo run -q -p quote-updater --example minimal -- --mode node \
 		--config .local/local.toml --rpc-url $(RPC_URL) --registry $(PUR_ADDR) --interval $(INTERVAL) --mine
+
+# The whole thing on a laptop: `make local`, then build example/ and have it quote the
+# USDC/USDT pair from Binance's live price, one updateState transaction per block, mining a
+# block each. Ctrl-c stops it; `make local-down` stops the chain.
+quickstart: local
+	cd example && sed "s/__PROPAMM__/$(PROPAMM_LOOKUP)/" config.local.toml > .local.toml && cargo build -q
+	cd example && $(PUSHER_KEY_ENV)=$(ANVIL_KEY) ./target/debug/my-propamm --config .local.toml --registry $(PUR_ADDR) --check
+	cd example && $(PUSHER_KEY_ENV)=$(ANVIL_KEY) ./target/debug/my-propamm --config .local.toml --registry $(PUR_ADDR) --mine --interval $(INTERVAL)
 
 ## QUOTE UPDATER LIBRARY ##
 cargo-build:

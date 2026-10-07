@@ -22,8 +22,7 @@ library's. The smallest possible binary is 30 lines; see the library README.
 From the repo root:
 
 ```bash
-./quickstart.sh                       # deploys the contracts on anvil, builds this, quotes
-QUICKSTART_SECONDS=40 ./quickstart.sh # same, stops after 40s and prints what happened
+make quickstart                       # deploys the contracts on anvil, builds this, quotes
 ```
 
 The quickstart uses `config.local.toml`: `--mode node`, which sends `updateState`
