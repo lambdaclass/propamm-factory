@@ -152,7 +152,7 @@ test: build
 	mkdir -p .local
 	git clone --depth 1 --recurse-submodules --shallow-submodules $(PUR_REPO) $@
 
-local: local-down test .local/priority-update-registry
+local: local-down build .local/priority-update-registry
 	mkdir -p .local
 	@# no-mining: transactions queue in the pool and only land when a block is explicitly
 	@# mined with anvil_mine. fifo executes them in arrival order (default is by gas price),
@@ -193,6 +193,11 @@ local: local-down test .local/priority-update-registry
 		$$(cd contracts && forge inspect MockERC20 deployedBytecode) --rpc-url $(RPC_URL)
 	cast rpc anvil_setCode $(USDT) \
 		$$(cd contracts && forge inspect MockERC20 deployedBytecode) --rpc-url $(RPC_URL)
+	@# setCode copies no storage, so the tokens' names come separately.
+	cast send $(USDC) 'setMeta(string,string,uint8)' "USD Coin" USDC 18 \
+		--private-key $(ANVIL_KEY) --rpc-url $(RPC_URL) >/dev/null
+	cast send $(USDT) 'setMeta(string,string,uint8)' "Tether USD" USDT 18 \
+		--private-key $(ANVIL_KEY) --rpc-url $(RPC_URL) >/dev/null
 	cast send $(USDC) 'mint(address,uint256)' $(ANVIL_ADDR) $(MINT_AMOUNT) \
 		--private-key $(ANVIL_KEY) --rpc-url $(RPC_URL)
 	cast send $(USDC) 'mint(address,uint256)' $(TRADER_ADDR) $(MINT_AMOUNT) \
@@ -241,11 +246,12 @@ update-price:
 swap:
 	@# With `make quickstart` running (its fake builders leave a pid in .local/mocks.pid), the
 	@# next block they mine includes this swap after that block's update, so the swap just
-	@# waits for it. On a bare `make local`, nothing mines: a price is pushed for the block if
-	@# the pair has none, and the block is mined here.
+	@# waits for it. On a bare `make local`, nothing mines: a price is pushed for the block
+	@# (a price is only good for the block stamped with its timestamp), and the block is
+	@# mined here.
 	set -e; PROP=$(PROPAMM_LOOKUP); \
 	if [ -f .local/mocks.pid ] && kill -0 $$(cat .local/mocks.pid) 2>/dev/null; then WAIT=1; fi; \
-	if [ -z "$$WAIT" ] && [ "$$(cast call $$PROP 'isActive(address,address)(bool)' $(USDC) $(USDT) --rpc-url $(RPC_URL))" != "true" ]; then \
+	if [ -z "$$WAIT" ]; then \
 	  MID=$$(cast to-wei $(PRICE) ether); D=$$(cast to-wei $(DELTA) ether); \
 	  TS=$$(( $$(cast block latest -f timestamp --rpc-url $(RPC_URL)) + 12 )); \
 	  cast rpc evm_setNextBlockTimestamp $$TS --rpc-url $(RPC_URL); \

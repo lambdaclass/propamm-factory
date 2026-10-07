@@ -12,7 +12,7 @@ What it adds, one per extension point the library offers:
 - `venue_spread`, a market guard: stops the pair when the exchanges behind the price disagree.
 - `share_cap`, a quote guard: withdraws the quote while the vault is lopsided, halts the pair
   if the pricer reports an impossible share.
-- `block_log`, an observer: one log line per block and per lifecycle event.
+- `block_log`, an observer: a log line per lifecycle event and per withdrawn block.
 
 `main()` at the bottom registers the four and calls `run_from_env()`. Everything else is the
 library's. The smallest possible binary is 30 lines; see the library README.

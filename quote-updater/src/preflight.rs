@@ -324,7 +324,11 @@ pub struct Row {
     pub label: String,
     pub lane: U256,
     pub orientation: String,
+    /// The pair's market as the file names it, `venue:symbol` (several, with weights, for an
+    /// averaged mid), or `-` for a pair that streams none.
     pub stream: String,
+    /// The pricing kind the pair's `[pairs.pricing]` names.
+    pub pricing: String,
     /// The account this pair fills from, `target.vaultFor(token0, token1)`, or `None` when
     /// that could not be read. Vaults are per pair, which is the whole reason there is a
     /// column: a mis-set vault on one row of a multi-pair config is exactly the class of
@@ -448,11 +452,12 @@ impl Report {
         };
         let _ = writeln!(
             out,
-            "{:<16} {:<14} {:<11} {:<10} {:<11} {:<w$} {:<v$} {}{:<42} {:<5} {:>9}  key_env",
+            "{:<16} {:<14} {:<11} {:<18} {:<15} {:<11} {:<w$} {:<v$} {}{:<11} {:<5} {:>9}  key_env",
             "pair",
             "lane",
             "orientation",
             "stream",
+            "pricing",
             "vault",
             "breaker",
             "window",
@@ -465,13 +470,10 @@ impl Report {
         );
         for row in &self.rows {
             let lane = format!("{:#x}", row.lane);
-            // In full, not truncated: this is the address the operator funds, monitors and
-            // passes to addUpdater, so it has to survive a copy-paste. On a healthy
-            // deployment it appears nowhere else — every other mention is inside a failure
-            // or a warning, which a working config does not produce.
-            let updater = row
-                .updater
-                .map_or_else(|| "-".to_owned(), |updater| format!("{updater:#x}"));
+            // Short, like the vault, so the table fits a terminal. The one time the full
+            // address is needed, a key the target has not authorized, the `addUpdater` hint
+            // under the table prints it in full.
+            let updater = row.updater.map_or_else(|| "-".to_owned(), short_address);
             let auth = match row.authorized {
                 Some(true) => "yes".to_owned(),
                 Some(false) => "NO".to_owned(),
@@ -485,13 +487,10 @@ impl Report {
                 // fee to price it against was not, so runway could not be computed.
                 None => "unknown".to_owned(),
             };
-            // Short form, unlike the updater: the vault is the operator's own on-chain setting,
-            // so recognising it is the job, while the updater address is copied into
-            // addUpdater and funding and has to survive a paste.
             let vault = row.vault.map_or_else(|| "-".to_owned(), short_address);
             let _ = writeln!(
                 out,
-                "{:<16} {:<14} {:<11} {:<10} {:<11} {:<w$} {:<v$} {}{:<42} {:<5} {:>9}  {}",
+                "{:<16} {:<14} {:<11} {:<18} {:<15} {:<11} {:<w$} {:<v$} {}{:<11} {:<5} {:>9}  {}",
                 // Width is a minimum, not a maximum, so an over-long label would push every
                 // later column out of line. Truncated rather than trusted: `lane_label`
                 // keeps the fallback short, but an ERC-20 free to return any string is not
@@ -501,7 +500,8 @@ impl Report {
                 // cross-check against a block explorer.
                 &lane[..lane.len().min(14)],
                 row.orientation,
-                row.stream,
+                truncate(&row.stream, 18),
+                truncate(&row.pricing, 15),
                 vault,
                 // Width is a minimum, so an over-long value would push every later column
                 // out of line — the one thing a table read row-against-row must not do.
@@ -768,17 +768,17 @@ pub async fn build_report(
             _ => crate::config::lane_label(spec.lane),
         };
         let orientation = if spec.invert { "inverted" } else { "direct" }.to_owned();
-        // The pair's market, if it streams one, and the kind that prices it.
-        let stream = match &spec.feeds {
-            Some(feeds) => format!("{} ({})", feeds.describe(), spec.pricing.kind),
-            None => spec.pricing.kind.clone(),
-        };
+        let stream = spec
+            .feeds
+            .as_ref()
+            .map_or_else(|| "-".to_owned(), |feeds| feeds.describe());
 
         let mut row = Row {
             label: label.clone(),
             lane: spec.lane,
             orientation,
             stream: stream.clone(),
+            pricing: spec.pricing.kind.clone(),
             vault: None,
             breaker: spec
                 .breaker
@@ -1511,9 +1511,10 @@ mod tests {
             text.contains("updater"),
             "the column needs a header: {text}"
         );
-        // In full: a truncated address cannot be pasted into a funding transaction.
+        // Short, like the vault, so the table fits a terminal; the `addUpdater` hint prints
+        // the address in full when the target does not know it.
         assert!(
-            text.contains(&format!("{:#x}", Address::from_low_u64_be(0xaaa1))),
+            text.contains(&short_address(Address::from_low_u64_be(0xaaa1))),
             "the signer address must appear on a clean row: {text}"
         );
     }
@@ -1823,6 +1824,7 @@ mod tests {
             lane: U256::from(0x85053f65u64),
             orientation: "USDC/WETH inverted".to_owned(),
             stream: "ETHUSDC".to_owned(),
+            pricing: "feed".to_owned(),
             vault: Some(Address::from_low_u64_be(0xfeed)),
             breaker: "-".to_owned(),
             window: "-".to_owned(),
