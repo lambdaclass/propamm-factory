@@ -88,8 +88,43 @@ impl Pricer for InventorySkew {
 
 struct InventorySkewFactory;
 
+/// What the backoffice shows for a pair priced by this kind: one input per knob, written
+/// into the stanza as numbers since the config reads `f64` and `u64`.
+const FIELDS: &[FormField] = &[
+    FormField::number(
+        "half_spread",
+        "0.0005",
+        "the spread, as a fraction of the mid. 0.0005 means we sell at mid + 0.05% and buy at \
+         mid − 0.05%.",
+    ),
+    FormField::number(
+        "strength",
+        "0.02",
+        "how far the mid moves per unit of imbalance. 0.02: a vault that is all base pushes \
+         the mid 1% down.",
+    ),
+    FormField::number(
+        "max_inventory_age_secs",
+        "60",
+        "a vault reading older than this many seconds stops the pair quoting. Blank is 60.",
+    ),
+];
+
 impl Factory for InventorySkewFactory {
     type Config = InventorySkewCfg;
+
+    fn fields(&self) -> &'static [FormField] {
+        FIELDS
+    }
+
+    fn form_help(&self) -> &'static str {
+        "<p class=explain>A fixed spread, with the mid moved toward the token the vault holds \
+         too much of, so fills rebalance it.</p>"
+    }
+
+    fn summary(&self, cfg: &InventorySkewCfg) -> String {
+        format!("half_spread {} strength {}", cfg.half_spread, cfg.strength)
+    }
     type Pricer = InventorySkew;
 
     /// Runs at startup, on reload and under `--check`, before anything is built.

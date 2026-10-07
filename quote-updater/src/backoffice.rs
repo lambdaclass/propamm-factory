@@ -22,7 +22,7 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
-use eyre::{Result, WrapErr, eyre};
+use eyre::{Result, WrapErr, bail, eyre};
 use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -486,7 +486,16 @@ fn pricing_stanza(
     for field in fields {
         let key = format!("pricing_{kind}_{}", field.name);
         if let Some(value) = posted.get(&key).and_then(|v| optional(v)) {
-            table.insert(field.name.to_owned(), toml::Value::String(value));
+            let value = if field.number {
+                match (value.parse::<i64>(), value.parse::<f64>()) {
+                    (Ok(int), _) => toml::Value::Integer(int),
+                    (_, Ok(float)) if float.is_finite() => toml::Value::Float(float),
+                    _ => bail!("`{}` must be a number, got {value:?}", field.name),
+                }
+            } else {
+                toml::Value::String(value)
+            };
+            table.insert(field.name.to_owned(), value);
         }
     }
     Ok(table)
@@ -3403,6 +3412,70 @@ api_key = "k"
     /// Every kind's inputs are posted whichever section is showing, so the stanza is built
     /// from the chosen kind's alone; a blank choice keeps the stanza, an unknown kind is
     /// refused, and a kind with no fields keeps a stanza it already prices.
+    /// A kind whose config reads numbers declares its fields as numbers, and the page writes
+    /// them as TOML numbers; a value that is not one is refused rather than written.
+    #[test]
+    fn a_numeric_field_is_written_as_a_number() {
+        #[derive(Clone, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Numeric {
+            #[allow(dead_code)]
+            half_spread: f64,
+            #[allow(dead_code)]
+            age_secs: u64,
+        }
+        struct Fields;
+        impl crate::pricing::Factory for Fields {
+            type Config = Numeric;
+            type Pricer = crate::pricing::FixedPricer;
+            fn fields(&self) -> &'static [crate::pricing::FormField] {
+                const FIELDS: &[crate::pricing::FormField] = &[
+                    crate::pricing::FormField::number("half_spread", "0.0005", ""),
+                    crate::pricing::FormField::number("age_secs", "60", ""),
+                ];
+                FIELDS
+            }
+            fn build<'a>(
+                &'a self,
+                _: &'a Numeric,
+                _: &'a mut crate::pricing::BuildCtx,
+            ) -> crate::pricing::BoxFuture<'a, eyre::Result<Self::Pricer>> {
+                Box::pin(std::future::ready(Err(eyre!("not built here"))))
+            }
+        }
+        let mut kinds = crate::kinds::Kinds::default();
+        kinds.insert("numeric", Arc::new(Fields));
+        let posted = |pairs: &[(&str, &str)]| -> std::collections::HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect()
+        };
+        let table = pricing_stanza(
+            &kinds,
+            "numeric",
+            None,
+            &posted(&[
+                ("pricing_numeric_half_spread", "0.0005"),
+                ("pricing_numeric_age_secs", "60"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(table.get("half_spread"), Some(&toml::Value::Float(0.0005)));
+        assert_eq!(table.get("age_secs"), Some(&toml::Value::Integer(60)));
+        let err = format!(
+            "{:#}",
+            pricing_stanza(
+                &kinds,
+                "numeric",
+                None,
+                &posted(&[("pricing_numeric_half_spread", "five")]),
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("`half_spread` must be a number"), "{err}");
+    }
+
     #[test]
     fn the_pricing_choice_decides_which_kinds_fields_are_kept() {
         let kinds = test_kinds();
