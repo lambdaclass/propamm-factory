@@ -63,7 +63,7 @@ cast send $PROPAMM "addUpdater(address)" $UPDATER_ADDRESS --rpc-url $RPC_URL --p
 
 ## 4. Get API keys from the builders
 
-The api to send builders quote update is permissioned, behind an API key. You will have to Aak each builder for one:
+The api to send builders quote updates is permissioned, behind an API key. You will have to Ask each builder for one:
 
 - Titan: `wss://eu.rpc.titanbuilder.xyz/ws/sendquoteupdate`
 - Quasar: `wss://rpc.quasar.win/ws/sendquoteupdate`
