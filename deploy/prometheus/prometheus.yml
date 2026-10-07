@@ -2,7 +2,7 @@ global:
   scrape_interval: 15s
   evaluation_interval: 15s
 
-# alerts/quote-updater.rules.yml, mounted by compose.yaml.
+# deploy/alerts/quote-updater.rules.yml, mounted by compose.yaml.
 rule_files:
   - /etc/prometheus/rules/*.rules.yml
 

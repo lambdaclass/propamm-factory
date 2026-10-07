@@ -191,7 +191,7 @@ impl LandingTracker {
 /// for the same reason. `PusherSignerNearlyDry` is a `predict_linear` over
 /// `signer_balance_wei`, and one NaN sample anywhere in its window makes the whole range
 /// return nothing, so the page falls silent and `PusherSignerRunwayUnknown` fires instead —
-/// see `alerts/quote-updater.rules.yml`. Note the silence now outlasts the
+/// see `deploy/alerts/quote-updater.rules.yml`. Note the silence now outlasts the
 /// outage: the NaN suppresses until it ages out of the window, not just while the read is
 /// failing, which is the cost of asking a regression rather than a threshold.
 ///
@@ -421,7 +421,7 @@ mod tests {
         // would assert a correspondence that does not exist — the exact confusion this test
         // was written to prevent, pointed the wrong way.
 
-        let rules = include_str!("../../alerts/quote-updater.rules.yml");
+        let rules = include_str!("../../deploy/alerts/quote-updater.rules.yml");
         assert!(
             rules.contains("quote_updater_consecutive_landing_misses >= 50"),
             "landing threshold drifted"

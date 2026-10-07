@@ -613,7 +613,7 @@ impl Metrics {
             // Beside `breaker_tripped`, which stays the page ("a lane needs a human", whatever
             // tripped it): this says what did. `source` is the kind, `cause` is guard, panic
             // or external. Never joined into the rule: a join against a series that was
-            // never recorded drops the page silently (see the rule's comment in alerts/).
+            // never recorded drops the page silently (see the rule's comment in deploy/alerts/).
             trip_source: gauge(
                 &r,
                 "quote_updater_trip_source",

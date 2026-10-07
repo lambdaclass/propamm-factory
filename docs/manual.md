@@ -866,7 +866,7 @@ Five series are worth watching ahead of everything else the registry exposes:
   back from the registry to see whether its update got in. Most blocks it did not, and that
   is normal: a builder includes the update only when a swap hits the lane in that block.
   What this counts is blocks where the read-back itself failed, so the updater cannot tell;
-  the `PusherLandingUnverified` alert in `alerts/` pages on it.
+  the `PusherLandingUnverified` alert in `deploy/alerts/` pages on it.
 - the gap between `quote_updater_feed_mid` and `quote_updater_published_mid` — that gap *is*
   withdrawn time. A stale price, an out-of-band print or a tripped breaker withdraws the
   published quote while the feed keeps moving underneath it, and watching the two series
@@ -904,7 +904,7 @@ on the previous config while the config file says something else. No other serie
 nothing is unhealthy — the gap is only between the file and what is running.
 `quote_updater_config_generation` counts the reloads that did apply.
 
-The alert rules for all of this live in `alerts/` (their thresholds are pinned to the same
+The alert rules for all of this live in `deploy/alerts/` (their thresholds are pinned to the same
 Rust constants the updater itself enforces at startup, and `make`'s promtool test checks they
 fire), and `deploy/` has the Prometheus scrape config, the Alertmanager routing and a Grafana
 dashboard, provisioned by its compose file.

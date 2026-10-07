@@ -1,4 +1,4 @@
-# Where the rules in alerts/quote-updater.rules.yml go: one Slack channel, pages at once and
+# Where the rules in deploy/alerts/quote-updater.rules.yml go: one Slack channel, pages at once and
 # re-sent every 30 minutes while they fire, tickets batched and re-sent every 4 hours.
 # templates/propamm.tmpl renders the message from the rule's summary and description.
 global:

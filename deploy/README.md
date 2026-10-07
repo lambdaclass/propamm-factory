@@ -40,7 +40,7 @@ know. Run it after every edit to `config.toml` too.
 | --- | --- | --- |
 | updater | backoffice at `BACKOFFICE_BIND:8088` | quotes; rewrites `config/config.toml` from the backoffice |
 | grafana | `GRAFANA_BIND:3000`, user `admin` | the "Quote updater" dashboard; Prometheus and the recorder as datasources |
-| prometheus | `127.0.0.1:9090` | 90 days of `quote_updater_*` metrics; the rules from [`alerts/`](../alerts/) |
+| prometheus | `127.0.0.1:9090` | 90 days of `quote_updater_*` metrics; the rules from [`alerts/`](alerts/) |
 | alertmanager | `127.0.0.1:9093` | routes pages and tickets to `#propamm-alerts` |
 | postgres | compose network only | the `feed` schema the recorder writes (quotes, mids, vault balances, config history) |
 
@@ -79,5 +79,5 @@ registers differ.
   `config/config.toml`; nothing else in the image needs it.
 - Postgres keeps its data in the `postgres-data` volume; the updater creates and migrates the
   `feed` schema itself on every connect, so there is nothing to run by hand.
-- Alert rules are mounted straight from `alerts/quote-updater.rules.yml`; a change there is
+- Alert rules are mounted straight from `deploy/alerts/quote-updater.rules.yml`; a change there is
   live after `docker compose restart prometheus`.

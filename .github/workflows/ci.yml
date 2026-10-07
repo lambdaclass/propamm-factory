@@ -94,8 +94,8 @@ jobs:
           echo "${PROMTOOL_SHA256}  ${TARBALL}" | sha256sum -c -
           tar -xzf "${TARBALL}" --strip-components=1 -C /usr/local/bin \
             "prometheus-${PROMTOOL_VERSION}.linux-amd64/promtool"
-      - run: promtool check rules alerts/quote-updater.rules.yml
-      - run: promtool test rules alerts/quote-updater.rules.test.yml
+      - run: promtool check rules deploy/alerts/quote-updater.rules.yml
+      - run: promtool test rules deploy/alerts/quote-updater.rules.test.yml
       # The Alertmanager config in deploy/ routes those rules; amtool parses it and its
       # templates the way the running Alertmanager will.
       - name: Install amtool
