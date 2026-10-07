@@ -106,13 +106,11 @@ docker compose up -d
 `--check` connects to the chain and reports anything wrong (a wallet not authorized or
 without ETH, a pair the contract doesn't have, a typo in the config).
 
-## 7. Add pairs
+## 7. Inspect Grafana and the backoffice to manage updater/pair settings 
 
-Open `http://<IP from .env>:8088`, click Add pair, fill in the tokens, the exchanges to
-follow, the pricing model and its settings, and the name of the env var with that pair's
-key. Save and it starts quoting.
+Open `http://<IP from .env>:8088` to go into the backoffice and change pair settings, pair curves, etc.
 
-A new key goes in `.env` first, then `docker compose up -d` so the updater picks it up.
+If you add a new pair (and thus a new updater), the new updater key goes in `.env` first, then `docker compose up -d` so the updater picks it up.
 
 Grafana is at `http://<IP from .env>:3000`. Day-to-day commands (reload, logs, updates) are in
 [`deploy/README.md`](../deploy/README.md).
