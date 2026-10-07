@@ -13,6 +13,9 @@ At a high level, a PropAMM is two things:
 
 This repo provides the tools to build these two things, and a set of examples and the necessary infra surrounding it to deploy on ethereum mainnet.
 
+## Deploying to production
+
+See [docs/production.md](docs/production.md): deploying the PropAMM contract through the mainnet factory, setting up the signer and vault wallets, and running the quote updater on a server.
 
 ## Running it locally
 
@@ -38,5 +41,4 @@ builders, signer balance).
 ## Documentation
 
 - [Deep dive into the internals](docs/components.md)
-- [Deploying to production](docs/production.md)
 - [Pricing models: the shipped ones, and writing your own](docs/pricing.md)
