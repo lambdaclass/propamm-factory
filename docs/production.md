@@ -63,7 +63,7 @@ cast send $PROPAMM "addUpdater(address)" $UPDATER_ADDRESS --rpc-url $RPC_URL --p
 
 ## 4. Get API keys from the builders
 
-Ask each builder for one:
+The api to send builders quote update is permissioned, behind an API key. You will have to Aak each builder for one:
 
 - Titan: `wss://eu.rpc.titanbuilder.xyz/ws/sendquoteupdate`
 - Quasar: `wss://rpc.quasar.win/ws/sendquoteupdate`
@@ -81,9 +81,18 @@ cp alertmanager/slack-webhook.example alertmanager/slack-webhook
 
 Edit the three files:
 
-- `.env`: RPC URL, the private key of each wallet from step 2 (`UPDATER_KEY_WETH_USDC=0x...`),
-  passwords for Postgres and Grafana, and the IP the backoffice and Grafana listen on. They
-  have no login, so use a private IP (your tailnet).
+- `.env`, one line per variable:
+  - `RPC_URL`: the Ethereum RPC the updater reads the chain through.
+  - `UPDATER_KEY_<PAIR>`: the private key of each wallet from step 2, one variable per pair.
+    The name is yours to pick; the pair's config refers to it by that name (`key_env`).
+    For example `UPDATER_KEY_WETH_USDC=0x...` and `UPDATER_KEY_USDC_USDT=0x...`.
+  - `POSTGRES_PASSWORD`: password for the Postgres the updater records into. Any string.
+  - `GRAFANA_ADMIN_PASSWORD`: password for Grafana's `admin` user.
+  - `BACKOFFICE_BIND` and `GRAFANA_BIND`: the IP of this server the backoffice (port 8088)
+    and Grafana (port 3000) listen on. Neither has a login, so use a private IP such as the
+    server's tailnet address. `127.0.0.1` keeps them reachable only from the server itself.
+  - `CRATE` and `BIN`: which crate in the repo the updater image is built from and the name
+    of its binary. `example` and `my-propamm` as shipped; your own once you write one.
 - `config/config.toml`: the PropAMM address, the builders with their API keys, and the
   pairs. Pairs can also be added later from the backoffice.
 - `alertmanager/slack-webhook`: the Slack webhook URL alerts go to.
@@ -97,7 +106,7 @@ docker compose up -d
 ```
 
 `--check` connects to the chain and reports anything wrong (a wallet not authorized or
-without ETH, a pair the contract doesn't have, a typo in the config). Fix until it passes.
+without ETH, a pair the contract doesn't have, a typo in the config).
 
 ## 7. Add pairs
 
