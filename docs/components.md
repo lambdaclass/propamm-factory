@@ -17,6 +17,15 @@ pair. Each pair can have its own vault.
 add and remove updaters (`addUpdater`, `removeUpdater`) and pause it. Traders call `swap`;
 anyone can call `quote` and `isActive` to see what a trade would get.
 
+Instances also implement `IPropAMMFillable`, advertised through ERC-165, which
+`PropAMMRouter`'s split routing (`swapSplitV1`) prices a venue with in one call:
+`quoteFillable(tokenIn, tokenOut, amountIn)` answers with how much of the order the pair's vault
+can fill (the lesser of its output-token balance and its allowance to the instance) and what that
+part pays, so an order larger than the vault still routes its fillable part here. The router
+reads every capacity before any leg fills, so two instances it lists must not fill the same
+output token from the same vault: when one instance replaces another, take the old one off the
+router's venue list first.
+
 Sources and tests are in [`contracts/`](../contracts/). `make test` runs the tests.
 
 ## The quote updater
