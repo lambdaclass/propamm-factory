@@ -1,6 +1,5 @@
-# Local chain state and generated configs (make local, make price-service, quickstart.sh).
+# Local chain state and generated configs (make local, make price-service, make quickstart).
 /.local/
-/.quickstart-*.log
 /example/.local.toml
 
 # Rust build output: the workspace, the example binary and the e2e's downstream crate.
@@ -18,3 +17,6 @@
 /deploy/config/*
 !/deploy/config/.gitkeep
 /deploy/alertmanager/slack-webhook
+
+# direnv's cache of the flake shell.
+/.direnv/

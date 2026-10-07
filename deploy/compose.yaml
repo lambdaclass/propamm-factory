@@ -13,9 +13,6 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
-      args:
-        CRATE: ${CRATE:-example}
-        BIN: ${BIN:-my-propamm}
     image: propamm/quote-updater:local
     container_name: propamm-updater
     # Every variable in deploy/.env reaches the process: the UPDATER_KEY_* the config names,
@@ -77,8 +74,8 @@ services:
       - "127.0.0.1:9090:9090"
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      # The rules the repo ships and tests, mounted straight from alerts/.
-      - ../alerts/quote-updater.rules.yml:/etc/prometheus/rules/quote-updater.rules.yml:ro
+      # The rules the repo ships and tests, mounted straight from deploy/alerts/.
+      - ./alerts/quote-updater.rules.yml:/etc/prometheus/rules/quote-updater.rules.yml:ro
       - prometheus-data:/prometheus
     command:
       - --config.file=/etc/prometheus/prometheus.yml
@@ -130,8 +127,12 @@ services:
     environment:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in deploy/.env}
-      # Read by the provisioned Recorder datasource (grafana/provisioning/datasources).
+      # Read by the provisioning files (grafana/provisioning), which `make quickstart`
+      # also uses, pointed at localhost.
+      PROMETHEUS_URL: http://prometheus:9090
+      RECORDER_ADDR: postgres:5432
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}
+      GRAFANA_DASHBOARDS: /var/lib/grafana/dashboards
       GF_USERS_DEFAULT_THEME: dark
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/quote-updater.json
       GF_ANALYTICS_REPORTING_ENABLED: "false"

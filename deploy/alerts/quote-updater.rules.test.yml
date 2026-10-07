@@ -1,8 +1,8 @@
 # promtool unit tests for quote-updater.rules.yml.
 #
-# Named `.rules.test.yml` rather than `.rules.yml` deliberately: prometheus.yml globs
-# `/etc/prometheus/rules/*.rules.yml` and the ansible play ships `../prometheus/*.rules.yml`,
-# and neither should ever load a file of fixtures as live rules.
+# Named `.rules.test.yml` rather than `.rules.yml` deliberately: the Prometheus in
+# ../compose.yaml globs `/etc/prometheus/rules/*.rules.yml`, and it must never load a file
+# of fixtures as live rules.
 #
 # Scoped to PusherSignerNearlyDry and its level check PusherSignerDry. The first is a `predict_linear`, which is the only
 # expression in the file whose *silence* is a designed behaviour rather than a side effect of

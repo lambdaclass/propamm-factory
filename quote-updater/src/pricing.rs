@@ -58,15 +58,31 @@ pub struct FormField {
     pub placeholder: &'static str,
     /// One or two sentences under the input: what the key means and what blank means.
     pub hint: &'static str,
+    /// Written into the stanza as a TOML number rather than a string, for a config type
+    /// with `f64`/`u64` fields; the page refuses a value that is not one.
+    pub number: bool,
 }
 
 impl FormField {
-    /// A field, as a `const` so a kind declares its list as a `&'static [FormField]`.
+    /// A field whose value is written as a string, as a `const` so a kind declares its list
+    /// as a `&'static [FormField]`.
     pub const fn new(name: &'static str, placeholder: &'static str, hint: &'static str) -> Self {
         FormField {
             name,
             placeholder,
             hint,
+            number: false,
+        }
+    }
+
+    /// A field whose value is written as a number (`half_spread = 0.0005`), for a config
+    /// type that reads `f64` or integer fields.
+    pub const fn number(name: &'static str, placeholder: &'static str, hint: &'static str) -> Self {
+        FormField {
+            name,
+            placeholder,
+            hint,
+            number: true,
         }
     }
 }

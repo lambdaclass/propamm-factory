@@ -4,7 +4,7 @@ datasources:
     type: prometheus
     uid: propamm-prometheus
     access: proxy
-    url: http://prometheus:9090
+    url: $PROMETHEUS_URL
     isDefault: true
     editable: false
     jsonData:
@@ -16,7 +16,7 @@ datasources:
     type: grafana-postgresql-datasource
     uid: propamm-recorder
     access: proxy
-    url: postgres:5432
+    url: $RECORDER_ADDR
     user: quote_updater
     editable: false
     secureJsonData:

@@ -955,6 +955,7 @@ mod tests {
             lane: U256::from(lane),
             orientation: String::new(),
             stream: String::new(),
+            pricing: String::new(),
             vault: None,
             breaker: "-".to_owned(),
             window: "-".to_owned(),

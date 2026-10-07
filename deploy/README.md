@@ -40,7 +40,7 @@ know. Run it after every edit to `config.toml` too.
 | --- | --- | --- |
 | updater | backoffice at `BACKOFFICE_BIND:8088` | quotes; rewrites `config/config.toml` from the backoffice |
 | grafana | `GRAFANA_BIND:3000`, user `admin` | the "Quote updater" dashboard; Prometheus and the recorder as datasources |
-| prometheus | `127.0.0.1:9090` | 90 days of `quote_updater_*` metrics; the rules from [`alerts/`](../alerts/) |
+| prometheus | `127.0.0.1:9090` | 90 days of `quote_updater_*` metrics; the rules from [`alerts/`](alerts/) |
 | alertmanager | `127.0.0.1:9093` | routes pages and tickets to `#propamm-alerts` |
 | postgres | compose network only | the `feed` schema the recorder writes (quotes, mids, vault balances, config history) |
 
@@ -65,13 +65,10 @@ the pairs and builders that changed; `target` and `[settings]` are read once at 
 is `.env`. [docs/manual.md](../docs/manual.md) covers the config file, the reload, the
 backoffice, the breaker, the metrics and the recorder.
 
-## Your own binary
+## Your own pricing models
 
-The image builds `example/` unless `.env` says otherwise. Once you have a crate of your own
-(docs/building-your-own.md), put it in this repository beside `example/` with its
-`Cargo.lock` committed, set `CRATE` to its directory and `BIN` to its binary name in `.env`,
-and `docker compose build`. Its config is the same file; only the `[pairs.pricing]` kinds it
-registers differ.
+The image builds `example/`. To run a pricing model of your own, add it to
+`example/src/main.rs` (docs/building-your-own.md) and `docker compose build`.
 
 ## Notes
 
@@ -79,5 +76,5 @@ registers differ.
   `config/config.toml`; nothing else in the image needs it.
 - Postgres keeps its data in the `postgres-data` volume; the updater creates and migrates the
   `feed` schema itself on every connect, so there is nothing to run by hand.
-- Alert rules are mounted straight from `alerts/quote-updater.rules.yml`; a change there is
+- Alert rules are mounted straight from `deploy/alerts/quote-updater.rules.yml`; a change there is
   live after `docker compose restart prometheus`.

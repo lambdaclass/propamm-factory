@@ -3,22 +3,41 @@ pragma solidity ^0.8.35;
 
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
-/// Mintable ERC20 for the local setup. `make local` writes this contract's runtime code onto
-/// the mainnet USDC/USDT addresses PropAMM registers as its pair, so swaps can actually move
-/// tokens. Anyone can mint.
-///
-/// The name and symbol read as empty on-chain: anvil_setCode copies code but not the storage
-/// a constructor would have written. Nothing depends on them for correctness, but the quote
-/// updater's preflight does read `symbol()` — to label each pair and to cross-check a
-/// configured Binance stream against its tokens. Against `make local` both reads come back
-/// empty, so pairs are labelled by lane (`lane 0x4aafb6…`) instead of `USDC/USDT` and the
-/// stream cross-check reports that it could not run. Both are warnings, not failures, so the
-/// local flow works — but it does mean `make local` cannot exercise either feature. An
-/// anvil fork of mainnet, which reads the real tokens, does.
+/// A mintable ERC-20 for tests and the local chain. `make local` writes this contract's code
+/// onto the mainnet USDC and USDT addresses with `anvil_setCode`, which copies code but no
+/// storage, so the name, symbol and decimals the constructor set are not there; `setMeta`
+/// writes them afterwards, and the updater's startup table then names the pair `USDC/USDT`
+/// instead of falling back to its lane.
 contract MockERC20 is ERC20 {
-    constructor() ERC20("Mock", "MOCK") {}
+    string private _metaName;
+    string private _metaSymbol;
+    uint8 private _metaDecimals;
+
+    constructor() ERC20("Mock", "MOCK") {
+        _metaName = "Mock";
+        _metaSymbol = "MOCK";
+        _metaDecimals = 18;
+    }
 
     function mint(address to, uint256 amount) external {
         _mint(to, amount);
+    }
+
+    function setMeta(string calldata name_, string calldata symbol_, uint8 decimals_) external {
+        _metaName = name_;
+        _metaSymbol = symbol_;
+        _metaDecimals = decimals_;
+    }
+
+    function name() public view override returns (string memory) {
+        return _metaName;
+    }
+
+    function symbol() public view override returns (string memory) {
+        return _metaSymbol;
+    }
+
+    function decimals() public view override returns (uint8) {
+        return _metaDecimals;
     }
 }

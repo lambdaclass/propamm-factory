@@ -1,0 +1,13 @@
+# Prometheus for `make quickstart`: the updater on this machine, the same rules as
+# production, no Alertmanager. prometheus.yml is the one the compose runs.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - ../alerts/*.rules.yml
+
+scrape_configs:
+  - job_name: quote-updater
+    static_configs:
+      - targets: ["127.0.0.1:9464"]
