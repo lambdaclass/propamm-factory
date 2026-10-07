@@ -25,8 +25,9 @@ From the repo root:
 make quickstart                       # deploys the contracts on anvil, builds this, quotes
 ```
 
-The quickstart uses `config.local.toml`: `--mode node`, which sends `updateState`
-transactions straight to the chain, since a local chain has no block builders.
+The quickstart uses `config.local.toml`: builder mode against the repo's two fake builders
+(`e2e/mocks.py`), which include each block's update in the block they mine on the local
+chain, so the backoffice at `http://127.0.0.1:8088` is there too.
 
 ## Run it against fake builders and a fake Binance
 

@@ -96,6 +96,10 @@ anvil_key = $$(cast wallet private-key --mnemonic '$(ANVIL_MNEMONIC)' --mnemonic
 # vault. Its approval is sent via impersonation below, so overriding still works:
 # `make local VAULT_ADDRESS=0x...`. The owner is the deployer, anvil account 0.
 VAULT_ADDRESS ?= 0x70997970C51812dc3A010C7d01b50e0d17dc79C8
+# anvil account 2: the local trader `make swap` sends from. Not the updater's account, so a
+# swap never fights the running updater for a nonce.
+TRADER_ADDR := 0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC
+TRADER_KEY = $(call anvil_key,2)
 
 # What updates publish, in human units: PropAMM reads slots = [delta, mid] with mid the
 # pair price at 1e18 (PRICE_SCALE) and delta the spread fraction discounted off it at
@@ -191,6 +195,8 @@ local: local-down test .local/priority-update-registry
 		$$(cd contracts && forge inspect MockERC20 deployedBytecode) --rpc-url $(RPC_URL)
 	cast send $(USDC) 'mint(address,uint256)' $(ANVIL_ADDR) $(MINT_AMOUNT) \
 		--private-key $(ANVIL_KEY) --rpc-url $(RPC_URL)
+	cast send $(USDC) 'mint(address,uint256)' $(TRADER_ADDR) $(MINT_AMOUNT) \
+		--private-key $(ANVIL_KEY) --rpc-url $(RPC_URL)
 	cast send $(USDT) 'mint(address,uint256)' $(VAULT_ADDRESS) $(MINT_AMOUNT) \
 		--private-key $(ANVIL_KEY) --rpc-url $(RPC_URL)
 	cast rpc anvil_impersonateAccount $(VAULT_ADDRESS) --rpc-url $(RPC_URL)
@@ -213,7 +219,7 @@ local: local-down test .local/priority-update-registry
 	@# End-to-end swap: the trader starts with USDC only, so after swapping 100 at price 1
 	@# their USDT balance is exactly 100.
 	$(MAKE) swap AMOUNT=100
-	@test "$$(cast call $(USDT) 'balanceOf(address)(uint256)' $(ANVIL_ADDR) --rpc-url $(RPC_URL))" = "100" || { \
+	@test "$$(cast call $(USDT) 'balanceOf(address)(uint256)' $(TRADER_ADDR) --rpc-url $(RPC_URL))" = "100" || { \
 		echo "swap did not credit the trader the expected USDT."; exit 1; }
 	@echo "Done. Factory at $(LOCAL_FACTORY), first PropAMM at $(PROPAMM_LOOKUP), vault: $(VAULT_ADDRESS)."
 	@echo "Chain: $(RPC_URL) (id 31337). Create more PropAMMs with createPropAMM on the factory."
@@ -233,23 +239,32 @@ update-price:
 	cast rpc anvil_mine --rpc-url $(RPC_URL)
 
 swap:
+	@# With `make quickstart` running (its fake builders leave a pid in .local/mocks.pid), the
+	@# next block they mine includes this swap after that block's update, so the swap just
+	@# waits for it. On a bare `make local`, nothing mines: a price is pushed for the block if
+	@# the pair has none, and the block is mined here.
 	set -e; PROP=$(PROPAMM_LOOKUP); \
-	MID=$$(cast to-wei $(PRICE) ether); D=$$(cast to-wei $(DELTA) ether); \
-	TS=$$(( $$(cast block latest -f timestamp --rpc-url $(RPC_URL)) + 12 )); \
-	NONCE=$$(cast nonce $(ANVIL_ADDR) --rpc-url $(RPC_URL)); \
-	cast rpc evm_setNextBlockTimestamp $$TS --rpc-url $(RPC_URL); \
-	cast send $(PUR_ADDR) 'updateState(address,uint256,uint32,uint256[])' \
-		$$PROP $(USDC_USDT_LANE) $$TS "[$$D,$$MID]" \
-		--async --nonce $$NONCE --private-key $(ANVIL_KEY) --rpc-url $(RPC_URL); \
+	if [ -f .local/mocks.pid ] && kill -0 $$(cat .local/mocks.pid) 2>/dev/null; then WAIT=1; fi; \
+	if [ -z "$$WAIT" ] && [ "$$(cast call $$PROP 'isActive(address,address)(bool)' $(USDC) $(USDT) --rpc-url $(RPC_URL))" != "true" ]; then \
+	  MID=$$(cast to-wei $(PRICE) ether); D=$$(cast to-wei $(DELTA) ether); \
+	  TS=$$(( $$(cast block latest -f timestamp --rpc-url $(RPC_URL)) + 12 )); \
+	  cast rpc evm_setNextBlockTimestamp $$TS --rpc-url $(RPC_URL); \
+	  cast send $(PUR_ADDR) 'updateState(address,uint256,uint32,uint256[])' \
+	    $$PROP $(USDC_USDT_LANE) $$TS "[$$D,$$MID]" \
+	    --async --private-key $(ANVIL_KEY) --rpc-url $(RPC_URL) >/dev/null; \
+	fi; \
+	NONCE=$$(cast nonce $(TRADER_ADDR) --rpc-url $(RPC_URL)); \
+	DEADLINE=$$(( $$(cast block latest -f timestamp --rpc-url $(RPC_URL)) + 3600 )); \
 	cast send $(USDC) 'transfer(address,uint256)' $$PROP $(AMOUNT) \
-		--async --nonce $$(( NONCE + 1 )) --private-key $(ANVIL_KEY) --rpc-url $(RPC_URL); \
-	cast send $$PROP 'swap(address,address,uint256,uint256,address,uint256)' \
-		$(USDC) $(USDT) $(AMOUNT) 0 $(ANVIL_ADDR) $$(( TS + 3600 )) \
-		--async --nonce $$(( NONCE + 2 )) --gas-limit 300000 \
-		--private-key $(ANVIL_KEY) --rpc-url $(RPC_URL); \
-	cast rpc anvil_mine --rpc-url $(RPC_URL)
-	@echo "trader USDC balance: $$(cast call $(USDC) 'balanceOf(address)(uint256)' $(ANVIL_ADDR) --rpc-url $(RPC_URL))"
-	@echo "trader USDT balance: $$(cast call $(USDT) 'balanceOf(address)(uint256)' $(ANVIL_ADDR) --rpc-url $(RPC_URL))"
+	  --async --nonce $$NONCE --private-key $(TRADER_KEY) --rpc-url $(RPC_URL) >/dev/null; \
+	TX=$$(cast send $$PROP 'swap(address,address,uint256,uint256,address,uint256)' \
+	  $(USDC) $(USDT) $(AMOUNT) 0 $(TRADER_ADDR) $$DEADLINE \
+	  --async --nonce $$(( NONCE + 1 )) --gas-limit 300000 \
+	  --private-key $(TRADER_KEY) --rpc-url $(RPC_URL)); \
+	if [ -z "$$WAIT" ]; then cast rpc anvil_mine --rpc-url $(RPC_URL) >/dev/null; fi; \
+	echo "swap $$TX: $$(cast receipt $$TX --confirmations 1 --rpc-url $(RPC_URL) status)"
+	@echo "trader USDC balance: $$(cast call $(USDC) 'balanceOf(address)(uint256)' $(TRADER_ADDR) --rpc-url $(RPC_URL))"
+	@echo "trader USDT balance: $$(cast call $(USDT) 'balanceOf(address)(uint256)' $(TRADER_ADDR) --rpc-url $(RPC_URL))"
 
 deploy-factory:
 	cd contracts && forge script script/DeployFactory.s.sol:DeployFactory \
@@ -274,13 +289,20 @@ price-service:
 	$(PUSHER_KEY_ENV)=$(ANVIL_KEY) cargo run -q -p quote-updater --example minimal -- --mode node \
 		--config .local/local.toml --rpc-url $(RPC_URL) --registry $(PUR_ADDR) --interval $(INTERVAL) --mine
 
-# The whole thing on a laptop: `make local`, then build example/ and have it quote the
-# USDC/USDT pair from Binance's live price, one updateState transaction per block, mining a
-# block each. Ctrl-c stops it; `make local-down` stops the chain.
+# The whole thing on a laptop: `make local`, then the two fake builders from e2e/ (they
+# include each block's update in the block they mine on anvil, every 12s), then example/
+# quoting the USDC/USDT pair from Binance's live price through them, in builder mode, with
+# the backoffice at http://127.0.0.1:8088. Ctrl-c stops the updater and the builders;
+# `make local-down` stops the chain.
+QUICKSTART_MOCKS := {"rpc_port": 8549, "anvil_rpc": "$(RPC_URL)", "mine_every": $(INTERVAL), "prices": {}, \
+	"builders": [{"name": "mock-a", "api_key": "key-a", "port": 8547}, {"name": "mock-b", "api_key": "key-b", "port": 8548}]}
 quickstart: local
 	cd example && sed "s/__PROPAMM__/$(PROPAMM_LOOKUP)/" config.local.toml > .local.toml && cargo build -q
-	cd example && $(PUSHER_KEY_ENV)=$(ANVIL_KEY) ./target/debug/my-propamm --config .local.toml --registry $(PUR_ADDR) --check
-	cd example && $(PUSHER_KEY_ENV)=$(ANVIL_KEY) ./target/debug/my-propamm --config .local.toml --registry $(PUR_ADDR) --mine --interval $(INTERVAL)
+	@set -e; (cd e2e && exec python3 mocks.py '$(QUICKSTART_MOCKS)') > .local/mocks.log 2>&1 & \
+	MOCKS=$$!; echo $$MOCKS > .local/mocks.pid; trap 'kill $$MOCKS 2>/dev/null; rm -f $(CURDIR)/.local/mocks.pid' EXIT; \
+	until grep -q READY .local/mocks.log 2>/dev/null; do sleep 0.2; done; \
+	cd example && $(PUSHER_KEY_ENV)=$(ANVIL_KEY) ./target/debug/my-propamm --config .local.toml --registry $(PUR_ADDR) --check && \
+	$(PUSHER_KEY_ENV)=$(ANVIL_KEY) ./target/debug/my-propamm --config .local.toml --registry $(PUR_ADDR)
 
 ## QUOTE UPDATER LIBRARY ##
 cargo-build:
