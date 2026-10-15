@@ -1,85 +1,81 @@
-# Capitán Monasterio — un maker malicioso real, sobre el código real de ElZorro
+# Capitán Monasterio — a real malicious maker, on ElZorro's own contract
 
-(nombre por el villano de la temporada 1 del Zorro clásico de Disney: el que le mueve el precio al Zorro.)
+(named after the villain of season 1 of Disney's classic Zorro series: the one who moves the price against the Zorro.)
 
-**Qué es:** un PoC de seguridad en Foundry. No es un contrato nuevo ni un modelo teórico de
-ataque — es el **contrato real de `PropAMM.sol`** (el mismo que esta factory deploya para
-ElZorro) corriendo local, donde la pieza "maliciosa" es simplemente una key de updater que hace
-lo mismo que el updater honesto (`quote-updater/src/node.rs: updateState(...)`), pero con mala
-intención. No se escribió ningún contrato atacante nuevo: el ataque vive enteramente en CUÁNDO y
-QUÉ escribe esa key, no en código custom.
+**What this is:** a Foundry security PoC. Not a new contract and not a theoretical attack model —
+it runs the repo's own `PropAMM.sol` (the same contract this factory deploys for a live maker),
+against an oracle mock that enforces the same authorization a real `IPrioUpdateRegistry` lane
+requires (`addUpdater`/`isUpdater`), unlike the repo's shared `MockPUR` test double, which leaves
+`setState` open to any caller by design (that one is fine for the repo's own pricing tests, which
+aren't testing authorization). The "malicious" piece here is not custom attacker code: it's the
+same `updateState` call an honest updater service makes, under someone else's control.
 
-**Por qué importa:** si un día una key de updater se compromete (laptop, CI, secret leak), esto
-es exactamente lo que podría hacer y qué le pasa al taker. Sirve para decidir qué defensa agregar
-antes de que haga falta, no después.
-
-**Archivo:** `contracts/test/CapitanMonasterioQuoteAndPull.t.sol`
-
-**Cómo correrlo** (no necesita RPC, no toca mainnet, 100% local — verificado, 4/4 pasan):
+**File:** `contracts/test/CapitanMonasterioQuoteAndPull.t.sol`
+**Run** (no RPC, no mainnet fork, fully local — 6/6 passing):
 ```
 cd contracts
 forge test --match-path 'test/CapitanMonasterioQuoteAndPull.t.sol' -vv
 ```
 
-## El mecanismo (quote-and-pull)
+## Revision history
 
-`PropAMM.sol` separa dos cosas: `quote()` (lo que ve el taker antes de operar) y `swap()` (lo que
-ejecuta). **Las dos leen el mismo oráculo (`IPrioUpdateRegistry`/PUR), cada una en su propio
-momento.** `swap()` NO reutiliza lo que devolvió `quote()` — vuelve a leer el precio fresco al
-momento de ejecutar (`PropAMM.sol:168`, `_quote` llamado de nuevo dentro de `swap`). Esto es
-bueno: significa que el contrato en sí mismo no puede mentir entre su propia cotización y su
-propio fill.
+v1 of this PoC used the repo's shared `MockPUR`, whose `setState` has no access control, so
+`vm.prank(updater)` was decorative — every test passed regardless of `msg.sender`. It also framed
+ordinary quote-and-pull under an honest updater (price changes between a taker's `quote()` read
+and its `swap()` landing, bounded by `minAmountOut`) as if it were the compromise scenario, and
+didn't model the actual high-severity case. This version:
+- adds `MockPURAuthenticated` (a dedicated test mock, only used here — the shared `MockPUR` is
+  untouched) so the updater's authorization is real, not decorative;
+- adds a test that proves an unregistered address cannot write a price at all;
+- adds the scenario a compromised key genuinely enables (below);
+- keeps the honest-price-change tests, relabeled as controls, not the vulnerability.
 
-El hueco está un nivel más abajo: **entre el momento en que el taker lee `quote()` off-chain (o
-simula su tx) y el momento en que su `swap()` realmente entra en un bloque, nada impide que el
-updater reescriba el precio.** Eso es el "pull":
+## The actual finding: a compromised updater key can drain the vault in one transaction
 
-1. El updater publica un precio atractivo (`delta=0`, `mid=2500`).
-2. El taker lee `quote()`, decide operar, arma su tx con un `minAmountOut` basado en ESE precio.
-3. Antes de que la tx del taker entre, el updater reescribe el precio (`delta=50bps`, mismo mid).
-4. `swap()` del taker re-cotiza contra el precio YA PULLEADO, no el que vio.
+`_pricing` only checks `mid != 0` (`PropAMM.sol:298`) — nothing compares the oracle's `mid`
+against any external reference. An address holding a valid, authorized updater key (compromised
+laptop, leaked CI secret, whatever the compromise vector) can write any `mid` it wants, then swap
+against the vault in the same transaction at that price.
 
-**Dos resultados posibles, según qué tan ajustado puso el taker su `minAmountOut`:**
+`test_compromisedUpdaterKey_drainsVaultWithAdverseMid` measures exactly this: vault funded with
+10,000 `tokenOut` at an honest mid of 2,500, the authorized key writes a mid 99% below market,
+and the attacker calls `quoteFillable` (the contract's own "most this pair can pay in one fill"
+function — used here to find the attacker's input size, rather than guessing one) and swaps for
+it. Result: **9,999.999999999999979976 tokenOut drained, 20,024 wei left in the vault** — the
+vault's entire balance, in one transaction.
 
-| Escenario | `minAmountOut` | Resultado | Test |
-|---|---|---|---|
-| Piso ajustado al precio que vio | == quote atractiva | `swap()` revierte (`InsufficientOutput`), **sin fallback** — perdió solo gas | `test_pulledBeforeSwap_tightMinOut_revertsNoFallback` |
-| Piso laxo (slippage genérico, ej. 5%) | < quote atractiva | `swap()` pasa, el taker recibe menos de lo que vio, sin que el contrato lo marque como nada raro | `test_pulledBeforeSwap_looseMinOut_takerShortchangedSilently` |
+## What is NOT the vulnerability (kept as controls)
 
-Importante: **llamado directo al venue (como en este test) no tiene fallback.** El fallback a
-Uniswap solo existe un nivel arriba, en el router (`PropAMMRouter._coreSwap`), si el fill llega
-por ahí. Un taker que llama a ElZorro directo, o cuyo agregador eligió este venue a mano, no tiene
-ese colchón.
+An honest updater changing the price between a taker's `quote()` read and its `swap()` landing is
+normal operation, not a compromise — every maker does this on its ordinary update schedule.
+`swap()` re-quotes fresh at execution (`PropAMM.sol:168`), so:
+- tight `minAmountOut` (pinned to the price the taker saw): the fresh, worse quote fails the
+  floor, `swap()` reverts `InsufficientOutput`, the taker loses only gas.
+- loose `minAmountOut` (a generic slippage tolerance the taker itself declared): the fill settles
+  within that declared tolerance — not a loss beyond what was disclosed going in.
 
-## Caso de control (no es exploit): phantom depth
+`test_phantomDepth_emptyVaultCaughtAtQuoteNotAtFill` is a second control: an empty vault is caught
+at `quote()` time (`EmptyVault`, `PropAMM.sol:304`), before any fill is attempted — unlike an
+adverse-mid write, which `quote()` has no way to flag as adverse.
 
-`test_phantomDepth_emptyVaultCaughtAtQuoteNotAtFill` muestra lo contrario: si el vault detrás del
-par no tiene `tokenOut`, `quote()` revierte ANTES de que nadie intente operar (`EmptyVault`,
-`PropAMM.sol:304`). Esta falla sí está cubierta hoy. Sirve de contraste: la insolvencia del vault
-se cacha en el momento de cotizar; el pull de precio, no.
+## What to decide (not decided here)
 
-## Qué decidir con esto
+- **Price band against an independent on-chain reference, checked in `_quote`.** The gap this PoC
+  exercises is specifically that nothing compares `mid` to anything external.
+- **Per-window withdrawal cap on the vault** (per pair or total), bounding a single-key
+  compromise's damage regardless of how adverse the written price is.
+- **Updater key isolation** (KMS/HSM, no access from CI or laptops) — reduces how a key gets
+  compromised in the first place, doesn't change what the contract allows once it is.
+- A simple rate-limit on how fast `mid`/`delta` can move between two updates from the same key is
+  weaker than it looks: it can be stepped around (e.g. 1% per 12-second block reaches 25% in about
+  5 minutes), and a genuine fast-market move (gaps across exchanges of tens of bps have been
+  observed in practice) would need headroom that may undercut the limit's usefulness. Worth
+  evaluating against real market data before relying on it alone.
 
-El contrato no tiene memoria de cuánto cambió el lane entre una lectura y la siguiente, ni una
-ventana de frescura propia (`PropAMM.sol` lee `oracle.getState(pairKey, now, now)` — la frescura,
-si existe, vive enteramente en el registry real, cuyo código no está en este repo). Dos capas
-donde podría agregarse una defensa, sin que sea una decisión tomada acá:
+## What this PoC does not cover
 
-- **En el updater/oracle:** límite de cuánto puede moverse `mid`/`delta` entre dos
-  `updateState` consecutivos en una ventana corta — mismo espíritu que
-  `max_source_age_ms`/`max_source_divergence` del PR `propamm-factory#9`, pero mirando hacia
-  adentro (key propia) en vez de hacia afuera (fuente de precio).
-- **En el taker/agregador:** no es responsabilidad del contrato, pero vale decirlo: un
-  `minAmountOut` ajustado convierte el ataque en "revert, pierdo gas" en vez de "me cobran la
-  diferencia en silencio".
-
-## Qué NO prueba este PoC
-
-- No mide si el registry REAL (no el `MockPUR` de test) ya tiene alguna ventana de frescura o
-  límite de variación — su código no está en este repo (`contracts/src/interfaces/
-  IPrioUpdateRegistry.sol` es solo la interfaz). Eso habría que confirmarlo mirando el registry
-  real on-chain.
-- No corre contra Kipseli ni ningún venue de terceros — ese intento (en
-  `propamm-router-contracts`) quedó bloqueado porque su cadena de contratos reales no está
-  documentada en ningún repo al que tengamos acceso, y reversarla a ciegas dio una dirección de
-  registry equivocada. Este PoC usa el contrato que SÍ conocemos de punta a punta: el nuestro.
+- Whether the real, deployed registry (not this test's mock) already enforces a freshness window
+  or a divergence bound beyond what `PropAMM.sol` itself checks — its source isn't in this repo,
+  only the interface. That would need checking against the live deployment directly.
+- Block-builder ordering assumptions (which update lands before which trade) are taken from this
+  repo's own documentation, not from an on-chain measurement.

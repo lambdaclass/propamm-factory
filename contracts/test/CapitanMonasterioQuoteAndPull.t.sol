@@ -3,43 +3,32 @@ pragma solidity ^0.8.35;
 
 import {Test} from "forge-std/Test.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {PropAMM, InsufficientOutput, EmptyVault} from "../src/PropAMM.sol";
-import {IPropAMM} from "../src/interfaces/IPropAMM.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
-import {MockPUR} from "./mocks/MockPUR.sol";
+import {MockPURAuthenticated} from "./mocks/MockPURAuthenticated.sol";
 
-/// @title Capitán Monasterio — a malicious maker modeled on ElZorro's real architecture, not a
-/// third-party venue
-/// @notice POL/Lambda security test of the router's anti-spoofing surface
-/// (internal_outputs/POL/Aligned/elzorro-unlocks/seguridad/). Supersedes the earlier
-/// Kipseli-based attempt in propamm-router-contracts/test/SpoofRegistryQuoteAndPullFork.t.sol,
-/// which required reverse-engineering an undocumented third-party proxy chain and got the
-/// registry address wrong. This file uses ElZorro's own contract (`PropAMM.sol`, the one the
-/// factory deploys) and its own oracle wiring, confirmed line-for-line from
-/// `PropAMM.sol`/`PropAMMFactory.sol`/`PropAMM.t.sol` in this repo. Fully local: no RPC, no
-/// mainnet fork, same `vm.etch` trick the repo's own tests use for the oracle
-/// (`0xDa7AfEeD021EAFC1c1Af9C362dE477DaD0396B81`).
+/// @title Capitán Monasterio — a malicious maker modeled on ElZorro's real architecture
+/// @notice Security PoC for a compromised/malicious oracle-updater key, built on this repo's own
+/// `PropAMM.sol` and a faithful (access-controlled) oracle mock. Fully local: no RPC, no mainnet
+/// fork, `vm.etch` at the same address `PropAMM.t.sol` uses for the oracle.
 ///
-/// CORRECTION vs the router-level "Spoofer A" model (propamm-router-contracts/test/
-/// SpoofQuoteMismatch.t.sol): that model assumed a venue's `quote()` and `swap()` could return
-/// independently different amounts. They cannot, here: `swap()` (PropAMM.sol:168) calls `_quote`
-/// AGAIN at execution time and prices off whatever the oracle says *right then*, not off
-/// whatever `quote()` returned earlier. A factory-deployed instance cannot lie between its own
-/// quote and its own fill. The real attack surface against this architecture is entirely in the
-/// oracle it reads from (`IPrioUpdateRegistry`/PUR): whoever controls an authorized updater key
-/// can rewrite the lane's `(delta, mid)` between the moment a taker read a price off-chain and
-/// the moment its swap transaction executes. That is quote-and-pull, and it is what this file
-/// tests — the same mechanism ElZorro's own `quote-updater` service uses to push honest prices
-/// (`quote-updater/src/node.rs`: `updateState(target, lane, ts, [delta, mid])`), here driven by a
-/// compromised/malicious key instead.
+/// Revised after review: the first version of this PoC used the repo's shared `MockPUR`, whose
+/// `setState` has no access control, so `vm.prank(updater)` was decorative — every test passed
+/// with any `msg.sender`, which proved nothing about what a compromised updater KEY specifically
+/// enables. It also framed ordinary quote-and-pull (an honest updater's price changing between a
+/// taker's `quote()` read and its `swap()` landing, which `minAmountOut` already bounds) as if it
+/// were the compromise scenario. This version fixes both: `MockPURAuthenticated` enforces
+/// `isUpdater`, so only the address `PropAMM.initialize` actually registered can write, and a
+/// dedicated test (`test_compromisedUpdaterKey_drainsVaultWithAdverseMid`) models the scenario a
+/// compromised key genuinely enables — setting an adverse `mid` and draining the vault in one
+/// transaction — which the earlier version did not cover.
 contract CapitanMonasterioQuoteAndPullTest is Test {
-    // The PUR oracle address PropAMM.sol hardcodes its reads against (via the oracle it's
-    // initialized with) — confirmed real/live address, not the stale one in
-    // propamm-router-contracts/test/interfaces/IPrioUpdateRegistry.sol.
+    // The oracle address PropAMM.sol's tests etch a mock onto (see `PropAMM.t.sol`).
     address constant ORACLE = 0xDa7AfEeD021EAFC1c1Af9C362dE477DaD0396B81;
     uint256 constant PRICE_SCALE = 1e18; // PropAMM.PRICE_SCALE
     uint256 constant AMOUNT_IN = 1 ether;
+    uint256 constant VAULT_TOKEN_OUT_BALANCE = 10_000 ether;
+    uint256 constant HONEST_MID = 2_500 * PRICE_SCALE;
 
     MockERC20 internal tokenIn;
     MockERC20 internal tokenOut;
@@ -47,16 +36,14 @@ contract CapitanMonasterioQuoteAndPullTest is Test {
 
     address internal owner = makeAddr("owner");
     address internal vault = makeAddr("vault");
-    // The authorized price-updater key. In production this is ElZorro's quote-updater service;
-    // here it is the attacker — modeling a compromised or malicious key with legitimate write
-    // access to the lane, not a flaw in PropAMM.sol itself.
+    // The authorized price-updater key. In production this is the maker's own quote-updater
+    // service; "a compromised key" means this exact address, under someone else's control.
     address internal updater = makeAddr("updater");
     address internal taker = makeAddr("taker");
-
-    uint256 internal pairKey;
+    address internal attacker = makeAddr("unauthorized-attacker");
 
     function setUp() public {
-        vm.etch(ORACLE, address(new MockPUR()).code);
+        vm.etch(ORACLE, address(new MockPURAuthenticated()).code);
 
         tokenIn = new MockERC20();
         tokenOut = new MockERC20();
@@ -74,115 +61,153 @@ contract CapitanMonasterioQuoteAndPullTest is Test {
                 )
             )
         );
-        pairKey = uint256(
-            keccak256(
-                address(tokenIn) < address(tokenOut)
-                    ? abi.encodePacked(address(tokenIn), address(tokenOut))
-                    : abi.encodePacked(address(tokenOut), address(tokenIn))
-            )
-        );
 
-        // Fund the vault with tokenOut and have it approve the instance, the precondition
-        // `setPairVault`'s own NatSpec calls out: "fund the new vault and have it approve this
-        // instance ... before calling this, or every swap reverts on the output leg."
-        tokenOut.mint(vault, 10_000 ether);
+        tokenOut.mint(vault, VAULT_TOKEN_OUT_BALANCE);
         vm.prank(vault);
         tokenOut.approve(address(propAmm), type(uint256).max);
     }
 
-    /// @dev Pushes `(delta, mid)` to the oracle lane as the authorized updater — exactly the call
-    /// ElZorro's own quote-updater makes (`quote-updater/src/node.rs`), just invoked here as
-    /// whoever holds that key, honest or not.
-    function _updatePrice(uint256 delta, uint256 mid) internal {
-        vm.prank(updater);
-        MockPUR(ORACLE).setState(delta, mid);
+    function _updatePriceAs(address caller, uint256 delta, uint256 mid) internal {
+        vm.prank(caller);
+        MockPURAuthenticated(ORACLE).setState(delta, mid);
     }
 
-    /// @dev Mirrors the router's push-payment model (`PropAMMRouter._dispatchVenue`): the taker's
-    /// `tokenIn` lands on the venue contract BEFORE `swap()` is called, so calling `swap()`
-    /// directly here (bypassing the router) needs the same pre-transfer to stay faithful to how
-    /// a real fill reaches this contract.
-    function _fundTakerAndPush(uint256 amountIn) internal {
-        tokenIn.mint(taker, amountIn);
-        vm.prank(taker);
+    /// @dev Mirrors the router's push-payment model: `tokenIn` lands on the venue contract before
+    /// `swap()` is called, so calling `swap()` directly here needs the same pre-transfer.
+    function _fundTakerAndPush(address from, uint256 amountIn) internal {
+        tokenIn.mint(from, amountIn);
+        vm.prank(from);
         tokenIn.transfer(address(propAmm), amountIn);
     }
 
-    /// @notice Baseline: no pull. The lane is set once, the taker quotes and swaps against the
-    /// same state. What an honest fill looks like, to measure the pulled scenarios against.
+    //------------------------------
+    // Access control: is "the updater key" actually required?
+    //------------------------------
+
+    /// @notice Proves the oracle mock's authorization is real, not decorative: an address never
+    /// registered via `PropAMM.initialize`/`addUpdater` cannot write a price, full stop. This is
+    /// the precondition every "compromised key" scenario below depends on — without it, "the
+    /// attacker holds the updater key" and "anyone can write" are indistinguishable.
+    function test_unauthorizedCallerCannotWritePrice_accessControlEnforced() public {
+        vm.prank(attacker);
+        vm.expectRevert(abi.encodeWithSelector(MockPURAuthenticated.NotAnUpdater.selector, attacker));
+        MockPURAuthenticated(ORACLE).setState(0, HONEST_MID);
+    }
+
+    //------------------------------
+    // The actual compromised-key scenario: an adverse mid, drained in one transaction
+    //------------------------------
+
+    /// @notice What a compromised updater key genuinely enables, per the review this PoC was
+    /// revised against: the key is real and authorized (this is not a bypass of the access
+    /// control proven above), so whoever holds it can write ANY `mid` — `_pricing` only checks
+    /// `mid != 0` (`PropAMM.sol:298`), with no comparison against an external reference. Setting
+    /// `mid` to 1% of the honest price and swapping against the vault in the same transaction
+    /// drains `tokenOut` at that price, bounded only by the vault's own balance and
+    /// `_priceImpact`'s cap on a single fill (found here via `quoteFillable`, the contract's own
+    /// "most this pair can pay in one fill" function, rather than guessed at). This is the
+    /// high-severity case the quote-and-pull framing in the prior version of this file did not
+    /// cover.
+    function test_compromisedUpdaterKey_drainsVaultWithAdverseMid() public {
+        _updatePriceAs(updater, 0, HONEST_MID);
+        uint256 vaultValueAtHonestPrice = VAULT_TOKEN_OUT_BALANCE; // all of it, priced in tokenOut
+
+        // The compromise: the legitimate (authorized) key writes a price 99% below market.
+        uint256 adverseMid = HONEST_MID / 100;
+        _updatePriceAs(updater, 0, adverseMid);
+
+        // Ask the contract itself for the largest single fill it will pay out at this price,
+        // rather than assuming a size: `quoteFillable` is what the router's split path uses for
+        // exactly this ("the most this pair can pay"), so reusing it keeps the attacker's input
+        // size honest to the contract's own cap instead of hand-picked.
+        (uint256 maxFillableIn, uint256 expectedOut) =
+            propAmm.quoteFillable(address(tokenIn), address(tokenOut), type(uint128).max);
+
+        _fundTakerAndPush(attacker, maxFillableIn);
+        vm.prank(attacker);
+        uint256 amountOut =
+            propAmm.swap(address(tokenIn), address(tokenOut), maxFillableIn, expectedOut, attacker, block.timestamp);
+
+        assertEq(amountOut, expectedOut, "drained exactly what quoteFillable priced at the adverse mid");
+        // What the taker paid (at the adverse mid) vs. what that same tokenOut was worth a moment
+        // earlier, at the honest price: the vault's loss, bounded by its own balance.
+        uint256 vaultValueLeftAtHonestPrice = tokenOut.balanceOf(vault);
+        assertLt(
+            vaultValueLeftAtHonestPrice,
+            vaultValueAtHonestPrice,
+            "vault should be measurably drained relative to the honest-price baseline"
+        );
+        emit log_named_uint("tokenOut drained in one tx", amountOut);
+        emit log_named_uint("tokenIn the attacker paid for it", maxFillableIn);
+        emit log_named_uint("vault tokenOut balance remaining", vaultValueLeftAtHonestPrice);
+    }
+
+    //------------------------------
+    // Control: ordinary quote-and-pull under an HONEST updater is not this vulnerability
+    //------------------------------
+
+    /// @notice Baseline: an honest updater, no pull. What a normal fill looks like.
     function test_noPull_honestFillBaseline() public {
-        _updatePrice(0, 2_500 * PRICE_SCALE); // delta=0 (no spread), mid=2500 tokenOut per tokenIn
+        _updatePriceAs(updater, 0, HONEST_MID);
         uint256 expected = propAmm.quote(address(tokenIn), address(tokenOut), AMOUNT_IN);
 
-        _fundTakerAndPush(AMOUNT_IN);
+        _fundTakerAndPush(taker, AMOUNT_IN);
         vm.prank(taker);
         uint256 amountOut = propAmm.swap(address(tokenIn), address(tokenOut), AMOUNT_IN, expected, taker, block.timestamp);
 
         assertEq(amountOut, expected, "honest fill should settle at the quoted price");
-        assertEq(tokenOut.balanceOf(taker), expected, "taker should receive exactly what it quoted");
     }
 
-    /// @notice The pull, tight `minAmountOut`: the taker reads an attractive price (delta=0,
-    /// mid=2500), builds its swap with `minAmountOut` from THAT price, but before the swap lands
-    /// the updater rewrites the lane to a worse one (delta=50 bps, same mid). `swap()` re-quotes
-    /// fresh against the pulled lane, undershoots the taker's floor, and reverts outright —
-    /// `InsufficientOutput`, thrown by PropAMM.sol itself (PropAMM.sol:169), with no fallback at
-    /// this layer: calling the venue directly (as this test does, and as the router's
-    /// `_dispatchVenue` does before its own try/catch) has nowhere else to go. The taker is out
-    /// only gas, not funds, but gets no fill at all.
-    function test_pulledBeforeSwap_tightMinOut_revertsNoFallback() public {
-        _updatePrice(0, 2_500 * PRICE_SCALE);
-        uint256 amountOutMinFromAttractivePrice = propAmm.quote(address(tokenIn), address(tokenOut), AMOUNT_IN);
+    /// @notice NOT a vulnerability: with an honest updater, the oracle's price can still change
+    /// between a taker's `quote()` read and its `swap()` landing — every maker in this system does
+    /// this on an ordinary schedule, it is not a compromise. `swap()` re-quotes fresh
+    /// (`PropAMM.sol:168`) and a tight `minAmountOut` (pinned to the price the taker saw) makes
+    /// that fresh quote fail its own floor, so the swap reverts (`InsufficientOutput`) rather than
+    /// settling at a worse price. The taker loses only gas. Kept as a control to distinguish this
+    /// from the compromised-key scenario above.
+    function test_honestPriceChangeBetweenQuoteAndSwap_tightMinOut_reverts() public {
+        _updatePriceAs(updater, 0, HONEST_MID);
+        uint256 amountOutMinFromEarlierQuote = propAmm.quote(address(tokenIn), address(tokenOut), AMOUNT_IN);
 
-        // The pull: same block, no event the taker can react to, by the same key that pushes
-        // ElZorro's honest prices in production.
-        _updatePrice(50 * PRICE_SCALE / 10_000, 2_500 * PRICE_SCALE); // 50 bps spread now
+        _updatePriceAs(updater, 50 * PRICE_SCALE / 10_000, HONEST_MID); // honest 50bps spread update
 
-        _fundTakerAndPush(AMOUNT_IN);
+        _fundTakerAndPush(taker, AMOUNT_IN);
         vm.prank(taker);
-        // Selector-only: the exact second argument (realAmountOut) also bakes in
-        // `_priceImpact`'s charge for the size of this fill against the vault, which is incidental
-        // to this scenario — asserting the revert type and the taker's own floor is enough to
-        // prove the pull causes an outright revert, without pinning to that unrelated detail.
+        // Selector-only: the exact second argument also bakes in `_priceImpact`'s charge for this
+        // fill's size against the vault, incidental to this scenario.
         vm.expectPartialRevert(InsufficientOutput.selector);
-        propAmm.swap(address(tokenIn), address(tokenOut), AMOUNT_IN, amountOutMinFromAttractivePrice, taker, block.timestamp);
+        propAmm.swap(address(tokenIn), address(tokenOut), AMOUNT_IN, amountOutMinFromEarlierQuote, taker, block.timestamp);
     }
 
-    /// @notice The pull, loose `minAmountOut`: same pull, but the taker's floor was set loosely
-    /// (e.g. a wide default slippage tolerance) rather than pinned to the attractive price. The
-    /// swap now succeeds — re-quoted fresh at the pulled (worse) price, same as the honest case
-    /// would at that price — and the taker is shortchanged by the full gap between the price it
-    /// saw and the price it got, with the contract treating it as an entirely ordinary fill.
-    function test_pulledBeforeSwap_looseMinOut_takerShortchangedSilently() public {
-        _updatePrice(0, 2_500 * PRICE_SCALE);
-        uint256 attractiveQuote = propAmm.quote(address(tokenIn), address(tokenOut), AMOUNT_IN);
+    /// @notice Same honest price change, but with a loose `minAmountOut` (a generic slippage
+    /// tolerance the taker itself declared): the swap succeeds at the new, slightly worse price,
+    /// within the tolerance the taker accepted going in. Not a silent loss beyond what was
+    /// disclosed.
+    function test_honestPriceChangeBetweenQuoteAndSwap_looseMinOut_withinDeclaredTolerance() public {
+        _updatePriceAs(updater, 0, HONEST_MID);
+        uint256 earlierQuote = propAmm.quote(address(tokenIn), address(tokenOut), AMOUNT_IN);
 
-        _updatePrice(50 * PRICE_SCALE / 10_000, 2_500 * PRICE_SCALE);
+        _updatePriceAs(updater, 50 * PRICE_SCALE / 10_000, HONEST_MID);
 
-        uint256 looseMinOut = attractiveQuote * 95 / 100; // a generic 5% slippage tolerance
+        uint256 looseMinOut = earlierQuote * 95 / 100; // a 5% slippage tolerance the taker declared
 
-        _fundTakerAndPush(AMOUNT_IN);
+        _fundTakerAndPush(taker, AMOUNT_IN);
         vm.prank(taker);
-        uint256 amountOut =
-            propAmm.swap(address(tokenIn), address(tokenOut), AMOUNT_IN, looseMinOut, taker, block.timestamp);
+        uint256 amountOut = propAmm.swap(address(tokenIn), address(tokenOut), AMOUNT_IN, looseMinOut, taker, block.timestamp);
 
-        assertLt(amountOut, attractiveQuote, "taker received less than the price it saw before the pull");
-        assertEq(attractiveQuote - amountOut, 12_500000000000000000, "quantified pull cost: 50bps of the attractive quote");
+        assertGe(amountOut, looseMinOut, "fill must clear the taker's own declared floor");
+        assertLt(amountOut, earlierQuote, "price moved against the taker, as an honest update can");
     }
 
-    /// @notice Contrast case, not an exploit: phantom depth. An attractive price is live, but the
-    /// vault backing the pair has no `tokenOut` at all. Unlike the pull, this is caught BEFORE any
-    /// fill is attempted — `quote()` itself reverts `EmptyVault` (PropAMM.sol:304), so a taker (or
-    /// the router's own selection loop, which try/catches `quote()`) never selects this venue in
-    /// the first place. Included to show the contract's existing defenses are not uniformly
-    /// absent: insolvency is caught at quote time, a pulled price is not.
+    /// @notice Control, not an exploit: if the vault behind a pair holds no `tokenOut`, `quote()`
+    /// reverts BEFORE any fill is attempted (`EmptyVault`, `PropAMM.sol:304`). Included to show
+    /// this failure mode is already covered, unlike an adverse-mid write.
     function test_phantomDepth_emptyVaultCaughtAtQuoteNotAtFill() public {
         address starvedVault = makeAddr("starved-vault");
         vm.prank(owner);
         propAmm.setPairVault(address(tokenIn), address(tokenOut), starvedVault);
-        // starvedVault holds no tokenOut and has approved nothing.
 
-        _updatePrice(0, 2_500 * PRICE_SCALE);
+        _updatePriceAs(updater, 0, HONEST_MID);
 
         vm.expectRevert(abi.encodeWithSelector(EmptyVault.selector, address(tokenOut)));
         propAmm.quote(address(tokenIn), address(tokenOut), AMOUNT_IN);
