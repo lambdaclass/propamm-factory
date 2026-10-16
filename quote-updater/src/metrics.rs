@@ -20,10 +20,11 @@
 
 use eyre::Result;
 use prometheus::{
-    Gauge, GaugeVec, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, Opts,
-    PullingGauge, Registry, TextEncoder,
+    Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramOpts, HistogramVec, IntCounter,
+    IntCounterVec, Opts, PullingGauge, Registry, TextEncoder,
 };
 
+use crate::source_gate::SourceFault;
 use crate::update::UnusableKind;
 
 /// Buckets for RPC call duration, in seconds. Straddles the documented ~50ms requote
@@ -268,7 +269,12 @@ pub struct Metrics {
     venue_feed_sample_current: GaugeVec,
     venue_feed_mid: GaugeVec,
     venue_feed_delta: GaugeVec,
+    venue_source_age_ms: GaugeVec,
+    venue_future_stamps: IntCounterVec,
     price_unusable: IntCounterVec,
+    source_withdrawn: GaugeVec,
+    source_divergence_inactive: GaugeVec,
+    source_withdrawn_seconds: CounterVec,
     diagnostic: GaugeVec,
     trip_source: GaugeVec,
     guards: GaugeVec,
@@ -326,7 +332,12 @@ pub struct PairMetrics {
     pub feed_delta: Gauge,
     pub feed_sources_fresh: Gauge,
     pub feed_sources_min: Gauge,
-    price_unusable: [IntCounter; 5],
+    price_unusable: [IntCounter; UnusableKind::ALL.len()],
+    source_withdrawn: [Gauge; SourceFault::ALL.len()],
+    source_withdrawn_seconds: [Counter; SourceFault::ALL.len()],
+    /// 1 while `max_source_divergence` is set and no source but the primary is fresh, so
+    /// the check compares nothing.
+    pub source_divergence_inactive: Gauge,
     publish_decisions: [IntCounter; 4],
     pub published_mid: Gauge,
     pub published_delta: Gauge,
@@ -363,6 +374,11 @@ pub struct VenueMetrics {
     pub sample_current: Gauge,
     pub mid: Gauge,
     pub delta: Gauge,
+    /// `quote_updater_venue_source_age_ms`: written at scrape time from the feed's own
+    /// clock (see `Metrics::render`), and by `quiesce`.
+    pub source_age_ms: Gauge,
+    /// Frames whose exchange stamp was too far ahead of their arrival to read a lag from.
+    pub future_stamps: IntCounter,
 }
 
 impl VenueMetrics {
@@ -378,6 +394,7 @@ impl VenueMetrics {
             &self.sample_current,
             &self.mid,
             &self.delta,
+            &self.source_age_ms,
         ] {
             gauge.set(f64::NAN);
         }
@@ -468,6 +485,18 @@ enum Count {
 /// Builds a counter family, registers it, and hands it back.
 fn counter(registry: &Registry, name: &str, help: &str, labels: &[&str]) -> Result<IntCounterVec> {
     let v = IntCounterVec::new(Opts::new(name, help), labels)?;
+    registry.register(Box::new(v.clone()))?;
+    Ok(v)
+}
+
+/// Builds a float counter family (one that counts seconds), registers it, and hands it back.
+fn seconds_counter(
+    registry: &Registry,
+    name: &str,
+    help: &str,
+    labels: &[&str],
+) -> Result<CounterVec> {
+    let v = CounterVec::new(Opts::new(name, help), labels)?;
     registry.register(Box::new(v.clone()))?;
     Ok(v)
 }
@@ -596,10 +625,44 @@ impl Metrics {
                 "Latest half-spread observed at this venue.",
                 pv,
             )?,
+            venue_source_age_ms: gauge(
+                &r,
+                "quote_updater_venue_source_age_ms",
+                "Age of this venue's latest price in milliseconds: by the exchange's own \
+                 timestamp when its frames carry one, else by arrival.",
+                pv,
+            )?,
+            venue_future_stamps: counter(
+                &r,
+                "quote_updater_venue_future_stamps_total",
+                "Frames whose exchange timestamp was more than 2s ahead of their arrival, left \
+                 out of the venue's usual lag: this host's clock or the venue's is off.",
+                pv,
+            )?,
             price_unusable: counter(
                 &r,
                 "quote_updater_price_unusable_total",
                 "Ticks where no price could be published.",
+                &["pair", "reason"],
+            )?,
+            source_withdrawn: gauge(
+                &r,
+                "quote_updater_source_withdrawn",
+                "1 while the pair is withdrawn by its source checks for this reason \
+                 (source_stale, source_divergence).",
+                &["pair", "reason"],
+            )?,
+            source_divergence_inactive: gauge(
+                &r,
+                "quote_updater_source_divergence_inactive",
+                "1 while max_source_divergence is set and no source but the primary has a \
+                 fresh price, so the divergence check compares nothing.",
+                &["pair"],
+            )?,
+            source_withdrawn_seconds: seconds_counter(
+                &r,
+                "quote_updater_source_withdrawn_seconds_total",
+                "Seconds the pair has spent withdrawn by its source checks, by reason.",
                 &["pair", "reason"],
             )?,
             // What a custom pricer declared in build(). Names are declared there, so the
@@ -998,6 +1061,13 @@ impl Metrics {
             feed_sources_min: self.feed_sources_min.with_label_values(p),
             price_unusable: UnusableKind::ALL
                 .map(|k| self.price_unusable.with_label_values(&[pair, k.as_str()])),
+            source_withdrawn: SourceFault::ALL
+                .map(|f| self.source_withdrawn.with_label_values(&[pair, f.as_str()])),
+            source_divergence_inactive: self.source_divergence_inactive.with_label_values(p),
+            source_withdrawn_seconds: SourceFault::ALL.map(|f| {
+                self.source_withdrawn_seconds
+                    .with_label_values(&[pair, f.as_str()])
+            }),
             publish_decisions: PublishAction::ALL.map(|a| {
                 self.publish_decisions
                     .with_label_values(&[pair, a.as_str()])
@@ -1044,6 +1114,8 @@ impl Metrics {
             sample_current: self.venue_feed_sample_current.with_label_values(pv),
             mid: self.venue_feed_mid.with_label_values(pv),
             delta: self.venue_feed_delta.with_label_values(pv),
+            source_age_ms: self.venue_source_age_ms.with_label_values(pv),
+            future_stamps: self.venue_future_stamps.with_label_values(pv),
         }
     }
 
@@ -1070,7 +1142,9 @@ impl Metrics {
     /// The Prometheus text exposition of everything registered right now.
     pub fn render(&self) -> Result<String> {
         // Each watched venue's `up` is what its feed task holds right now, read here, when
-        // Prometheus asks, rather than whatever was last written.
+        // Prometheus asks, rather than whatever was last written; its price's age too, which
+        // grows between frames and so has no write that could keep it right.
+        let (now, wall) = (std::time::Instant::now(), std::time::SystemTime::now());
         for ((pair, venue), connected) in self
             .venue_connections
             .lock()
@@ -1080,6 +1154,9 @@ impl Metrics {
             self.venue_feed_up
                 .with_label_values(&[pair, venue])
                 .set(connected.gauge_value());
+            self.venue_source_age_ms
+                .with_label_values(&[pair, venue])
+                .set(connected.source_age_ms(now, wall));
         }
         Ok(TextEncoder::new().encode_to_string(&self.registry.gather())?)
     }
@@ -1325,10 +1402,31 @@ impl PairMetrics {
         ] {
             gauge.set(f64::NAN);
         }
+        for gauge in &self.source_withdrawn {
+            gauge.set(f64::NAN);
+        }
+        self.source_divergence_inactive.set(f64::NAN);
     }
 
     pub fn price_unusable(&self, kind: UnusableKind) -> &IntCounter {
         &self.price_unusable[kind as usize]
+    }
+    /// Lowers the source-check gauges (withdrawn, divergence inactive): what a generation
+    /// that has not judged a tick, or a pair whose checks were removed, says. Without it a pair reloaded out of the checks
+    /// while withdrawn would read 1 until the process restarted, and keep a ticket open.
+    pub fn clear_source_withdrawn(&self) {
+        for gauge in &self.source_withdrawn {
+            gauge.set(0.0);
+        }
+        self.source_divergence_inactive.set(0.0);
+    }
+    /// 1 while the source checks hold the pair withdrawn for `fault`.
+    pub fn source_withdrawn(&self, fault: SourceFault) -> &Gauge {
+        &self.source_withdrawn[fault as usize]
+    }
+    /// The seconds the source checks have held the pair withdrawn for `fault`.
+    pub fn source_withdrawn_seconds(&self, fault: SourceFault) -> &Counter {
+        &self.source_withdrawn_seconds[fault as usize]
     }
     pub fn publish_decisions(&self, action: PublishAction) -> &IntCounter {
         &self.publish_decisions[action as usize]
@@ -1588,6 +1686,8 @@ mod tests {
             (UnusableKind::OutOfBand, 3),
             (UnusableKind::DeltaOverflow, 4),
             (UnusableKind::Panic, 5),
+            (UnusableKind::SourceStale, 6),
+            (UnusableKind::SourceDivergence, 7),
         ];
         assert_eq!(kinds.len(), UnusableKind::ALL.len());
         for (kind, n) in kinds {

@@ -176,6 +176,126 @@ venue with a wrong symbol, or one disagreeing with the others, shows up before a
 published. Each venue can be repointed (a mock, a regional endpoint) from
 `[settings.endpoints]`; `binance_ws` is the older spelling of its Binance entry.
 
+### Source checks: a late or disagreeing primary
+
+Two optional keys withdraw a pair while its primary source cannot be trusted, and quote it
+again as soon as it can. Both are off unless set; a pair that sets neither quotes exactly as
+before.
+
+```toml
+[[pairs]]
+# ...
+sources = [
+  { venue = "binance", symbol = "ETHUSDT", weight = "2" },
+  { venue = "okx",     symbol = "ETH-USDT" },
+]
+max_source_age_ms     = "1500"   # see below: for Binance this catches silence, not a backlog
+max_source_divergence = "0.001"  # at most 10bp from the nearest fresh other source
+```
+
+The primary is the highest-weight source, the first of them on a tie, or the one market a
+`symbol` pair reads. While either check fails, every tick is refused before the pricer
+runs, under `source_stale` or `source_divergence`, and the quote is withdrawn the way a
+stale feed withdraws it: an empty-tx cancel at every builder, kept in force for that block
+and every block after it until a tick passes both checks. Nothing latches; there is no
+reload to make, unlike the circuit breaker.
+
+- **`max_source_age_ms`** (whole milliseconds, 1 to 30000): how old the primary's latest
+  price may be. The age moves only on a price, never on a ping, so a stream that is
+  connected but sends nothing new ages out. The quote loop also sets a timer for the moment
+  the primary would cross the limit, so a primary that simply stops is withdrawn on time
+  even when nothing else is moving.
+  - Where the venue stamps its frames (OKX's `tickers` `ts`, Gate's `book_ticker` `t`), the
+    age is the time since the frame arrived plus how much later than usual it arrived
+    behind its stamp. "Usual" is the least lag the venue's frames have had over the last
+    hour, capped at 1 second. That absorbs up to a second of this host's clock offset from
+    the exchange's, either way, and the network's ordinary latency. Because of the cap, a
+    backlog always shows: one that started before the feed was dialled (at start or on a
+    reload), or one that lasts longer than the hour, still reads as at least its length
+    less one second. A host clock more than a second ahead makes every stamped price read
+    late by the excess, which fails closed (see below). A stamp more than 2 seconds ahead
+    of its arrival is left out of the baseline and counted in
+    `quote_updater_venue_future_stamps_total`; a steady count there means this host's clock
+    is behind. A step of the host clock against its monotonic clock (an NTP correction, a
+    resume from sleep) restarts the baseline, so a correction cannot leave every later
+    frame looking late for an hour.
+  - Where the venue does not stamp its frames, the age is measured from the frame's
+    arrival: Binance's spot `bookTicker` carries no event time (its frame is `u s b B a A`),
+    nor do the other venues as the updater reads them. With such a primary this key only
+    catches a stream that has gone silent. A stream that keeps delivering old prices on
+    time, as on 2026-10-08, passes it; `max_source_divergence` is what catches that.
+- **`max_source_divergence`** (a fraction between 0 and 1, `0.001` = 10bp): how far the
+  primary's mid may sit from the other sources'. Needs at least two sources. Set alone, the
+  primary is held to the 30-second rule every source already has. Exactly what is
+  compared:
+  - Never a source on the *same venue* as the primary. A second market on the primary's
+    exchange shares the path to it, so it shares any backlog on that path: two Binance
+    markets behind one congested link read the same stale price and agree, which is no
+    check at all. Only a different venue is an independent cross-check.
+  - Only sources whose own price is fresh: inside 30 seconds, and inside
+    `max_source_age_ms` when that is set. A *stamped* source (OKX, Gate) is also held to
+    its exchange-time age even when `max_source_age_ms` is unset — to 30 seconds — so a
+    backlogged stamped secondary is dropped rather than used to withdraw a healthy primary.
+  - Of the fresh ones, only those that stamp their frames, whenever at least one such is
+    fresh. A source without stamps is fresh by arrival, which a backlog does not change, so
+    it is not trusted to withdraw the pair while a stamped source can speak instead. When
+    no stamped source is fresh (or none is configured), the unstamped ones are compared,
+    because they are then the only check there is. Pair a Binance primary with an OKX or
+    Gate source.
+  - The pair withdraws when the primary is further than the limit from every source
+    compared: the nearest one decides. With one other source, that source decides, and a
+    single bad tick from it withdraws the pair for that tick. With two or more, one source
+    off on its own does not.
+  - The check only sees a *correlated* backlog — one across every live source at once — if
+    an independent, exchange-stamped clock is in play: the primary's own, or a compared
+    secondary's. When none is (an unstamped primary whose only live cross-checks are on its
+    own venue, or unstamped, or stale), it cannot, and `quote_updater_source_divergence_inactive{pair}`
+    reads 1, the `PusherSourceDivergenceInactive` alert raises a ticket after five minutes,
+    and the updater logs a line when the check stops and starts comparing. The same gauge
+    reads 1 when nothing at all is compared (no other source fresh, or only ones whose mid
+    is zero). This is the case to pair a stamped venue against an unstamped primary for.
+
+There is no hysteresis: a tick that fails withdraws, and the next tick that passes quotes
+again. That is a choice. A cancel costs an empty-tx update at the builders, and a persistence
+requirement of 2 seconds or more gave back most of the avoided loss when we calibrated it
+on the incidents below.
+
+Why both, and why the 30-second rule is not enough. That rule counts a venue fresh while
+frames keep arriving, and the last price stands until 30 seconds pass with no frame at all.
+A stream that is alive but running behind the exchange never trips it. Measured on one
+production pair: on 2026-10-08 between 15:21 and 15:26 UTC the Binance ETHUSDT stream
+reaching the updater ran 21-40 seconds behind Binance's public data (ETHUSDC 9-20 seconds),
+while OKX and Gate were 0-1 second behind; the backlog then drained in about 15 seconds,
+the way a queue does. The same pattern recurred on 10-13 around 11:23 and 10-14 around
+12:30. Frames kept arriving, so nothing withdrew, and the pair's quotes stood at prices
+tens of seconds old. Binance's bookTicker carries no timestamp, so the age check cannot see
+that lag on Binance itself; the divergence check does, as soon as the market moves further
+than the limit, because OKX was current. On a venue that stamps its frames, the age check
+sees the lag on the first frame.
+
+Starting values: on an ETH pair, `max_source_age_ms = "1500"` and
+`max_source_divergence = "0.001"`. On a stable pair, `max_source_divergence = "0.0005"`,
+and either leave `max_source_age_ms` unset or set it high (10000 or more): the age moves
+only on a new price, and a stable book can sit unchanged for long stretches, which a tight
+limit would read as a dead feed. With `max_source_age_ms` unset the divergence check still
+prefers stamped secondaries and still drops a backlogged stamped one, so a stable pair
+configured with divergence alone is guarded the same way — give it at least one stamped
+cross-check on a different venue. The divergence limit has to sit above the ordinary
+dispersion between the venues (and between USDT and USDC books, if the sources mix them).
+Enable on one pair first and watch `quote_updater_venue_source_age_ms` and
+`quote_updater_source_withdrawn` for a few days before widening.
+
+The backoffice's pair form has both fields. Blank clears a key. A form loaded before the
+fields existed does not post them, so it keeps whatever the file sets. An edit the file
+parser would refuse, such as a divergence left on a pair cut down to one venue, is refused
+before anything is written. The same form then comes back with the reason and the values
+as posted, so the field can be fixed or cleared there. An edit the reload applies only in
+part is saved, and the list says so.
+
+Rolling back to a version without these keys: the config parser refuses keys it does not
+know, so remove `max_source_age_ms` and `max_source_divergence` from every pair before
+downgrading, or the older binary will not load the file.
+
 ### What the updater charges a taker
 
 Every pair names how it is priced in its `pricing` table: a kind, and the keys that kind
@@ -871,6 +991,21 @@ Five series are worth watching ahead of everything else the registry exposes:
   withdrawn time. A stale price, an out-of-band print or a tripped breaker withdraws the
   published quote while the feed keeps moving underneath it, and watching the two series
   pull apart answers "why is this lane not trading" faster than any log line does.
+- `quote_updater_source_withdrawn{pair, reason}` — 1 while the source checks (see "Source
+  checks" above) hold the pair withdrawn for `source_stale` or `source_divergence`, 0
+  otherwise; `quote_updater_source_withdrawn_seconds_total{pair, reason}` accumulates the
+  time, and the ticks themselves are counted in `quote_updater_price_unusable_total` under
+  the same reasons. The `PusherSourceWithdrawn` alert raises a ticket after five minutes.
+- `quote_updater_source_divergence_inactive{pair}` — 1 while `max_source_divergence` is set
+  and no other source is fresh, so the check compares nothing (`PusherSourceDivergenceInactive`
+  raises a ticket after five minutes).
+- `quote_updater_venue_future_stamps_total{pair, venue}` — frames whose exchange timestamp
+  was more than 2 seconds ahead of their arrival, left out of the venue's usual lag. A
+  steady rate means this host's clock (or the venue's) is off.
+- `quote_updater_venue_source_age_ms{pair, venue}` — how old each venue's latest price is,
+  read at scrape time: by the exchange's own timestamp where the venue sends one, by arrival
+  where it does not. Exported for every venue, whether or not the pair sets the checks, so
+  the limit can be chosen from what the venues actually do.
 - `quote_updater_breaker_deviation_ratio` — the last tick-to-tick move as a fraction of the
   pair's configured `max_deviation`, where `1.0` is that limit itself (the breaker trips
   just past it, not on it — `beyond_threshold` is a strict `>`). It is the only *leading*
