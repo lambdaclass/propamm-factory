@@ -38,8 +38,10 @@ the honest mid), not unit count.
 - adds `MockPURAuthenticated` (a dedicated test mock, only used here — the shared `MockPUR` is
   untouched) so the updater's authorization is real, not decorative;
 - adds a test that proves an unregistered address cannot write a price at all;
-- adds the scenario a compromised key genuinely enables (below), order-independent and
-  value-checked;
+- adds the scenario a compromised key genuinely enables (below), run under BOTH token orderings
+  (forced explicitly — `new MockERC20()` addresses are deterministic per deploy sequence, so
+  re-running the same test never exercises the other order on its own) and value-checked against
+  a material-loss threshold, not just "any drop";
 - keeps the honest-price-change tests, relabeled as controls, not the vulnerability.
 
 ## The actual finding: a compromised updater key can drain the vault in one transaction
@@ -49,12 +51,16 @@ against any external reference. An address holding a valid, authorized updater k
 laptop, leaked CI secret, whatever the compromise vector) can write any `mid` it wants, then swap
 against the vault in the same transaction at that price.
 
-`test_compromisedUpdaterKey_drainsVaultWithAdverseMid` measures exactly this: vault funded with
-10,000 `tokenOut` at an honest mid of 2,500, the authorized key writes a mid that makes `tokenOut`
-~10,000x cheap (direction picked from the actual token order, not assumed), and the attacker calls
-`quoteFillable` (the contract's own "most this pair can pay in one fill" function — used here to
-find the attacker's input size, rather than guessing one) and swaps for it. Result: **the attacker
-pays ~0.04 `tokenIn` (worth ~100 `tokenOut` at the honest price) and drains ~9,999.75 `tokenOut` —
+Two tests measure this, one per token order (`_deployWithForcedOrder` forces each explicitly
+rather than relying on whichever order `new MockERC20()` happens to produce):
+`test_compromisedUpdaterKey_drainsVaultWithAdverseMid_tokenInIsToken0` and
+`..._tokenOutIsToken0`. Both: vault funded with 10,000 `tokenOut` at an honest mid of 2,500, the
+authorized key writes a mid that makes `tokenOut` ~100x cheap (direction depends on which token is
+token0 — a high mid in one order, a low mid in the other), and the attacker calls `quoteFillable`
+(the contract's own "most this pair can pay in one fill" function — used here to find the
+attacker's input size, rather than guessing one) and swaps for it. Result, in both orderings: **the
+attacker pays ~0.04–250,000 `tokenIn` (the unit price differs by order, but is worth only ~100
+`tokenOut` at the honest price either way) and drains ~9,999.75 `tokenOut` —
 the vault's value drops from 10,000 to about 100 `tokenOut`-equivalent, ~99% in one transaction.**
 
 ## What is NOT the vulnerability (kept as controls)
