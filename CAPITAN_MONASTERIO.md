@@ -19,15 +19,27 @@ forge test --match-path 'test/CapitanMonasterioQuoteAndPull.t.sol' -vv
 
 ## Revision history
 
-v1 of this PoC used the repo's shared `MockPUR`, whose `setState` has no access control, so
+v1 used the repo's shared `MockPUR`, whose `setState` has no access control, so
 `vm.prank(updater)` was decorative — every test passed regardless of `msg.sender`. It also framed
 ordinary quote-and-pull under an honest updater (price changes between a taker's `quote()` read
 and its `swap()` landing, bounded by `minAmountOut`) as if it were the compromise scenario, and
-didn't model the actual high-severity case. This version:
+didn't model the actual high-severity case. v2 fixed the access control and added the drain
+scenario below, but got the drain's direction backwards (see v3).
+
+v2 → v3: a second review caught that the drain test always wrote a LOW `adverseMid` and asserted
+only that the vault's `tokenOut` balance dropped. `mid` prices token0 in token1
+(`PropAMM.sol:306-310`), so which direction is "cheap for the attacker" depends on which token
+deployed as token0 — the version that shipped happened to pay ~400 `tokenIn` (worth 1,000,000
+`tokenOut` at the honest price) for only 10,000 `tokenOut`: the attacker massively overpaid, the
+opposite of a drain, and the unit-count assertion couldn't tell. v3 picks `adverseMid` per the
+actual token order and asserts on VALUE (`tokenOut` left plus `tokenIn` received, both priced at
+the honest mid), not unit count.
+
 - adds `MockPURAuthenticated` (a dedicated test mock, only used here — the shared `MockPUR` is
   untouched) so the updater's authorization is real, not decorative;
 - adds a test that proves an unregistered address cannot write a price at all;
-- adds the scenario a compromised key genuinely enables (below);
+- adds the scenario a compromised key genuinely enables (below), order-independent and
+  value-checked;
 - keeps the honest-price-change tests, relabeled as controls, not the vulnerability.
 
 ## The actual finding: a compromised updater key can drain the vault in one transaction
@@ -38,11 +50,12 @@ laptop, leaked CI secret, whatever the compromise vector) can write any `mid` it
 against the vault in the same transaction at that price.
 
 `test_compromisedUpdaterKey_drainsVaultWithAdverseMid` measures exactly this: vault funded with
-10,000 `tokenOut` at an honest mid of 2,500, the authorized key writes a mid 99% below market,
-and the attacker calls `quoteFillable` (the contract's own "most this pair can pay in one fill"
-function — used here to find the attacker's input size, rather than guessing one) and swaps for
-it. Result: **9,999.999999999999979976 tokenOut drained, 20,024 wei left in the vault** — the
-vault's entire balance, in one transaction.
+10,000 `tokenOut` at an honest mid of 2,500, the authorized key writes a mid that makes `tokenOut`
+~10,000x cheap (direction picked from the actual token order, not assumed), and the attacker calls
+`quoteFillable` (the contract's own "most this pair can pay in one fill" function — used here to
+find the attacker's input size, rather than guessing one) and swaps for it. Result: **the attacker
+pays ~0.04 `tokenIn` (worth ~100 `tokenOut` at the honest price) and drains ~9,999.75 `tokenOut` —
+the vault's value drops from 10,000 to about 100 `tokenOut`-equivalent, ~99% in one transaction.**
 
 ## What is NOT the vulnerability (kept as controls)
 
