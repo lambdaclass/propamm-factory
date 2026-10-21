@@ -82,7 +82,8 @@ jobs:
     # e2e/stocks/run.sh runs the example binary against anvil, the contracts' own mocks and
     # a local mock of Ondo's API: --check and each refusal it names, one landed push, an
     # event that withdraws the quote. Nothing in it touches the network, so the script
-    # builds --offline; the fetch step is what fills Cargo's cache for it on a runner.
+    # builds --offline; the fetch and the forge build are what fill Cargo's and forge's
+    # caches for it on a runner, which has no crate and no solc until then.
     steps:
       - uses: actions/checkout@v4
         with:
@@ -95,6 +96,8 @@ jobs:
         with:
           workspaces: example
       - run: cargo fetch --locked --manifest-path example/Cargo.toml
+      - run: forge build
+        working-directory: contracts
       - run: bash e2e/stocks/run.sh
 
   alert-rules:

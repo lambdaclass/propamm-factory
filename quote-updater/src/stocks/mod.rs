@@ -44,3 +44,27 @@ pub trait Issuer: crate::pricing::Factory {
     /// The token guard's factory.
     fn token_guard(&self) -> Self::TokenGuard;
 }
+
+#[cfg(test)]
+mod tests {
+    /// The smoke test's CI job builds the contracts online before the script's offline
+    /// build, the way it fetches the example's crates first: a fresh runner has no solc,
+    /// and `--offline` cannot install one.
+    #[test]
+    fn the_smoke_job_compiles_the_contracts_before_running_the_offline_script() {
+        let ci = include_str!("../../../.github/workflows/ci.yml");
+        let job = ci
+            .split("  stocks-smoke:")
+            .nth(1)
+            .expect("the stocks-smoke job");
+        let job = job.split("\n  alert-rules:").next().unwrap();
+        let build = job.find("run: forge build").expect("a forge build step");
+        let script = job
+            .find("run: bash e2e/stocks/run.sh")
+            .expect("the script step");
+        assert!(
+            build < script,
+            "forge build must come before the script:\n{job}"
+        );
+    }
+}
