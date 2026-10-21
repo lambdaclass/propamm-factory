@@ -183,6 +183,30 @@ begin
   end if;
 end $$;
 
+-- Every time a lane halted on its latch: when, which pair (`label`, the updater's name for
+-- it), who tripped it and how (`source` and `cause` as the `trip_source` series labels them:
+-- `deviation`/`guard` for the circuit breaker, a registered guard's kind, the kind that
+-- panicked, or a binary's own component) and the alarm line the operator saw (`reason`).
+-- A trip judged on the composite also keeps the sample it tripped on and the one judged
+-- before it: `mid` and `previous_mid` in lane orientation and human units like
+-- `feed.quotes`, and each sample's venues as a JSON list of `{venue, weight, mid,
+-- half_spread, age_secs}`, so which venue moved is answerable after the fact. The four
+-- are null for any other trip (a quote guard's halt, a panic, a component's own call).
+-- One row per halt; a reload that re-arms the lane adds nothing here.
+create table if not exists feed.breaker_trips (
+  id bigserial primary key,
+  ts bigint not null,
+  label text not null,
+  source text not null,
+  cause text not null,
+  reason text not null,
+  previous_mid double precision,
+  mid double precision,
+  previous_sources jsonb,
+  sources jsonb
+);
+create index if not exists breaker_trips_label_ts on feed.breaker_trips (label, ts);
+
 -- Grafana reads through a `grafana` role the host setup may have created with SELECT on
 -- `public` only. Give it the same on `feed`, for these tables
 -- and any added later. Skipped on a local database without that role.

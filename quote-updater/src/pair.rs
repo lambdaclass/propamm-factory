@@ -454,6 +454,12 @@ pub(crate) async fn build_live(
     let pair_metrics = metrics.for_pair(&resolved.pair.label);
     let adopted = feed::Adoption::new();
     latch.attach_metrics(feed::Gated::new(pair_metrics.clone(), adopted.clone()));
+    // Not gated on adoption like the series: a trip is one row whichever generation the
+    // lane is, and a rebuild that trips while the lane it replaces still quotes is a halt
+    // worth the record too.
+    if let Some(recorder) = recorder {
+        latch.attach_recorder(recorder.clone(), resolved.pair.label.clone());
+    }
     let armed = resolved.breaker.is_some();
     let deviation = resolved.breaker.map(|config| {
         crate::guard::deviation::DeviationGuard::new(

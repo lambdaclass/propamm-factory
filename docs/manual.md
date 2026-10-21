@@ -740,11 +740,17 @@ What the operator sees (every line is prefixed with the pair it belongs to; a re
 prints one ack column per configured builder):
 
 ```
-[USDC/USDT] circuit breaker tripped: mid moved 4.12% > 2.00% (previous 0.9998, new 1.041)
+[USDC/USDT] circuit breaker tripped: mid moved 4.12% > 2.00% (previous 0.9998, new 1.041); venues: binance 0.9998 -> 1.041 (weight 0.999, 0.1s old), okx 0.9998 -> 0.9998 (weight 0.001, 0.7s old)
 [USDC/USDT] quoting block 19999999: withdrawn (price deviation 4.12% exceeds the 2.00% limit)
 [USDC/USDT]   mock-a withdrawn
 [USDC/USDT] halted; this pair will not quote again until you reload (kill -HUP $(pidof my-quote-updater)) once the feed is trusted
 ```
+
+The trip line ends with every venue behind the two mids it compares, each with what it
+read in the sample before and in the one that tripped, its share of the weight and the age
+of its sample: the mids in the reason are averages, and this is what says which venue moved.
+With a database configured the same goes into `feed.breaker_trips` (see "Recording the
+feed"), so the question can be answered after the log has rotated.
 
 The trip line and the halt line go to **stderr**, like every other alarm here; the block
 summary between them is an ordinary stdout line. The halt waits briefly for each builder to
@@ -931,13 +937,16 @@ declared diagnostics as one `terms` jsonb map by name, which for a volatile pair
 terms, skew and inventory, and the vault holdings and Binance mid at that moment), every
 configuration it has run (`feed.config_changes`, secrets redacted: builder keys, a pricing
 stanza's credentials and any URL in it cut to its host; a row when it changes, even only
-inside a redacted value, and `feed.pairs`, one row per pair those configs ran), and the two
-series a P&L dashboard needs: the mid of every market it prices from, and each pair's vault
+inside a redacted value, and `feed.pairs`, one row per pair those configs ran), every lane
+halt (`feed.breaker_trips`: when, which pair, what tripped it and the alarm line, and for a
+trip judged on the composite the mid and the venues of the sample that tripped and of the
+one before it, each venue with its weight, mid, half-spread and age), and the two series a
+P&L dashboard needs: the mid of every market it prices from, and each pair's vault
 balances. A Binance market is keyed by its bare symbol (`ETHUSDC`); any other venue is
 `VENUE:SYMBOL` (`KRAKEN:ETH/USD`), and each pair's composite is recorded under the pair's
 label. All of it goes into a `feed` schema the updater creates on first connect
-(`feed.mids`, `feed.vault_balances`, `feed.quotes`, `feed.config_changes`, `feed.pairs`).
-The schema's P&L functions join these against the tables of the PropAMM indexer, when the
+(`feed.mids`, `feed.vault_balances`, `feed.quotes`, `feed.config_changes`, `feed.pairs`,
+`feed.breaker_trips`). The schema's P&L functions join these against the tables of the PropAMM indexer, when the
 same database holds one.
 
 How: the feed task hands every tick to a recorder handle (a mutex around the latest book
