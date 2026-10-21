@@ -1,12 +1,13 @@
-# propamm-stocks
+# Tokenized stocks
 
-The quote updater for tokenized stocks against USDC on Ethereum mainnet, built on the
-[`quote-updater`](../quote-updater) library like [`example/`](../example). It supports Ondo
-Global Markets tokens (AAPLon, TSLAon, SPYon, ...) today, and is laid out so another token
-design is a module of its own (see [Layout](#layout)). The PropAMM contract needs no change for
-these tokens: they are plain ERC-20s (see `contracts/test/PropAMMStockToken.t.sol` and
-`PropAMMOndoToken.t.sol`). What differs is everything around the price, which is what this
-crate adds:
+Stock pairs, a stock token against USDC on Ethereum mainnet, are quoted by the same binary as
+any other pair: the library carries the stock kinds in its `stocks` module, and
+[`example/`](../example), the binary the deployment builds, registers them in two lines. It
+supports Ondo Global Markets tokens (AAPLon, TSLAon, SPYon, ...) today, and is laid out so
+another token design is a module of its own (see [Adding another issuer](#adding-another-issuer)).
+The PropAMM contract needs no change for these tokens: they are plain ERC-20s (see
+`contracts/test/PropAMMStockToken.t.sol` and `PropAMMOndoToken.t.sol`). What differs is
+everything around the price, which is what the stock kinds add:
 
 - **`ondo`**, a pricing model. The mid is Ondo's own price for the token, polled from Ondo's
   GM API: the price Ondo mints and redeems around, already including the token's share
@@ -37,20 +38,40 @@ crate adds:
 It quotes the US regular session only, about a fifth of the week; the tokens trade on chain
 around the clock.
 
-## Run it
+## Registering the kinds
+
+```rust
+Updater::builder()
+    .us_market_hours()                                        // the NYSE calendar guard
+    .stock_issuer(quote_updater::stocks::issuers::ondo::Ondo)  // "ondo" and "ondo_token"
+```
+
+`us_market_hours()` registers the calendar guard under the name the two calendar alerts
+match on; it is its own call because the calendar is the exchange's, not an issuer's.
+`stock_issuer(..)` takes an issuer and registers its pricer and its token guard under the
+names the issuer declares. A binary names the issuers it integrates, one call each, and
+nothing registers one implicitly. `example/` does both; `quote-updater/examples/stocks.rs`
+is the same from outside the crate. The explicit `pricer`/`quote_guard` calls remain for
+other names, at the cost of the alerts, which match on `us_market_hours`.
+
+## Run a stock pair
 
 You need:
 
-- an Ondo GM API key (partner-only, through Ondo's onboarding) in `ONDO_API_KEY`
-- the pair's updater key in the variable its `key_env` names, registered on your PropAMM
-- a vault holding the stock token and USDC, with approvals for the PropAMM on both
+- an Ondo GM API key (partner-only, through Ondo's onboarding) in `ONDO_API_KEY`;
+- the pair's updater key in the variable its `key_env` names, registered on your PropAMM;
+- a vault holding the stock token and USDC, with approvals for the PropAMM on both;
+- the pair on the PropAMM (`addPair`), as for any pair ([production.md](production.md)).
 
-Copy `config.example.toml` to `config.toml` (git ignores it: it holds the builders' API
-keys), fill in `target`, the RPC and the builders, then:
+Then add the pair from the backoffice: its tokens, key variable and band, the `ondo` pricing
+kind with its fields (the API key as the name of the variable holding it), and in the guards
+section `us_market_hours` with its calendar and `ondo_token`, both checked. Saving reloads
+the running updater. In the file, the stanza is the one in
+[`example/config.stocks.toml`](../example/config.stocks.toml): copy it into your config and
+reload with a SIGHUP. Either way, `--check` first:
 
 ```bash
-cargo run --release -- --config config.toml --check
-cargo run --release -- --config config.toml
+cd example && cargo run --release -- --config config.toml --check
 ```
 
 `min_mid`/`max_mid` are in the lane's orientation, the number `--check`'s mid column prints:
@@ -59,46 +80,67 @@ token per USDC when it sorts after. The build refuses a band written the other w
 
 Keep the `holidays`/`early_closes` lists current from
 [NYSE's calendar](https://www.nyse.com/markets/hours-calendars), and `listed_through` with
-them. The example lists them through 2027.
+them. The example lists them through 2027; `PusherStockCalendarEnding` warns a month out,
+and `PusherStockCalendarEnded` says when the pair has stopped quoting for it.
 
 ## Layout
 
 The checks a stock pair needs are the same whoever issued the token; what differs between
-designs is where the answers come from. The code is split along that line:
+designs is where the answers come from. `quote-updater/src/stocks/` is split along that line:
 
-- `src/ports.rs`: what the core asks of a design, and the shape of each answer. A
+- `ports.rs`: what the core asks of a design, and the shape of each answer. A
   `PriceSource` (the token's price), a `Valuation` (how many shares a token is worth, and the
   corporate action that will change it), an optional `MarketStatus` (the issuer's session
   and asset events), and `Restrictions` (the token's transfer rules).
-- `src/stock/`: the core. The pricer and all its gates (`pricer.rs`), the guard on the token's
-  transfer rules (`guard.rs`), and `us_market_hours` (`hours.rs`). It reads every design
-  through the ports, and is tested against fakes of them.
-- `src/issuers/ondo/`: Ondo's adapters (its API, the `SyntheticSharesOracle`, its compliance
-  contracts, its status) and the `ondo` and `ondo_token` kinds built from them.
-- `src/chain.rs`: the reads every design shares. Every on-chain read goes through its `Calls`,
-  which tests answer with a fake that knows only the exact calls it was given, so an adapter's
-  wiring (which contract, which argument) is tested without a node.
+- `pricer.rs`, `guard.rs`, `hours.rs`: the core. The pricer and all its gates, the guard on
+  the token's transfer rules, and `us_market_hours`. It reads every design through the ports,
+  and is tested against fakes of them.
+- `issuers/ondo/`: Ondo's adapters (its API, the `SyntheticSharesOracle`, its compliance
+  contracts, its status) and `Ondo`, the issuer built from them.
+- `chain.rs`: the reads every design shares. Every on-chain read goes through its `Calls`,
+  which tests answer with `quote_updater::testing::FakeChain`, a chain that knows only the
+  exact calls it was given, so an adapter's wiring (which contract, which argument) is tested
+  without a node.
+- `mod.rs`: the `Issuer` trait.
 
-Adding a design means:
+## Adding another issuer
 
-1. writing its adapters under `src/issuers/<design>/`;
-2. writing a stanza for its pricer that fills the core's `Stanza`, with defaults of its own;
-3. registering its kinds in `src/main.rs`;
-4. adding a mock of its token to the contracts' tests, inheriting `PropAMMStockTokenTest`. The
-   suite takes a token on either side of USDC's address and of any decimals.
+The safety checks are the same for every issuer; only where each answer comes from changes.
+An issuer is:
 
-A design whose answers the ports cannot carry yet extends the port first, with a fake
-of the new answer in the core's tests. Two examples: a token whose corporate actions take
-effect at an instant rather than under a pause the issuer lifts, and a source that prices
+1. its adapters, one per port it answers, under `quote-updater/src/stocks/issuers/<issuer>/`
+   or in a crate of your own: the ports, the core, `Calls` and `FakeChain` are public;
+2. a config struct for its `[pairs.pricing]` stanza, `#[serde(deny_unknown_fields)]` with
+   defaults of its own, that fills the core's `Stanza` and is checked with `Settings::new`
+   plus its own rules;
+3. a unit struct implementing `Factory` over that config (its `build` hands the adapters to
+   `pricer::build`) and `Issuer`, which names its two kinds and gives the token guard,
+   `RestrictionGuardFactory { issuer, restrictions }` for a design whose rules the core's
+   guard reads through `Restrictions`;
+4. `fields()` and `form_help()` on the factory, so the backoffice edits the pair. The
+   round-trip test beside `Ondo` is the template: every declared field is a key the config
+   reads, and the example stanza survives the form unchanged;
+5. a mock of its token under `contracts/test/mocks/` and a test inheriting
+   `PropAMMStockTokenTest` (`PropAMMOndoToken.t.sol` is the template). The suite takes a
+   token on either side of USDC's address and of any decimals, and assumes a plain ERC-20
+   with no transfer fee and no rebasing, like Ondo's; a token that isn't one needs a look at
+   PropAMM itself first.
+
+Then one line in the binary, `.stock_issuer(Yours)` after `.us_market_hours()`. Nothing in
+the core or the builder changes.
+
+A design whose answers the ports cannot carry yet extends the port first, with a fake of the
+new answer in the core's tests. Two cases we already expect: a token whose corporate actions
+take effect at an instant rather than under a pause the issuer lifts, and a source that prices
 only the stock.
 
 ## Smoke test
 
-`smoke/run.sh` runs the real binary against anvil, mock Ondo contracts
+`e2e/stocks/run.sh` runs the example binary against anvil, mock Ondo contracts
 (`contracts/test/mocks/MockOndoStack.sol`, one contract per role, each answering only for what
-it holds) and a mock of Ondo's API (`smoke/ondo_api.py`). It checks that:
+it holds) and a mock of Ondo's API (`e2e/stocks/ondo_api.py`). It checks that:
 
-1. `--check` passes on the example config, and with the pair halted;
+1. `--check` passes on the example stanza, and with the pair halted;
 2. it fails on a wrong key and on a token with no multiplier;
 3. it names each refusal Ondo's stack holds (the token paused, the vault blocklisted, the
    PropAMM sanctioned), found where Ondo keeps them, and withdraws on a refusal none of
@@ -106,8 +148,8 @@ it holds) and a mock of Ondo's API (`smoke/ondo_api.py`). It checks that:
 4. one node-mode push lands and PropAMM quotes Ondo's price less the delta;
 5. an event Ondo files under the stock's ticker withdraws the quote.
 
-It needs Foundry and Python 3, and no network.
+It needs Foundry and Python 3, and no network. CI runs it in the `stocks-smoke` job.
 
 ```bash
-bash stocks/smoke/run.sh
+bash e2e/stocks/run.sh
 ```

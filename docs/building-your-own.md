@@ -125,6 +125,18 @@ What to know:
   escalate but never reverse. A quote guard reads the pricer's diagnostics by handle
   (`ctx.read_diagnostic`), bound at build. Guards are builder mode only, like
   `max_deviation`.
+- **A guard with a form.** A factory struct implementing `MarketGuardFactory` or
+  `QuoteGuardFactory` can declare `fields()` and `form_help()`, as a pricer's `Factory`
+  does, and the backoffice then edits the pair's stanza of that kind from the guards section
+  of its page: one block per registered kind, with an "enabled" box. A field is a string, a
+  number, a list (one item per line) or the name of an environment variable
+  (`FormField::env`, written as `{ env = "NAME" }`). The closure helpers above declare no
+  fields, so a kind registered through them shows as edited in the file. `example/`'s two
+  guards are factories for this reason.
+- **Tokenized stocks** are two more calls: `.us_market_hours()` for the NYSE calendar guard
+  and `.stock_issuer(quote_updater::stocks::issuers::ondo::Ondo)` for an issuer's pricer and
+  token guard, under the names the issuer declares. See [stocks.md](stocks.md), including
+  how an issuer of your own implements `stocks::Issuer` over the public ports.
 - **A trip is not a halt.** Every lane has a latch: a guard's `Trip`/`Halt`, a panic
   anywhere in a component's code (its `price`, `check`, `assess`, or a task it spawned), or
   a component's own `ctx.latch().trip(..)` trips it, the lane withdraws and stops, and only

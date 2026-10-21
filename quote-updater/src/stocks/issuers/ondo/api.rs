@@ -429,7 +429,7 @@ pub fn client() -> reqwest::Client {
             reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(TIMEOUT)
-                .user_agent(concat!("propamm-stocks/", env!("CARGO_PKG_VERSION")))
+                .user_agent(concat!("propamm-quote-updater/", env!("CARGO_PKG_VERSION")))
                 .build()
                 .expect("a reqwest client with no redirects builds")
         })
