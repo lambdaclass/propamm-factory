@@ -29,6 +29,60 @@ pub struct Connected {
     up: Arc<AtomicU8>,
     /// How late the venue's latest accepted price arrived; see [`PriceLag`].
     priced: Arc<std::sync::Mutex<Option<PriceLag>>>,
+    /// The round trips to the venue lately; see [`Latency`].
+    rtt: Arc<std::sync::Mutex<Latency>>,
+}
+
+/// How many round trips [`Latency`] keeps: at one every [`RTT_INTERVAL`], ten minutes.
+const LATENCY_SAMPLES: usize = 60;
+
+/// The last [`LATENCY_SAMPLES`] round trips to a venue: for a streaming venue, a protocol
+/// ping answered with a pong, sent every [`RTT_INTERVAL`] whether or not the book moves;
+/// for a polled one, each fetch. What the backoffice's pair form shows beside each venue,
+/// so an operator picking venues sees how far away each one is from this host.
+#[derive(Debug, Default)]
+pub struct Latency {
+    samples: std::collections::VecDeque<Duration>,
+}
+
+/// [`Latency`] summarised: the median, the 95th percentile and the mean of the samples
+/// kept, and how many there are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LatencyStats {
+    pub p50: Duration,
+    pub p95: Duration,
+    pub avg: Duration,
+    pub samples: usize,
+}
+
+impl Latency {
+    /// One more round trip, the oldest going once [`LATENCY_SAMPLES`] are kept.
+    pub fn record(&mut self, rtt: Duration) {
+        if self.samples.len() == LATENCY_SAMPLES {
+            self.samples.pop_front();
+        }
+        self.samples.push_back(rtt);
+    }
+
+    /// The summary, or `None` before the first round trip. Percentiles by the nearest
+    /// rank: the p-th percentile of n samples is the ceil(p·n)-th smallest, so one sample
+    /// is its own median and p95, and the p95 of twenty is the 19th.
+    pub fn stats(&self) -> Option<LatencyStats> {
+        if self.samples.is_empty() {
+            return None;
+        }
+        let mut sorted: Vec<Duration> = self.samples.iter().copied().collect();
+        sorted.sort_unstable();
+        let n = sorted.len();
+        let rank = |p: f64| sorted[((p * n as f64).ceil() as usize).clamp(1, n) - 1];
+        let total: Duration = sorted.iter().sum();
+        Some(LatencyStats {
+            p50: rank(0.50),
+            p95: rank(0.95),
+            avg: total / n as u32,
+            samples: n,
+        })
+    }
 }
 
 /// How late a venue's latest accepted price arrived behind the exchange's own stamp, over
@@ -232,6 +286,19 @@ impl Connected {
         }
     }
 
+    /// Records one round trip to the venue.
+    pub(crate) fn round_trip(&self, rtt: Duration) {
+        self.rtt
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record(rtt);
+    }
+
+    /// The round trips to the venue lately, summarised; `None` before the first.
+    pub fn latency(&self) -> Option<LatencyStats> {
+        self.rtt.lock().unwrap_or_else(|e| e.into_inner()).stats()
+    }
+
     /// Records how late the price the feed just accepted arrived.
     pub(crate) fn priced(&self, lag: PriceLag) {
         *self.priced.lock().unwrap_or_else(|e| e.into_inner()) = Some(lag);
@@ -358,6 +425,12 @@ const PING_INTERVAL: Duration = Duration::from_secs(10);
 /// it is considered dead and redialed. Pings go out every PING_INTERVAL, so a live
 /// socket answers well within this bound even while the book itself is quiet.
 const MAX_QUIET: Duration = Duration::from_secs(30);
+
+/// How often a streaming venue is sent a protocol ping to time its round trip, busy or
+/// quiet: the first right after subscribing, so the pair form has a number within a
+/// second of ticking a venue. Separate from the quiet-stream probe above, which goes out
+/// only when nothing arrives and in the venue's own keepalive dialect.
+const RTT_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Delay between reconnect attempts.
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
@@ -574,21 +647,37 @@ impl Feed {
         // in place, and from that moment on it no longer describes a book anyone can trade —
         // so it must be allowed to age out. See the Ping/Pong arm below.
         let mut sample_is_current = false;
+        // The round-trip pings: numbered, so a pong is matched to the ping it answers and
+        // the quiet-stream probe's empty pong (or a late one) is not timed as a fresh one.
+        let mut rtt_ticker = tokio::time::interval(RTT_INTERVAL);
+        rtt_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut rtt_seq: u64 = 0;
+        let mut rtt_sent: Option<(u64, Instant)> = None;
         loop {
-            let msg = match tokio::time::timeout(PING_INTERVAL, ws.next()).await {
-                Ok(msg) => msg,
-                Err(_) => {
-                    ensure!(
-                        last_inbound.elapsed() < MAX_QUIET,
-                        "no message in {MAX_QUIET:?}"
-                    );
-                    // A quiet book emits nothing, so probe the socket instead of assuming
-                    // the worst; any answering frame below counts as feed liveness.
-                    let probe = match keepalive.frame() {
-                        None => Message::Ping(Vec::new().into()),
-                        Some(text) => Message::text(text),
-                    };
-                    ws.send(probe).await.wrap_err("ping failed")?;
+            let msg = tokio::select! {
+                msg = tokio::time::timeout(PING_INTERVAL, ws.next()) => match msg {
+                    Ok(msg) => msg,
+                    Err(_) => {
+                        ensure!(
+                            last_inbound.elapsed() < MAX_QUIET,
+                            "no message in {MAX_QUIET:?}"
+                        );
+                        // A quiet book emits nothing, so probe the socket instead of assuming
+                        // the worst; any answering frame below counts as feed liveness.
+                        let probe = match keepalive.frame() {
+                            None => Message::Ping(Vec::new().into()),
+                            Some(text) => Message::text(text),
+                        };
+                        ws.send(probe).await.wrap_err("ping failed")?;
+                        continue;
+                    }
+                },
+                _ = rtt_ticker.tick() => {
+                    rtt_seq += 1;
+                    ws.send(Message::Ping(rtt_seq.to_be_bytes().to_vec().into()))
+                        .await
+                        .wrap_err("ping failed")?;
+                    rtt_sent = Some((rtt_seq, Instant::now()));
                     continue;
                 }
             };
@@ -599,6 +688,17 @@ impl Feed {
             match msg? {
                 Message::Text(text) => self.on_frame(&text, &mut sample_is_current),
                 Message::Close(_) => return Ok(()),
+                // The answer to the latest round-trip ping, timed; any other pong (the
+                // quiet-stream probe's, an older one's) is liveness only.
+                Message::Pong(payload) => {
+                    if let Some((seq, sent)) = rtt_sent
+                        && payload.as_ref() == seq.to_be_bytes()
+                    {
+                        self.connected.round_trip(sent.elapsed());
+                        rtt_sent = None;
+                    }
+                    refresh_if_current(tx, sample_is_current);
+                }
                 // A live socket with no book change means the last mid is still current
                 // (bookTicker emits on every change), so liveness refreshes the sample.
                 // tungstenite answers the server's pings by itself while the stream is polled.
@@ -609,7 +709,7 @@ impl Feed {
                 // inbound frame — and Binance pings well inside that window — so a book stuck
                 // one-sided or crossed would keep an unpublishable price looking fresh
                 // indefinitely, which is exactly what the staleness guard exists to stop.
-                Message::Ping(_) | Message::Pong(_) => {
+                Message::Ping(_) => {
                     refresh_if_current(tx, sample_is_current);
                 }
                 _ => {}
@@ -639,6 +739,8 @@ impl Feed {
             for (name, value) in headers {
                 request = request.header(name.as_str(), value.as_str());
             }
+            // The whole fetch, body included: what a polled venue's round trip is.
+            let started = Instant::now();
             let body = request
                 .send()
                 .await
@@ -648,6 +750,7 @@ impl Feed {
                 .text()
                 .await
                 .wrap_err("body unreadable")?;
+            self.connected.round_trip(started.elapsed());
             if first {
                 tracing::info!("[{symbol}] {venue} polling: {url}");
                 self.set_connected(true);
@@ -1739,5 +1842,86 @@ mod tests {
                 .unwrap()
                 .contains(r#"pair="USDC/USDT",reason="one_sided",venue="binance"} 1"#)
         );
+    }
+
+    /// The summary by nearest rank: one sample is its own median and p95, the p95 of
+    /// twenty is the 19th smallest, the mean is the mean, and only the last sixty count.
+    #[test]
+    fn latency_summarises_the_last_sixty_round_trips() {
+        let ms = Duration::from_millis;
+        let mut latency = Latency::default();
+        assert_eq!(latency.stats(), None);
+        latency.record(ms(7));
+        assert_eq!(
+            latency.stats(),
+            Some(LatencyStats {
+                p50: ms(7),
+                p95: ms(7),
+                avg: ms(7),
+                samples: 1
+            })
+        );
+        // 1..=20 ms, recorded out of order: median the 10th smallest, p95 the 19th.
+        let mut latency = Latency::default();
+        for n in [
+            5, 20, 1, 19, 2, 18, 3, 17, 4, 16, 6, 15, 7, 14, 8, 13, 9, 12, 10, 11,
+        ] {
+            latency.record(ms(n));
+        }
+        let stats = latency.stats().unwrap();
+        assert_eq!((stats.p50, stats.p95, stats.samples), (ms(10), ms(19), 20));
+        assert_eq!(stats.avg, ms(10) + Duration::from_micros(500));
+        // Past sixty, the oldest go: sixty slow ones then sixty fast ones read all fast.
+        for _ in 0..60 {
+            latency.record(ms(900));
+        }
+        for _ in 0..60 {
+            latency.record(ms(3));
+        }
+        let stats = latency.stats().unwrap();
+        assert_eq!(
+            (stats.p50, stats.p95, stats.avg, stats.samples),
+            (ms(3), ms(3), ms(3), 60)
+        );
+    }
+
+    /// A stream's round trip is timed on the first pong after subscribing, through a real
+    /// socket, and the quiet-stream probe's empty pong is not mistaken for it.
+    #[tokio::test]
+    async fn a_streams_round_trip_is_timed_from_the_first_ping() {
+        use futures_util::StreamExt;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            // Reading is what lets tungstenite answer pings with pongs.
+            while let Some(Ok(_)) = ws.next().await {}
+        });
+        let connected = Connected::default();
+        let metrics = crate::metrics::Metrics::new().unwrap();
+        let _rx = spawn_feed(
+            Arc::new(http_client()),
+            VenueId::Binance,
+            &format!("ws://{addr}"),
+            "ETHUSDC",
+            8,
+            false,
+            Gated::new(metrics.for_venue("T", "binance"), Adoption::new()),
+            None,
+            connected.clone(),
+        );
+        let stats = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(stats) = connected.latency() {
+                    return stats;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a round trip within 5s of connecting");
+        assert_eq!(stats.samples, 1);
+        assert!(stats.p50 < Duration::from_secs(1), "{stats:?}");
     }
 }
