@@ -329,11 +329,10 @@ fn main() -> std::process::ExitCode {
         .pricer("feed", quote_updater::pricers::Feed)
         .pricer("volatile", quote_updater::pricers::Volatile)
         .pricer("inventory_skew", InventorySkewFactory)
-        // Tokenized stocks, from the library: the NYSE calendar guard, and Ondo Global
-        // Markets' pricer and token guard (docs/stocks.md).
-        .quote_guard("us_market_hours", quote_updater::stocks::hours::UsMarketHoursFactory)
-        .pricer("ondo", quote_updater::stocks::issuers::ondo::OndoFactory)
-        .quote_guard("ondo_token", quote_updater::stocks::issuers::ondo::token_guard())
+        // Tokenized stocks, from the library: the NYSE calendar guard, then each issuer's
+        // pricer and token guard under the issuer's own names (docs/stocks.md).
+        .us_market_hours()
+        .stock_issuer(quote_updater::stocks::issuers::ondo::Ondo)
         .market_guard_fn("venue_spread", |cfg: VenueSpreadCfg, ctx: &mut BuildCtx| {
             eyre::ensure!(cfg.max_dispersion > 0.0, "max_dispersion must be positive");
             let dispersion = ctx.diagnostic("venue_dispersion")?;

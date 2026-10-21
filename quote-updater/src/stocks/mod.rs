@@ -24,3 +24,23 @@ pub mod issuers;
 mod mock_http;
 pub mod ports;
 pub mod pricer;
+
+/// A tokenized-stock design a binary integrates: its pricing kind, which is the issuer
+/// itself as a [`crate::pricing::Factory`] over the design's adapters, and the guard on its
+/// token's transfer rules. Register one with [`crate::UpdaterBuilder::stock_issuer`], which
+/// uses the two names declared here, so a binary names the issuers it integrates and nothing
+/// registers one implicitly. Ondo Global Markets is [`issuers::ondo::Ondo`]; a second
+/// issuer, in this crate or in a crate of its own, implements this over the ports the same
+/// way and needs no change to the builder.
+pub trait Issuer: crate::pricing::Factory {
+    /// The pricing kind's registered name, e.g. `ondo`.
+    const PRICER_KIND: &'static str;
+    /// The token guard's registered name, e.g. `ondo_token`.
+    const TOKEN_GUARD_KIND: &'static str;
+    /// The factory of the guard on the token's transfer rules:
+    /// [`guard::RestrictionGuardFactory`] for a design whose rules the core's guard reads
+    /// through [`ports::Restrictions`].
+    type TokenGuard: crate::pricing::QuoteGuardFactory;
+    /// The token guard's factory.
+    fn token_guard(&self) -> Self::TokenGuard;
+}

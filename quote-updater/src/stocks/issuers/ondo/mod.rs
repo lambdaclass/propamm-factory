@@ -36,6 +36,8 @@ use std::{sync::Arc, time::Duration};
 use crate::{Address, eyre, prelude::*};
 use serde::Deserialize;
 
+use crate::stocks::Issuer;
+
 use crate::{
     stocks::chain::parse_address,
     stocks::ports::StatusFeed,
@@ -162,10 +164,11 @@ impl OndoCfg {
     }
 }
 
-/// Registered as `ondo`.
-pub struct OndoFactory;
+/// Ondo Global Markets: registered with [`crate::UpdaterBuilder::stock_issuer`] as
+/// `ondo` (the pricer) and `ondo_token` (the guard on the token's rules).
+pub struct Ondo;
 
-impl Factory for OndoFactory {
+impl Factory for Ondo {
     type Config = OndoCfg;
     type Pricer = StockPricer;
 
@@ -215,11 +218,17 @@ impl Factory for OndoFactory {
     }
 }
 
-/// Registered as `ondo_token`: the restriction guard over Ondo's pause and lists.
-pub fn token_guard() -> RestrictionGuardFactory {
-    RestrictionGuardFactory {
-        issuer: "Ondo",
-        restrictions: |chain, token| Box::new(compliance::OndoCompliance { chain, token }),
+impl Issuer for Ondo {
+    const PRICER_KIND: &'static str = "ondo";
+    const TOKEN_GUARD_KIND: &'static str = "ondo_token";
+    type TokenGuard = RestrictionGuardFactory;
+
+    /// The restriction guard over Ondo's pause and lists.
+    fn token_guard(&self) -> RestrictionGuardFactory {
+        RestrictionGuardFactory {
+            issuer: "Ondo",
+            restrictions: |chain, token| Box::new(compliance::OndoCompliance { chain, token }),
+        }
     }
 }
 
@@ -402,18 +411,13 @@ mod tests {
     #[test]
     fn the_stanza_is_checked_against_its_pair() {
         let pair = testkit::pair();
+        assert!(Ondo.validate(&cfg(serde_json::json!({})), &pair).is_ok());
         assert!(
-            OndoFactory
-                .validate(&cfg(serde_json::json!({})), &pair)
-                .is_ok()
-        );
-        assert!(
-            OndoFactory
-                .validate(
-                    &cfg(serde_json::json!({"api": "http://127.0.0.1:8556"})),
-                    &pair
-                )
-                .is_ok(),
+            Ondo.validate(
+                &cfg(serde_json::json!({"api": "http://127.0.0.1:8556"})),
+                &pair
+            )
+            .is_ok(),
             "the smoke test's mock"
         );
         for (bad, why) in [
@@ -482,7 +486,7 @@ mod tests {
             ),
         ] {
             assert!(
-                OndoFactory.validate(&cfg(bad), &pair).is_err(),
+                Ondo.validate(&cfg(bad), &pair).is_err(),
                 "{why} was accepted"
             );
         }
@@ -496,11 +500,7 @@ mod tests {
         // own symbol() instead, and only a live pair is built.
         let mut halted = testkit::pair();
         halted.label = "lane 0x95a4117f".to_owned();
-        assert!(
-            OndoFactory
-                .validate(&cfg(serde_json::json!({})), &halted)
-                .is_ok()
-        );
+        assert!(Ondo.validate(&cfg(serde_json::json!({})), &halted).is_ok());
     }
 
     #[test]
