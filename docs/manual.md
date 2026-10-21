@@ -846,6 +846,12 @@ quote_updater_published_mid{pair="WETH/USDC"} 3541.98
 # HELP quote_updater_breaker_deviation_ratio Last tick-to-tick move as a fraction of the configured limit.
 # TYPE quote_updater_breaker_deviation_ratio gauge
 quote_updater_breaker_deviation_ratio{pair="WETH/USDC"} 0.0421
+# HELP quote_updater_breaker_deviation Last tick-to-tick move, as a fraction of the previous mid.
+# TYPE quote_updater_breaker_deviation gauge
+quote_updater_breaker_deviation{pair="WETH/USDC"} 0.000842
+# HELP quote_updater_breaker_limit The pair's max_deviation, as a fraction of the mid; NaN for a pair with none.
+# TYPE quote_updater_breaker_limit gauge
+quote_updater_breaker_limit{pair="WETH/USDC"} 0.02
 # HELP quote_updater_breaker_tripped 1 once the circuit breaker has latched.
 # TYPE quote_updater_breaker_tripped gauge
 quote_updater_breaker_tripped{pair="WETH/USDC"} 0
@@ -882,6 +888,10 @@ Five series are worth watching ahead of everything else the registry exposes:
   just past it, not on it — `beyond_threshold` is a strict `>`). It is the only *leading*
   indicator anywhere in this layer; everything else above reports on something that has
   already happened.
+- `quote_updater_breaker_deviation` and `quote_updater_breaker_limit` — the two numbers
+  that ratio is made of: the last tick-to-tick move as a fraction of the previous mid, and
+  the pair's `max_deviation` (NaN for a pair with none). For a line that says the move in
+  price terms, "0.99% against a 0.20% limit", rather than as a multiple of the limit.
 - `quote_updater_head_number` — the one series that is not per pair, and the only one whose
   failure is everyone's. No pair can quote for a new block until the head watcher publishes
   it, so a value that stops moving stops every lane at once; the four series above would all

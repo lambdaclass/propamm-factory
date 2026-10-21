@@ -288,6 +288,8 @@ pub struct Metrics {
     breaker_rearms: IntCounterVec,
     breaker_deviation_ratio: GaugeVec,
     breaker_window_deviation_ratio: GaugeVec,
+    breaker_limit: GaugeVec,
+    breaker_deviation: GaugeVec,
     rpc_duration: HistogramVec,
     rpc_errors: IntCounterVec,
     sign_errors: IntCounterVec,
@@ -336,6 +338,13 @@ pub struct PairMetrics {
     pub breaker_rearms: IntCounter,
     pub breaker_deviation_ratio: Gauge,
     pub breaker_window_deviation_ratio: Gauge,
+    /// `quote_updater_breaker_limit`: the pair's `max_deviation` as a fraction of the
+    /// mid, NaN for a pair with none. With `breaker_deviation`, what the ratio above is
+    /// made of, so a line about the breaker can say the move and the limit in price terms.
+    pub breaker_limit: Gauge,
+    /// `quote_updater_breaker_deviation`: the last tick-to-tick move as a fraction of the
+    /// previous mid.
+    pub breaker_deviation: Gauge,
     rpc_duration: [Histogram; 3],
     rpc_errors: [IntCounter; 3],
     pub sign_errors: IntCounter,
@@ -718,6 +727,18 @@ impl Metrics {
                 "Last windowed move as a fraction of the configured limit.",
                 pair,
             )?,
+            breaker_limit: gauge(
+                &r,
+                "quote_updater_breaker_limit",
+                "The pair's max_deviation, as a fraction of the mid; NaN for a pair with none.",
+                pair,
+            )?,
+            breaker_deviation: gauge(
+                &r,
+                "quote_updater_breaker_deviation",
+                "Last tick-to-tick move, as a fraction of the previous mid.",
+                pair,
+            )?,
             rpc_duration: histogram(
                 &r,
                 "quote_updater_rpc_duration_seconds",
@@ -1009,6 +1030,8 @@ impl Metrics {
             breaker_trips: self.breaker_trips.with_label_values(p),
             breaker_rearms: self.breaker_rearms.with_label_values(p),
             breaker_deviation_ratio: self.breaker_deviation_ratio.with_label_values(p),
+            breaker_limit: self.breaker_limit.with_label_values(p),
+            breaker_deviation: self.breaker_deviation.with_label_values(p),
             breaker_window_deviation_ratio: self
                 .breaker_window_deviation_ratio
                 .with_label_values(p),
@@ -1319,6 +1342,8 @@ impl PairMetrics {
             &self.breaker_tripped,
             &self.breaker_deviation_ratio,
             &self.breaker_window_deviation_ratio,
+            &self.breaker_limit,
+            &self.breaker_deviation,
             &self.signer_balance_wei,
             &self.signer_runway_updates,
             &self.consecutive_landing_misses,
