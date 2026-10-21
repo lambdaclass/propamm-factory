@@ -81,6 +81,35 @@
     {% endfor %}
   </style>
 
+  <hr>
+
+  {# One block per registered guard kind (a pair holds one stanza per kind), each with an
+     "enabled" checkbox: checked adds or keeps the stanza, unchecked removes it. A kind the
+     pair uses that this binary does not register is shown too, kept while checked. The
+     hidden input tells the handler this page has a guards section, so a page rendered
+     before it existed keeps the pair's guards. #}
+  <div class=guards>
+    <span class=key>guards</span>
+    <input type=hidden name=guards_present value=1>
+    {% for guard in guards %}
+    <div class=guard>
+      <label class=check>
+        <input type=checkbox name="guard_{{ guard.name }}_enabled"{% if guard.enabled %} checked{% endif %}>
+        <span class=choice-name>{{ guard.name }}</span>
+      </label>
+      {{ guard.help|safe }}
+      {% if guard.in_file %}
+      <p class=explain><code>{{ guard.name }}</code> has no form here: its stanza is edited as
+      <code>[[pairs.guards]]</code> in config.toml</p>
+      {% else %}
+      <div class=grid>
+        {% for field in guard.fields %}{% include "field.html" %}{% endfor %}
+      </div>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+
   <div class=actions>
     <label class=check>
       <input type=checkbox name=allow_symbol_mismatch {% if allow_symbol_mismatch %}checked{% endif %}>

@@ -211,3 +211,7 @@ pre.err {
   tbody td { border: none; padding: .15rem .8rem; }
   .rowactions { text-align: left; padding-top: .5rem; }
 }
+
+/* The pair form's guards section: one block per kind. */
+.guards { display: flex; flex-direction: column; gap: .5rem; }
+.guard { padding: .5rem 0; border-top: 1px solid var(--line, #ddd); }
