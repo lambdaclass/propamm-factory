@@ -210,14 +210,20 @@ the frame's arrival, which gives how long the frame took to reach us. A backlog 
 frame late by seconds; a quiet book whose last frame arrived promptly reads as prompt
 however long ago that was, so a thin market is not read as a late one. That difference is
 the reason this is lateness and not the age of the price. "Usual" lag is subtracted first:
-the least lag the venue's frames have had over the last hour, capped at 1 second, which
-absorbs up to a second of this host's clock offset from the exchange's, either way, and the
-network's ordinary latency. Because of the cap a backlog always shows, even one that started
-before the feed was dialled or lasts longer than the hour. A stamp more than 2 seconds ahead
-of its arrival is left out of that baseline and counted in
-`quote_updater_venue_future_stamps_total`; a steady count there means this host's clock is
-behind. A step of the host clock (an NTP correction, a resume from sleep) restarts the
-baseline.
+the least lag the venue's frames have had over the last hour, taken only from minutes in
+which at least two frames arrived (so one odd frame cannot set it, and a venue sending
+under two frames a minute gets no baseline and has its whole offset counted). That absorbs
+the network's ordinary latency and this host's clock offset from the exchange's, within
+bounds that differ by direction: a host clock up to 1 second ahead of the exchange's is
+absorbed, since the baseline is capped there, and beyond it every frame reads late by the
+excess, which fails closed (the venue drops out); a host clock up to 2 seconds behind is
+absorbed, since a stamp more than 2 seconds ahead of its arrival is left out of the
+baseline and counted in `quote_updater_venue_future_stamps_total`, and beyond it every
+frame's lateness reads as zero, which fails open (a backlog goes unseen). Both are far
+outside what a host kept on NTP drifts, which is why the host must be. Because of the 1
+second cap a backlog always shows, even one that started before the feed was dialled or
+lasts longer than the hour. A step of the host clock (an NTP correction, a resume from
+sleep) restarts the baseline.
 
 A venue whose latest frame was late is treated exactly like one that has gone silent: out
 of the average, its weight spread over the rest, until a prompt frame arrives. The pair's
@@ -925,7 +931,7 @@ so there is no pair a sample of it could belong to; the same is true of its poll
 and error count. In `--mode node` those three are absent rather than zero — nothing there
 starts a watcher.
 
-Five series are worth watching ahead of everything else the registry exposes:
+Seven series are worth watching ahead of everything else the registry exposes:
 
 - `quote_updater_breaker_tripped` — the circuit breaker latches (see "Circuit breaker"
   above): once this reads 1 for a pair it stays there until a human has looked at the feed
