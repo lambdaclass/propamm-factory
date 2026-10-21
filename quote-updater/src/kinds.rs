@@ -147,7 +147,6 @@ pub(crate) trait ErasedGuard: Send + Sync {
     fn check(&self, table: &toml::Table) -> Result<()>;
     fn validate(&self, table: &toml::Table, pair: &PairShape) -> Result<()>;
     fn fields(&self) -> &'static [FormField];
-    #[allow(dead_code)]
     fn form_help(&self) -> &'static str;
     fn summary(&self, table: &toml::Table) -> Result<String>;
     fn build<'a>(
@@ -426,7 +425,6 @@ impl Kinds {
     }
 
     /// A registered guard kind's form help, or `None` for a kind nobody registered.
-    #[allow(dead_code)] // read by the backoffice's guards section, which follows
     pub(crate) fn guard_form_help(&self, kind: &str) -> Option<&'static str> {
         self.guards.get(kind).map(|factory| factory.form_help())
     }
