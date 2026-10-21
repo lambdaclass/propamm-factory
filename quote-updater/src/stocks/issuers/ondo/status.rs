@@ -14,12 +14,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use quote_updater::eyre;
+use crate::eyre;
 
 use super::api::{self, AssetEvent};
 use crate::{
     poll::{self, Failures, Stamped, lock},
-    ports::{Event, MarketStatus, StatusReading},
+    stocks::ports::{Event, MarketStatus, StatusReading},
 };
 
 /// What the latest read of Ondo's status found.
@@ -99,6 +99,7 @@ impl Status {
         Arc::new(Status::new("", "", Duration::MAX, readings))
     }
 
+    /// The readings the reader has left, under their lock.
     pub fn readings(&self) -> MutexGuard<'_, Readings> {
         lock(&self.readings)
     }
@@ -153,6 +154,7 @@ struct Judged {
 }
 
 impl OndoStatus {
+    /// The adapter over a shared reader of Ondo's status.
     pub fn new(status: Arc<Status>) -> OndoStatus {
         OndoStatus {
             status,
@@ -232,7 +234,7 @@ async fn read(api: &str, key: &str) -> eyre::Result<(String, Vec<AssetEvent>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mock_http::{MockApi, json};
+    use crate::stocks::mock_http::{MockApi, json};
 
     fn ondo() -> MockApi {
         MockApi::serve(vec![

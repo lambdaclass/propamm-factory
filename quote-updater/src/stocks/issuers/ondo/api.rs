@@ -11,20 +11,24 @@
 
 use std::{sync::OnceLock, time::Duration};
 
-use quote_updater::{eyre, prelude::BoxFuture, reqwest};
+use crate::{eyre, prelude::BoxFuture, reqwest};
 use serde::Deserialize;
 
 use crate::{
-    ports::{Event, Fetched, Price, PriceSource},
-    stock::hours::days_from_civil,
+    stocks::hours::days_from_civil,
+    stocks::ports::{Event, Fetched, Price, PriceSource},
 };
 
 /// A GM token's price, from `GET /v1/assets/{symbol}/prices/latest`: the token's price (the
 /// stock's times the token's share multiplier), the stock's, and the stock's ticker.
 pub struct OndoPrices {
+    /// The client the API is asked with.
     pub http: reqwest::Client,
+    /// The API's base URL.
     pub api: String,
+    /// The partner API key.
     pub key: String,
+    /// The token's GM symbol, e.g. `AAPLon`.
     pub symbol: String,
     /// The stock's ticker as the stanza states it, for an answer that does not name it.
     pub ticker: Option<String>,
@@ -347,7 +351,7 @@ fn rfc3339_ms(written: &str) -> Option<i64> {
     if !written.is_ascii() || bytes.len() < 20 || !matches!(bytes[10], b'T' | b't' | b' ') {
         return None;
     }
-    let date: crate::stock::hours::Date = written[..10].parse().ok()?;
+    let date: crate::stocks::hours::Date = written[..10].parse().ok()?;
     let number = |range: std::ops::Range<usize>| -> Option<i64> {
         let part = written.get(range)?;
         part.bytes()
@@ -729,7 +733,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_price_answer_without_a_ticker_takes_the_stanzas() {
-        use crate::mock_http::{MockApi, json};
+        use crate::stocks::mock_http::{MockApi, json};
         let untickered = PRICE.replace(r#""ticker": "AAPL", "#, "");
         let api = MockApi::serve(vec![("/v1/assets/AAPLon/prices/latest", json(&untickered))]);
         let prices = |ticker: Option<&str>| OndoPrices {
@@ -746,7 +750,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_redirect_is_refused_rather_than_followed_with_the_key() {
-        use crate::mock_http::{MockApi, json, respond};
+        use crate::stocks::mock_http::{MockApi, json, respond};
         let elsewhere = MockApi::serve(vec![("/collect", json("[]"))]);
         let location = format!("{}/collect", elsewhere.url);
         let api = MockApi::serve(vec![(

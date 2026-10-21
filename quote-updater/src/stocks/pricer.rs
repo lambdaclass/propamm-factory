@@ -1,6 +1,6 @@
 //! The pricer every tokenized-stock kind builds (`ondo` today): the token's price as the mid,
 //! a fixed `delta`, an optional inventory `skew`, and a quote only while every input says the
-//! token's price is what it seems. The inputs come through the ports ([`crate::ports`]) from
+//! token's price is what it seems. The inputs come through the ports ([`crate::stocks::ports`]) from
 //! the adapters of the kind's design; the gates are the same whoever the issuer:
 //!
 //! - **Fresh.** The latest price is under `max_price_age_secs` old by the source's own
@@ -40,12 +40,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use quote_updater::{Address, U256, eyre, prelude::*};
+use crate::{Address, U256, eyre, prelude::*};
 
 use crate::{
-    chain,
     poll::{self, Failures, Stamped, lock, wall_clock_ms},
-    ports::{Action, MarketStatus, Price, PriceSource, Shares, StatusFeed, Valuation},
+    stocks::{
+        chain,
+        ports::{Action, MarketStatus, Price, PriceSource, Shares, StatusFeed, Valuation},
+    },
 };
 
 /// The oldest a stanza may let a price or a status reading be.
@@ -106,6 +108,7 @@ pub struct Settings {
 }
 
 impl Settings {
+    /// Reads a stanza's settings and checks them against the pair they price.
     pub fn new(s: &Stanza<'_>, pair: &PairShape) -> eyre::Result<Settings> {
         eyre::ensure!(
             pair.sources == 0,
@@ -597,7 +600,9 @@ impl Pricer for StockPricer {
 
 /// What a kind hands the core to build its pricer: its design's adapters.
 pub struct Adapters {
+    /// The token's price source.
     pub prices: Box<dyn PriceSource>,
+    /// The token's shares per token, and its corporate actions.
     pub valuation: Box<dyn Valuation>,
     /// Opens the issuer's status, for a design whose issuer reports one. The build awaits it
     /// after the first price, as one of its reads: a wrong key or an answer that does not
@@ -757,10 +762,12 @@ fn judge_band(first: &Price, pair: &PairShape, s: &Settings) -> eyre::Result<()>
 /// would have left, and the design's status adapter, without a chain or a task.
 #[cfg(test)]
 pub mod testkit {
-    use quote_updater::testing::{self, Inputs};
+    #![allow(missing_docs)]
+
+    use crate::testing::{self, Inputs};
 
     use super::*;
-    use crate::{chain::parse_address, ports::StatusReading};
+    use crate::{stocks::chain::parse_address, stocks::ports::StatusReading};
 
     pub const AAPLON: &str = "0x14c3abF95Cb9C93a8b82C1CdCB76D72Cb87b2d4c";
     pub const USDC: &str = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
@@ -942,10 +949,10 @@ pub mod testkit {
 
 #[cfg(test)]
 mod tests {
-    use quote_updater::testing;
+    use crate::testing;
 
     use super::{testkit::*, *};
-    use crate::ports::{Event, StatusReading};
+    use crate::stocks::ports::{Event, StatusReading};
 
     /// A stanza with the `ondo` kind's defaults, changed by `edit`.
     fn stanza_with(edit: impl FnOnce(&mut Stanza<'static>)) -> Stanza<'static> {

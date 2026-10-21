@@ -81,6 +81,9 @@ mod node;
 pub mod observe;
 pub mod output;
 mod pair;
+/// What the crate's background readers share: the schedule they read on, the lock they
+/// leave readings under, and how they log a source that keeps failing.
+pub(crate) mod poll;
 mod preflight;
 pub mod pricing;
 /// The pricing kinds this crate ships, each an ordinary [`pricing::Factory`] a binary
@@ -98,6 +101,7 @@ mod rpc;
 #[cfg(test)]
 mod rpc_mock;
 mod service;
+pub mod stocks;
 mod supervisor;
 mod tasks;
 pub mod testing;

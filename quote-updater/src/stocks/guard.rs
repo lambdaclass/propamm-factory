@@ -27,13 +27,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use quote_updater::{U256, calldata::Value, eyre, prelude::*};
+use crate::{U256, calldata::Value, eyre, prelude::*};
 use serde::Deserialize;
 
 use crate::{
-    chain::{self, Calls},
     poll::{self, Failures, lock},
-    ports::{Restrictions, Rules},
+    stocks::chain::{self, Calls},
+    stocks::ports::{Restrictions, Rules},
 };
 
 /// The `[[pairs.guards]]` stanza of a restriction guard, whatever the design.
@@ -297,10 +297,10 @@ async fn poll(
 
 #[cfg(test)]
 mod tests {
-    use quote_updater::testing;
+    use crate::testing;
 
     use super::*;
-    use crate::chain::fake::FakeChain;
+    use crate::testing::FakeChain;
 
     fn guard_with(reading: Option<Reading>) -> (RestrictionGuard, BuildCtx) {
         let mut ctx = testing::build_ctx(&testing::pair());

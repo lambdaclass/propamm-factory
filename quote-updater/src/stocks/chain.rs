@@ -2,10 +2,10 @@
 //! vault, and the single-value answers the issuers' adapters decode their contracts with.
 //!
 //! Every read goes through [`Calls`], which the run's [`Chain`] answers and a test's
-//! [`fake::FakeChain`] answers only for the exact calls it was given, so an adapter's wiring
+//! [`crate::testing::FakeChain`] answers only for the exact calls it was given, so an adapter's wiring
 //! (which contract, which argument) is tested without a node.
 
-use quote_updater::{
+use crate::{
     Address,
     calldata::{Value, decode_return_data},
     eyre,
@@ -15,6 +15,7 @@ use quote_updater::{
 /// What a read asks of the chain: one `eth_call` by signature, answering the undecoded
 /// return data, or one made as an account, answering whether it reverted.
 pub trait Calls: Send + Sync + 'static {
+    /// One `eth_call` of `sig(args)` on `to`, answering the undecoded return data.
     fn call_sig<'a>(
         &'a self,
         to: Address,
@@ -141,97 +142,10 @@ pub async fn read_bool(
     }
 }
 
-/// A chain for tests, answering only what it was told to.
-#[cfg(test)]
-pub mod fake {
-    use std::collections::HashMap;
-
-    use quote_updater::calldata::encode_calldata;
-
-    use super::*;
-
-    /// `values` ABI-encoded as a call's return data: calldata without its selector.
-    pub fn returned(types: &str, values: &[Value]) -> Vec<u8> {
-        encode_calldata(&format!("f({types})"), values).unwrap()[4..].to_vec()
-    }
-
-    /// Answers each call it was given, by contract and exact calldata (and, for a call made
-    /// as an account, that account), and nothing else: a call to another contract, another
-    /// function, with other arguments or as another account fails, as a read that could
-    /// not be made.
-    #[derive(Debug, Default)]
-    pub struct FakeChain {
-        answers: HashMap<(Address, Vec<u8>), Vec<u8>>,
-        outcomes: HashMap<(Address, Address, Vec<u8>), CallOutcome>,
-    }
-
-    impl FakeChain {
-        /// `to.sig(args)` answers `values`, of the return types `types` (as `address`).
-        pub fn answer(
-            mut self,
-            to: Address,
-            sig: &str,
-            args: &[Value],
-            types: &str,
-            values: &[Value],
-        ) -> FakeChain {
-            let calldata = encode_calldata(sig, args).unwrap();
-            self.answers.insert((to, calldata), returned(types, values));
-            self
-        }
-
-        /// `to.sig(args)`, made as `from`, ends in `outcome`.
-        pub fn outcome(
-            mut self,
-            from: Address,
-            to: Address,
-            sig: &str,
-            args: &[Value],
-            outcome: CallOutcome,
-        ) -> FakeChain {
-            let calldata = encode_calldata(sig, args).unwrap();
-            self.outcomes.insert((from, to, calldata), outcome);
-            self
-        }
-    }
-
-    impl Calls for FakeChain {
-        fn call_sig<'a>(
-            &'a self,
-            to: Address,
-            sig: &'a str,
-            args: &'a [Value],
-        ) -> BoxFuture<'a, eyre::Result<Vec<u8>>> {
-            let answer = encode_calldata(sig, args)
-                .ok()
-                .and_then(|calldata| self.answers.get(&(to, calldata)).cloned());
-            Box::pin(async move {
-                answer.ok_or_else(|| eyre::eyre!("no contract at {to:#x} answers {sig} so called"))
-            })
-        }
-
-        fn call_sig_as<'a>(
-            &'a self,
-            from: Address,
-            to: Address,
-            sig: &'a str,
-            args: &'a [Value],
-        ) -> BoxFuture<'a, eyre::Result<CallOutcome>> {
-            let outcome = encode_calldata(sig, args)
-                .ok()
-                .and_then(|calldata| self.outcomes.get(&(from, to, calldata)).cloned());
-            Box::pin(async move {
-                outcome.ok_or_else(|| {
-                    eyre::eyre!("no call of {sig} on {to:#x} as {from:#x} was expected")
-                })
-            })
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{fake::returned, *};
+    use super::*;
+    use crate::testing::returned;
 
     #[test]
     fn a_symbol_reads_as_a_string_or_a_padded_bytes32() {

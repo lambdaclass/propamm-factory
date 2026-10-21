@@ -25,16 +25,18 @@
 
 use std::sync::Arc;
 
-use quote_updater::{Address, calldata::Value, eyre, prelude::BoxFuture};
+use crate::{Address, calldata::Value, eyre, prelude::BoxFuture};
 
 use crate::{
-    chain::{Calls, read_address, read_bool},
-    ports::{Restrictions, Rules},
+    stocks::chain::{Calls, read_address, read_bool},
+    stocks::ports::{Restrictions, Rules},
 };
 
 /// A GM token's transfer rules, discovered from the token on each read.
 pub struct OndoCompliance {
+    /// The chain the token is read through.
     pub chain: Arc<dyn Calls>,
+    /// The GM token.
     pub token: Address,
 }
 
@@ -148,7 +150,7 @@ impl Rules for OndoRules {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chain::fake::FakeChain;
+    use crate::testing::FakeChain;
 
     const TOKEN: Address = Address::repeat_byte(0x14);
     const MANAGER: Address = Address::repeat_byte(0x21);

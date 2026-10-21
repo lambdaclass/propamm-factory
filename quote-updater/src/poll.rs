@@ -6,14 +6,16 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use quote_updater::eyre;
+use crate::eyre;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
 
 /// A reading this process took, and when, by the monotonic clock: its age cannot jump when
 /// the wall clock is stepped. A source's own timestamp (a price's) stays on the wall clock.
 #[derive(Clone, Copy, Debug)]
 pub struct Stamped<T> {
+    /// When the reading was taken, by the monotonic clock.
     pub at: std::time::Instant,
+    /// The reading.
     pub value: T,
 }
 

@@ -1,14 +1,14 @@
 //! Ondo Global Markets stock tokens (AAPLon, ...): Ondo's adapters to the ports, and the two
 //! kinds built from them.
 //!
-//! - **`ondo`**, the stock pricer ([`crate::stock::pricer`]) over Ondo's adapters: the price
+//! - **`ondo`**, the stock pricer ([`crate::stocks::pricer`]) over Ondo's adapters: the price
 //!   from Ondo's own API ([`api::OndoPrices`]), the price Ondo itself mints and redeems
 //!   around; the share multiplier and its corporate-action pause from the chain's
 //!   `SyntheticSharesOracle` ([`oracle::OndoOracle`]); and Ondo's market session and asset
 //!   events ([`status::OndoStatus`]), which withdraw on any session but `regular`, on an
 //!   active pause or size limit under the token's symbol or the stock's ticker, and on an
 //!   upcoming event that will move the share multiplier.
-//! - **`ondo_token`**, the restriction guard ([`crate::stock::guard`]) over Ondo's pause
+//! - **`ondo_token`**, the restriction guard ([`crate::stocks::guard`]) over Ondo's pause
 //!   manager, blocklist and sanctions list ([`compliance::OndoCompliance`]).
 //!
 //! ```toml
@@ -33,13 +33,13 @@ pub mod status;
 
 use std::{sync::Arc, time::Duration};
 
-use quote_updater::{Address, eyre, prelude::*};
+use crate::{Address, eyre, prelude::*};
 use serde::Deserialize;
 
 use crate::{
-    chain::parse_address,
-    ports::StatusFeed,
-    stock::{
+    stocks::chain::parse_address,
+    stocks::ports::StatusFeed,
+    stocks::{
         guard::RestrictionGuardFactory,
         pricer::{self, Adapters, Settings, Stanza, StockPricer},
     },
@@ -227,7 +227,7 @@ pub fn token_guard() -> RestrictionGuardFactory {
 mod tests {
     use std::sync::Arc;
 
-    use quote_updater::testing;
+    use crate::testing;
 
     use super::{
         status::{OndoStatus, Readings, Status},
@@ -235,7 +235,7 @@ mod tests {
     };
     use crate::{
         poll::Stamped,
-        stock::pricer::testkit::{self, Built, read_at},
+        stocks::pricer::testkit::{self, Built, read_at},
     };
 
     fn cfg(extra: serde_json::Value) -> OndoCfg {

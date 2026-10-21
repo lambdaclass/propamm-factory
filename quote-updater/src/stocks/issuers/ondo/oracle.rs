@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use quote_updater::{
+use crate::{
     Address, U256,
     calldata::{Value, decode_return_data},
     eyre,
@@ -11,8 +11,8 @@ use quote_updater::{
 };
 
 use crate::{
-    chain::Calls,
-    ports::{Action, Shares, Valuation},
+    stocks::chain::Calls,
+    stocks::ports::{Action, Shares, Valuation},
 };
 
 /// Ondo's `SyntheticSharesOracle` on Ethereum mainnet.
@@ -95,8 +95,11 @@ pub async fn read_multiplier(
 
 /// A GM token's [`Shares`], read from `oracle`.
 pub struct OndoOracle {
+    /// The chain the oracle is read through.
     pub chain: Arc<dyn Calls>,
+    /// The `SyntheticSharesOracle`.
     pub oracle: Address,
+    /// The GM token whose shares are read.
     pub token: Address,
 }
 
@@ -113,7 +116,7 @@ impl Valuation for OndoOracle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chain::fake::FakeChain;
+    use crate::testing::FakeChain;
 
     #[tokio::test]
     async fn the_multiplier_is_the_oracles_answer_for_this_token() {

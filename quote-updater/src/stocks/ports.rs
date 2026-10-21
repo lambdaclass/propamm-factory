@@ -1,4 +1,4 @@
-//! What the stock core (`stock/`) asks of a tokenized-stock design, and the shape of each
+//! What the stock core asks of a tokenized-stock design, and the shape of each
 //! answer. A design answers through adapters of its own (`issuers/ondo/` for Ondo's Global
 //! Markets tokens); the core judges every answer the same way, whoever gave it:
 //!
@@ -10,13 +10,13 @@
 //! - [`Restrictions`]: what would stop the token moving for the parties of a fill.
 //!
 //! Each read is a [`BoxFuture`], so the core holds adapters as trait objects: a new design is
-//! a module of adapters, and the kinds it registers in `main.rs`.
+//! a module of adapters, and the kinds a binary registers.
 
 use std::sync::Arc;
 
-use quote_updater::{Address, eyre, prelude::BoxFuture};
+use crate::{Address, eyre, prelude::BoxFuture};
 
-use crate::poll::Stamped;
+pub use crate::poll::Stamped;
 
 /// A token's price, as a source quotes it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -32,6 +32,7 @@ pub struct Price {
 /// One read of a [`PriceSource`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct Fetched {
+    /// The prices, and when the source stamped them.
     pub price: Price,
     /// The underlying stock's ticker, when the source names it: the asset's other name in
     /// what the issuer reports (see [`MarketStatus::read`]).
@@ -59,6 +60,7 @@ pub struct Shares {
 /// stays stopped until then.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Action {
+    /// When it starts, in seconds since the epoch.
     pub starts: u64,
 }
 
@@ -82,6 +84,7 @@ impl Action {
 /// Where the token's `k` and its scheduled corporate actions are read: on chain, by a task of
 /// the core's, a block apart.
 pub trait Valuation: Send + Sync + 'static {
+    /// The shares one token is worth now, and the corporate action scheduled on it, if any.
     fn read(&self) -> BoxFuture<'_, eyre::Result<Shares>>;
 }
 
@@ -132,7 +135,9 @@ pub trait MarketStatus: Send + Sync + 'static {
 /// and the task that keeps it current, which the core starts once the build has
 /// succeeded and which stops with the pair.
 pub struct StatusFeed {
+    /// Answers the status for an asset's names.
     pub reader: Box<dyn MarketStatus>,
+    /// The task that keeps the reader current; it stops with the pair.
     pub refresh: BoxFuture<'static, ()>,
 }
 

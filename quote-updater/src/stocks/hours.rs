@@ -33,7 +33,7 @@
 
 use std::{collections::BTreeSet, fmt, str::FromStr};
 
-use quote_updater::{eyre, prelude::*};
+use crate::{eyre, prelude::*};
 use serde::Deserialize;
 
 use crate::poll;
@@ -174,8 +174,11 @@ impl QuoteGuardFactory for UsMarketHoursFactory {
 /// A calendar date, as the config writes it: `2026-11-26`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Date {
+    /// The year, four digits.
     pub year: i32,
+    /// 1 to 12.
     pub month: u32,
+    /// 1 to 31.
     pub day: u32,
 }
 
@@ -484,7 +487,7 @@ fn civil_from_days(days: i64) -> Date {
 
 #[cfg(test)]
 mod tests {
-    use quote_updater::testing;
+    use crate::testing;
 
     use super::*;
 
