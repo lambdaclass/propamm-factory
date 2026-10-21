@@ -328,10 +328,10 @@ pub struct Feeds {
     pub checks: SourceChecks,
 }
 
-/// The largest `max_source_lag_ms`: a frame arriving later than
-/// [`crate::update::MAX_PRICE_AGE`] behind its stamp means the venue has been behind for
-/// longer than it takes to be dropped for silence, so a looser limit could never be what
-/// leaves a venue out.
+/// The largest `max_source_lag_ms`. A guard against the unit, not a bound the feed needs:
+/// a backlogged venue keeps delivering frames, so the silence rule never drops it and any
+/// limit would act, but a lane willing to average prices half a minute old has not set a
+/// lateness limit, it has written seconds (or microseconds) where milliseconds go.
 pub const MAX_SOURCE_LAG_MS: u64 = 30_000;
 
 /// How late a venue's price may arrive behind the exchange's own stamp before the
@@ -682,9 +682,9 @@ fn parse_source_checks(raw: &RawPair, sources: &[Source], at: &str) -> Result<So
             );
             ensure!(
                 ms <= MAX_SOURCE_LAG_MS,
-                "{at}: max_source_lag_ms {ms} is above {MAX_SOURCE_LAG_MS}: a venue 30 seconds \
-                 behind has already been dropped for silence, so the limit could never be what \
-                 leaves it out (it is milliseconds: write 1500 for 1.5 seconds)"
+                "{at}: max_source_lag_ms {ms} is above {MAX_SOURCE_LAG_MS}: that would keep \
+                 averaging a venue's prices until they are over half a minute old; it is \
+                 milliseconds, so write 1500 for 1.5 seconds"
             );
             Some(std::time::Duration::from_millis(ms))
         }
