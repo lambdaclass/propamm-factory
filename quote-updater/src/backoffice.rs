@@ -4869,4 +4869,43 @@ api_key = "k"
         };
         assert_eq!(by_kind(&pair.guards), by_kind(&want.guards));
     }
+
+    /// A pair priced by a kind that sources its own mid (a stock pair) lists no venue, and
+    /// the add page takes it that way: no symbol, no sources.
+    #[tokio::test]
+    async fn a_pair_whose_pricing_kind_sources_its_own_mid_saves_with_no_venue() {
+        let (path, state, mut reloads) = config_on_disk("no-venue");
+        let (local, _task) = bind(
+            "127.0.0.1:0".parse().unwrap(),
+            path.clone(),
+            state.reloads.clone(),
+            test_client(),
+            PairStates::default(),
+            std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            test_kinds(),
+        )
+        .await
+        .unwrap();
+        let service = tokio::spawn(async move {
+            let request = reloads.recv().await.expect("a reload must be requested");
+            let _ = request.reply.send(Ok("reload: 1 started".to_owned()));
+        });
+        let body = "token0=0x14c3abF95Cb9C93a8b82C1CdCB76D72Cb87b2d4c\
+                    &token1=0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48\
+                    &key_env=UPDATER_KEY_AAPLON_USDC&symbol_binance=&weight_binance=&min_sources=\
+                    &min_mid=150&max_mid=400&max_deviation=&max_deviation_window=\
+                    &max_deviation_window_blocks=&pricing=skewed&pricing_skewed_half_spread=0.001";
+        let (ok, message) = post(local, "/pairs/add", body).await;
+        assert!(ok, "{message}");
+        service.await.unwrap();
+        let written = config::load_raw(&path).unwrap();
+        let pair = written
+            .pairs
+            .iter()
+            .find(|p| p.key_env == "UPDATER_KEY_AAPLON_USDC")
+            .expect("the pair was added");
+        assert_eq!(pair.symbol, None);
+        assert!(pair.sources.is_empty());
+        assert_eq!(pair.min_sources, None);
+    }
 }
