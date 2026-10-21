@@ -475,6 +475,22 @@ fn pricing_stanza(
             )
         }
     })?;
+    kind_stanza("pricing", fields, kind, existing, posted)
+}
+
+/// A kind's stanza from what the form posted: `kind`, then each declared field the operator
+/// filled in, written by its type ([`field_toml`]). Shared by the pricing section (`prefix`
+/// is `pricing`) and the guards section (`guard`), whose inputs are named
+/// `<prefix>_<kind>_<field>`. A kind that declares no fields keeps the stanza it had when
+/// that is the same kind (the page cannot edit one, and says so), and otherwise gets a
+/// stanza naming it alone.
+fn kind_stanza(
+    prefix: &str,
+    fields: &'static [crate::pricing::FormField],
+    kind: &str,
+    existing: Option<&toml::Table>,
+    posted: &std::collections::HashMap<String, String>,
+) -> Result<toml::Table> {
     let existing_kind = existing
         .and_then(|t| t.get("kind"))
         .and_then(|k| k.as_str());
@@ -484,21 +500,93 @@ fn pricing_stanza(
     let mut table = toml::Table::new();
     table.insert("kind".to_owned(), toml::Value::String(kind.to_owned()));
     for field in fields {
-        let key = format!("pricing_{kind}_{}", field.name);
-        if let Some(value) = posted.get(&key).and_then(|v| optional(v)) {
-            let value = if field.number {
-                match (value.parse::<i64>(), value.parse::<f64>()) {
-                    (Ok(int), _) => toml::Value::Integer(int),
-                    (_, Ok(float)) if float.is_finite() => toml::Value::Float(float),
-                    _ => bail!("`{}` must be a number, got {value:?}", field.name),
-                }
-            } else {
-                toml::Value::String(value)
-            };
+        let key = format!("{prefix}_{kind}_{}", field.name);
+        let text = posted.get(&key).map(String::as_str).unwrap_or("");
+        if let Some(value) = field_toml(field, text)? {
             table.insert(field.name.to_owned(), value);
         }
     }
     Ok(table)
+}
+
+/// What an input's text writes into the stanza, by the field's type, or `None` for a blank,
+/// which is an absent key so the kind's default applies. A list is the exception: its empty
+/// textarea is an empty array, since the key is required where a list is used.
+fn field_toml(field: &crate::pricing::FormField, text: &str) -> Result<Option<toml::Value>> {
+    use crate::pricing::FieldKind;
+    Ok(match field.kind {
+        FieldKind::Text => optional(text).map(toml::Value::String),
+        FieldKind::Number => match optional(text) {
+            None => None,
+            Some(value) => Some(match (value.parse::<i64>(), value.parse::<f64>()) {
+                (Ok(int), _) => toml::Value::Integer(int),
+                (_, Ok(float)) if float.is_finite() => toml::Value::Float(float),
+                _ => bail!("`{}` must be a number, got {value:?}", field.name),
+            }),
+        },
+        FieldKind::List => Some(toml::Value::Array(
+            text.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(|line| toml::Value::String(line.to_owned()))
+                .collect(),
+        )),
+        FieldKind::Env => match optional(text) {
+            None => None,
+            Some(name) => {
+                // Not echoed: what is not a variable's name may be the secret itself.
+                if !is_variable_name(&name) {
+                    bail!(
+                        "`{}` must be the name of an environment variable (letters, digits \
+                         and underscores), never its value",
+                        field.name
+                    );
+                }
+                let mut env = toml::Table::new();
+                env.insert("env".to_owned(), toml::Value::String(name));
+                Some(toml::Value::Table(env))
+            }
+        },
+    })
+}
+
+/// Whether `name` is spelled like an environment variable: a letter or underscore, then
+/// letters, digits and underscores.
+fn is_variable_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// A stanza value as the edit page shows it in the field's input: a number as TOML writes
+/// it, a list one item per line, an env reference as the variable's name, a string as it
+/// is. A value of another shape than the field's type writes (a number written by hand for
+/// a text field, say) still shows, so a save does not drop it; what cannot show is blank.
+fn field_value(field: &crate::pricing::FormField, value: Option<&toml::Value>) -> String {
+    use crate::pricing::FieldKind;
+    match (field.kind, value) {
+        (_, None) => String::new(),
+        (FieldKind::List, Some(toml::Value::Array(items))) => items
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        (FieldKind::Env, Some(toml::Value::Table(table))) => table
+            .get("env")
+            .and_then(toml::Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        (FieldKind::Env | FieldKind::List, Some(_)) => String::new(),
+        (FieldKind::Text | FieldKind::Number, Some(scalar)) => match scalar {
+            toml::Value::String(text) => text.clone(),
+            toml::Value::Integer(int) => int.to_string(),
+            toml::Value::Float(float) => float.to_string(),
+            toml::Value::Boolean(flag) => flag.to_string(),
+            _ => String::new(),
+        },
+    }
 }
 
 async fn add_pair(
@@ -1656,6 +1744,8 @@ struct Filled {
     secret: bool,
     value: String,
     readonly: bool,
+    /// A textarea rather than an input: a list field, one item per line.
+    multiline: bool,
 }
 
 impl Filled {
@@ -1668,20 +1758,28 @@ impl Filled {
             secret: field.secret,
             value: value.unwrap_or_default().to_owned(),
             readonly: false,
+            multiline: false,
         }
     }
 
-    /// A pricing kind's declared field, posted as `pricing_<kind>_<field>` so every kind's
-    /// section can be on the page at once ([`pricing_stanza`] reads the chosen kind's).
-    fn kind_field(kind: &str, field: &crate::pricing::FormField, value: Option<&str>) -> Self {
+    /// A kind's declared field, posted as `<prefix>_<kind>_<field>` so every kind's section
+    /// can be on the page at once ([`kind_stanza`] reads the chosen kind's), its current
+    /// value read back by its type ([`field_value`]).
+    fn kind_field(
+        prefix: &str,
+        kind: &str,
+        field: &crate::pricing::FormField,
+        value: Option<&toml::Value>,
+    ) -> Self {
         Self {
-            name: format!("pricing_{kind}_{}", field.name),
+            name: format!("{prefix}_{kind}_{}", field.name),
             label: field.name,
             placeholder: field.placeholder,
             hint: field.hint,
             secret: false,
-            value: value.unwrap_or_default().to_owned(),
+            value: field_value(field, value),
             readonly: false,
+            multiline: field.kind == crate::pricing::FieldKind::List,
         }
     }
 
@@ -2077,11 +2175,10 @@ fn render_pair_form(pair: Option<&RawPair>, kinds: &crate::kinds::Kinds) -> Stri
                     .map(|field| {
                         let value = if mine {
                             pair.and_then(|p| p.pricing.get(field.name))
-                                .and_then(|v| v.as_str())
                         } else {
                             None
                         };
-                        Filled::kind_field(name, field, value)
+                        Filled::kind_field("pricing", name, field, value)
                     })
                     .collect(),
                 in_file: fields.is_empty(),
@@ -3414,37 +3511,44 @@ api_key = "k"
     /// refused, and a kind with no fields keeps a stanza it already prices.
     /// A kind whose config reads numbers declares its fields as numbers, and the page writes
     /// them as TOML numbers; a value that is not one is refused rather than written.
+    /// A pricing kind with two number fields, for the tests of how numbers are written and
+    /// read back.
+    #[derive(Clone, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Numeric {
+        #[allow(dead_code)]
+        half_spread: f64,
+        #[allow(dead_code)]
+        age_secs: u64,
+    }
+    struct NumericFactory;
+    impl crate::pricing::Factory for NumericFactory {
+        type Config = Numeric;
+        type Pricer = crate::pricing::FixedPricer;
+        fn fields(&self) -> &'static [crate::pricing::FormField] {
+            const FIELDS: &[crate::pricing::FormField] = &[
+                crate::pricing::FormField::number("half_spread", "0.0005", ""),
+                crate::pricing::FormField::number("age_secs", "60", ""),
+            ];
+            FIELDS
+        }
+        fn build<'a>(
+            &'a self,
+            _: &'a Numeric,
+            _: &'a mut crate::pricing::BuildCtx,
+        ) -> crate::pricing::BoxFuture<'a, eyre::Result<Self::Pricer>> {
+            Box::pin(std::future::ready(Err(eyre!("not built here"))))
+        }
+    }
+    fn numeric_kinds() -> crate::kinds::Kinds {
+        let mut kinds = crate::kinds::Kinds::default();
+        kinds.insert("numeric", Arc::new(NumericFactory));
+        kinds
+    }
+
     #[test]
     fn a_numeric_field_is_written_as_a_number() {
-        #[derive(Clone, serde::Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Numeric {
-            #[allow(dead_code)]
-            half_spread: f64,
-            #[allow(dead_code)]
-            age_secs: u64,
-        }
-        struct Fields;
-        impl crate::pricing::Factory for Fields {
-            type Config = Numeric;
-            type Pricer = crate::pricing::FixedPricer;
-            fn fields(&self) -> &'static [crate::pricing::FormField] {
-                const FIELDS: &[crate::pricing::FormField] = &[
-                    crate::pricing::FormField::number("half_spread", "0.0005", ""),
-                    crate::pricing::FormField::number("age_secs", "60", ""),
-                ];
-                FIELDS
-            }
-            fn build<'a>(
-                &'a self,
-                _: &'a Numeric,
-                _: &'a mut crate::pricing::BuildCtx,
-            ) -> crate::pricing::BoxFuture<'a, eyre::Result<Self::Pricer>> {
-                Box::pin(std::future::ready(Err(eyre!("not built here"))))
-            }
-        }
-        let mut kinds = crate::kinds::Kinds::default();
-        kinds.insert("numeric", Arc::new(Fields));
+        let kinds = numeric_kinds();
         let posted = |pairs: &[(&str, &str)]| -> std::collections::HashMap<String, String> {
             pairs
                 .iter()
@@ -4166,5 +4270,119 @@ api_key = "k"
             "{form}"
         );
         assert!(!form.contains(r#"name="pricing_skewed_"#), "{form}");
+    }
+
+    /// A list field is a textarea, one item per line: trimmed, blank lines dropped, a
+    /// browser's `\r\n` taken, and an empty textarea an empty array with the key present.
+    #[test]
+    fn a_list_field_is_written_as_an_array_of_trimmed_lines() {
+        const FIELDS: &[crate::pricing::FormField] =
+            &[crate::pricing::FormField::list("holidays", "", "")];
+        let posted = |value: &str| -> std::collections::HashMap<String, String> {
+            [("guard_cal_holidays".to_owned(), value.to_owned())]
+                .into_iter()
+                .collect()
+        };
+        let table = kind_stanza(
+            "guard",
+            FIELDS,
+            "cal",
+            None,
+            &posted("2026-11-26\r\n\r\n 2026-12-25 \n"),
+        )
+        .unwrap();
+        assert_eq!(
+            table.get("holidays"),
+            Some(&toml::Value::Array(vec![
+                toml::Value::String("2026-11-26".to_owned()),
+                toml::Value::String("2026-12-25".to_owned()),
+            ]))
+        );
+        let table = kind_stanza("guard", FIELDS, "cal", None, &posted("")).unwrap();
+        assert_eq!(table.get("holidays"), Some(&toml::Value::Array(Vec::new())));
+    }
+
+    /// An env field holds the name of a variable and is written as `{ env = "NAME" }`; a
+    /// value that is not a variable name (a pasted secret, say) is refused without being
+    /// echoed.
+    #[test]
+    fn an_env_field_is_written_as_an_env_table_and_refuses_what_is_not_a_variable_name() {
+        const FIELDS: &[crate::pricing::FormField] = &[crate::pricing::FormField::env(
+            "api_key",
+            "ONDO_API_KEY",
+            "",
+        )];
+        let posted = |value: &str| -> std::collections::HashMap<String, String> {
+            [("pricing_ondo_api_key".to_owned(), value.to_owned())]
+                .into_iter()
+                .collect()
+        };
+        let table =
+            kind_stanza("pricing", FIELDS, "ondo", None, &posted(" ONDO_API_KEY ")).unwrap();
+        let mut env = toml::Table::new();
+        env.insert(
+            "env".to_owned(),
+            toml::Value::String("ONDO_API_KEY".to_owned()),
+        );
+        assert_eq!(table.get("api_key"), Some(&toml::Value::Table(env)));
+        let err = format!(
+            "{:#}",
+            kind_stanza("pricing", FIELDS, "ondo", None, &posted("sk-live-123")).unwrap_err()
+        );
+        assert!(err.contains("variable"), "{err}");
+        assert!(
+            !err.contains("sk-live"),
+            "the value must not be echoed: {err}"
+        );
+    }
+
+    /// The edit page reads each field back by its type: a float as written, a list one
+    /// item per line, an env reference as the variable's name.
+    #[test]
+    fn every_field_type_reads_back_for_the_edit_page() {
+        use crate::pricing::FormField;
+        let number = FormField::number("gap", "", "");
+        assert_eq!(
+            field_value(&number, Some(&toml::Value::Float(0.001))),
+            "0.001"
+        );
+        assert_eq!(field_value(&number, Some(&toml::Value::Integer(60))), "60");
+        let list = FormField::list("holidays", "", "");
+        let dates = toml::Value::Array(vec![
+            toml::Value::String("2026-11-26".to_owned()),
+            toml::Value::String("2026-12-25".to_owned()),
+        ]);
+        assert_eq!(field_value(&list, Some(&dates)), "2026-11-26\n2026-12-25");
+        let env = FormField::env("api_key", "", "");
+        let mut table = toml::Table::new();
+        table.insert("env".to_owned(), toml::Value::String("K".to_owned()));
+        assert_eq!(field_value(&env, Some(&toml::Value::Table(table))), "K");
+        let text = FormField::new("symbol", "", "");
+        assert_eq!(field_value(&text, None), "");
+        assert_eq!(
+            field_value(&text, Some(&toml::Value::String("AAPLon".to_owned()))),
+            "AAPLon"
+        );
+    }
+
+    /// The edit page used to read every field as a string, so a number field rendered blank
+    /// and saving the page dropped the operator's value.
+    #[test]
+    fn a_number_field_shows_its_current_value_on_the_edit_page() {
+        let mut config: config::RawConfig = toml::from_str(CUSTOM_PAIR).unwrap();
+        let mut pricing = toml::Table::new();
+        pricing.insert("kind".to_owned(), toml::Value::String("numeric".to_owned()));
+        pricing.insert("half_spread".to_owned(), toml::Value::Float(0.0005));
+        pricing.insert("age_secs".to_owned(), toml::Value::Integer(60));
+        config.pairs[0].pricing = pricing;
+        let form = render_pair_form(Some(&config.pairs[0]), &numeric_kinds());
+        assert!(
+            form.contains("name=\"pricing_numeric_half_spread\"\n         value=\"0.0005\""),
+            "{form}"
+        );
+        assert!(
+            form.contains("name=\"pricing_numeric_age_secs\"\n         value=\"60\""),
+            "{form}"
+        );
     }
 }
