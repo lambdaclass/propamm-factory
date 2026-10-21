@@ -208,6 +208,18 @@ pub trait MarketGuardFactory: Send + Sync + 'static {
         Ok(())
     }
 
+    /// The stanza's keys as inputs on the backoffice's pair form, in the order shown, as
+    /// [`Factory::fields`] for a pricing kind. Empty, the default, means the stanza is edited
+    /// in the file and the page says so.
+    fn fields(&self) -> &'static [FormField] {
+        &[]
+    }
+
+    /// HTML the pair form shows above this kind's fields; see [`Factory::form_help`].
+    fn form_help(&self) -> &'static str {
+        ""
+    }
+
     /// One short line for `--check`'s `guards` column, e.g. `max_spread 0.3%`. The kind's
     /// name is shown either way; this is the settings after it. Empty shows the name alone.
     fn summary(&self, _cfg: &Self::Config) -> String {
@@ -237,6 +249,18 @@ pub trait QuoteGuardFactory: Send + Sync + 'static {
     /// Checks a stanza against the pair it would judge. Synchronous and without I/O.
     fn validate(&self, _cfg: &Self::Config, _pair: &PairShape) -> eyre::Result<()> {
         Ok(())
+    }
+
+    /// The stanza's keys as inputs on the backoffice's pair form, in the order shown, as
+    /// [`Factory::fields`] for a pricing kind. Empty, the default, means the stanza is edited
+    /// in the file and the page says so.
+    fn fields(&self) -> &'static [FormField] {
+        &[]
+    }
+
+    /// HTML the pair form shows above this kind's fields; see [`Factory::form_help`].
+    fn form_help(&self) -> &'static str {
+        ""
     }
 
     /// One short line for `--check`'s `guards` column; see [`MarketGuardFactory::summary`].
