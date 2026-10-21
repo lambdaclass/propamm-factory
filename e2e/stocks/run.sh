@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Smoke test for propamm-stocks: the real binary against a local chain and a local Ondo API,
+# Smoke test for tokenized stocks: the example binary, the one the deployment builds, against
+# a local chain and a local Ondo API,
 # so the parts unit tests cannot reach (HTTP to Ondo, every eth_call and its decoding, the
 # build's first reads, a published update and the quote PropAMM prices from it) run for real.
 # Nothing here touches the network: anvil, the contracts' own mocks, and ondo_api.py.
 #
-#   bash stocks/smoke/run.sh   from anywhere; builds what it needs, exits 0 when every check holds
+#   bash e2e/stocks/run.sh   from anywhere; builds what it needs, exits 0 when every check holds
 #
 # 1. `--check` on a full builder-mode config (pricer and both guards) passes, and passes with
 #    the pair halted, which the library labels by its lane.
@@ -62,8 +63,8 @@ echo "== building"
 # forge's lint notes go to stderr on every build: kept in a log, shown only if the build fails.
 (cd "$ROOT/contracts" && forge build --offline >"$WORK/forge.log" 2>&1) \
   || { cat "$WORK/forge.log"; fail "the contracts do not build"; }
-(cd "$ROOT/stocks" && cargo build --offline --locked -q)
-BIN=$ROOT/stocks/target/debug/propamm-stocks
+(cd "$ROOT/example" && cargo build --offline --locked -q)
+BIN=$ROOT/example/target/debug/my-propamm
 
 echo "== local chain and Ondo API"
 # The asset events the mock lists, re-read on every request: none until step 4.
@@ -71,7 +72,7 @@ EVENTS=$WORK/events.json
 echo '[]' >"$EVENTS"
 # Disowned, so bash does not announce their termination when cleanup kills them.
 anvil --port "$RPC_PORT" --silent & PIDS+=($!); disown
-python3 "$ROOT/stocks/smoke/ondo_api.py" "$API_PORT" "$API_KEY" AAPLon "$TOKEN_PRICE" "$STOCK_PRICE" \
+python3 "$ROOT/e2e/stocks/ondo_api.py" "$API_PORT" "$API_KEY" AAPLon "$TOKEN_PRICE" "$STOCK_PRICE" \
   "$EVENTS" >"$WORK/api.log" 2>&1 & PIDS+=($!); disown
 wait_for anvil chain_up
 wait_for "the mock Ondo API" api_up
@@ -110,7 +111,7 @@ echo "PropAMM $PROPAMM, registry $REGISTRY"
 # `halted` is builder mode with the pair halted.
 write_config() {
   python3 - "$1" "$PROPAMM" "$RPC" "$API_PORT" "$ORACLE" \
-    "$ROOT/stocks/config.example.toml" "$WORK/$1.toml" <<'PY'
+    "$ROOT/example/config.stocks.toml" "$WORK/$1.toml" <<'PY'
 import re
 import sys
 
