@@ -88,11 +88,12 @@ struct UnderlyingMarket {
     price: String,
 }
 
-/// Parses a latest-price answer for `symbol`, refusing one for another asset.
+/// Parses a latest-price answer for `symbol`, refusing one for another asset (case aside,
+/// as every symbol compare here).
 pub fn parse_price(body: &str, symbol: &str) -> Result<Fetched, String> {
     let answer: LatestPrice = serde_json::from_str(body)
         .map_err(|err| format!("the latest-price answer does not parse: {err}"))?;
-    if answer.primary_market.symbol != symbol {
+    if !answer.primary_market.symbol.eq_ignore_ascii_case(symbol) {
         return Err(format!(
             "asked for {symbol}, Ondo answered for {}",
             answer.primary_market.symbol
@@ -502,6 +503,13 @@ mod tests {
     fn a_price_for_another_asset_is_refused() {
         let err = parse_price(PRICE, "TSLAon").unwrap_err();
         assert!(err.contains("AAPLon"), "{err}");
+    }
+
+    #[test]
+    fn a_price_answer_in_another_case_of_the_symbol_is_taken() {
+        // Every other symbol compare in the crate ignores case: Ondo's casing is not ours
+        // to pin, and a mismatch here would withdraw the pair until the config was edited.
+        assert!(parse_price(PRICE, "aaplon").is_ok());
     }
 
     #[test]

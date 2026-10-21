@@ -25,8 +25,8 @@ crate adds:
 - **`us_market_hours`**, a quote guard. It withdraws outside 09:30–16:00 New York time on
   trading days (13:00 on early closes), by the holiday calendar the config lists, and past the
   calendar's `listed_through` date. It publishes the days the calendar has left
-  (`calendar_days_left`, which `PusherStockCalendarEnding` alerts on a month out) and warns
-  in its log once a day from then.
+  (`calendar_days_left`, which `PusherStockCalendarEnding` alerts on a month out and
+  `PusherStockCalendarEnded` once it has passed) and warns in its log once a day from then.
 - **`ondo_token`**, a quote guard. It withdraws while Ondo would refuse the fill: the token
   paused, or the vault or the PropAMM on Ondo's blocklist or the sanctions list. It also
   tries the transfer a fill makes, `transferFrom(vault, vault, 0)` as the PropAMM, so a

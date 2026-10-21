@@ -31,15 +31,12 @@
 //! The guard reads the wall clock on every tick. The quote it lets through is for the next
 //! block, up to one block time later, which is what `close_margin_secs` covers.
 
-use std::{
-    collections::BTreeSet,
-    fmt,
-    str::FromStr,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{collections::BTreeSet, fmt, str::FromStr};
 
 use quote_updater::{eyre, prelude::*};
 use serde::Deserialize;
+
+use crate::poll;
 
 /// The `[[pairs.guards]]` stanza for `kind = "us_market_hours"`.
 #[derive(Clone, Debug, Deserialize)]
@@ -123,10 +120,9 @@ impl QuoteGuard for UsMarketHours {
     }
 }
 
+/// Seconds since the epoch now: the one clock read in the crate, in the unit this guard keeps.
 fn wall_clock() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs() as i64)
+    poll::wall_clock_ms() / 1_000
 }
 
 /// Registered as `us_market_hours`.
@@ -334,26 +330,30 @@ impl Calendar {
         let secs = local.rem_euclid(86_400);
         let date = civil_from_days(days);
         let weekday = weekday(days);
-        let at = format!(
-            "{} {date} {:02}:{:02} New York",
-            WEEKDAYS[weekday as usize],
-            secs / 3_600,
-            secs / 60 % 60
-        );
+        // Only a refusal says the time, and the guard asks every tick: built when one does.
+        let at = || {
+            format!(
+                "{} {date} {:02}:{:02} New York",
+                WEEKDAYS[weekday as usize],
+                secs / 3_600,
+                secs / 60 % 60
+            )
+        };
         // First, weekends included: a calendar that ran out has to be heard, not just
         // noticed on the next trading day.
         if date > self.through {
             return Err(Closed::Unlisted(format!(
-                "the calendar ends {} ({at}): list the next year's holidays and early closes \
+                "the calendar ends {} ({}): list the next year's holidays and early closes \
                  and move listed_through",
-                self.through
+                self.through,
+                at()
             )));
         }
         if weekday == 0 || weekday == 6 {
-            return Err(Closed::Session(format!("weekend ({at})")));
+            return Err(Closed::Session(format!("weekend ({})", at())));
         }
         if self.holidays.contains(&date) {
-            return Err(Closed::Session(format!("holiday ({at})")));
+            return Err(Closed::Session(format!("holiday ({})", at())));
         }
         let close = if self.early_closes.contains(&date) {
             EARLY_CLOSE
@@ -364,13 +364,15 @@ impl Calendar {
         let until = close - self.close_margin_secs;
         if secs < from {
             return Err(Closed::Session(format!(
-                "before the open ({at}; quoting from {})",
+                "before the open ({}; quoting from {})",
+                at(),
                 clock(from)
             )));
         }
         if secs >= until {
             return Err(Closed::Session(format!(
-                "after the close ({at}; quoting stopped at {})",
+                "after the close ({}; quoting stopped at {})",
+                at(),
                 clock(until)
             )));
         }

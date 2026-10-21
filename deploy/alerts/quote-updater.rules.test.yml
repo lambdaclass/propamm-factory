@@ -5,8 +5,8 @@
 # of fixtures as live rules.
 #
 # Scoped to PusherSignerNearlyDry and its level check PusherSignerDry, plus
-# PusherStockCalendarEnding (last), which is new enough to want its labels and wording
-# proven. The first is a `predict_linear`, which is the only
+# PusherStockCalendarEnding and PusherStockCalendarEnded (last), which are new enough to want
+# their labels and wording proven. The first is a `predict_linear`, which is the only
 # expression in the file whose *silence* is a designed behaviour rather than a side effect of
 # a comparison coming out false: one NaN sample anywhere in the range suppresses it entirely,
 # and that is what stops a failed eth_getBalance paging an operator about a key that is fine.
@@ -167,3 +167,39 @@ tests:
             exp_annotations:
               summary: "AAPLon/USDC: the trading calendar ends in 29 days"
               description: "The us_market_hours guard withdraws every quote past its listed_through date, since it cannot tell a holiday from a trading day there. List the next year's NYSE holidays and early closes in the pair's guard stanza, move listed_through, and reload."
+
+  # The same calendar past its end. From then on the guard withdraws every quote on the pair,
+  # and this is the only alert that says so: a withdrawn quote is not a halt, so
+  # PusherNothingQuoting never counts it. The month's notice stops, rather than firing on
+  # with a negative number. On the last listed day itself (0 left) the pair still quotes,
+  # so that day is still the notice's, not the outage's.
+  - interval: 1m
+    name: a stock calendar past its end says nothing is quoting, and ends the month's notice
+    input_series:
+      - series: 'quote_updater_diagnostic{pair="AAPLon/USDC",kind="us_market_hours",name="calendar_days_left"}'
+        values: "-3x120"
+      - series: 'quote_updater_diagnostic{pair="TSLAon/USDC",kind="us_market_hours",name="calendar_days_left"}'
+        values: "0x120"
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: PusherStockCalendarEnding
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              pair: TSLAon/USDC
+              kind: us_market_hours
+              name: calendar_days_left
+            exp_annotations:
+              summary: "TSLAon/USDC: the trading calendar ends in 0 days"
+              description: "The us_market_hours guard withdraws every quote past its listed_through date, since it cannot tell a holiday from a trading day there. List the next year's NYSE holidays and early closes in the pair's guard stanza, move listed_through, and reload."
+      - eval_time: 90m
+        alertname: PusherStockCalendarEnded
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              pair: AAPLon/USDC
+              kind: us_market_hours
+              name: calendar_days_left
+            exp_annotations:
+              summary: "AAPLon/USDC: 3 days past the end of its trading calendar, nothing is quoting"
+              description: "The pair's calendar ran past its listed_through date without being extended, so the us_market_hours guard has withdrawn every quote since. List the next year's NYSE holidays and early closes in the pair's guard stanza, move listed_through, and reload."

@@ -213,8 +213,22 @@ async fn read(
              {issuer}'s rules do not name: it reverts with 0x{}",
             hex(&data)
         )],
+        CallOutcome::Returned(data) if named.is_empty() && !succeeded(&data) => vec![format!(
+            "the token refuses a transfer the PropAMM makes out of the vault, for a reason \
+             {issuer}'s rules do not name: transferFrom returned 0x{} rather than true, \
+             which the PropAMM's SafeERC20 reverts on",
+            hex(&data)
+        )],
         _ => named,
     })
+}
+
+/// Whether `data`, what `transferFrom` returned, is a success to the PropAMM. It moves
+/// tokens with OpenZeppelin's SafeERC20, which takes `true` or no data at all (a token that
+/// returns nothing, as USDT does) and reverts on anything else: `false`, which the standard
+/// lets a token refuse with, included.
+fn succeeded(data: &[u8]) -> bool {
+    data.is_empty() || (data.len() >= 32 && U256::from_big_endian(&data[..32]) == U256::one())
 }
 
 /// `stock.transferFrom(vault, vault, 0)` as the PropAMM: every check a fill's transfers
@@ -480,6 +494,37 @@ mod tests {
         let pair = testing::pair();
         let vault = Address::repeat_byte(0x01);
         let chain = chain_with(vault, Some(CallOutcome::Returned(returned_true())));
+        let problems = read(&chain, &pair, &Refusing(Vec::new()), "Test")
+            .await
+            .unwrap();
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    #[tokio::test]
+    async fn a_transfer_the_token_answers_false_to_withdraws_though_no_rule_names_why() {
+        // The ERC-20 standard lets a token refuse by returning false rather than reverting,
+        // and the PropAMM moves tokens with SafeERC20, which reverts on that answer.
+        let pair = testing::pair();
+        let vault = Address::repeat_byte(0x01);
+        let chain = chain_with(vault, Some(CallOutcome::Returned(vec![0; 32])));
+        let problems = read(&chain, &pair, &Refusing(Vec::new()), "Test")
+            .await
+            .unwrap();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("rather than true") && problems[0].contains(&"0".repeat(64)),
+            "the refusal says what the token returned instead: {}",
+            problems[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transfer_the_token_answers_nothing_to_adds_nothing() {
+        // SafeERC20 takes no return data as success (USDT answers that way), so the guard
+        // must not withdraw on it.
+        let pair = testing::pair();
+        let vault = Address::repeat_byte(0x01);
+        let chain = chain_with(vault, Some(CallOutcome::Returned(Vec::new())));
         let problems = read(&chain, &pair, &Refusing(Vec::new()), "Test")
             .await
             .unwrap();
