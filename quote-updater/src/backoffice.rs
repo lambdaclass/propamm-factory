@@ -484,7 +484,7 @@ fn pricing_stanza(
 /// `<prefix>_<kind>_<field>`. A kind that declares no fields keeps the stanza it had when
 /// that is the same kind (the page cannot edit one, and says so), and otherwise gets a
 /// stanza naming it alone.
-fn kind_stanza(
+pub(crate) fn kind_stanza(
     prefix: &str,
     fields: &'static [crate::pricing::FormField],
     kind: &str,
@@ -610,7 +610,10 @@ fn is_variable_name(name: &str) -> bool {
 /// it, a list one item per line, an env reference as the variable's name, a string as it
 /// is. A value of another shape than the field's type writes (a number written by hand for
 /// a text field, say) still shows, so a save does not drop it; what cannot show is blank.
-fn field_value(field: &crate::pricing::FormField, value: Option<&toml::Value>) -> String {
+pub(crate) fn field_value(
+    field: &crate::pricing::FormField,
+    value: Option<&toml::Value>,
+) -> String {
     use crate::pricing::FieldKind;
     match (field.kind, value) {
         (_, None) => String::new(),
@@ -4751,5 +4754,119 @@ api_key = "k"
         assert!(posted.contains("location: /?ok="), "{posted}");
         service.await.unwrap();
         assert!(config::load_raw(&path).unwrap().pairs[0].guards.is_empty());
+    }
+
+    /// A stock pair added from the page with the `ondo` kind and both guards is the example
+    /// stanza, the one the smoke test runs: nothing about a stock pair needs the file.
+    #[tokio::test]
+    async fn a_stock_pair_added_from_the_page_is_the_example_stanza() {
+        use crate::stocks::{Issuer, hours::UsMarketHoursFactory, issuers::ondo::Ondo};
+        let example: config::RawConfig =
+            toml::from_str(include_str!("../../example/config.stocks.toml")).unwrap();
+        let want = example.pairs[0].clone();
+        let mut kinds = crate::kinds::Kinds::default();
+        kinds.insert("ondo", Arc::new(Ondo));
+        kinds.insert_guard(
+            "us_market_hours",
+            crate::kinds::quote_guard_factory(UsMarketHoursFactory),
+        );
+        kinds.insert_guard(
+            "ondo_token",
+            crate::kinds::quote_guard_factory(Ondo.token_guard()),
+        );
+        let (path, state, mut reloads) = config_on_disk("stock-pair");
+        let (local, _task) = bind(
+            "127.0.0.1:0".parse().unwrap(),
+            path.clone(),
+            state.reloads.clone(),
+            test_client(),
+            PairStates::default(),
+            std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            Arc::new(kinds),
+        )
+        .await
+        .unwrap();
+        let service = tokio::spawn(async move {
+            let request = reloads.recv().await.expect("a reload must be requested");
+            let _ = request.reply.send(Ok("reload: 1 started".to_owned()));
+        });
+        let (pricing, hours, token) = (&want.pricing, &want.guards[0], &want.guards[1]);
+        let text = |table: &toml::Table, key: &str| table[key].as_str().unwrap().to_owned();
+        let lines = |key: &str| {
+            hours[key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let fields: Vec<(&str, String)> = vec![
+            ("token0", want.tokens[0].clone()),
+            ("token1", want.tokens[1].clone()),
+            ("key_env", want.key_env.clone()),
+            ("min_mid", want.min_mid.clone().unwrap()),
+            ("max_mid", want.max_mid.clone().unwrap()),
+            ("max_deviation", String::new()),
+            ("max_deviation_window", String::new()),
+            ("max_deviation_window_blocks", String::new()),
+            ("allow_symbol_mismatch", "on".to_owned()),
+            ("pricing", "ondo".to_owned()),
+            ("pricing_ondo_symbol", text(pricing, "symbol")),
+            (
+                "pricing_ondo_api_key",
+                pricing["api_key"]["env"].as_str().unwrap().to_owned(),
+            ),
+            ("pricing_ondo_delta", text(pricing, "delta")),
+            ("guards_present", "1".to_owned()),
+            ("guard_us_market_hours_enabled", "on".to_owned()),
+            (
+                "guard_us_market_hours_open_delay_secs",
+                hours["open_delay_secs"].to_string(),
+            ),
+            (
+                "guard_us_market_hours_close_margin_secs",
+                hours["close_margin_secs"].to_string(),
+            ),
+            ("guard_us_market_hours_holidays", lines("holidays")),
+            ("guard_us_market_hours_early_closes", lines("early_closes")),
+            (
+                "guard_us_market_hours_listed_through",
+                text(hours, "listed_through"),
+            ),
+            ("guard_ondo_token_enabled", "on".to_owned()),
+            ("guard_ondo_token_poll_secs", token["poll_secs"].to_string()),
+            (
+                "guard_ondo_token_max_age_secs",
+                token["max_age_secs"].to_string(),
+            ),
+        ];
+        let body = fields
+            .iter()
+            .map(|(name, value)| format!("{}={}", urlencode(name), urlencode(value)))
+            .collect::<Vec<_>>()
+            .join("&");
+        let (ok, message) = post(local, "/pairs/add", &body).await;
+        assert!(ok, "{message}");
+        service.await.unwrap();
+        let written = config::load_raw(&path).unwrap();
+        let pair = written
+            .pairs
+            .iter()
+            .find(|p| p.key_env == want.key_env)
+            .expect("the stock pair was added");
+        assert_eq!(pair.tokens, want.tokens);
+        assert_eq!(pair.min_mid, want.min_mid);
+        assert_eq!(pair.max_mid, want.max_mid);
+        assert!(pair.allow_symbol_mismatch);
+        assert_eq!(pair.pricing, want.pricing);
+        // Every guard runs and the most severe answer wins, so the order of the stanzas
+        // carries nothing: a new pair's follow the registry's order, the example's its own.
+        let by_kind = |guards: &[toml::Table]| {
+            let mut sorted = guards.to_vec();
+            sorted.sort_by_key(|g| g["kind"].as_str().unwrap_or_default().to_owned());
+            sorted
+        };
+        assert_eq!(by_kind(&pair.guards), by_kind(&want.guards));
     }
 }

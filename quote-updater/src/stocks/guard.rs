@@ -108,9 +108,34 @@ pub struct RestrictionGuardFactory {
     pub restrictions: fn(Arc<dyn Calls>, Address) -> Box<dyn Restrictions>,
 }
 
+/// What the backoffice shows for the guard, whatever the design: its two timings.
+const FIELDS: &[FormField] = &[
+    FormField::number(
+        "poll_secs",
+        "12",
+        "seconds between reads of the token's status; 12 is one block. Blank is 12.",
+    ),
+    FormField::number(
+        "max_age_secs",
+        "60",
+        "the oldest reading the guard trusts; past it the status is unknown and the quote \
+         withdrawn. Blank is 60.",
+    ),
+];
+
 impl QuoteGuardFactory for RestrictionGuardFactory {
     type Config = GuardCfg;
     type Guard = RestrictionGuard;
+
+    fn fields(&self) -> &'static [FormField] {
+        FIELDS
+    }
+
+    fn form_help(&self) -> &'static str {
+        "<p class=explain>Withdraws while the token would refuse the fill: paused, the vault \
+         or the PropAMM refused by the issuer's lists, or a transfer tried on the token as \
+         the PropAMM refused for a reason no list names.</p>"
+    }
 
     fn validate(&self, cfg: &GuardCfg, _pair: &PairShape) -> eyre::Result<()> {
         eyre::ensure!(cfg.poll_secs >= 1, "poll_secs is zero");
@@ -615,5 +640,46 @@ mod tests {
             );
         }
         testing::assert_rejects_unknown_fields::<GuardCfg>("poll_secs = 12");
+    }
+
+    /// Every field the form declares is a key the stanza reads, and every key the example
+    /// stanza sets is declared, so a form round trip rebuilds the stanza unchanged.
+    #[test]
+    fn every_declared_field_is_a_key_the_stanza_reads_and_every_key_is_declared() {
+        use crate::{
+            backoffice::{field_value, kind_stanza},
+            kinds::typed,
+            pricing::QuoteGuardFactory,
+        };
+        let factory = factory();
+        let fields = factory.fields();
+        assert!(!fields.is_empty(), "the kind declares no fields");
+        let posted: std::collections::HashMap<String, String> = fields
+            .iter()
+            .map(|f| {
+                (
+                    format!("guard_ondo_token_{}", f.name),
+                    f.placeholder.to_owned(),
+                )
+            })
+            .collect();
+        let table = kind_stanza("guard", fields, "ondo_token", None, &posted).unwrap();
+        typed::<GuardCfg>(&table).unwrap();
+
+        let example: toml::Value =
+            toml::from_str(include_str!("../../../example/config.stocks.toml")).unwrap();
+        let stanza = example["pairs"][0]["guards"][1].as_table().unwrap().clone();
+        assert_eq!(stanza["kind"].as_str(), Some("ondo_token"));
+        let posted: std::collections::HashMap<String, String> = fields
+            .iter()
+            .map(|f| {
+                (
+                    format!("guard_ondo_token_{}", f.name),
+                    field_value(f, stanza.get(f.name)),
+                )
+            })
+            .collect();
+        let rebuilt = kind_stanza("guard", fields, "ondo_token", Some(&stanza), &posted).unwrap();
+        assert_eq!(rebuilt, stanza);
     }
 }

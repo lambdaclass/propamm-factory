@@ -67,7 +67,7 @@ pub(crate) trait ErasedPricer: Send + Sync {
 }
 
 /// The stanza minus its `kind`, as the kind's own config type.
-fn typed<C: DeserializeOwned>(table: &toml::Table) -> Result<C> {
+pub(crate) fn typed<C: DeserializeOwned>(table: &toml::Table) -> Result<C> {
     let mut table = table.clone();
     table.remove("kind");
     toml::Value::Table(table)

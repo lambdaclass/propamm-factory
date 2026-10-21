@@ -128,9 +128,52 @@ fn wall_clock() -> i64 {
 /// Registered as `us_market_hours`.
 pub struct UsMarketHoursFactory;
 
+/// What the backoffice shows for the guard: the two margins as numbers, the two calendars
+/// one date per line, and the last listed day.
+const FIELDS: &[FormField] = &[
+    FormField::number(
+        "open_delay_secs",
+        "60",
+        "seconds after 09:30 before the first quote, so the opening auction settles. Blank \
+         is 60.",
+    ),
+    FormField::number(
+        "close_margin_secs",
+        "60",
+        "seconds before the close the last quote stops. Blank is 60.",
+    ),
+    FormField::list(
+        "holidays",
+        "2026-11-26\n2026-12-25",
+        "exchange holidays, one YYYY-MM-DD per line (nyse.com/markets/hours-calendars). \
+         Required, even if empty.",
+    ),
+    FormField::list(
+        "early_closes",
+        "2026-11-27\n2026-12-24",
+        "days the exchange closes at 13:00, one YYYY-MM-DD per line. Required, even if empty.",
+    ),
+    FormField::new(
+        "listed_through",
+        "2027-12-31",
+        "the last day the two lists cover: past it the guard withdraws every quote, and it \
+         warns a month out. Required.",
+    ),
+];
+
 impl QuoteGuardFactory for UsMarketHoursFactory {
     type Config = UsMarketHoursCfg;
     type Guard = UsMarketHours;
+
+    fn fields(&self) -> &'static [FormField] {
+        FIELDS
+    }
+
+    fn form_help(&self) -> &'static str {
+        "<p class=explain>Quotes only 09:30–16:00 New York time on NYSE trading days (13:00 \
+         on early closes), by the calendar listed here. Extend it before listed_through: \
+         past that day every quote is withdrawn.</p>"
+    }
 
     fn validate(&self, cfg: &UsMarketHoursCfg, _pair: &PairShape) -> eyre::Result<()> {
         cfg.calendar().map(drop)
@@ -922,5 +965,47 @@ mod tests {
         // Wrapped, u64::MAX + 1 is 0: no margin at all, and quoting from 09:30:00.
         assert!(Calendar::new(&[], &[], THROUGH, u64::MAX, 1).is_err());
         assert!(Calendar::new(&[], &[], THROUGH, 1, u64::MAX).is_err());
+    }
+
+    /// Every field the form declares is a key the stanza reads, and every key the example
+    /// stanza sets is declared, so a form round trip rebuilds the stanza unchanged.
+    #[test]
+    fn every_declared_field_is_a_key_the_stanza_reads_and_every_key_is_declared() {
+        use crate::{
+            backoffice::{field_value, kind_stanza},
+            kinds::typed,
+            pricing::QuoteGuardFactory,
+        };
+        let factory = UsMarketHoursFactory;
+        let fields = factory.fields();
+        assert!(!fields.is_empty(), "the kind declares no fields");
+        let posted: std::collections::HashMap<String, String> = fields
+            .iter()
+            .map(|f| {
+                (
+                    format!("guard_us_market_hours_{}", f.name),
+                    f.placeholder.to_owned(),
+                )
+            })
+            .collect();
+        let table = kind_stanza("guard", fields, "us_market_hours", None, &posted).unwrap();
+        typed::<UsMarketHoursCfg>(&table).unwrap();
+
+        let example: toml::Value =
+            toml::from_str(include_str!("../../../example/config.stocks.toml")).unwrap();
+        let stanza = example["pairs"][0]["guards"][0].as_table().unwrap().clone();
+        assert_eq!(stanza["kind"].as_str(), Some("us_market_hours"));
+        let posted: std::collections::HashMap<String, String> = fields
+            .iter()
+            .map(|f| {
+                (
+                    format!("guard_us_market_hours_{}", f.name),
+                    field_value(f, stanza.get(f.name)),
+                )
+            })
+            .collect();
+        let rebuilt =
+            kind_stanza("guard", fields, "us_market_hours", Some(&stanza), &posted).unwrap();
+        assert_eq!(rebuilt, stanza);
     }
 }

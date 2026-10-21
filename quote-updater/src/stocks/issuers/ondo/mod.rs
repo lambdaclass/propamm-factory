@@ -168,9 +168,102 @@ impl OndoCfg {
 /// `ondo` (the pricer) and `ondo_token` (the guard on the token's rules).
 pub struct Ondo;
 
+/// What the backoffice shows for a pair priced by Ondo: every key of the stanza, the
+/// numbers written as numbers since the config reads `u64` and `f64`, the API key as the
+/// name of the variable holding it.
+const FIELDS: &[FormField] = &[
+    FormField::new(
+        "symbol",
+        "AAPLon",
+        "the asset's GM symbol in Ondo's API; the pair's first token must be it.",
+    ),
+    FormField::new(
+        "ticker",
+        "AAPL",
+        "the stock's ticker, needed only if Ondo's price answer does not name it. Blank takes \
+         the answer's.",
+    ),
+    FormField::env(
+        "api_key",
+        "ONDO_API_KEY",
+        "the environment variable holding the Ondo GM API key, never the key itself.",
+    ),
+    FormField::new(
+        "delta",
+        "0.003",
+        "the half-spread as a fraction of the mid: 0.003 is 30 bp.",
+    ),
+    FormField::new(
+        "api",
+        "https://api.gm.ondo.finance",
+        "Ondo's GM API. Blank is the production one.",
+    ),
+    FormField::new(
+        "multiplier_oracle",
+        oracle::MAINNET_MULTIPLIER_ORACLE,
+        "the SyntheticSharesOracle the share multiplier is read from. Blank is Ethereum \
+         mainnet's.",
+    ),
+    FormField::number(
+        "poll_ms",
+        "1000",
+        "milliseconds between price polls; Ondo caches prices for a second. Blank is 1000.",
+    ),
+    FormField::number(
+        "status_poll_secs",
+        "15",
+        "seconds between polls of Ondo's market and asset status. Blank is 15.",
+    ),
+    FormField::number(
+        "max_price_age_secs",
+        "15",
+        "the oldest price, by Ondo's timestamp, that is quoted. Blank is 15.",
+    ),
+    FormField::number(
+        "max_unchanged_secs",
+        "30",
+        "the longest Ondo's price may stand still and be quoted: a halted stock's price stops \
+         before the status says so. Blank is 30.",
+    ),
+    FormField::number(
+        "max_status_age_secs",
+        "60",
+        "the oldest status or multiplier reading that is trusted. Blank is 60.",
+    ),
+    FormField::number(
+        "pause_lead_secs",
+        "300",
+        "how long before a scheduled corporate-action pause quoting stops. Blank is 300.",
+    ),
+    FormField::number(
+        "max_multiplier_gap",
+        "0.001",
+        "the largest relative gap between Ondo's multiplier and the chain's. Blank is 0.001.",
+    ),
+    FormField::number(
+        "skew",
+        "0",
+        "inventory skew: the mid moves by skew × (base share − 0.5), down when the vault is \
+         long the stock. Blank is 0, which reads no inventory.",
+    ),
+];
+
 impl Factory for Ondo {
     type Config = OndoCfg;
     type Pricer = StockPricer;
+
+    fn fields(&self) -> &'static [FormField] {
+        FIELDS
+    }
+
+    fn form_help(&self) -> &'static str {
+        "<p class=explain>Ondo's own price for the token is the mid, less and plus a fixed \
+         half-spread. The quote is withdrawn while the price is stale or frozen, outside \
+         Ondo's regular session, around an asset event or a corporate action, and when \
+         Ondo's share multiplier and the chain's disagree. The band above is in the lane's \
+         orientation: USDC per token when the stock token's address sorts before USDC's, \
+         token per USDC (1/price) when it sorts after.</p>"
+    }
 
     fn validate(&self, cfg: &OndoCfg, pair: &PairShape) -> eyre::Result<()> {
         cfg.check(pair).map(drop)
@@ -517,5 +610,41 @@ mod tests {
             format!("{oracle:#x}"),
             "0x9bc39db6fbb44b91a48b8d5a6c208b82b1741be6"
         );
+    }
+
+    /// Every field the form declares is a key the stanza reads, and every key the example
+    /// stanza sets is declared, so a form round trip rebuilds the stanza unchanged.
+    #[test]
+    fn every_declared_field_is_a_key_the_stanza_reads_and_every_key_is_declared() {
+        use crate::{
+            backoffice::{field_value, kind_stanza},
+            kinds::typed,
+            pricing::Factory,
+        };
+        let factory = Ondo;
+        let fields = factory.fields();
+        assert!(!fields.is_empty(), "the kind declares no fields");
+        let posted: std::collections::HashMap<String, String> = fields
+            .iter()
+            .map(|f| (format!("pricing_ondo_{}", f.name), f.placeholder.to_owned()))
+            .collect();
+        let table = kind_stanza("pricing", fields, "ondo", None, &posted).unwrap();
+        typed::<OndoCfg>(&table).unwrap();
+
+        let example: toml::Value =
+            toml::from_str(include_str!("../../../../../example/config.stocks.toml")).unwrap();
+        let stanza = example["pairs"][0]["pricing"].as_table().unwrap().clone();
+        assert_eq!(stanza["kind"].as_str(), Some("ondo"));
+        let posted: std::collections::HashMap<String, String> = fields
+            .iter()
+            .map(|f| {
+                (
+                    format!("pricing_ondo_{}", f.name),
+                    field_value(f, stanza.get(f.name)),
+                )
+            })
+            .collect();
+        let rebuilt = kind_stanza("pricing", fields, "ondo", Some(&stanza), &posted).unwrap();
+        assert_eq!(rebuilt, stanza);
     }
 }
