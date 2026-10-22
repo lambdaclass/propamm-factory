@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Smoke test for tokenized stocks: the example binary, the one the deployment builds, against
-# a local chain and a local Ondo API,
-# so the parts unit tests cannot reach (HTTP to Ondo, every eth_call and its decoding, the
-# build's first reads, a published update and the quote PropAMM prices from it) run for real.
+# a local chain and a local Ondo API, so the parts unit tests cannot reach (HTTP to Ondo,
+# every eth_call and its decoding, the build's first reads, a published update and the quote
+# PropAMM prices from it) run for real.
 # Nothing here touches the network: anvil, the contracts' own mocks, and ondo_api.py.
 #
 #   bash e2e/stocks/run.sh   from anywhere; builds what it needs, exits 0 when every check holds

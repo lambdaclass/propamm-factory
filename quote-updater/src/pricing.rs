@@ -64,8 +64,10 @@ pub struct FormField {
     pub kind: FieldKind,
 }
 
-/// How a [`FormField`]'s input is written into the stanza, and read back from it.
+/// How a [`FormField`]'s input is written into the stanza, and read back from it. More
+/// kinds may come, so a match outside this crate needs a wildcard arm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FieldKind {
     /// A string, as typed. Blank is an absent key.
     Text,

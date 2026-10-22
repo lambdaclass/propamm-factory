@@ -631,7 +631,8 @@ pub(crate) fn field_value(
         (FieldKind::Text | FieldKind::Number, Some(scalar)) => match scalar {
             toml::Value::String(text) => text.clone(),
             toml::Value::Integer(int) => int.to_string(),
-            toml::Value::Float(float) => float.to_string(),
+            // `{:?}` keeps a whole float a float (`1.0`), so it is written back as one.
+            toml::Value::Float(float) => format!("{float:?}"),
             toml::Value::Boolean(flag) => flag.to_string(),
             _ => String::new(),
         },
@@ -4907,5 +4908,58 @@ api_key = "k"
         assert_eq!(pair.symbol, None);
         assert!(pair.sources.is_empty());
         assert_eq!(pair.min_sources, None);
+    }
+
+    /// A list field renders as a textarea holding the stanza's items one per line, so the
+    /// calendar is edited as it is written.
+    #[test]
+    fn a_list_field_renders_as_a_textarea_with_one_item_per_line() {
+        use crate::stocks::hours::UsMarketHoursFactory;
+        let mut kinds = crate::kinds::Kinds::default();
+        kinds.insert_guard(
+            "us_market_hours",
+            crate::kinds::quote_guard_factory(UsMarketHoursFactory),
+        );
+        let mut config = a_config();
+        let mut hours = guard_table("us_market_hours", None);
+        hours.insert(
+            "holidays".to_owned(),
+            toml::Value::Array(vec![
+                toml::Value::String("2026-11-26".to_owned()),
+                toml::Value::String("2026-12-25".to_owned()),
+            ]),
+        );
+        config.pairs[0].guards = vec![hours];
+        let form = render_pair_form(Some(&config.pairs[0]), &kinds);
+        assert!(
+            form.contains(r#"<textarea name="guard_us_market_hours_holidays""#),
+            "{form}"
+        );
+        assert!(
+            form.contains(">2026-11-26\n2026-12-25</textarea>"),
+            "{form}"
+        );
+        assert!(
+            form.contains(r#"<textarea name="guard_us_market_hours_early_closes""#)
+                && form.contains("spellcheck=false></textarea>"),
+            "an absent list is an empty textarea: {form}"
+        );
+    }
+
+    /// A float with no fraction reads back as a float (`1.0`), so an unrelated save does
+    /// not rewrite `max_multiplier_gap = 1.0` as the integer `1`.
+    #[test]
+    fn a_whole_float_reads_back_as_a_float_and_is_written_back_as_one() {
+        let number = crate::pricing::FormField::number("gap", "", "");
+        let shown = field_value(&number, Some(&toml::Value::Float(1.0)));
+        assert_eq!(shown, "1.0");
+        assert_eq!(
+            field_toml(&number, &shown).unwrap(),
+            Some(toml::Value::Float(1.0))
+        );
+        assert_eq!(
+            field_value(&number, Some(&toml::Value::Float(0.001))),
+            "0.001"
+        );
     }
 }
