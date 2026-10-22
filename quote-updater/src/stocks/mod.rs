@@ -20,8 +20,6 @@ pub mod chain;
 pub mod guard;
 pub mod hours;
 pub mod issuers;
-#[cfg(test)]
-mod mock_http;
 pub mod ports;
 pub mod pricer;
 

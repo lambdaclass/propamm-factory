@@ -318,15 +318,26 @@ impl Issuer for Ondo {
 
     /// The restriction guard over Ondo's pause and lists.
     fn token_guard(&self) -> RestrictionGuardFactory {
-        RestrictionGuardFactory {
-            issuer: "Ondo",
-            restrictions: |chain, token| Box::new(compliance::OndoCompliance { chain, token }),
-        }
+        RestrictionGuardFactory::new("Ondo", |chain, token| {
+            Box::new(compliance::OndoCompliance { chain, token })
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
+    /// The core's default stanza is this kind's: a design that takes `Stanza::new`'s
+    /// defaults quotes under the gates `ondo` documents, and the two lists cannot drift.
+    #[test]
+    fn the_cores_default_stanza_is_the_ondo_kinds() {
+        let cfg: super::OndoCfg = toml::from_str(
+            "symbol = \"AAPLon\"\napi_key = { env = \"ONDO_API_KEY\" }\ndelta = \"0.003\"",
+        )
+        .unwrap();
+        let core = super::Stanza::new("ondo", "Ondo", "AAPLon", "0.003");
+        assert_eq!(core, cfg.stanza());
+    }
+
     use std::sync::Arc;
 
     use crate::testing;

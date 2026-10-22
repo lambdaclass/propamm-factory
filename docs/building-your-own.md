@@ -136,7 +136,8 @@ What to know:
 - **Tokenized stocks** are two more calls: `.us_market_hours()` for the NYSE calendar guard
   and `.stock_issuer(quote_updater::stocks::issuers::ondo::Ondo)` for an issuer's pricer and
   token guard, under the names the issuer declares. See [stocks.md](stocks.md), including
-  how an issuer of your own implements `stocks::Issuer` over the public ports.
+  how an issuer of your own implements `stocks::Issuer` over the public ports;
+  `quote-updater/examples/issuer.rs` is a whole one.
 - **A trip is not a halt.** Every lane has a latch: a guard's `Trip`/`Halt`, a panic
   anywhere in a component's code (its `price`, `check`, `assess`, or a task it spawned), or
   a component's own `ctx.latch().trip(..)` trips it, the lane withdraws and stops, and only

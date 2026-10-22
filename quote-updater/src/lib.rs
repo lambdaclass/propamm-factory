@@ -81,9 +81,9 @@ mod node;
 pub mod observe;
 pub mod output;
 mod pair;
-/// What the crate's background readers share: the schedule they read on, the lock they
-/// leave readings under, and how they log a source that keeps failing.
-pub(crate) mod poll;
+// Documented in the module itself: an outer doc here would have its links resolved in
+// this scope rather than the module's.
+pub mod poll;
 mod preflight;
 pub mod pricing;
 /// The pricing kinds this crate ships, each an ordinary [`pricing::Factory`] a binary

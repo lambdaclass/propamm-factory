@@ -20,6 +20,7 @@ pub use crate::poll::Stamped;
 
 /// A token's price, as a source quotes it.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Price {
     /// The token's price in USD: the stock's price times the token's `k`.
     pub token: f64,
@@ -29,14 +30,37 @@ pub struct Price {
     pub at_ms: i64,
 }
 
+impl Price {
+    /// The token at `token` and its stock at `stock`, in USD, as the source stamped them
+    /// at `at_ms` (milliseconds since the epoch, on the wall clock).
+    pub fn new(token: f64, stock: f64, at_ms: i64) -> Price {
+        Price {
+            token,
+            stock,
+            at_ms,
+        }
+    }
+}
+
 /// One read of a [`PriceSource`].
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Fetched {
     /// The prices, and when the source stamped them.
     pub price: Price,
     /// The underlying stock's ticker, when the source names it: the asset's other name in
     /// what the issuer reports (see [`MarketStatus::read`]).
     pub ticker: Option<String>,
+}
+
+impl Fetched {
+    /// A read of `price`, with no ticker named: a source that names one sets `ticker`.
+    pub fn new(price: Price) -> Fetched {
+        Fetched {
+            price,
+            ticker: None,
+        }
+    }
 }
 
 /// Where the token's price comes from. Polled by a task of the core's.
@@ -47,6 +71,7 @@ pub trait PriceSource: Send + Sync + 'static {
 
 /// How the token's price follows its stock now.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Shares {
     /// Shares per token: the token is worth the stock's price times this.
     pub k: f64,
@@ -54,17 +79,31 @@ pub struct Shares {
     pub action: Option<Action>,
 }
 
+impl Shares {
+    /// `k` shares per token, with no corporate action scheduled: a token that has one
+    /// sets `action`.
+    pub fn new(k: f64) -> Shares {
+        Shares { k, action: None }
+    }
+}
+
 /// A corporate action the token has scheduled: a pause the issuer starts at `starts`
 /// (seconds since the epoch) and lifts when it is done, which the next reading shows as no
 /// action, with the multiplier after the change. Quoting stops a lead before it starts and
 /// stays stopped until then.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Action {
     /// When it starts, in seconds since the epoch.
     pub starts: u64,
 }
 
 impl Action {
+    /// One starting at `starts`, in seconds since the epoch.
+    pub fn new(starts: u64) -> Action {
+        Action { starts }
+    }
+
     /// Whether it is under way at `now_secs`.
     pub fn is_on(&self, now_secs: i64) -> bool {
         self.reached(now_secs)
@@ -91,7 +130,8 @@ pub trait Valuation: Send + Sync + 'static {
 /// Something the issuer reports on the asset that stops quoting: a pause, a size limit, a
 /// corporate action, under way or to come.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Event {
+#[non_exhaustive]
+pub struct Stoppage {
     /// Why, worded for the refusal: `ASSET_PAUSED: split`.
     pub why: String,
     /// When it starts, in milliseconds since the epoch; `None` for one under way, and for
@@ -103,7 +143,19 @@ pub struct Event {
     pub moves_multiplier: bool,
 }
 
-impl Event {
+impl Stoppage {
+    /// One for `why`, under way or with no start the issuer gives (so stopping quoting
+    /// now); one to come at a known time sets `starts_ms`. `moves_multiplier` says
+    /// whether it changes how many shares the token is worth, which stops quoting a lead
+    /// ahead: when an issuer does not say, `true` is the safer answer.
+    pub fn new(why: impl Into<String>, moves_multiplier: bool) -> Stoppage {
+        Stoppage {
+            why: why.into(),
+            starts_ms: None,
+            moves_multiplier,
+        }
+    }
+
     /// Whether it stops quoting at `now_ms`, `lead_ms` ahead of its start if it moves the
     /// multiplier.
     pub fn stops_quoting(&self, now_ms: i64, lead_ms: i64) -> bool {
@@ -113,14 +165,16 @@ impl Event {
     }
 }
 
-/// What the issuer says, judged for one asset; `None` until first read.
+/// What the issuer says, judged for one asset; `None` until first read. Starts as
+/// [`Default`], nothing read, and an adapter sets what it has.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct StatusReading {
     /// Whether the market is in the session the pair quotes: `Ok`, or why not, worded for
     /// the refusal (`Ondo reports the market closed`).
     pub session: Option<Stamped<Result<(), String>>>,
     /// What the issuer reports on the asset that stops quoting, now or from its start.
-    pub asset: Option<Stamped<Arc<[Event]>>>,
+    pub asset: Option<Stamped<Arc<[Stoppage]>>>,
 }
 
 /// What the issuer says about its market and its assets. The core reads the latest
@@ -134,11 +188,19 @@ pub trait MarketStatus: Send + Sync + 'static {
 /// An issuer's status, opened by the pair's build: the reader the core reads every tick,
 /// and the task that keeps it current, which the core starts once the build has
 /// succeeded and which stops with the pair.
+#[non_exhaustive]
 pub struct StatusFeed {
     /// Answers the status for an asset's names.
     pub reader: Box<dyn MarketStatus>,
     /// The task that keeps the reader current; it stops with the pair.
     pub refresh: BoxFuture<'static, ()>,
+}
+
+impl StatusFeed {
+    /// `reader`, kept current by `refresh`.
+    pub fn new(reader: Box<dyn MarketStatus>, refresh: BoxFuture<'static, ()>) -> StatusFeed {
+        StatusFeed { reader, refresh }
+    }
 }
 
 /// Where the token's transfer rules are read: on chain, by the restriction guard's task.

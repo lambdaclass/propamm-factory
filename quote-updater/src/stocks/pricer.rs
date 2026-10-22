@@ -61,9 +61,10 @@ const SHARES_POLL: Duration = Duration::from_secs(12);
 const MAX_INVENTORY_AGE: Duration = Duration::from_secs(60);
 
 /// A stock stanza as the core reads it: the keys every kind's stanza has, whatever its
-/// design adds. Each kind fills it from a stanza of its own, which keeps its own defaults
-/// and refuses unknown keys.
-#[derive(Clone, Debug)]
+/// design adds. Each kind fills it from a stanza of its own, which refuses unknown keys:
+/// [`Self::new`] with the core's defaults, then each key the kind lets the operator set.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Stanza<'a> {
     /// The kind, as messages name it: `ondo`.
     pub kind: &'static str,
@@ -89,6 +90,35 @@ pub struct Stanza<'a> {
     pub max_multiplier_gap: f64,
     /// Inventory skew: the mid moves by `skew × (base share − 0.5)`. 0 reads no inventory.
     pub skew: f64,
+}
+
+impl<'a> Stanza<'a> {
+    /// A stanza for `symbol` at `delta`, priced by `source` under the kind `kind`, with
+    /// the core's defaults for everything else: the price polled every second and quoted
+    /// up to 15s old and 30s unchanged; the status read every 15s and trusted, like the
+    /// multiplier, for 60s; quoting stopped 300s ahead of a corporate action; a 0.1%
+    /// multiplier gap; no inventory skew. The `ondo` kind documents the same numbers.
+    pub fn new(
+        kind: &'static str,
+        source: &'static str,
+        symbol: &'a str,
+        delta: &'a str,
+    ) -> Stanza<'a> {
+        Stanza {
+            kind,
+            source,
+            symbol,
+            delta,
+            price_poll: Duration::from_secs(1),
+            status_poll: Some(Duration::from_secs(15)),
+            max_price_age_secs: 15,
+            max_unchanged_secs: 30,
+            max_status_age_secs: 60,
+            pause_lead_secs: 300,
+            max_multiplier_gap: 0.001,
+            skew: 0.0,
+        }
+    }
 }
 
 /// A stanza, checked against its pair: what `validate` proves and `build` uses.
@@ -613,7 +643,9 @@ impl Pricer for StockPricer {
     }
 }
 
-/// What a kind hands the core to build its pricer: its design's adapters.
+/// What a kind hands the core to build its pricer: its design's adapters, from
+/// [`Self::new`].
+#[non_exhaustive]
 pub struct Adapters {
     /// The token's price source.
     pub prices: Box<dyn PriceSource>,
@@ -624,6 +656,18 @@ pub struct Adapters {
     /// parse fails the build, not every tick. Opening it starts nothing: the build runs its
     /// refresh as one of the pair's tasks.
     pub status: Option<BoxFuture<'static, eyre::Result<StatusFeed>>>,
+}
+
+impl Adapters {
+    /// The design's price source and valuation, with no issuer status: a design whose
+    /// issuer reports one sets `status`.
+    pub fn new(prices: Box<dyn PriceSource>, valuation: Box<dyn Valuation>) -> Adapters {
+        Adapters {
+            prices,
+            valuation,
+            status: None,
+        }
+    }
 }
 
 /// Builds the pair's pricer from its design's adapters: reads everything once, so a wrong
@@ -967,7 +1011,7 @@ mod tests {
     use crate::testing;
 
     use super::{testkit::*, *};
-    use crate::stocks::ports::{Event, StatusReading};
+    use crate::stocks::ports::{StatusReading, Stoppage};
 
     /// A stanza with the `ondo` kind's defaults, changed by `edit`.
     fn stanza_with(edit: impl FnOnce(&mut Stanza<'static>)) -> Stanza<'static> {
@@ -1090,7 +1134,7 @@ mod tests {
     }
 
     /// The issuer reports `events` on the asset, read a second ago.
-    fn reads_with_events(events: Vec<Event>) -> Reads {
+    fn reads_with_events(events: Vec<Stoppage>) -> Reads {
         reads_with_status(|status| {
             status.asset = Some(Stamped {
                 at: read_at(),
@@ -1099,8 +1143,8 @@ mod tests {
         })
     }
 
-    fn event(starts_ms: Option<i64>, moves_multiplier: bool) -> Event {
-        Event {
+    fn event(starts_ms: Option<i64>, moves_multiplier: bool) -> Stoppage {
+        Stoppage {
             why: "ASSET_PAUSED: split".to_owned(),
             starts_ms,
             moves_multiplier,

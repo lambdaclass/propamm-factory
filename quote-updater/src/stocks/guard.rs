@@ -100,12 +100,31 @@ impl QuoteGuard for RestrictionGuard {
     }
 }
 
+/// What builds a design's [`Restrictions`] for a token, read through a chain.
+type Restricted = dyn Fn(Arc<dyn Calls>, Address) -> Box<dyn Restrictions> + Send + Sync;
+
 /// A restriction guard's kind: the [`Restrictions`] of its design, and who keeps them.
+/// Built with [`Self::new`]; a design whose rules need a setting of its own (a registry's
+/// address, say) carries it in the closure.
 pub struct RestrictionGuardFactory {
     /// Who keeps the rules, as messages name it: `Ondo`.
-    pub issuer: &'static str,
-    /// The design's rules for `token`, read through `chain`.
-    pub restrictions: fn(Arc<dyn Calls>, Address) -> Box<dyn Restrictions>,
+    issuer: &'static str,
+    /// The design's rules for a token, read through the chain the guard hands over.
+    restrictions: Box<Restricted>,
+}
+
+impl RestrictionGuardFactory {
+    /// The guard over the rules `issuer` keeps, as `restrictions` reads them for the pair's
+    /// stock token through the run's chain.
+    pub fn new(
+        issuer: &'static str,
+        restrictions: impl Fn(Arc<dyn Calls>, Address) -> Box<dyn Restrictions> + Send + Sync + 'static,
+    ) -> RestrictionGuardFactory {
+        RestrictionGuardFactory {
+            issuer,
+            restrictions: Box::new(restrictions),
+        }
+    }
 }
 
 /// What the backoffice shows for the guard, whatever the design: its two timings.
@@ -601,10 +620,42 @@ mod tests {
     }
 
     fn factory() -> RestrictionGuardFactory {
-        RestrictionGuardFactory {
-            issuer: "Test",
-            restrictions: |_, _| Box::new(Unread),
+        RestrictionGuardFactory::new("Test", |_, _| Box::new(Unread))
+    }
+
+    /// The design's rules are built by a closure, not a fn pointer, so an issuer whose rules
+    /// need a setting of its own (a registry's address, say) carries it in.
+    #[tokio::test]
+    async fn the_rules_closure_carries_the_issuers_own_settings() {
+        struct Registry(Address);
+        impl Restrictions for Registry {
+            fn read(&self) -> BoxFuture<'_, eyre::Result<Box<dyn Rules>>> {
+                let registry = self.0;
+                Box::pin(async move { Ok(Box::new(Listed(registry)) as Box<dyn Rules>) })
+            }
         }
+        struct Listed(Address);
+        impl Rules for Listed {
+            fn problems(&self) -> Vec<String> {
+                vec![format!("registry {:#x}", self.0)]
+            }
+            fn refusals<'a>(
+                &'a self,
+                _: &'a str,
+                _: Address,
+            ) -> BoxFuture<'a, eyre::Result<Vec<String>>> {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+        }
+        let registry = Address::repeat_byte(0x42);
+        let factory =
+            RestrictionGuardFactory::new("Test", move |_, _| Box::new(Registry(registry)));
+        let chain: Arc<dyn Calls> = Arc::new(testing::FakeChain::default());
+        let rules = (factory.restrictions)(chain, Address::repeat_byte(0x14))
+            .read()
+            .await
+            .unwrap();
+        assert_eq!(rules.problems(), vec![format!("registry {registry:#x}")]);
     }
 
     #[test]

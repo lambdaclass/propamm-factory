@@ -1,5 +1,7 @@
-//! What the crate's background readers share: the schedule they read on, the lock they leave
-//! readings under, and how they log a source that keeps failing.
+//! What the crate's background readers share, and what an issuer's adapters are built with
+//! so they behave like them: the schedule they read on ([`every`]), the wall clock a
+//! source's reading is stamped with ([`wall_clock_ms`]), the lock they leave readings
+//! under ([`lock`]), and how they log a source that keeps failing ([`Failures`]).
 
 use std::{
     sync::{Mutex, MutexGuard, PoisonError},
@@ -64,6 +66,7 @@ pub struct Failures {
 }
 
 impl Failures {
+    /// For the reader of `what`, as its lines name it: `Ondo price for AAPLon`.
     pub fn new(what: String) -> Failures {
         Failures {
             what,
@@ -72,12 +75,14 @@ impl Failures {
         }
     }
 
+    /// A read that failed with `err`: logged on the first, then at most once a minute.
     pub fn failed(&mut self, err: &eyre::Report) {
         if let Some(in_a_row) = self.record(Instant::now()) {
             tracing::warn!("{}: read failed ({in_a_row} in a row): {err:#}", self.what);
         }
     }
 
+    /// A read that succeeded: logged when it ends a run of failures.
     pub fn succeeded(&mut self) {
         if self.count > 0 {
             tracing::info!("{}: reading again after {} failures", self.what, self.count);

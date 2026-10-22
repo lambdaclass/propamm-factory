@@ -19,7 +19,7 @@ use crate::eyre;
 use super::api::{self, AssetEvent};
 use crate::{
     poll::{self, Failures, Stamped, lock},
-    stocks::ports::{Event, MarketStatus, StatusReading},
+    stocks::ports::{MarketStatus, StatusReading, Stoppage},
 };
 
 /// What the latest read of Ondo's status found.
@@ -194,7 +194,7 @@ impl MarketStatus for OndoStatus {
             }),
             asset: readings.events.as_ref().map(|events| Stamped {
                 at: events.at,
-                value: Arc::<[Event]>::from(api::events_for(&events.value, names)),
+                value: Arc::<[Stoppage]>::from(api::events_for(&events.value, names)),
             }),
         };
         if let Some(at) = at {
@@ -239,12 +239,15 @@ async fn read(api: &str, key: &str) -> eyre::Result<(String, Vec<AssetEvent>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stocks::mock_http::{MockApi, json};
+    use crate::testing::MockApi;
 
     fn ondo() -> MockApi {
         MockApi::serve(vec![
-            ("/v1/status/market", json(r#"{"marketStatus":"regular"}"#)),
-            ("/v1/status/assets", json("[]")),
+            (
+                "/v1/status/market",
+                MockApi::json(r#"{"marketStatus":"regular"}"#),
+            ),
+            ("/v1/status/assets", MockApi::json("[]")),
         ])
     }
 
@@ -353,8 +356,8 @@ mod tests {
     #[tokio::test]
     async fn a_wrong_key_or_an_answer_that_does_not_parse_fails_the_build_that_asked() {
         let api = MockApi::serve(vec![
-            ("/v1/status/market", json(r#"{"isOpen":true}"#)),
-            ("/v1/status/assets", json("[]")),
+            ("/v1/status/market", MockApi::json(r#"{"isOpen":true}"#)),
+            ("/v1/status/assets", MockApi::json("[]")),
         ]);
         let err = Status::shared(&api.url, "unparsed", Duration::from_secs(60))
             .await

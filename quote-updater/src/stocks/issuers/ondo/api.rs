@@ -16,7 +16,7 @@ use serde::Deserialize;
 
 use crate::{
     stocks::hours::days_from_civil,
-    stocks::ports::{Event, Fetched, Price, PriceSource},
+    stocks::ports::{Fetched, Price, PriceSource, Stoppage},
 };
 
 /// A GM token's price, from `GET /v1/assets/{symbol}/prices/latest`: the token's price (the
@@ -256,7 +256,7 @@ pub fn parse_asset_events(body: &str) -> Result<Vec<AssetEvent>, String> {
 }
 
 /// The events that stop quoting the asset known by `names` (its GM symbol, the stock's
-/// ticker; in any case), each with when it does ([`Event`]; the core times them):
+/// ticker; in any case), each with when it does ([`Stoppage`]; the core times them):
 ///
 /// - an active event: a pause, or an `ASSET_LIMITED` size limit, now;
 /// - an upcoming one that moves the share multiplier, the split or dividend Ondo has
@@ -271,7 +271,7 @@ pub fn parse_asset_events(body: &str) -> Result<Vec<AssetEvent>, String> {
 /// An event keyed or spelt some other way than `names` is invisible here: the ticker comes
 /// from Ondo's own price answer (or the stanza's `ticker`, which must agree with it), so the
 /// two names are Ondo's.
-pub fn events_for(events: &[AssetEvent], names: &[String]) -> Vec<Event> {
+pub fn events_for(events: &[AssetEvent], names: &[String]) -> Vec<Stoppage> {
     events
         .iter()
         .filter(|event| {
@@ -303,7 +303,7 @@ pub fn events_for(events: &[AssetEvent], names: &[String]) -> Vec<Event> {
                     None,
                 ),
             };
-            Some(Event {
+            Some(Stoppage {
                 why,
                 starts_ms,
                 moves_multiplier: event.moves_multiplier,
@@ -584,7 +584,7 @@ mod tests {
         parse_asset_events(body).map(|events| whys(&events_for(&events, &names)))
     }
 
-    fn whys(events: &[Event]) -> Option<String> {
+    fn whys(events: &[Stoppage]) -> Option<String> {
         let whys: Vec<&str> = events.iter().map(|event| event.why.as_str()).collect();
         (!whys.is_empty()).then(|| whys.join("; "))
     }
@@ -733,9 +733,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_price_answer_without_a_ticker_takes_the_stanzas() {
-        use crate::stocks::mock_http::{MockApi, json};
+        use crate::testing::MockApi;
         let untickered = PRICE.replace(r#""ticker": "AAPL", "#, "");
-        let api = MockApi::serve(vec![("/v1/assets/AAPLon/prices/latest", json(&untickered))]);
+        let api = MockApi::serve(vec![(
+            "/v1/assets/AAPLon/prices/latest",
+            MockApi::json(&untickered),
+        )]);
         let prices = |ticker: Option<&str>| OndoPrices {
             http: client(),
             api: api.url.clone(),
@@ -750,12 +753,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_redirect_is_refused_rather_than_followed_with_the_key() {
-        use crate::stocks::mock_http::{MockApi, json, respond};
-        let elsewhere = MockApi::serve(vec![("/collect", json("[]"))]);
+        use crate::testing::MockApi;
+        let elsewhere = MockApi::serve(vec![("/collect", MockApi::json("[]"))]);
         let location = format!("{}/collect", elsewhere.url);
         let api = MockApi::serve(vec![(
             "/v1/status/assets",
-            respond("302 Found", &[("location", &location)], ""),
+            MockApi::answer("302 Found", &[("location", &location)], ""),
         )]);
         let err = get(&client(), &api.url, "/v1/status/assets", "secret")
             .await

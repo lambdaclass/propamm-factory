@@ -832,10 +832,9 @@ mod tests {
             const TOKEN_GUARD_KIND: &'static str = "other_token";
             type TokenGuard = RestrictionGuardFactory;
             fn token_guard(&self) -> RestrictionGuardFactory {
-                RestrictionGuardFactory {
-                    issuer: "Other",
-                    restrictions: |chain, token| Box::new(OndoCompliance { chain, token }),
-                }
+                RestrictionGuardFactory::new("Other", |chain, token| {
+                    Box::new(OndoCompliance { chain, token })
+                })
             }
         }
         let builder = Updater::builder()

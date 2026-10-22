@@ -434,8 +434,12 @@ pub fn assert_rejects_unknown_fields<C: DeserializeOwned>(valid_stanza: &str) {
 }
 
 // ----------------------------------------------------------------------------------------
-// A chain for a stock design's adapters, answering only what it was told to.
+// A stock design's adapters: an HTTP API on this machine, and a chain answering only what
+// it was told to.
 // ----------------------------------------------------------------------------------------
+
+mod mock_http;
+pub use mock_http::MockApi;
 
 use std::collections::HashMap;
 

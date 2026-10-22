@@ -507,8 +507,15 @@ fn days_in_month(year: i32, month: u32) -> u32 {
     }
 }
 
-/// Days since 1970-01-01 of a proleptic Gregorian date (Howard Hinnant's `days_from_civil`).
-pub(crate) fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+/// Days since 1970-01-01 of a proleptic Gregorian date (Howard Hinnant's `days_from_civil`),
+/// for an issuer's adapter turning a date its API writes into a time:
+///
+/// ```
+/// use quote_updater::stocks::hours::days_from_civil;
+/// assert_eq!(days_from_civil(1970, 1, 1), 0);
+/// assert_eq!(days_from_civil(2026, 10, 8) * 86_400, 1_791_417_600);
+/// ```
+pub fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
     let year = i64::from(year) - i64::from(month <= 2);
     let era = year.div_euclid(400);
     let year_of_era = year - era * 400;

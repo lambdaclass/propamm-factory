@@ -51,7 +51,8 @@ match on; it is its own call because the calendar is the exchange's, not an issu
 `stock_issuer(..)` takes an issuer and registers its pricer and its token guard under the
 names the issuer declares. A binary names the issuers it integrates, one call each, and
 nothing registers one implicitly. `example/` does both; `quote-updater/examples/stocks.rs`
-is the same from outside the crate. The explicit `pricer`/`quote_guard` calls remain for
+is the same from outside the crate, and `quote-updater/examples/issuer.rs` registers a
+second issuer of its own beside Ondo. The explicit `pricer`/`quote_guard` calls remain for
 other names, at the cost of the alerts, which match on `us_market_hours`.
 
 ## Run a stock pair
@@ -91,40 +92,64 @@ designs is where the answers come from. `quote-updater/src/stocks/` is split alo
 - `ports.rs`: what the core asks of a design, and the shape of each answer. A
   `PriceSource` (the token's price), a `Valuation` (how many shares a token is worth, and the
   corporate action that will change it), an optional `MarketStatus` (the issuer's session
-  and asset events), and `Restrictions` (the token's transfer rules).
+  and the stoppages it reports on the asset), and `Restrictions` (the token's transfer
+  rules). Each answer is a struct built with its `new` (`Price::new`, `Shares::new`,
+  `Stoppage::new`, ...) and read or set by field: they are `#[non_exhaustive]`, so a field
+  the core gains later is not a change an issuer outside this crate has to make.
 - `pricer.rs`, `guard.rs`, `hours.rs`: the core. The pricer and all its gates, the guard on
   the token's transfer rules, and `us_market_hours`. It reads every design through the ports,
-  and is tested against fakes of them.
+  and is tested against fakes of them. `Stanza::new` carries the core's defaults for a
+  kind's stanza, `Adapters::new` takes a design's adapters, and
+  `RestrictionGuardFactory::new` a closure building its rules, which carries any setting
+  they need.
 - `issuers/ondo/`: Ondo's adapters (its API, the `SyntheticSharesOracle`, its compliance
   contracts, its status) and `Ondo`, the issuer built from them.
 - `chain.rs`: the reads every design shares. Every on-chain read goes through its `Calls`,
   which tests answer with `quote_updater::testing::FakeChain`, a chain that knows only the
   exact calls it was given, so an adapter's wiring (which contract, which argument) is tested
-  without a node.
+  without a node. An adapter that reads an HTTP API is tested against
+  `quote_updater::testing::MockApi` the same way.
+- `quote_updater::poll`, at the crate root: what the core's own readers are built from, for
+  an adapter's refresher to read and log like them: `every` (the schedule), `wall_clock_ms`
+  (the clock a price is stamped on), `Failures` (one log line a minute while a source keeps
+  failing, and one when it recovers).
 - `mod.rs`: the `Issuer` trait.
 
 ## Adding another issuer
 
 The safety checks are the same for every issuer; only where each answer comes from changes.
-An issuer is:
+[`quote-updater/examples/issuer.rs`](../quote-updater/examples/issuer.rs) is a whole one,
+`acme`, written against the public API alone the way a crate of your own is, and compiled
+with the workspace, so that path cannot close unnoticed. An issuer is:
 
 1. its adapters, one per port it answers, under `quote-updater/src/stocks/issuers/<issuer>/`
-   or in a crate of your own: the ports, the core, `Calls` and `FakeChain` are public;
-2. a config struct for its `[pairs.pricing]` stanza, `#[serde(deny_unknown_fields)]` with
-   defaults of its own, that fills the core's `Stanza` and is checked with `Settings::new`
-   plus its own rules;
-3. a unit struct implementing `Factory` over that config (its `build` hands the adapters to
-   `pricer::build`) and `Issuer`, which names its two kinds and gives the token guard,
-   `RestrictionGuardFactory { issuer, restrictions }` for a design whose rules the core's
-   guard reads through `Restrictions`;
+   or in a crate of your own: a `PriceSource` answering `Fetched::new(Price::new(..))`, a
+   `Valuation` answering `Shares::new(k)` (its `action` set for a scheduled corporate
+   action), a `MarketStatus` if the issuer reports one, whose reader a task of yours keeps
+   current (built from `quote_updater::poll`'s `every` and `Failures`, so it reads and logs
+   like the core's own), and `Restrictions` answering the token's rules. Reads of the chain
+   go through `stocks::chain::Calls` and its helpers; a test answers them with
+   `testing::FakeChain`, and an HTTP API with `testing::MockApi`;
+2. a config struct for its `[pairs.pricing]` stanza, `#[serde(deny_unknown_fields)]`, that
+   fills the core's `Stanza` (`Stanza::new(kind, source, symbol, delta)` carries the core's
+   defaults; set the keys your kind lets the operator change) and is checked with
+   `Settings::new` plus its own rules;
+3. a unit struct implementing `Factory` over that config (its `build` hands
+   `Adapters::new(prices, valuation)`, with `status` set when the issuer reports one, to
+   `pricer::build`) and `Issuer`, which names its two kinds and gives the token guard:
+   `RestrictionGuardFactory::new(issuer, closure)` for a design whose rules the core's guard
+   reads through `Restrictions`, the closure carrying any setting the rules need;
 4. `fields()` and `form_help()` on the factory, so the backoffice edits the pair. The
    round-trip test beside `Ondo` is the template: every declared field is a key the config
-   reads, and the example stanza survives the form unchanged;
-5. a mock of its token under `contracts/test/mocks/` and a test inheriting
-   `PropAMMStockTokenTest` (`PropAMMOndoToken.t.sol` is the template). The suite takes a
-   token on either side of USDC's address and of any decimals, and assumes a plain ERC-20
-   with no transfer fee and no rebasing, like Ondo's; a token that isn't one needs a look at
-   PropAMM itself first.
+   reads, and the example stanza survives the form unchanged. A key the config accepts but
+   the form does not declare survives a save too, since the page rebuilds a stanza from the
+   one the pair has;
+5. for a token design of its own, a Solidity test of PropAMM against it. In this repository
+   that is a mock under `contracts/test/mocks/` and a test inheriting
+   `PropAMMStockTokenTest` (`PropAMMOndoToken.t.sol` is the template); from another
+   repository, copy that suite. It takes a token on either side of USDC's address and of any
+   decimals, and assumes a plain ERC-20 with no transfer fee and no rebasing, like Ondo's; a
+   token that isn't one needs a look at PropAMM itself first.
 
 Then one line in the binary, `.stock_issuer(Yours)` after `.us_market_hours()`. Nothing in
 the core or the builder changes.
