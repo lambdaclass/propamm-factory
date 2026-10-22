@@ -225,11 +225,14 @@ second cap a backlog always shows, even one that started before the feed was dia
 lasts longer than the hour. A step of the host clock (an NTP correction, a resume from
 sleep) restarts the baseline.
 
-A venue whose latest frame was late is treated exactly like one that has gone silent: out
-of the average, its weight spread over the rest, until a prompt frame arrives. The pair's
-`min_sources` then decides, as it already does, whether the pair keeps publishing on the
-venues left or withdraws (an empty-tx cancel at every builder, kept in force until enough
-venues are fresh again). Nothing latches. `quote_updater_venue_late{pair, venue}` reads 1
+A venue whose latest frame was late is out of the average, its weight spread over the
+rest, until a prompt frame arrives. The pair's `min_sources` then decides, as it already
+does, whether the pair keeps publishing on the venues left. When it cannot, the composite
+withdraws its price at once, so the next tick is refused and the quote is cancelled at
+every builder (an empty-tx update, kept in force until enough venues are fresh again); it
+does not leave the last price standing to age out, since with a late venue that price was
+already behind. With a single venue, a late frame is therefore an immediate withdrawal.
+Nothing latches. `quote_updater_venue_late{pair, venue}` reads 1
 while a venue is out for this, the updater logs a line when it drops out and when it comes
 back, and `PusherVenueLate` raises a ticket after five minutes of it.
 
@@ -669,6 +672,9 @@ variable exists so a flag-driven run stays possible, and setting one overrides t
   network. Builder mode rules out `MINE` and `NO_PIN`, which are anvil-only.
 - `RPC_URL` — reads only, but on the hot loop (latest block, pending nonce): each requote
   has a ~50ms budget, so endpoint latency shows up directly.
+- `RPC_WS_URL` — a WebSocket endpoint of the same node, for the `newHeads` subscription
+  described under builder mode above; builder mode only. Unset, the head is polled over
+  `RPC_URL`; set, each new block is pushed and the poll drops to a slow liveness check.
 - `BUILDERS` — a separate TOML file to read the `[[builder]]` entries from instead of the
   config file. An override, not an addition: given it, the config file's own list is
   ignored entirely.
