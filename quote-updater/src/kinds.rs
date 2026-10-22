@@ -345,12 +345,6 @@ impl Kinds {
             self.errors.push(format!(
                 "guard kind `{kind}` is built in and cannot be registered"
             ));
-        } else if factory.fields().iter().any(|field| field.name == "enabled") {
-            // The pair form posts `guard_<kind>_enabled` for the kind's checkbox.
-            self.errors.push(format!(
-                "guard kind `{kind}` declares a field named `enabled`, the name of its checkbox \
-                 on the pair form"
-            ));
         } else if self.guards.insert(kind, factory).is_some() {
             self.errors
                 .push(format!("guard kind `{kind}` registered twice"));
@@ -1202,40 +1196,5 @@ api_key = "k"
         assert_eq!(kinds.guard_form_help("cap"), Some("<p>cap</p>"));
         assert!(kinds.guard_fields("plain").is_some_and(|f| f.is_empty()));
         assert_eq!(kinds.guard_fields("nobody"), None);
-    }
-
-    /// The guards section posts `guard_<kind>_enabled` for the kind's checkbox, so a kind
-    /// cannot also declare a field by that name: the registry refuses it as it refuses a
-    /// name registered twice.
-    #[test]
-    fn a_guard_field_named_enabled_is_refused_at_registration() {
-        #[derive(Clone, serde::Deserialize)]
-        struct Flagged {
-            #[allow(dead_code)]
-            enabled: bool,
-        }
-        struct FlaggedFactory;
-        impl QuoteGuardFactory for FlaggedFactory {
-            type Config = Flagged;
-            type Guard = AllowAll;
-            fn fields(&self) -> &'static [FormField] {
-                const FIELDS: &[FormField] = &[FormField::new("enabled", "true", "")];
-                FIELDS
-            }
-            fn build<'a>(
-                &'a self,
-                _: &'a Flagged,
-                _: &'a mut BuildCtx,
-            ) -> BoxFuture<'a, Result<AllowAll>> {
-                Box::pin(std::future::ready(Ok(AllowAll)))
-            }
-        }
-        let mut kinds = Kinds::default();
-        kinds.insert_guard("flagged", quote_guard_factory(FlaggedFactory));
-        let err = format!("{:#}", kinds.errors().unwrap_err());
-        assert!(
-            err.contains("guard kind `flagged` declares a field named `enabled`"),
-            "{err}"
-        );
     }
 }

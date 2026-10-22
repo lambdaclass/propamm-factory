@@ -94,7 +94,7 @@
     {% for guard in guards %}
     <div class=guard>
       <label class=check>
-        <input type=checkbox name="guard_{{ guard.name }}_enabled"{% if guard.enabled %} checked{% endif %}>
+        <input type=checkbox name="enabled_guard_{{ guard.name }}"{% if guard.enabled %} checked{% endif %}>
         <span class=choice-name>{{ guard.name }}</span>
       </label>
       {{ guard.help|safe }}

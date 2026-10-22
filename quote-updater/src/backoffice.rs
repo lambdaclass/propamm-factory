@@ -478,12 +478,17 @@ fn pricing_stanza(
     kind_stanza("pricing", fields, kind, existing, posted)
 }
 
-/// A kind's stanza from what the form posted: `kind`, then each declared field the operator
-/// filled in, written by its type ([`field_toml`]). Shared by the pricing section (`prefix`
-/// is `pricing`) and the guards section (`guard`), whose inputs are named
-/// `<prefix>_<kind>_<field>`. A kind that declares no fields keeps the stanza it had when
-/// that is the same kind (the page cannot edit one, and says so), and otherwise gets a
-/// stanza naming it alone.
+/// A kind's stanza from what the form posted: the stanza the pair has when it is of this
+/// kind, then each declared field the post carries, written by its type ([`field_toml`]) or
+/// removed when posted blank. Shared by the pricing section (`prefix` is `pricing`) and the
+/// guards section (`guard`), whose inputs are named `<prefix>_<kind>_<field>`.
+///
+/// Starting from the pair's own stanza is what keeps a key the kind accepts but does not
+/// declare as a field through a save, and what keeps a declared field's value when the post
+/// does not carry its input at all (a page rendered before the field existed, a scripted
+/// post): a missing input is not a blank one, which for a list would write `[]` over a
+/// required calendar. A kind that declares no fields keeps its stanza whole (the page
+/// cannot edit one, and says so); a kind the pair did not have gets a stanza naming it.
 pub(crate) fn kind_stanza(
     prefix: &str,
     fields: &'static [crate::pricing::FormField],
@@ -491,27 +496,30 @@ pub(crate) fn kind_stanza(
     existing: Option<&toml::Table>,
     posted: &std::collections::HashMap<String, String>,
 ) -> Result<toml::Table> {
-    let existing_kind = existing
-        .and_then(|t| t.get("kind"))
-        .and_then(|k| k.as_str());
-    if fields.is_empty() && existing_kind == Some(kind) {
-        return Ok(existing.cloned().unwrap_or_default());
-    }
-    let mut table = toml::Table::new();
+    let mut table = match existing {
+        Some(existing) if existing.get("kind").and_then(|k| k.as_str()) == Some(kind) => {
+            existing.clone()
+        }
+        _ => toml::Table::new(),
+    };
     table.insert("kind".to_owned(), toml::Value::String(kind.to_owned()));
     for field in fields {
         let key = format!("{prefix}_{kind}_{}", field.name);
-        let text = posted.get(&key).map(String::as_str).unwrap_or("");
-        if let Some(value) = field_toml(field, text)? {
-            table.insert(field.name.to_owned(), value);
-        }
+        let Some(text) = posted.get(&key) else {
+            continue;
+        };
+        match field_toml(field, text)? {
+            Some(value) => table.insert(field.name.to_owned(), value),
+            None => table.remove(field.name),
+        };
     }
     Ok(table)
 }
 
 /// The pair's `[[pairs.guards]]` stanzas from what the guards section posted. A pair holds
-/// one stanza per kind, so the section is one block per registered kind, with an `enabled`
-/// checkbox and the kind's fields, named `guard_<kind>_<field>`. The pair's existing stanzas
+/// one stanza per kind, so the section is one block per registered kind: its checkbox,
+/// `enabled_guard_<kind>`, and the kind's fields, named `guard_<kind>_<field>`. The checkbox
+/// is outside the fields' prefix, so no field a kind declares can be its name. The pair's existing stanzas
 /// come first, in their order: each is rebuilt from its block if its kind declares fields,
 /// kept as written if it declares none or nobody registered it (the page shows it as edited
 /// in the file), and dropped if its box is unchecked. Then every registered kind the pair
@@ -525,7 +533,7 @@ fn guard_stanzas(
     if !posted.contains_key("guards_present") {
         return Ok(existing.to_vec());
     }
-    let enabled = |kind: &str| posted.contains_key(&format!("guard_{kind}_enabled"));
+    let enabled = |kind: &str| posted.contains_key(&format!("enabled_guard_{kind}"));
     let mut guards = Vec::with_capacity(existing.len());
     let mut seen: Vec<&str> = Vec::with_capacity(existing.len());
     for stanza in existing {
@@ -4457,6 +4465,57 @@ api_key = "k"
         assert_eq!(table.get("holidays"), Some(&toml::Value::Array(Vec::new())));
     }
 
+    /// A declared field the post does not carry (a page rendered before the field existed,
+    /// a scripted post) keeps the value the stanza has rather than reading as blank: for a
+    /// list, blank writes `[]`, and a required calendar would be replaced with nothing. A
+    /// field posted blank is cleared, so the kind's default applies.
+    #[test]
+    fn a_declared_field_missing_from_the_post_keeps_the_stanzas_value() {
+        const FIELDS: &[crate::pricing::FormField] = &[
+            crate::pricing::FormField::list("holidays", "", ""),
+            crate::pricing::FormField::number("open_delay_secs", "", ""),
+        ];
+        let mut existing = guard_table("cal", None);
+        existing.insert(
+            "holidays".to_owned(),
+            toml::Value::Array(vec![toml::Value::String("2026-11-26".to_owned())]),
+        );
+        existing.insert("open_delay_secs".to_owned(), toml::Value::Integer(60));
+        let posted = posted_map(&[("guard_cal_open_delay_secs", "90")]);
+        let table = kind_stanza("guard", FIELDS, "cal", Some(&existing), &posted).unwrap();
+        assert_eq!(table.get("holidays"), existing.get("holidays"), "{table:?}");
+        assert_eq!(
+            table.get("open_delay_secs"),
+            Some(&toml::Value::Integer(90))
+        );
+        let posted = posted_map(&[("guard_cal_open_delay_secs", "")]);
+        let table = kind_stanza("guard", FIELDS, "cal", Some(&existing), &posted).unwrap();
+        assert_eq!(table.get("open_delay_secs"), None, "{table:?}");
+    }
+
+    /// A key the kind's config accepts but its form does not declare survives a save: the
+    /// rebuilt stanza starts from the one the pair has, when that is the same kind.
+    #[test]
+    fn a_key_the_kind_accepts_but_does_not_declare_survives_a_save() {
+        const FIELDS: &[crate::pricing::FormField] =
+            &[crate::pricing::FormField::number("max_share", "", "")];
+        let mut existing = guard_table("cap", Some(("max_share", 0.8)));
+        existing.insert("extra".to_owned(), toml::Value::Integer(1));
+        let posted = posted_map(&[("guard_cap_max_share", "0.7")]);
+        let table = kind_stanza("guard", FIELDS, "cap", Some(&existing), &posted).unwrap();
+        assert_eq!(
+            table.get("extra"),
+            Some(&toml::Value::Integer(1)),
+            "{table:?}"
+        );
+        assert_eq!(table.get("max_share"), Some(&toml::Value::Float(0.7)));
+        // A stanza of another kind is no base: its keys are that kind's.
+        let other = guard_table("other", Some(("max_share", 0.5)));
+        let table = kind_stanza("guard", FIELDS, "cap", Some(&other), &posted).unwrap();
+        assert_eq!(table.get("max_share"), Some(&toml::Value::Float(0.7)));
+        assert_eq!(table.len(), 2, "{table:?}");
+    }
+
     /// An env field holds the name of a variable and is written as `{ env = "NAME" }`; a
     /// value that is not a variable name (a pasted secret, say) is refused without being
     /// echoed.
@@ -4570,7 +4629,7 @@ api_key = "k"
             &existing,
             &posted_map(&[
                 ("guards_present", "1"),
-                ("guard_cap_enabled", "on"),
+                ("enabled_guard_cap", "on"),
                 ("guard_cap_max_share", "0.8"),
             ]),
         )
@@ -4581,8 +4640,8 @@ api_key = "k"
             &existing,
             &posted_map(&[
                 ("guards_present", "1"),
-                ("guard_plain_enabled", "on"),
-                ("guard_cap_enabled", "on"),
+                ("enabled_guard_plain", "on"),
+                ("enabled_guard_cap", "on"),
                 ("guard_cap_max_share", "0.8"),
             ]),
         )
@@ -4606,7 +4665,7 @@ api_key = "k"
         let written = guard_stanzas(
             &kinds,
             &existing,
-            &posted_map(&[("guards_present", "1"), ("guard_exotic_enabled", "on")]),
+            &posted_map(&[("guards_present", "1"), ("enabled_guard_exotic", "on")]),
         )
         .unwrap();
         assert_eq!(written, existing);
@@ -4624,7 +4683,7 @@ api_key = "k"
         config.pairs[0].guards = vec![guard_table("cap", Some(("max_share", 0.8)))];
         let form = render_pair_form(Some(&config.pairs[0]), &test_kinds());
         assert!(
-            form.contains(r#"name="guard_cap_enabled" checked"#),
+            form.contains(r#"name="enabled_guard_cap" checked"#),
             "{form}"
         );
         assert!(
@@ -4632,7 +4691,7 @@ api_key = "k"
             "{form}"
         );
         assert!(
-            form.contains(r#"name="guard_plain_enabled">"#),
+            form.contains(r#"name="enabled_guard_plain">"#),
             "plain is offered, unchecked: {form}"
         );
         assert_eq!(
@@ -4662,7 +4721,7 @@ api_key = "k"
         assert_eq!(guards_before.len(), 1);
         let page = render_pair_form(Some(&raw.pairs[0]), &test_kinds());
         assert!(
-            page.contains(r#"name="guard_exotic_enabled" checked"#),
+            page.contains(r#"name="enabled_guard_exotic" checked"#),
             "{page}"
         );
         assert!(
@@ -4742,7 +4801,7 @@ api_key = "k"
         let posted = http(
             local,
             &post(format!(
-                "{base}&guard_cap_enabled=on&guard_cap_max_share=0.8"
+                "{base}&enabled_guard_cap=on&guard_cap_max_share=0.8"
             )),
         )
         .await;
@@ -4820,7 +4879,7 @@ api_key = "k"
             ),
             ("pricing_ondo_delta", text(pricing, "delta")),
             ("guards_present", "1".to_owned()),
-            ("guard_us_market_hours_enabled", "on".to_owned()),
+            ("enabled_guard_us_market_hours", "on".to_owned()),
             (
                 "guard_us_market_hours_open_delay_secs",
                 hours["open_delay_secs"].to_string(),
@@ -4835,7 +4894,7 @@ api_key = "k"
                 "guard_us_market_hours_listed_through",
                 text(hours, "listed_through"),
             ),
-            ("guard_ondo_token_enabled", "on".to_owned()),
+            ("enabled_guard_ondo_token", "on".to_owned()),
             ("guard_ondo_token_poll_secs", token["poll_secs"].to_string()),
             (
                 "guard_ondo_token_max_age_secs",
