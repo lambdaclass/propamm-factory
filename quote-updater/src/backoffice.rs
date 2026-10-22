@@ -535,7 +535,9 @@ pub(crate) fn kind_stanza(
 /// come first, in their order: each is rebuilt from its block if its kind declares fields,
 /// kept as written if it declares none or nobody registered it (the page shows it as edited
 /// in the file), and dropped if its box is unchecked. Then every registered kind the pair
-/// did not have, if checked, appended. A page rendered before the section existed posts no
+/// did not have, if checked, appended; one unchecked but with text in its fields refuses the
+/// save, since its fields render blank and the text was typed for a guard that would be
+/// dropped without a word. A page rendered before the section existed posts no
 /// `guards_present`, and keeps the pair's guards as they were.
 fn guard_stanzas(
     kinds: &crate::kinds::Kinds,
@@ -566,10 +568,29 @@ fn guard_stanzas(
         }
     }
     for kind in kinds.guard_kinds() {
-        if seen.contains(&kind) || !enabled(kind) {
+        if seen.contains(&kind) {
             continue;
         }
         let fields = kinds.guard_fields(kind).unwrap_or(&[]);
+        if !enabled(kind) {
+            let filled: Vec<&str> = fields
+                .iter()
+                .map(|field| field.name)
+                .filter(|name| {
+                    posted
+                        .get(&format!("guard_{kind}_{name}"))
+                        .is_some_and(|text| !text.trim().is_empty())
+                })
+                .collect();
+            if !filled.is_empty() {
+                bail!(
+                    "guard `{kind}` has {} filled in but its box is not ticked: tick it to \
+                     add the guard, or clear the fields",
+                    filled.join(", ")
+                );
+            }
+            continue;
+        }
         guards.push(kind_stanza("guard", fields, kind, None, posted)?);
     }
     Ok(guards)
@@ -4908,6 +4929,42 @@ api_key = "k"
         let written =
             guard_stanzas(&kinds, &existing, &posted_map(&[("pricing", "feed")])).unwrap();
         assert_eq!(written, existing);
+    }
+
+    /// A registered guard the pair does not have, with text in its fields but its box not
+    /// ticked, refuses the save naming the fields; blank fields under an unticked box are
+    /// the page as rendered and pass. Unticking a guard the pair has removes it even though
+    /// its fields still carry the stanza's values.
+    #[test]
+    fn a_filled_but_unticked_guard_refuses_the_save() {
+        let kinds = test_kinds();
+        let err = guard_stanzas(
+            &kinds,
+            &[],
+            &posted_map(&[("guards_present", "1"), ("guard_cap_max_share", "0.8")]),
+        )
+        .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("guard `cap` has max_share filled in"),
+            "{message}"
+        );
+        assert!(message.contains("not ticked"), "{message}");
+        let written = guard_stanzas(
+            &kinds,
+            &[],
+            &posted_map(&[("guards_present", "1"), ("guard_cap_max_share", "  ")]),
+        )
+        .unwrap();
+        assert_eq!(written, Vec::<toml::Table>::new());
+        let existing = vec![guard_table("cap", Some(("max_share", 0.8)))];
+        let written = guard_stanzas(
+            &kinds,
+            &existing,
+            &posted_map(&[("guards_present", "1"), ("guard_cap_max_share", "0.8")]),
+        )
+        .unwrap();
+        assert_eq!(written, Vec::<toml::Table>::new());
     }
 
     /// A guard of a kind this binary does not register is shown as edited in the file and
