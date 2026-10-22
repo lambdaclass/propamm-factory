@@ -5,8 +5,8 @@
 # of fixtures as live rules.
 #
 # Scoped to PusherSignerNearlyDry and its level check PusherSignerDry, plus
-# PusherStockCalendarEnding and PusherStockCalendarEnded (last), which are new enough to want
-# their labels and wording proven. The first is a `predict_linear`, which is the only
+# PusherStockCalendarEnding and PusherStockCalendarEnded and PusherVenueLate (at the end),
+# which are new enough to want their labels and wording proven. The first is a `predict_linear`, which is the only
 # expression in the file whose *silence* is a designed behaviour rather than a side effect of
 # a comparison coming out false: one NaN sample anywhere in the range suppresses it entirely,
 # and that is what stops a failed eth_getBalance paging an operator about a key that is fine.
@@ -203,3 +203,28 @@ tests:
             exp_annotations:
               summary: "AAPLon/USDC: 3 days past the end of its trading calendar, nothing is quoting"
               description: "The pair's calendar ran past its listed_through date without being extended, so the us_market_hours guard has withdrawn every quote since. List the next year's NYSE holidays and early closes in the pair's guard stanza, move listed_through, and reload."
+
+  # PusherVenueLate: five minutes of a venue left out for lateness raises a ticket; a few
+  # late frames that clear inside that do not. Scrape-rate fixtures, like the level check
+  # above: the gauge holds its value between frames.
+  - interval: 1m
+    name: a venue left out for lateness for five minutes raises a ticket
+    input_series:
+      - series: 'quote_updater_venue_late{pair="ETH/USDT",venue="okx"}'
+        values: "0 1x10"
+      - series: 'quote_updater_venue_late{pair="ETH/USDT",venue="kucoin"}'
+        values: "0 1x3 0x6"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: PusherVenueLate
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: PusherVenueLate
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              pair: ETH/USDT
+              venue: okx
+            exp_annotations:
+              summary: "ETH/USDT: okx has been delivering prices late for 5 minutes"
+              description: "This venue's prices have been arriving later behind the exchange's own timestamps than max_source_lag_ms allows for five minutes, so it is out of the pair's average. quote_updater_venue_source_lag_ms says how far behind; a steady quote_updater_venue_future_stamps_total, or every stamped venue late by about the same amount, points at this host's clock instead."
