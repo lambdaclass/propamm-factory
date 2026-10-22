@@ -202,11 +202,12 @@ impl Settings {
     }
 }
 
-/// That the stanza's `symbol` is the pair's first token's, `first` (its on-chain symbol()).
-/// It is what stops a TSLAon stanza pricing AMZNon.
+/// That the stanza's `symbol` is the pair's first token's, `first` (its on-chain symbol()),
+/// in any case, as every symbol compare in the stocks module. It is what stops a TSLAon
+/// stanza pricing AMZNon.
 fn check_symbol(symbol: &str, first: &str) -> eyre::Result<()> {
     eyre::ensure!(
-        first == symbol,
+        first.eq_ignore_ascii_case(symbol),
         "symbol {symbol} is not the pair's first token, whose symbol() is {first}: the stock \
          token is listed first (tokens = [stock, USDC]) and the stanza prices it"
     );
@@ -229,10 +230,7 @@ enum Band {
 /// band, which is in the lane's orientation: token per USDC when the stock token's address
 /// sorts after USDC's.
 fn band_of(token_price: f64, pair: &PairShape) -> Band {
-    let number = |bound: U256| {
-        bound.to_string().parse::<f64>().unwrap_or(f64::INFINITY)
-            / 10f64.powi(pair.price_decimals as i32)
-    };
+    let number = |bound: U256| crate::pricing::scaled_to_f64(bound, pair.price_decimals);
     let (min, max) = (pair.min_mid.map(number), pair.max_mid.map(number));
     let holds = |mid: f64| min.is_none_or(|min| mid >= min) && max.is_none_or(|max| mid <= max);
     let lane_mid = if pair.inverted {
@@ -249,7 +247,10 @@ fn band_of(token_price: f64, pair: &PairShape) -> Band {
     }
 }
 
-/// `written`, a decimal fraction such as `0.003`, exactly, at `decimals` decimals.
+/// `written`, a decimal fraction such as `0.003`, exactly, at `decimals` decimals: the
+/// library's own scaler, held to plain digits with no more decimals than the pair's (on
+/// its own it takes an exponent and truncates the digits past `decimals`, neither of which
+/// a setting should pass silently).
 fn parse_fraction(written: &str, decimals: u32) -> Result<U256, String> {
     let bad = || format!("{written:?} is not a decimal number such as 0.003");
     let (whole, fraction) = written.split_once('.').unwrap_or((written, ""));
@@ -262,8 +263,7 @@ fn parse_fraction(written: &str, decimals: u32) -> Result<U256, String> {
             "{written:?} has more than the pair's {decimals} decimals"
         ));
     }
-    let scaled = format!("{whole}{fraction:0<width$}", width = decimals as usize);
-    U256::from_dec_str(&scaled).map_err(|_| bad())
+    crate::feed::parse_decimal_scaled(written, decimals).map_err(|_| bad())
 }
 
 /// How far ahead of our clock a source may stamp a price before it is refused as impossible.
@@ -341,6 +341,7 @@ struct Handles {
     price_stale: RefusalHandle,
     price_frozen: RefusalHandle,
     status_stale: RefusalHandle,
+    multiplier_stale: RefusalHandle,
     market_session: RefusalHandle,
     asset_event: RefusalHandle,
     multiplier_paused: RefusalHandle,
@@ -361,6 +362,7 @@ impl Handles {
             price_stale: ctx.refusal("price_stale")?,
             price_frozen: ctx.refusal("price_frozen")?,
             status_stale: ctx.refusal("status_stale")?,
+            multiplier_stale: ctx.refusal("multiplier_stale")?,
             market_session: ctx.refusal("market_session")?,
             asset_event: ctx.refusal("asset_event")?,
             multiplier_paused: ctx.refusal("multiplier_paused")?,
@@ -394,24 +396,24 @@ pub struct StockPricer {
 }
 
 impl StockPricer {
-    /// `reading`, if there is one and, on a gated tick, it is recent enough to trust.
+    /// `reading`, if there is one and, on a gated tick, it is recent enough to trust;
+    /// refused under `stale` otherwise, which names where the reading comes from (the
+    /// issuer's status, the chain's multiplier), since each fails on its own.
     fn fresh<'a, T>(
         &self,
         reading: Option<&'a Stamped<T>>,
         what: &str,
+        stale: &RefusalHandle,
         now: Instant,
         gated: bool,
     ) -> Result<&'a Stamped<T>, Refusal> {
         let Some(reading) = reading else {
-            return Err(Refusal::new(
-                &self.h.status_stale,
-                format!("no {what} reading yet"),
-            ));
+            return Err(Refusal::new(stale, format!("no {what} reading yet")));
         };
         let age = now.saturating_duration_since(reading.at);
         if gated && age > self.settings.max_status_age {
             return Err(Refusal::new(
-                &self.h.status_stale,
+                stale,
                 format!(
                     "the {what} reading is {}s old (limit {}s)",
                     age.as_secs(),
@@ -430,8 +432,15 @@ impl StockPricer {
             return Ok(());
         };
         let reading = status.read(&self.names);
-        let session = self.fresh(reading.session.as_ref(), "market session", now, gated)?;
-        let asset = self.fresh(reading.asset.as_ref(), "asset status", now, gated)?;
+        let stale = &self.h.status_stale;
+        let session = self.fresh(
+            reading.session.as_ref(),
+            "market session",
+            stale,
+            now,
+            gated,
+        )?;
+        let asset = self.fresh(reading.asset.as_ref(), "asset status", stale, now, gated)?;
         if !gated {
             return Ok(());
         }
@@ -522,7 +531,13 @@ impl StockPricer {
         }
 
         self.check_status(tick.now(), now_ms, gated)?;
-        let reading = self.fresh(shares.as_ref(), "share multiplier", tick.now(), gated)?;
+        let reading = self.fresh(
+            shares.as_ref(),
+            "share multiplier",
+            &h.multiplier_stale,
+            tick.now(),
+            gated,
+        )?;
         let shares = reading.value;
         out.set(&h.svalue, shares.k);
         let now_secs = now_ms.div_euclid(1_000);
@@ -1159,11 +1174,16 @@ mod tests {
         let old = ago(60_001);
         let session = reads_with_status(|status| status.session.as_mut().unwrap().at = old);
         assert_eq!(priced(session).unwrap_err().reason(), "status_stale");
-        let mut shares = reads();
-        shares.shares.as_mut().unwrap().at = old;
-        assert_eq!(priced(shares).unwrap_err().reason(), "status_stale");
         let unread = reads_with_status(|status| status.asset = None);
         assert_eq!(priced(unread).unwrap_err().reason(), "status_stale");
+        // The multiplier is read from the chain, not the issuer: an oracle outage must not
+        // read as an issuer-status outage on the dashboards.
+        let mut shares = reads();
+        shares.shares.as_mut().unwrap().at = old;
+        assert_eq!(priced(shares).unwrap_err().reason(), "multiplier_stale");
+        let mut unread = reads();
+        unread.shares = None;
+        assert_eq!(priced(unread).unwrap_err().reason(), "multiplier_stale");
     }
 
     #[test]
@@ -1215,7 +1235,7 @@ mod tests {
         old.shares.as_mut().unwrap().at = ago(61_000);
         let mut b = built(pair(), settings(), old, None);
         b.pricer.clock = || NOW_MS - 4_000;
-        assert_eq!(b.refusal().reason(), "status_stale");
+        assert_eq!(b.refusal().reason(), "multiplier_stale");
         // A reading a second old stays fresh across a step either way.
         for stepped in [|| NOW_MS - 4_000, || NOW_MS + 4_000] {
             let mut b = built(pair(), settings(), reads(), None);
@@ -1321,6 +1341,16 @@ mod tests {
         other.label = "AMZNon/USDC".to_owned();
         let err = Settings::new(&stanza_with(|_| {}), &other).unwrap_err();
         assert!(format!("{err}").contains("AMZNon"), "{err}");
+    }
+
+    #[test]
+    fn the_stanzas_symbol_matches_the_tokens_in_any_case() {
+        // As every other symbol compare in the stocks module: the casing is the issuer's,
+        // not ours to pin, and a stanza the API accepts must not fail the build.
+        let upper = stanza_with(|s| s.symbol = "AAPLON");
+        assert!(Settings::new(&upper, &pair()).is_ok());
+        assert!(check_symbol("aaplon", "AAPLon").is_ok());
+        assert!(check_symbol("TSLAon", "AAPLon").is_err());
     }
 
     #[test]

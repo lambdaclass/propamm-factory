@@ -236,13 +236,13 @@ async fn read(
         CallOutcome::Reverted(data) if named.is_empty() => vec![format!(
             "the token refuses a transfer the PropAMM makes out of the vault, for a reason \
              {issuer}'s rules do not name: it reverts with 0x{}",
-            hex(&data)
+            hex::encode(&data)
         )],
         CallOutcome::Returned(data) if named.is_empty() && !succeeded(&data) => vec![format!(
             "the token refuses a transfer the PropAMM makes out of the vault, for a reason \
              {issuer}'s rules do not name: transferFrom returned 0x{} rather than true, \
              which the PropAMM's SafeERC20 reverts on",
-            hex(&data)
+            hex::encode(&data)
         )],
         _ => named,
     })
@@ -278,11 +278,6 @@ async fn try_transfer(
         .call_sig_as(propamm, stock, sig, &args)
         .await
         .map_err(|err| eyre::eyre!("trying {sig} on {stock:#x} as the PropAMM: {err:#}"))
-}
-
-/// `data` as lowercase hex, without the `0x`.
-fn hex(data: &[u8]) -> String {
-    data.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Everything in `rules` that would revert a fill through the vault and the PropAMM, each

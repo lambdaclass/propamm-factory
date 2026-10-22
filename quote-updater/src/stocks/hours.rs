@@ -195,22 +195,32 @@ impl QuoteGuardFactory for UsMarketHoursFactory {
         cfg: &'a UsMarketHoursCfg,
         ctx: &'a mut BuildCtx,
     ) -> BoxFuture<'a, eyre::Result<UsMarketHours>> {
-        Box::pin(async move {
-            let mut guard = UsMarketHours {
-                calendar: cfg.calendar()?,
-                closed: ctx.refusal("market_closed")?,
-                ended: ctx.refusal("calendar_ended")?,
-                days_left: ctx.diagnostic("calendar_days_left")?,
-                warned_on: None,
-                label: ctx.pair().label.clone(),
-                clock: wall_clock,
-            };
-            // Said at build too, so `--check` shows it.
-            if let Some(warning) = guard.daily_warning(wall_clock()) {
-                tracing::warn!("[{}] us_market_hours: {warning}", guard.label);
-            }
-            Ok(guard)
-        })
+        Box::pin(std::future::ready(Self::built(cfg, ctx, wall_clock)))
+    }
+}
+
+impl UsMarketHoursFactory {
+    /// The guard on `clock`: the run's wall clock, a fixed instant in a test. The build's
+    /// own warning reads it too, so nothing in a test reads the host's date.
+    fn built(
+        cfg: &UsMarketHoursCfg,
+        ctx: &mut BuildCtx,
+        clock: fn() -> i64,
+    ) -> eyre::Result<UsMarketHours> {
+        let mut guard = UsMarketHours {
+            calendar: cfg.calendar()?,
+            closed: ctx.refusal("market_closed")?,
+            ended: ctx.refusal("calendar_ended")?,
+            days_left: ctx.diagnostic("calendar_days_left")?,
+            warned_on: None,
+            label: ctx.pair().label.clone(),
+            clock,
+        };
+        // Said at build too, so `--check` shows it.
+        if let Some(warning) = guard.daily_warning(clock()) {
+            tracing::warn!("[{}] us_market_hours: {warning}", guard.label);
+        }
+        Ok(guard)
     }
 }
 
@@ -545,13 +555,11 @@ mod tests {
     }
 
     /// The guard as the run builds it, its clock stopped at `unix`.
-    async fn built_at(unix: fn() -> i64) -> (UsMarketHours, BuildCtx) {
+    /// The guard built with its clock stopped at `unix`, the build's own warning included,
+    /// so nothing in a test reads the host's date.
+    fn built_at(unix: fn() -> i64) -> (UsMarketHours, BuildCtx) {
         let mut ctx = testing::build_ctx(&testing::pair());
-        let mut guard = UsMarketHoursFactory
-            .build(&stanza(), &mut ctx)
-            .await
-            .unwrap();
-        guard.clock = unix;
+        let guard = UsMarketHoursFactory::built(&stanza(), &mut ctx, unix).unwrap();
         (guard, ctx)
     }
 
@@ -568,8 +576,21 @@ mod tests {
 
     /// The guard's verdict on a tick, its clock stopped at `unix`.
     async fn verdict_at(unix: fn() -> i64) -> Gate {
-        let (mut guard, ctx) = built_at(unix).await;
+        let (mut guard, ctx) = built_at(unix);
         check(&mut guard, &ctx).0
+    }
+
+    /// The build's warning is on the guard's clock, not the host's: a build on 2026-12-02
+    /// has warned for that New York day, and a build in October has not. Otherwise a test
+    /// run on the days this stanza's calendar is ending would find the day already warned
+    /// of before its own clock got there.
+    #[test]
+    fn the_build_warns_on_the_clock_the_guard_is_given() {
+        let december = utc(2026, 12, 2, 15, 0, 0);
+        let (guard, _) = built_at(|| utc(2026, 12, 2, 15, 0, 0));
+        assert_eq!(guard.warned_on, Some(new_york_day(december)));
+        let (guard, _) = built_at(|| utc(2026, 10, 8, 14, 0, 0));
+        assert_eq!(guard.warned_on, None);
     }
 
     #[test]
@@ -588,14 +609,14 @@ mod tests {
     #[tokio::test]
     async fn every_tick_says_how_many_days_the_calendar_has_left() {
         // Wednesday 2026-12-02, 10:00 EST: 29 days to 2026-12-31.
-        let (mut guard, ctx) = built_at(|| utc(2026, 12, 2, 15, 0, 0)).await;
+        let (mut guard, ctx) = built_at(|| utc(2026, 12, 2, 15, 0, 0));
         let (_, out) = check(&mut guard, &ctx);
         assert_eq!(out.get(&guard.days_left), Some(29.0));
     }
 
     #[tokio::test]
     async fn a_running_guard_warns_once_a_day_from_a_month_before_its_calendar_ends() {
-        let (mut guard, _) = built_at(|| utc(2026, 10, 8, 14, 0, 0)).await;
+        let (mut guard, _) = built_at(|| utc(2026, 10, 8, 14, 0, 0));
         assert_eq!(
             guard.daily_warning(utc(2026, 11, 15, 15, 0, 0)),
             None,

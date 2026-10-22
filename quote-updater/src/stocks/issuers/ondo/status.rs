@@ -62,7 +62,13 @@ impl Status {
     /// parse fails the build that asked. Starts nothing: see [`keep_fresh`].
     pub async fn shared(api: &str, key: &str, every: Duration) -> eyre::Result<Arc<Status>> {
         let id = (api.to_owned(), key.to_owned(), every);
-        let held = lock(live()).get(&id).and_then(Weak::upgrade);
+        let held = {
+            let mut live = lock(live());
+            // Every lookup drops the entries of readers nobody holds: an entry carries the
+            // key it was opened with, and a rotated key must not sit in a static map.
+            live.retain(|_, held| held.strong_count() > 0);
+            live.get(&id).and_then(Weak::upgrade)
+        };
         if let Some(status) = held {
             return Ok(status);
         }
@@ -74,7 +80,6 @@ impl Status {
             return Ok(status);
         }
         let status = Arc::new(Status::new(api, key, every, stamped(session, events)));
-        live.retain(|_, held| held.strong_count() > 0);
         live.insert(id, Arc::downgrade(&status));
         Ok(status)
     }
@@ -264,6 +269,25 @@ mod tests {
         let again = Status::shared(&api.url, "shared", every).await.unwrap();
         assert_eq!(api.hits("/v1/status/market"), 3);
         drop((other, again));
+    }
+
+    #[tokio::test]
+    async fn a_reader_nobody_holds_leaves_the_registry_on_the_next_lookup() {
+        let api = ondo();
+        let every = Duration::from_secs(60);
+        let held = Status::shared(&api.url, "held", every).await.unwrap();
+        let dropped = Status::shared(&api.url, "dropped", every).await.unwrap();
+        let id = (api.url.clone(), "dropped".to_owned(), every);
+        assert!(lock(live()).contains_key(&id));
+        drop(dropped);
+        // A lookup that finds its reader live inserts nothing: the dead entry, with the key
+        // string in it, must go all the same.
+        let again = Status::shared(&api.url, "held", every).await.unwrap();
+        assert!(Arc::ptr_eq(&held, &again));
+        assert!(
+            !lock(live()).contains_key(&id),
+            "a dropped reader's entry lingers"
+        );
     }
 
     #[tokio::test]
