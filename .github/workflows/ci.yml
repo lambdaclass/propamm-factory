@@ -96,9 +96,9 @@ jobs:
         with:
           workspaces: example
       - run: cargo fetch --locked --manifest-path example/Cargo.toml
-      - run: forge build
-        working-directory: contracts
-      - run: bash e2e/stocks/run.sh
+      # One step, so the contracts are built before the script's offline build by the
+      # step's own order: a fresh runner has no solc until this forge build fetches one.
+      - run: (cd contracts && forge build) && bash e2e/stocks/run.sh
 
   alert-rules:
     name: Alert rules (promtool)
