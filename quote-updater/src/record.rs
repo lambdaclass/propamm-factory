@@ -1,10 +1,10 @@
 //! Records, into the indexer's Postgres, what nothing on chain provides and the P&L work
 //! needs: the Binance mid of every symbol we price from, each pair's vault balances, the
 //! working behind every update we publish (the feed mid, the spread terms, σ, the skew),
-//! and every configuration the pusher has run. The feed task hands over every tick, the
-//! vault exporter every reading, the quote loop every signed update and the reload path
-//! every config; one writer task decides what is worth a row and writes it, so quoting
-//! never waits on the database. See README.md ("Recording the feed") for the tables and
+//! every configuration the pusher has run, and every lane halt with the venues behind it.
+//! The feed task hands over every tick, the vault exporter every reading, the quote loop
+//! every signed update, the reload path every config and the latch every trip; one writer
+//! task decides what is worth a row and writes it, so quoting never waits on the database. See README.md ("Recording the feed") for the tables and
 //! their rules.
 //!
 //! Two halves. [`Recorder`] is the handle the producers hold: a mutex around the latest
@@ -153,6 +153,51 @@ impl std::fmt::Debug for Unredacted {
     }
 }
 
+/// One lane halt, as `feed.breaker_trips` keeps it: when, which pair, who tripped it and
+/// how (`source` and `cause` as the `trip_source` series labels them), and the alarm line
+/// the operator saw. A trip judged on the composite also carries the sample it tripped on
+/// and the one judged before it: each mid in lane orientation and human units, like
+/// `feed.quotes`, and each sample's venues as a JSON list (venue, weight, mid, half-spread,
+/// age); every other trip (a quote guard, a panic, a component's own call) leaves those
+/// four null.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TripRow {
+    pub ts: i64,
+    pub label: String,
+    pub source: &'static str,
+    pub cause: &'static str,
+    pub reason: String,
+    pub previous_mid: Option<f64>,
+    pub mid: Option<f64>,
+    pub previous_sources: Option<serde_json::Value>,
+    pub sources: Option<serde_json::Value>,
+}
+
+impl TripRow {
+    /// The row for `trip`, stamped now.
+    pub(crate) fn new(
+        label: &str,
+        trip: &crate::guard::Trip,
+        market: Option<crate::guard::MarketTrip>,
+    ) -> TripRow {
+        let (previous, current) = match market {
+            Some(market) => (market.previous, Some(market.current)),
+            None => (None, None),
+        };
+        TripRow {
+            ts: now_secs(),
+            label: label.to_owned(),
+            source: trip.source,
+            cause: trip.cause.as_str(),
+            reason: trip.reason.alarm.clone(),
+            previous_mid: previous.as_ref().map(|j| j.mid),
+            mid: current.as_ref().map(|j| j.mid),
+            previous_sources: previous.as_ref().map(|j| j.sources_json()),
+            sources: current.as_ref().map(|j| j.sources_json()),
+        }
+    }
+}
+
 /// Whether `next` is a change from `last`, the newest config this process recorded, judged
 /// on the files rather than on the redacted JSON: a change only inside a redacted value (a
 /// rotated key, or `token_decimals`, which the name rule blanks beside the credentials)
@@ -271,6 +316,7 @@ struct Pending {
     dropped_quotes: u64,
     configs: Vec<ConfigSnapshot>,
     tokens: Vec<TokenRow>,
+    trips: Vec<TripRow>,
     latest: Latest,
 }
 
@@ -362,6 +408,12 @@ impl Recorder {
     /// The configuration the pusher is running from now on. Rare, so unbounded.
     pub fn config(&self, snapshot: ConfigSnapshot) {
         lock(&self.0).configs.push(snapshot);
+    }
+
+    /// A lane halted on its latch. Once per lane per trip (the latch makes it so), so
+    /// unbounded like configs.
+    pub fn trip(&self, row: TripRow) {
+        lock(&self.0).trips.push(row);
     }
 
     /// Everything left since the last call, keeping only `latest`, which outlives flushes.
@@ -586,13 +638,14 @@ pub fn spawn(
                     pending.dropped_quotes
                 );
             }
-            // Quotes and configs have no cadence rule: every one is a row.
+            // Quotes, configs and trips have no cadence rule: every one is a row.
             let quote_rows = std::mem::take(&mut pending.quotes);
             let config_rows = std::mem::take(&mut pending.configs);
+            let trip_rows = std::mem::take(&mut pending.trips);
             writer.tokens.append(&mut pending.tokens);
             let (mid_rows, balance_rows) =
                 select_rows(pending, now_secs(), &mut mids, &mut balances);
-            writer.queue(mid_rows, balance_rows, quote_rows, config_rows);
+            writer.queue(mid_rows, balance_rows, quote_rows, config_rows, trip_rows);
             writer.flush().await;
             if stopping {
                 return;
@@ -611,6 +664,7 @@ struct Writer {
     quotes: Vec<RecordedQuote>,
     configs: Vec<ConfigSnapshot>,
     tokens: Vec<TokenRow>,
+    trips: Vec<TripRow>,
     /// The newest config this writer has put in, unredacted, which the next one is judged a
     /// change against ([`change_since`]). Memory only: a restart starts without one.
     last_config: Option<Unredacted>,
@@ -639,6 +693,7 @@ impl Writer {
             quotes: Vec::new(),
             configs: Vec::new(),
             tokens: Vec::new(),
+            trips: Vec::new(),
             last_config: None,
             retry_at: None,
             backoff: RECONNECT_MIN,
@@ -653,6 +708,7 @@ impl Writer {
         balances: Vec<BalanceReading>,
         quotes: Vec<RecordedQuote>,
         configs: Vec<ConfigSnapshot>,
+        trips: Vec<TripRow>,
     ) {
         // One row per key per batch, the newest winning. Two flushes can land in the same
         // second after a stall (the ticker catches up), and a batch holding the same
@@ -690,6 +746,7 @@ impl Writer {
             }
         }
         self.configs.extend(configs);
+        self.trips.extend(trips);
         for queue_len in [self.mids.len(), self.balances.len(), self.quotes.len()] {
             if queue_len > MAX_BACKLOG {
                 self.dropped += queue_len - MAX_BACKLOG;
@@ -715,6 +772,7 @@ impl Writer {
             && self.quotes.is_empty()
             && self.configs.is_empty()
             && self.tokens.is_empty()
+            && self.trips.is_empty()
     }
 
     async fn flush(&mut self) {
@@ -775,6 +833,10 @@ impl Writer {
                 insert_tokens(client, &self.tokens).await?;
                 self.tokens.clear();
             }
+            if !self.trips.is_empty() {
+                insert_trips(client, &self.trips).await?;
+                self.trips.clear();
+            }
             // One at a time, each removed only once it is in: a failure leaves the rest
             // queued for the next flush, like every other row here. Judged against the last
             // one written rather than the last one queued, so a snapshot dropped with a
@@ -802,17 +864,19 @@ impl Writer {
                 self.backoff = (self.backoff * 2).min(RECONNECT_MAX);
                 if self.write_failures >= MAX_WRITE_FAILURES {
                     tracing::warn!(
-                        "[record] write failed {} times in a row ({err}); dropping {} mid, {} balance, {} quote and {} config rows",
+                        "[record] write failed {} times in a row ({err}); dropping {} mid, {} balance, {} quote, {} config and {} trip rows",
                         self.write_failures,
                         self.mids.len(),
                         self.balances.len(),
                         self.quotes.len(),
-                        self.configs.len()
+                        self.configs.len(),
+                        self.trips.len()
                     );
                     self.mids.clear();
                     self.balances.clear();
                     self.quotes.clear();
                     self.configs.clear();
+                    self.trips.clear();
                     self.write_failures = 0;
                 } else {
                     tracing::warn!("[record] write failed ({err}); reconnecting in {wait:?}");
@@ -961,6 +1025,37 @@ async fn insert_quotes(
     Ok(())
 }
 
+/// One statement for the batch, every row kept: a trip is one row per lane halt, and the
+/// latch makes sure it is queued once.
+async fn insert_trips(
+    client: &tokio_postgres::Client,
+    rows: &[TripRow],
+) -> Result<(), tokio_postgres::Error> {
+    let ts: Vec<i64> = rows.iter().map(|r| r.ts).collect();
+    let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
+    let sources: Vec<&str> = rows.iter().map(|r| r.source).collect();
+    let causes: Vec<&str> = rows.iter().map(|r| r.cause).collect();
+    let reasons: Vec<&str> = rows.iter().map(|r| r.reason.as_str()).collect();
+    let previous_mids: Vec<Option<f64>> = rows.iter().map(|r| r.previous_mid).collect();
+    let mids: Vec<Option<f64>> = rows.iter().map(|r| r.mid).collect();
+    let previous_venues: Vec<Option<serde_json::Value>> =
+        rows.iter().map(|r| r.previous_sources.clone()).collect();
+    let venues: Vec<Option<serde_json::Value>> = rows.iter().map(|r| r.sources.clone()).collect();
+    client
+        .execute(
+            "insert into feed.breaker_trips (ts, label, source, cause, reason, previous_mid, mid, previous_sources, sources)
+               select t, l, s, c, r, pm, m, pv, v
+               from unnest($1::int8[], $2::text[], $3::text[], $4::text[], $5::text[], $6::float8[], $7::float8[], $8::jsonb[], $9::jsonb[])
+                 as r(t, l, s, c, r, pm, m, pv, v)",
+            &[
+                &ts, &labels, &sources, &causes, &reasons, &previous_mids, &mids, &previous_venues,
+                &venues,
+            ],
+        )
+        .await?;
+    Ok(())
+}
+
 /// A row when `change` says this process saw the file change ([`change_since`]), or else
 /// when the config differs from the newest one stored, so the newest row's `ts` is when the
 /// running configuration last changed and a restart on the same file is not a change.
@@ -1079,13 +1174,31 @@ mod tests {
             ts,
             book: book(mid),
         };
-        w.queue(vec![row(1, 1.0)], Vec::new(), Vec::new(), Vec::new());
+        w.queue(
+            vec![row(1, 1.0)],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
         // A second flush in the same second (the ticker catching up after a stall): the
         // newer book replaces the older row instead of sitting beside it.
-        w.queue(vec![row(1, 2.0)], Vec::new(), Vec::new(), Vec::new());
+        w.queue(
+            vec![row(1, 2.0)],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
         assert_eq!(w.mids.len(), 1);
         assert_eq!(w.mids[0].book.mid, 2.0);
-        w.queue(vec![row(2, 3.0)], Vec::new(), Vec::new(), Vec::new());
+        w.queue(
+            vec![row(2, 3.0)],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
         assert_eq!(w.mids.len(), 2);
     }
 
@@ -1124,11 +1237,13 @@ mod tests {
                 stamp(row(2, 10, 3.0)),
             ],
             Vec::new(),
+            Vec::new(),
         );
         writer.queue(
             Vec::new(),
             Vec::new(),
             vec![stamp(row(1, 10, 1.5))],
+            Vec::new(),
             Vec::new(),
         );
         assert_eq!(writer.quotes.len(), 3);
@@ -1246,6 +1361,7 @@ mod tests {
             Vec::new(),
             vec![stamp(row(10, None)), stamp(row(10, terms.clone()))],
             Vec::new(),
+            Vec::new(),
         );
         assert_eq!(writer.quotes.len(), 1);
         assert_eq!(
@@ -1347,7 +1463,7 @@ api_key = "very-secret"
                 book: book(1.0),
             })
             .collect();
-        w.queue(rows, Vec::new(), Vec::new(), Vec::new());
+        w.queue(rows, Vec::new(), Vec::new(), Vec::new(), Vec::new());
         assert_eq!(w.mids.len(), MAX_BACKLOG);
         assert_eq!(w.dropped, 10);
         // The oldest went, the newest stayed.
@@ -1539,5 +1655,121 @@ api_key = "{builder_key}"
             !printed.contains("very-secret") && !printed.contains("builder-secret"),
             "{printed}"
         );
+    }
+
+    /// A latch with a recorder attached leaves one row for its trip, once: the row for a
+    /// trip judged on the composite carries both samples' mids and venues, and a trip from
+    /// anywhere else leaves those null. A second trip on the same latch is not a trip, and
+    /// leaves nothing.
+    #[test]
+    fn a_trip_is_one_row_with_the_venues_when_it_was_judged_on_the_composite() {
+        use crate::guard::{Cause, Judged, Latch, MarketTrip, SourceSample, TripReason};
+        let venue = |name: &'static str, mid: u64| {
+            SourceSample::new(
+                name,
+                1.0,
+                U256::from(mid),
+                U256::from(10_000u64),
+                Duration::from_millis(100),
+                false,
+                8,
+            )
+        };
+        let recorder = Recorder::new();
+        let judged = Latch::new();
+        judged.attach_recorder(recorder.clone(), "A/B".into());
+        judged.trip_judged(
+            "deviation",
+            Cause::Guard,
+            TripReason::new("circuit breaker tripped: mid moved 0.99% > 0.20%"),
+            MarketTrip {
+                previous: Some(Judged {
+                    mid: 1.001175,
+                    sources: vec![venue("binance", 100_117_500)],
+                }),
+                current: Judged {
+                    mid: 1.011175,
+                    sources: vec![venue("binance", 101_117_500)],
+                },
+            },
+        );
+        assert!(
+            !judged.trip("kill", Cause::External, TripReason::new("kill switch")),
+            "the first trip stands"
+        );
+        let external = Latch::new();
+        external.attach_recorder(recorder.clone(), "C/D".into());
+        external.trip(
+            "funding",
+            Cause::External,
+            TripReason::new("funding rate stale"),
+        );
+        let unattached = Latch::new();
+        unattached.trip("kill", Cause::External, TripReason::new("kill switch"));
+
+        let pending = recorder.take();
+        assert_eq!(
+            pending.trips.len(),
+            2,
+            "one row per tripped latch with a recorder"
+        );
+        let row = &pending.trips[0];
+        assert_eq!(
+            (row.label.as_str(), row.source, row.cause),
+            ("A/B", "deviation", "guard")
+        );
+        assert!(
+            row.reason
+                .starts_with("circuit breaker tripped: mid moved 0.99% > 0.20%; venues: binance"),
+            "the alarm line as the operator saw it: {}",
+            row.reason
+        );
+        assert_eq!(
+            (row.previous_mid, row.mid),
+            (Some(1.001175), Some(1.011175))
+        );
+        assert_eq!(
+            row.sources,
+            Some(serde_json::json!([{
+                "venue": "binance",
+                "weight": 1.0,
+                "mid": 1.011175,
+                "half_spread": 0.0001,
+                "age_secs": 0.1,
+            }]))
+        );
+        assert_eq!(
+            row.previous_sources
+                .as_ref()
+                .and_then(|s| s[0]["mid"].as_f64()),
+            Some(1.001175)
+        );
+        let row = &pending.trips[1];
+        assert_eq!(
+            (row.label.as_str(), row.source, row.cause),
+            ("C/D", "funding", "external")
+        );
+        assert_eq!(row.reason, "funding rate stale");
+        assert_eq!(
+            (
+                row.previous_mid,
+                row.mid,
+                &row.previous_sources,
+                &row.sources
+            ),
+            (None, None, &None, &None)
+        );
+
+        // Queued like configs: every row, no cadence, no cap.
+        let mut writer = Writer::new(String::new());
+        writer.queue(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            pending.trips,
+        );
+        assert_eq!(writer.trips.len(), 2);
+        assert!(!writer.is_empty());
     }
 }

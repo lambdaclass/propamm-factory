@@ -18,7 +18,10 @@ use tokio::sync::{mpsc, watch};
 
 use crate::config::{Feeds, Source};
 use crate::feed::{self, Adoption, Gated, PriceSample, scaled_to_f64};
-use crate::guard::{BoundGuard, Cause, CompositeSample, Latch, SourceSample, TripReason, Verdict};
+use crate::guard::{
+    BoundGuard, Cause, CompositeSample, Judged, Latch, MarketTrip, SourceSample, TripReason,
+    Verdict,
+};
 use crate::metrics::{Metrics, PairMetrics, VenueMetrics};
 use crate::record::Recorder;
 use crate::update::MAX_PRICE_AGE;
@@ -171,6 +174,7 @@ pub fn spawn(feeds: &Feeds, params: Params<'_>) -> Spawned {
         latch,
         guards,
         judges_sources,
+        previous: None,
         metrics: Gated::new(pair_metrics, adopted),
         label,
         recorder,
@@ -269,10 +273,48 @@ struct Composite {
     /// Whether any guard reads the sources behind a sample: the built-in deviation guard
     /// does not, and a lane with only that one builds no `SourceSample`s per sample.
     judges_sources: bool,
+    /// The last sample the guards passed, kept so a trip can say what each venue read
+    /// then and reads now; `None` until the first.
+    previous: Option<Previous>,
     metrics: Gated<PairMetrics>,
     label: String,
     recorder: Option<Recorder>,
     history: Option<Arc<Mutex<PriceHistory>>>,
+}
+
+/// What a trip needs of the sample judged before it: enough to rebuild the fresh venues
+/// behind it as they were ([`fresh_in`] over `latest` at `at`/`wall`), without building a
+/// `SourceSample` list on every tick for the one tick that trips.
+struct Previous {
+    at: Instant,
+    wall: SystemTime,
+    mid: U256,
+    /// Every source's latest sample as of that tick, copied, not rebuilt: one `Copy` per
+    /// source into a buffer allocated once.
+    latest: Vec<Option<PriceSample>>,
+    /// Which sources were judged late as of that tick, likewise.
+    late: Vec<bool>,
+}
+
+/// The sources whose latest sample is fresh at `(now, wall)`: delivered within
+/// [`MAX_PRICE_AGE`] and not judged `late` behind its stamp.
+fn fresh_in<'a>(
+    sources: &'a [Source],
+    latest: &[Option<PriceSample>],
+    late: &[bool],
+    now: Instant,
+    wall: SystemTime,
+) -> Vec<(&'a Source, PriceSample)> {
+    sources
+        .iter()
+        .zip(latest)
+        .zip(late)
+        .filter_map(|((source, sample), late)| {
+            sample
+                .filter(|s| !late && s.age_at(now, wall) <= MAX_PRICE_AGE)
+                .map(|s| (source, s))
+        })
+        .collect()
 }
 
 impl Composite {
@@ -305,14 +347,63 @@ impl Composite {
             .collect()
     }
 
-    /// Trips the lane, if nothing has yet, and records the transition once: the gauge and
-    /// the counter the dashboard and the page read, and the source series. A replayed
-    /// trip records nothing, so a counter cannot climb once per tick for the life of a
-    /// halted process and make `rate()` read a dead feed as a trip storm.
+    /// Trips the lane, if nothing has yet, with the sample that tripped it (`current`, as
+    /// the caller judged it from its fresh list) and the one the guards passed before it,
+    /// rebuilt here from that tick's samples as they were: what the alarm line and the
+    /// recorder's row say beyond the reason. Both venue lists cost only the tick that trips.
     /// The latch records the transition itself (see `Latch::trip`); a second trip changes
     /// nothing, and says nothing.
-    fn trip(&self, source: &'static str, cause: Cause, reason: TripReason) {
-        self.latch.trip(source, cause, reason);
+    fn trip(&self, source: &'static str, cause: Cause, reason: TripReason, current: Judged) {
+        let market = MarketTrip {
+            previous: self.previous.as_ref().map(|p| {
+                self.judged(
+                    p.mid,
+                    &fresh_in(&self.sources, &p.latest, &p.late, p.at, p.wall),
+                    p.at,
+                    p.wall,
+                )
+            }),
+            current,
+        };
+        self.latch.trip_judged(source, cause, reason, market);
+    }
+
+    /// A sample as a trip keeps it: its mid in lane orientation and human units, and the
+    /// fresh venues behind it.
+    fn judged(
+        &self,
+        mid: U256,
+        fresh: &[(&Source, PriceSample)],
+        now: Instant,
+        wall: SystemTime,
+    ) -> Judged {
+        Judged {
+            mid: scaled_to_f64(mid, self.decimals),
+            sources: self.source_samples(fresh, now, wall),
+        }
+    }
+
+    /// Keeps this tick as the one the next trip will be judged against: the guards passed
+    /// it, so it is the deviation guard's new reference.
+    fn remember(&mut self, now: Instant, wall: SystemTime, mid: U256) {
+        match &mut self.previous {
+            Some(previous) => {
+                previous.at = now;
+                previous.wall = wall;
+                previous.mid = mid;
+                previous.latest.copy_from_slice(&self.latest);
+                previous.late.copy_from_slice(&self.late);
+            }
+            None => {
+                self.previous = Some(Previous {
+                    at: now,
+                    wall,
+                    mid,
+                    latest: self.latest.clone(),
+                    late: self.late.clone(),
+                })
+            }
+        }
     }
     /// Whether source `i`'s price, which just arrived, came later than `max_lag` behind
     /// its exchange stamp, and the venue's `late` gauge. A venue late on one frame stays
@@ -346,30 +437,25 @@ impl Composite {
     /// [`MAX_PRICE_AGE`] and, under `max_lag`, not late behind its stamp. With the gauges
     /// that describe the count written.
     fn fresh_sources(&self, now: Instant, wall: SystemTime) -> Vec<(&Source, PriceSample)> {
-        let fresh: Vec<(&Source, PriceSample)> = self
-            .sources
-            .iter()
-            .zip(&self.latest)
-            .zip(&self.late)
-            .filter_map(|((source, sample), late)| {
-                sample
-                    .filter(|s| !late && s.age_at(now, wall) <= MAX_PRICE_AGE)
-                    .map(|s| (source, s))
-            })
-            .collect();
+        let fresh = fresh_in(&self.sources, &self.latest, &self.late, now, wall);
+        self.note_fresh(fresh.len());
+        fresh
+    }
+
+    /// The gauges that describe how many sources are fresh, `count` of them.
+    fn note_fresh(&self, count: usize) {
         let min = self.min_sources as f64;
         self.metrics.record(|m| {
-            m.feed_sources_fresh.set(fresh.len() as f64);
+            m.feed_sources_fresh.set(count as f64);
             m.feed_sources_min.set(min);
         });
-        if fresh.len() < self.min_sources {
+        if count < self.min_sources {
             // `feed_up` is the pair's "can publish" signal, and right now it cannot.
             self.metrics.record(|m| {
                 m.feed_up.set(0.0);
                 m.feed_sample_current.set(0.0);
             });
         }
-        fresh
     }
 
     /// The timer's work: the gauges, from what is fresh right now, and no sample.
@@ -382,7 +468,10 @@ impl Composite {
     fn recompute(&mut self, tx: &watch::Sender<Option<PriceSample>>) {
         let now = Instant::now();
         let wall = SystemTime::now();
-        let fresh = self.fresh_sources(now, wall);
+        // Borrowing the sources alone, not `self`: the guards below are run through
+        // `&mut self.guards` while `fresh` is still needed for a trip.
+        let fresh = fresh_in(&self.sources, &self.latest, &self.late, now, wall);
+        self.note_fresh(fresh.len());
         if fresh.len() < self.min_sources {
             // The last composite is withdrawn, not left to age out. For venues that went
             // silent that changes nothing: the last composite was published at the last
@@ -458,8 +547,12 @@ impl Composite {
                     }
                 }
             }
-            if let Some((source, cause, reason)) = tripped {
-                self.trip(source, cause, reason);
+            match tripped {
+                Some((source, cause, reason)) => {
+                    let current = self.judged(mid, &fresh, now, wall);
+                    self.trip(source, cause, reason, current);
+                }
+                None => self.remember(now, wall, mid),
             }
         }
 
@@ -711,8 +804,23 @@ mod tests {
             .expect("a 5.9% jump between two unread samples must trip the lane");
         assert_eq!((trip.source, trip.cause), ("deviation", Cause::Guard));
         assert!(
-            trip.reason.alarm.ends_with("(previous 1.001, new 1.06)"),
+            trip.reason.alarm.contains("(previous 1.001, new 1.06)"),
             "judged against the sample before it: {}",
+            trip.reason.alarm
+        );
+        // The venues behind both samples follow the reason: the one venue, with the mid
+        // it read then and the one it reads now, its whole share of the weight, and its
+        // age, which only the clock knows.
+        assert!(
+            trip.reason
+                .alarm
+                .contains("; venues: binance 1.001 -> 1.06 (weight 1.000, "),
+            "the alarm names the venue that moved: {}",
+            trip.reason.alarm
+        );
+        assert!(
+            trip.reason.alarm.ends_with("s old)"),
+            "{}",
             trip.reason.alarm
         );
         let m = metrics.for_pair("TEST");
@@ -894,9 +1002,12 @@ mod tests {
         .unwrap();
         let trip = latch.tripped().expect("a panic trips the lane");
         assert_eq!((trip.source, trip.cause), ("dispersion", Cause::Panic));
+        // A panic in a market guard is a trip judged on the composite too: the venues
+        // behind the sample it panicked on follow the reason, as after any verdict.
         assert_eq!(
             trip.reason.alarm,
-            "assess of `dispersion` panicked: dispersion index out of range"
+            "assess of `dispersion` panicked: dispersion index out of range; venues: \
+             binance 1 (no earlier sample; weight 1.000, 0.0s old)"
         );
         assert_eq!(
             metrics.trip_source("TEST", "dispersion", "panic").get(),

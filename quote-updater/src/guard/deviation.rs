@@ -79,6 +79,9 @@ impl Deviation {
 pub(crate) struct Ratios {
     pub(crate) tick: Option<f64>,
     pub(crate) window: Option<f64>,
+    /// The last tick-to-tick move itself, as a fraction of the previous mid: what `tick`
+    /// is before dividing by the limit, for `quote_updater_breaker_deviation`.
+    pub(crate) tick_move: Option<f64>,
 }
 
 /// The shared readout of [`Ratios`].
@@ -98,6 +101,8 @@ pub(crate) struct DeviationGuard {
     window: VecDeque<(Instant, U256)>,
     /// The ratio `assess` last measured. See `last_deviation_ratio`.
     last_ratio: Option<f64>,
+    /// The move `assess` last measured, as a fraction of the previous mid. See `last_move`.
+    last_move: Option<f64>,
     /// The windowed ratio `assess` last measured. See `last_window_deviation_ratio`.
     last_window_ratio: Option<f64>,
     /// The numbers of the last trip, for the tests that pin them.
@@ -120,6 +125,7 @@ impl DeviationGuard {
             reference: None,
             window: VecDeque::new(),
             last_ratio: None,
+            last_move: None,
             last_window_ratio: None,
             last_deviation: None,
             readout: Readout::default(),
@@ -160,14 +166,27 @@ impl DeviationGuard {
     /// than an infinity: a zero mid is refused upstream, and an infinity on a dashboard
     /// reads as a bug in the gauge rather than in the feed.
     fn ratio(&self, diff: U256, reference: U256, threshold: U256) -> f64 {
-        let d = crate::feed::scaled_to_f64(diff, self.config.decimals);
-        let r = crate::feed::scaled_to_f64(reference, self.config.decimals);
         let limit = crate::feed::scaled_to_f64(threshold, self.config.decimals);
-        if r == 0.0 || limit == 0.0 {
+        if limit == 0.0 {
             0.0
         } else {
-            (d / r) / limit
+            self.fraction(diff, reference) / limit
         }
+    }
+
+    /// `diff/reference`: the move as a fraction of the mid it is measured from, 0.0 for a
+    /// zero reference as [`Self::ratio`] reads it.
+    fn fraction(&self, diff: U256, reference: U256) -> f64 {
+        let d = crate::feed::scaled_to_f64(diff, self.config.decimals);
+        let r = crate::feed::scaled_to_f64(reference, self.config.decimals);
+        if r == 0.0 { 0.0 } else { d / r }
+    }
+
+    /// The last tick-to-tick move `assess` measured, as a fraction of the previous mid.
+    /// `None` until a second sample arrives.
+    #[cfg(test)]
+    pub(crate) fn last_move(&self) -> Option<f64> {
+        self.last_move
     }
 
     /// The last tick-to-tick move `assess` measured, as a fraction of the configured limit:
@@ -287,11 +306,15 @@ impl DeviationGuard {
         *self.readout.lock().unwrap_or_else(|e| e.into_inner()) = Ratios {
             tick: self.last_ratio,
             window: self.last_window_ratio,
+            tick_move: self.last_move,
         };
         if let Some(gated) = &self.metrics {
             gated.record(|m| {
                 if let Some(ratio) = self.last_ratio {
                     m.breaker_deviation_ratio.set(ratio);
+                }
+                if let Some(moved) = self.last_move {
+                    m.breaker_deviation.set(moved);
                 }
                 if let Some(ratio) = self.last_window_ratio {
                     m.breaker_window_deviation_ratio.set(ratio);
@@ -338,6 +361,7 @@ impl MarketGuard for DeviationGuard {
         if let Some(threshold) = self.config.threshold_scaled {
             let diff = self.deviation(mid, previous);
             self.last_ratio = Some(self.ratio(diff, previous, threshold));
+            self.last_move = Some(self.fraction(diff, previous));
             if self.beyond(diff, previous, threshold) {
                 let deviation =
                     self.describe(diff, previous, mid, threshold, String::new(), "previous");
@@ -825,5 +849,24 @@ mod tests {
         let sample = crate::testing::composite_sample(&pair, 4000.0, 0.0001, now());
         assert!((sample.mid_f64() - 4000.0).abs() < 1e-9);
         assert!(sample.sources().is_empty());
+    }
+
+    /// The move itself, beside the ratio: a 1% step at a 2% limit reads 0.01 and 0.5, and
+    /// the first sample has none.
+    #[test]
+    fn the_last_move_is_the_ratio_before_the_limit_divides_it() {
+        let mut g = guard(config("0.02"));
+        assert_eq!(g.last_move(), None);
+        assert_eq!(assess(&mut g, mid("100000"), now()), Verdict::Pass);
+        assert_eq!(
+            g.last_move(),
+            None,
+            "the first mid has nothing to move from"
+        );
+        assert_eq!(assess(&mut g, mid("101000"), now()), Verdict::Pass);
+        let moved = g.last_move().unwrap();
+        assert!((moved - 0.01).abs() < 1e-9, "{moved}");
+        let ratio = g.last_deviation_ratio().unwrap();
+        assert!((ratio - 0.5).abs() < 1e-9, "{ratio}");
     }
 }
