@@ -536,7 +536,14 @@ venue's live price (a websocket to `/pairs/preview`). The form still works witho
 
 The live prices run over one websocket per open page. Ticking a venue tells the server to
 connect to it, unticking tells it to disconnect that venue, and a new weight reconnects
-nothing, so a change never touches the other venues. The preview connects to the venues from
+nothing, so a change never touches the other venues. Beside each ticked venue's live mid the
+form shows its latency from this host, `median / p95 ms` with the mean and the sample count
+on hover: for a streaming venue, a protocol ping over that same socket every ten seconds
+(the first right after subscribing), timed to its pong; for a polled venue, each fetch. It
+is the round trip to the venue's edge from the host the updater runs on, so a venue far
+from the host shows it here before it is chosen. The feeds a running pair opens time theirs
+the same way; the numbers on the form are those of the form's own connections, from the
+moment the venue was ticked. The preview connects to the venues from
 this host, the same address the live feeds use, and a venue can block an address that opens
 too many connections, so it is kept small: at most 4 pages open at once, and each venue
 connected at most once every 2 seconds per page however fast the page changes it. The socket
