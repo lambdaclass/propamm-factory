@@ -12,7 +12,7 @@
       <button class=danger>Halt all pairs</button>
     </form>
     <form method=post action=/reload>
-      <button class=primary title="Resumes the pairs halted from this page and re-arms tripped breakers. A pair halted with a reason (a binary's kill switch) resumes only from its own row.">Restart halted pairs</button>
+      <button class=primary title="Resumes the pairs halted from this page and re-arms every tripped breaker. A pair halted with a reason (a binary's kill switch) resumes only from its own row, and a tripped pair's row has Re-arm for just that one.">Restart halted pairs</button>
     </form>
     <a class=btn href="/settings">Settings</a>
   </div>
@@ -45,6 +45,13 @@
         <td>{% if let Some(v) = pair.breaker %}<span class=val>{{ v }}</span>{% else %}<span class=unset>&ndash;</span>{% endif %}</td>
         <td class=rowactions>
           <a class=btn href="/pairs/edit/{{ pair.key_env }}">Edit</a>
+          {% if pair.tripped %}
+          <form method=post action=/pairs/rearm
+                onsubmit="return confirm('Re-arm {{ pair.key_env }}? It starts quoting again at every builder; any other pair stopped on its breaker stays stopped.')">
+            <input type=hidden name=key_env value="{{ pair.key_env }}">
+            <button>Re-arm</button>
+          </form>
+          {% endif %}
           {% if pair.halted %}
           <form method=post action=/pairs/resume
                 onsubmit="return confirm('Resume {{ pair.key_env }}? It starts quoting again at every builder.')">

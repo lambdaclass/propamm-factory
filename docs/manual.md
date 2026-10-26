@@ -508,8 +508,11 @@ reload: [WETH/USDC] re-armed, clearing the halt it took 14m ago on a 4.10% move 
 ```
 
 A reload re-arms **every** halted lane, including one you were not thinking about when you
-ran it. That is the cost of having a single verb rather than a separate "resume this pair",
-and why each one is named individually rather than folded into a count.
+ran it. That is the cost of having a single verb, and why each one is named individually
+rather than folded into a count. To bring one pair back while another stays down, use
+**Re-arm** on that pair's row in the backoffice: it is the same reload scoped to that one
+lane, so every other lane halted on its breaker is left as it is (and an edit waiting in
+the file is still applied). It is refused when the pair is not stopped on its breaker.
 
 Some things still need a restart, and the updater refuses the reload and says which:
 
@@ -557,11 +560,12 @@ updater treats a halted pair as absent: its quote is withdrawn at every builder,
 would, but the stanza and every setting stay in the file. It stays halted across reloads and
 restarts until someone resumes it, from its row or with Restart halted pairs, which clears
 the `halted` flag of every pair halted from the page along with re-arming pairs stopped on
-their circuit breaker. A halt with a `halt_reason` beside it is left alone by that button: a
-binary's `UpdaterHandle::halt` always writes one (it is that binary's kill switch), and the
-page's own Halt writes none. The banner names each pair it left halted and its reason; only
-that pair's own Resume (or the handle's `resume`) clears it. A halted pair's vault balances
-are still exported.
+their circuit breaker. A pair stopped on its breaker shows **Re-arm** on its row instead,
+which re-arms that one and leaves every other tripped pair stopped. A halt with a
+`halt_reason` beside it is left alone by that button: a binary's `UpdaterHandle::halt`
+always writes one (it is that binary's kill switch), and the page's own Halt writes none.
+The banner names each pair it left halted and its reason; only that pair's own Resume (or
+the handle's `resume`) clears it. A halted pair's vault balances are still exported.
 
 **Every change is write, reload, and revert if refused.** The file is rewritten atomically,
 the service is asked to reload it, and if the reload is rejected the previous file is put
