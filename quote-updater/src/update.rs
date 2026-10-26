@@ -4,7 +4,7 @@
 
 use std::{
     sync::{Arc, Mutex},
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 
 use ethrex_common::{
@@ -114,10 +114,7 @@ impl UpdateStamp {
 
 /// Seconds since the epoch on the wall clock.
 pub fn wall_clock_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+    (crate::poll::wall_clock_ms() / 1_000) as u64
 }
 
 /// max_fee_per_gas for a transaction that must land in the very next block: twice the
@@ -386,7 +383,7 @@ fn fresh_sample(
     let sample = (*rx.borrow()).ok_or_else(|| {
         Unusable::new(
             UnusableKind::NoSample,
-            "no price received from the feed yet".to_owned(),
+            "no usable price from the feed".to_owned(),
         )
     })?;
     let age = sample.age();
@@ -794,6 +791,8 @@ pub(crate) fn stamped_ts(raw_tx: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use std::time::SystemTime;
+
     use ethrex_common::Bytes;
     use ethrex_l2_sdk::calldata::decode_calldata;
 
@@ -994,7 +993,7 @@ mod tests {
 
             let err = source.current_detailed(&band).unwrap_err();
             assert_eq!(err.kind(), Some(UnusableKind::NoSample));
-            assert_eq!(err.to_string(), "no price received from the feed yet");
+            assert_eq!(err.to_string(), "no usable price from the feed");
             assert!(latch.tripped().is_none());
 
             // A sample a minute old by the wall clock: stale.
@@ -1281,7 +1280,7 @@ mod tests {
         let (_tx, source) = feed_of_empty();
         let err = source.current(&MidBand::default()).unwrap_err();
         assert_eq!(err.kind(), Some(UnusableKind::NoSample));
-        assert_eq!(err.to_string(), "no price received from the feed yet");
+        assert_eq!(err.to_string(), "no usable price from the feed");
     }
 
     /// `Stale` is the one `Unusable` message this branch retyped by hand (`ensure!` ->
