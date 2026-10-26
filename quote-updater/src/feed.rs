@@ -8,7 +8,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use ethrex_common::U256;
-use eyre::{Result, WrapErr, ensure, eyre};
+use eyre::{Result, WrapErr, bail, ensure, eyre};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::Message;
@@ -29,17 +29,19 @@ pub struct Connected {
     up: Arc<AtomicU8>,
     /// How late the venue's latest accepted price arrived; see [`PriceLag`].
     priced: Arc<std::sync::Mutex<Option<PriceLag>>>,
-    /// The round trips to the venue lately; see [`Latency`].
-    rtt: Arc<std::sync::Mutex<Latency>>,
+    /// The round trips to the venue lately, on a connection that times them
+    /// ([`Connected::timed`]); `None` on every other. See [`Latency`].
+    rtt: Option<Arc<std::sync::Mutex<Latency>>>,
 }
 
 /// How many round trips [`Latency`] keeps: at one every [`PING_INTERVAL`], ten minutes.
 const LATENCY_SAMPLES: usize = 60;
 
-/// The last [`LATENCY_SAMPLES`] round trips to a venue: for a streaming venue, a protocol
-/// ping answered with a pong, sent every [`PING_INTERVAL`] whether or not the book moves;
-/// for a polled one, each fetch. What the backoffice's pair form shows beside each venue,
-/// so an operator picking venues sees how far away each one is from this host.
+/// The last [`LATENCY_SAMPLES`] round trips to a venue, on a connection that times them
+/// ([`Connected::timed`]): for a streaming venue, a protocol ping answered with a pong,
+/// sent every [`PING_INTERVAL`] whether or not the book moves; for a polled one, each
+/// fetch. What the backoffice's pair form shows beside each venue, so an operator picking
+/// venues sees how far away each one is from this host.
 #[derive(Debug, Default)]
 pub struct Latency {
     samples: std::collections::VecDeque<Duration>,
@@ -286,17 +288,41 @@ impl Connected {
         }
     }
 
-    /// Records one round trip to the venue.
-    pub(crate) fn round_trip(&self, rtt: Duration) {
-        self.rtt
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .record(rtt);
+    /// A connection that times its round trips: the pair form's, whose latency column
+    /// reads them. A streaming one sends a numbered protocol ping every [`PING_INTERVAL`],
+    /// the first at once; a polled one times each fetch. The connections a running pair
+    /// quotes from are `Connected::default()` and time nothing, so the only frames that
+    /// prove them alive are the venue's own.
+    pub fn timed() -> Self {
+        Self {
+            rtt: Some(Arc::default()),
+            ..Self::default()
+        }
     }
 
-    /// The round trips to the venue lately, summarised; `None` before the first.
+    /// Whether this connection times its round trips; see [`Self::timed`].
+    pub(crate) fn times_round_trips(&self) -> bool {
+        self.rtt.is_some()
+    }
+
+    /// Records one round trip to the venue, on a connection that times them.
+    pub(crate) fn round_trip(&self, rtt: Duration) {
+        if let Some(latency) = &self.rtt {
+            latency
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .record(rtt);
+        }
+    }
+
+    /// The round trips to the venue lately, summarised; `None` before the first, and on a
+    /// connection that does not time them.
     pub fn latency(&self) -> Option<LatencyStats> {
-        self.rtt.lock().unwrap_or_else(|e| e.into_inner()).stats()
+        self.rtt
+            .as_ref()?
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .stats()
     }
 
     /// Records how late the price the feed just accepted arrived.
@@ -416,9 +442,9 @@ impl Adoption {
     }
 }
 
-/// How often a connection is pinged, in the venue's own keepalive dialect and with a
-/// numbered protocol ping that times the round trip ([`Latency`]), whether or not frames
-/// are arriving. Two jobs. On a quiet book the answer is the only sign the socket is
+/// How often a connection is pinged, in the venue's own keepalive dialect, whether or not
+/// frames are arriving (and, on a connection that times its round trips, with a numbered
+/// protocol ping as well; see [`Connected::timed`]). Two jobs. On a quiet book the answer is the only sign the socket is
 /// alive: bookTicker emits only when the best bid/ask changes, so silence alone does not
 /// mean the connection is dead — a quiet book on an illiquid pair is healthy. And several
 /// venues drop a socket that has not pinged them lately however busy it is: KuCoin's
@@ -641,47 +667,73 @@ impl Feed {
                 .wrap_err("subscribe failed")?;
         }
         self.set_connected(true);
-        let mut last_inbound = Instant::now();
+        let mut last_inbound = tokio::time::Instant::now();
         // Whether the sample in the channel is still backed by a ticker this connection
         // accepted. A rejected ticker (one-sided or crossed book) leaves the previous sample
         // in place, and from that moment on it no longer describes a book anyone can trade —
         // so it must be allowed to age out. See the Ping/Pong arm below.
         let mut sample_is_current = false;
-        // One timer, on a clock rather than after a silence: a busy stream never goes
-        // quiet, and the venues that require a ping would close the socket while frames
-        // were still arriving. See PING_INTERVAL. Each tick sends the venue's own keepalive
-        // when it has one, and a protocol ping always: numbered, so the pong is matched to
-        // the ping it answers and a late one is not timed as a fresh round trip. For a venue
-        // with no keepalive of its own that ping is the keepalive. The first tick completes
-        // at once, so the pair form has a round trip within a second of ticking a venue.
-        let mut ping_ticker = tokio::time::interval(PING_INTERVAL);
+        // On a clock rather than after a silence: a busy stream never goes quiet, and the
+        // venues that require a ping would close the socket while frames were still
+        // arriving. See PING_INTERVAL. The first ping is one interval out: the subscribe
+        // just went out and the venue has nothing to answer yet. A connection that times
+        // its round trips (the pair form's, see `Connected::timed`) pings at once instead,
+        // so the form has a latency within a second of a venue being ticked.
+        let timed = self.connected.times_round_trips();
+        let first_ping = if timed {
+            tokio::time::Instant::now()
+        } else {
+            tokio::time::Instant::now() + PING_INTERVAL
+        };
+        let mut ping_ticker = tokio::time::interval_at(first_ping, PING_INTERVAL);
         ping_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The round-trip ping last sent and when, on a connection that times them: numbered,
+        // so its pong is matched to it and a late one is not timed as a fresh round trip.
         let mut rtt_seq: u64 = 0;
         let mut rtt_sent: Option<(u64, Instant)> = None;
         loop {
             let msg = tokio::select! {
                 msg = ws.next() => msg,
                 _ = ping_ticker.tick() => {
-                    ensure!(
-                        last_inbound.elapsed() < MAX_QUIET,
-                        "no message in {MAX_QUIET:?}"
-                    );
-                    // Any answering frame below counts as feed liveness.
-                    if let Some(text) = keepalive.frame() {
-                        ws.send(Message::text(text)).await.wrap_err("ping failed")?;
+                    // Any answering frame below counts as feed liveness. The venue's own
+                    // keepalive always; the numbered protocol ping only on a connection that
+                    // times its round trips, where it is also the keepalive of a venue with
+                    // none of its own. Never on a quoting connection: the websocket layer
+                    // answers a protocol ping by itself, so its pong would keep a connection
+                    // looking alive (and its last price fresh) after the venue stopped
+                    // serving it.
+                    match keepalive.frame() {
+                        Some(text) => {
+                            ws.send(Message::text(text)).await.wrap_err("ping failed")?;
+                        }
+                        None if !timed => {
+                            ws.send(Message::Ping(Vec::new().into()))
+                                .await
+                                .wrap_err("ping failed")?;
+                        }
+                        None => {}
                     }
-                    rtt_seq += 1;
-                    ws.send(Message::Ping(rtt_seq.to_be_bytes().to_vec().into()))
-                        .await
-                        .wrap_err("ping failed")?;
-                    rtt_sent = Some((rtt_seq, Instant::now()));
+                    if timed {
+                        rtt_seq += 1;
+                        ws.send(Message::Ping(rtt_seq.to_be_bytes().to_vec().into()))
+                            .await
+                            .wrap_err("ping failed")?;
+                        rtt_sent = Some((rtt_seq, Instant::now()));
+                    }
                     continue;
+                }
+                // Its own deadline from the last frame, not a check on the ping grid: the
+                // grid is laid down at connect and a frame can land anywhere on it, so a
+                // check that ran only on ticks would hang up to one ping late. A fresh
+                // sleep per turn of the loop, which is one timer per inbound frame.
+                _ = tokio::time::sleep_until(last_inbound + MAX_QUIET) => {
+                    bail!("no message in {MAX_QUIET:?}");
                 }
             };
             let Some(msg) = msg else {
                 return Ok(());
             };
-            last_inbound = Instant::now();
+            last_inbound = tokio::time::Instant::now();
             match msg? {
                 Message::Text(text) => self.on_frame(&text, &mut sample_is_current),
                 Message::Close(_) => return Ok(()),
@@ -1400,18 +1452,19 @@ mod tests {
     /// PING_INTERVAL. The venues that require a client ping on a cadence close the socket
     /// otherwise, while frames are still arriving, so a ping sent only after a silence is
     /// a ping those venues never see on a busy market. The mock streams a ticker every
-    /// 200ms, well inside PING_INTERVAL, and must still receive the venue's text ping: one
-    /// on connecting and the next a PING_INTERVAL later. Real time, so the test takes a
-    /// PING_INTERVAL: a paused clock races ahead of the socket handshake and cuts it off.
+    /// 200ms, well inside PING_INTERVAL, and must still receive the venue's text ping.
+    /// Real time, so the test takes a PING_INTERVAL: a paused clock races ahead of the
+    /// socket handshake and cuts it off.
     #[tokio::test]
     async fn a_busy_stream_is_still_pinged_on_the_cadence() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let (pinged_tx, mut pinged_rx) = tokio::sync::mpsc::channel::<Duration>(4);
+        let (pinged_tx, pinged_rx) = tokio::sync::oneshot::channel::<Duration>();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = accept_async(stream).await.unwrap();
             let started = Instant::now();
+            let mut pinged_tx = Some(pinged_tx);
             let mut frames = tokio::time::interval(Duration::from_millis(200));
             loop {
                 tokio::select! {
@@ -1423,7 +1476,9 @@ mod tests {
                     }
                     msg = ws.next() => match msg {
                         Some(Ok(Message::Text(text))) if text.as_str() == "ping" => {
-                            let _ = pinged_tx.try_send(started.elapsed());
+                            if let Some(tx) = pinged_tx.take() {
+                                let _ = tx.send(started.elapsed());
+                            }
                             if ws.send(Message::text("pong")).await.is_err() {
                                 return;
                             }
@@ -1446,18 +1501,179 @@ mod tests {
             None,
             Default::default(),
         );
-        let first = tokio::time::timeout(Duration::from_secs(5), pinged_rx.recv())
+        let after = tokio::time::timeout(PING_INTERVAL * 2, pinged_rx)
             .await
-            .expect("a stream is pinged on connecting")
+            .expect("a busy stream was never pinged")
             .expect("the mock went away before a ping arrived");
-        let second = tokio::time::timeout(PING_INTERVAL * 2, pinged_rx.recv())
-            .await
-            .expect("a busy stream was never pinged again")
-            .expect("the mock went away before the second ping arrived");
-        let gap = second - first;
         assert!(
-            gap >= PING_INTERVAL - Duration::from_millis(500) && gap < PING_INTERVAL * 2,
-            "the ping must follow the cadence, not the silence: {gap:?} between the first two"
+            after >= PING_INTERVAL && after < PING_INTERVAL * 2,
+            "the ping must follow the cadence, not the silence: arrived after {after:?}"
+        );
+    }
+
+    /// A quoting connection pings only in the venue's own dialect: no protocol ping, whose
+    /// pong the websocket layer gives by itself and which would keep the connection looking
+    /// alive after the venue stopped serving it. The round-trip pings are the pair form's
+    /// alone (`Connected::timed`). The mock records every frame for a little over one
+    /// PING_INTERVAL and must see the venue's text ping and no protocol ping. Real time,
+    /// as above.
+    #[tokio::test]
+    async fn a_quoting_connection_sends_no_protocol_ping() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<(usize, usize)>();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            let ticker = r#"{"arg":{"channel":"tickers","instId":"ETH-USDC"},"data":[{"instId":"ETH-USDC","askPx":"1.0000","bidPx":"0.9998","ts":"1597026383085"}]}"#;
+            ws.send(Message::text(ticker)).await.unwrap();
+            let (mut text_pings, mut protocol_pings) = (0, 0);
+            let until = tokio::time::Instant::now() + PING_INTERVAL + Duration::from_secs(2);
+            while let Ok(Some(Ok(msg))) = tokio::time::timeout_at(until, ws.next()).await {
+                match msg {
+                    Message::Text(text) if text.as_str() == "ping" => {
+                        text_pings += 1;
+                        let _ = ws.send(Message::text("pong")).await;
+                    }
+                    Message::Ping(_) => protocol_pings += 1,
+                    _ => {}
+                }
+            }
+            let _ = seen_tx.send((text_pings, protocol_pings));
+        });
+
+        let _rx = spawn_feed(
+            Arc::new(http_client()),
+            VenueId::Okx,
+            &format!("ws://{addr}/ws"),
+            "ETH-USDC",
+            8,
+            false,
+            adopted(&test_metrics()),
+            None,
+            Connected::default(),
+        );
+        let (text_pings, protocol_pings) =
+            tokio::time::timeout(PING_INTERVAL + Duration::from_secs(5), seen_rx)
+                .await
+                .expect("the mock never reported")
+                .expect("the mock went away");
+        assert!(text_pings >= 1, "the venue's own keepalive must go out");
+        assert_eq!(
+            protocol_pings, 0,
+            "a quoting connection must not send a protocol ping"
+        );
+    }
+
+    /// A socket that stops answering is hung up on MAX_QUIET after its last inbound frame,
+    /// not at the next ping after that. The pings go out on a grid laid down at connect and
+    /// a frame can land anywhere on it, so a check that ran only on the grid would declare
+    /// the socket dead up to one ping late: a redial up to PING_INTERVAL later on every
+    /// dead-socket event. The mock sends one ticker a quarter of a ping into the connection,
+    /// then swallows every ping, and measures the silence from that ticker to the feed
+    /// hanging up. Real time, so the test takes a MAX_QUIET, for the reason given on the
+    /// busy-stream test.
+    #[tokio::test]
+    async fn a_dead_socket_is_hung_up_on_at_max_quiet_not_at_the_next_ping() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (silence_tx, silence_rx) = tokio::sync::oneshot::channel::<Duration>();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            // Off the ping grid: a quarter of a ping in.
+            tokio::time::sleep(PING_INTERVAL / 4).await;
+            let ticker = r#"{"arg":{"channel":"tickers","instId":"ETH-USDC"},"data":[{"instId":"ETH-USDC","askPx":"1.0000","bidPx":"0.9998","ts":"1597026383085"}]}"#;
+            ws.send(Message::text(ticker)).await.unwrap();
+            let quiet_since = Instant::now();
+            // Half dead from here: reads whatever the feed sends, answers nothing.
+            while let Some(Ok(_)) = ws.next().await {}
+            let _ = silence_tx.send(quiet_since.elapsed());
+        });
+
+        let _rx = spawn_feed(
+            Arc::new(http_client()),
+            VenueId::Okx,
+            &format!("ws://{addr}/ws"),
+            "ETH-USDC",
+            8,
+            false,
+            adopted(&test_metrics()),
+            None,
+            Default::default(),
+        );
+        let silence = tokio::time::timeout(MAX_QUIET + PING_INTERVAL, silence_rx)
+            .await
+            .expect("the feed never hung up on a dead socket")
+            .expect("the mock went away before the feed hung up");
+        assert!(
+            silence >= MAX_QUIET,
+            "hung up before MAX_QUIET: {silence:?} after the last frame"
+        );
+        assert!(
+            silence < MAX_QUIET + PING_INTERVAL / 2,
+            "the hang-up must follow the silence, not the ping grid: {silence:?} after the \
+             last frame"
+        );
+    }
+
+    /// A pong is liveness. On a quiet book the venue's answer to the ping is the only
+    /// inbound frame, and it must both keep the socket up past MAX_QUIET and keep the
+    /// retained sample fresh: a book that has not changed is still the book. The mock sends
+    /// one ticker and then only answers pings, in OKX's dialect so the answer goes through
+    /// the venue's parser as a no-price frame rather than through tungstenite's own pong
+    /// handling. Real time, so the test takes a little over a MAX_QUIET, as above.
+    #[tokio::test]
+    async fn a_pong_is_liveness_on_a_quiet_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            let ticker = r#"{"arg":{"channel":"tickers","instId":"ETH-USDC"},"data":[{"instId":"ETH-USDC","askPx":"1.0000","bidPx":"0.9998","ts":"1597026383085"}]}"#;
+            ws.send(Message::text(ticker)).await.unwrap();
+            // Then only pongs, for as long as the feed keeps asking.
+            while let Some(Ok(msg)) = ws.next().await {
+                if matches!(&msg, Message::Text(text) if text.as_str() == "ping")
+                    && ws.send(Message::text("pong")).await.is_err()
+                {
+                    return;
+                }
+            }
+        });
+
+        let mut rx = spawn_feed(
+            Arc::new(http_client()),
+            VenueId::Okx,
+            &format!("ws://{addr}/ws"),
+            "ETH-USDC",
+            8,
+            false,
+            adopted(&test_metrics()),
+            None,
+            Default::default(),
+        );
+        let first = tokio::time::timeout(Duration::from_secs(5), rx.wait_for(|s| s.is_some()))
+            .await
+            .expect("no price from the mock")
+            .unwrap()
+            .unwrap();
+        // Past MAX_QUIET with no second ticker: the socket is still up only if the pongs
+        // counted, and the stamp has moved only if they refreshed the sample.
+        let refreshed = tokio::time::timeout(
+            MAX_QUIET + PING_INTERVAL * 2,
+            rx.wait_for(|s| {
+                s.as_ref()
+                    .is_some_and(|s| s.at >= first.at + MAX_QUIET + PING_INTERVAL)
+            }),
+        )
+        .await
+        .expect("the sample stopped being refreshed: the pongs did not count as liveness")
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            refreshed.mid, first.mid,
+            "a pong refreshes the sample's stamp, not its value"
         );
     }
 
@@ -1960,7 +2176,7 @@ mod tests {
             // Reading is what lets tungstenite answer pings with pongs.
             while let Some(Ok(_)) = ws.next().await {}
         });
-        let connected = Connected::default();
+        let connected = Connected::timed();
         let metrics = crate::metrics::Metrics::new().unwrap();
         let _rx = spawn_feed(
             Arc::new(http_client()),

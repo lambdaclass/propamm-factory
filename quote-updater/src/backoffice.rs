@@ -998,7 +998,8 @@ async fn preview_session(
                     if state.rx.is_some() || !due {
                         continue;
                     }
-                    state.connected = Default::default();
+                    // Timed: the latency column reads these round trips.
+                    state.connected = crate::feed::Connected::timed();
                     state.rx = Some(crate::feed::spawn_feed(
                         endpoints.http(),
                         *venue,
