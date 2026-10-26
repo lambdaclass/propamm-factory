@@ -1008,6 +1008,7 @@ async fn preview_session(
                         ),
                         None,
                         Default::default(),
+                        crate::feed::Cadence::default(),
                     ));
                     dialed.insert(*venue, now);
                 }
