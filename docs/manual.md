@@ -141,7 +141,7 @@ The venues, and how each spells a market (wrapped tokens are spelled as the unde
 | venue | spelling | how it is read |
 |---|---|---|
 | `binance` | `ETHUSDC` | bookTicker stream |
-| `coinbase` | `ETH-USD` | ticker stream |
+| `coinbase` | `ETH-USD` | Advanced Trade ticker stream |
 | `kraken` | `ETH/USD` | ticker stream (v2) |
 | `okx` | `ETH-USDC` | tickers stream |
 | `bybit` | `ETHUSDC` | level-1 order book stream |
@@ -204,7 +204,7 @@ stay current. Frames keep arriving, so nothing drops out, and the pair quotes pr
 of seconds old.
 
 What the key measures is the stream, not the market. Most venues write the exchange's own
-clock reading into every price frame: Kraken (`timestamp`), Coinbase (`time`), OKX (`ts`),
+clock reading into every price frame: Kraken (`timestamp`), Coinbase (`timestamp`), OKX (`ts`),
 Bybit (`ts`), KuCoin (`timestamp`), Bitget (`ts`) and Gate (`t`). The feed subtracts that from
 the frame's arrival, which gives how long the frame took to reach us. A backlog makes every
 frame late by seconds; a quiet book whose last frame arrived promptly reads as prompt

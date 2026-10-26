@@ -16,13 +16,13 @@ pub const DEFAULT_ENDPOINT: &str = "wss://ws.kraken.com/v2";
 pub fn connection(endpoint: &str, symbol: &str) -> Connection {
     Connection::Stream {
         url: endpoint.trim_end_matches('/').to_owned(),
-        subscribe: Some(
+        subscribe: vec![
             json!({
                 "method": "subscribe",
                 "params": { "channel": "ticker", "symbol": [symbol] },
             })
             .to_string(),
-        ),
+        ],
         keepalive: Keepalive::Text(json!({ "method": "ping" }).to_string()),
     }
 }
@@ -108,7 +108,10 @@ mod tests {
         else {
             panic!("streams")
         };
-        let sub: serde_json::Value = serde_json::from_str(&subscribe.unwrap()).unwrap();
+        let [sub] = subscribe.as_slice() else {
+            panic!("one subscribe frame")
+        };
+        let sub: serde_json::Value = serde_json::from_str(sub).unwrap();
         assert_eq!(sub["params"]["channel"], "ticker");
         assert_eq!(sub["params"]["symbol"], json!(["ETH/USD"]));
         assert_eq!(keepalive, Keepalive::Text(r#"{"method":"ping"}"#.into()));

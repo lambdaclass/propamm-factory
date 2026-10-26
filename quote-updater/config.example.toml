@@ -94,7 +94,7 @@ disable_cross_region = false
 # [settings], because it is a sub-table.
 # [settings.endpoints]
 # binance = "wss://stream.binance.com:9443/ws"
-# coinbase = "wss://ws-feed.exchange.coinbase.com"
+# coinbase = "wss://advanced-trade-ws.coinbase.com"
 # kucoin = "https://api.kucoin.com"        # the REST host its socket URL is fetched from
 # mexc = "https://api.mexc.com"            # polled
 # coingecko = "https://api.coingecko.com/api/v3"  # not a venue: where vault USD prices come from

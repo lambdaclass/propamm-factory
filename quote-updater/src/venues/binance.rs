@@ -20,7 +20,7 @@ pub fn connection(endpoint: &str, symbol: &str) -> Connection {
             endpoint.trim_end_matches('/'),
             symbol.to_lowercase()
         ),
-        subscribe: None,
+        subscribe: Vec::new(),
         keepalive: Keepalive::Ping,
     }
 }
@@ -81,7 +81,7 @@ mod tests {
             panic!("streams")
         };
         assert_eq!(url, "wss://stream.binance.com:9443/ws/ethusdc@bookTicker");
-        assert_eq!(subscribe, None);
+        assert!(subscribe.is_empty());
         assert_eq!(keepalive, Keepalive::Ping);
     }
 
