@@ -71,7 +71,7 @@ pub async fn connection(
         .ok_or_else(|| eyre!("kucoin bullet-public listed no servers"))?;
     Ok(Connection::Stream {
         url: format!("{}?token={}", server.endpoint, data.token),
-        subscribe: Some(
+        subscribe: vec![
             json!({
                 "id": "1",
                 "type": "subscribe",
@@ -80,7 +80,7 @@ pub async fn connection(
                 "response": true,
             })
             .to_string(),
-        ),
+        ],
         keepalive: Keepalive::Text(json!({ "id": "1", "type": "ping" }).to_string()),
     })
 }
@@ -195,7 +195,10 @@ mod tests {
             panic!("streams")
         };
         assert_eq!(url, "wss://ws-api-spot.kucoin.com/?token=tok123");
-        let sub: serde_json::Value = serde_json::from_str(&subscribe.unwrap()).unwrap();
+        let [sub] = subscribe.as_slice() else {
+            panic!("one subscribe frame")
+        };
+        let sub: serde_json::Value = serde_json::from_str(sub).unwrap();
         assert_eq!(sub["topic"], "/spotMarket/level1:ETH-USDC");
     }
 

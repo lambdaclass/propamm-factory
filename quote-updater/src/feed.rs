@@ -489,7 +489,7 @@ pub fn spawn_feed(
                             url,
                             subscribe,
                             keepalive,
-                        }) => feed.read_stream(&url, subscribe.as_deref(), &keepalive).await,
+                        }) => feed.read_stream(&url, &subscribe, &keepalive).await,
                         Ok(Connection::Poll { url, headers, every }) => {
                             feed.poll(&url, &headers, every).await
                         }
@@ -556,7 +556,7 @@ impl Feed {
     async fn read_stream(
         &self,
         url: &str,
-        subscribe: Option<&str>,
+        subscribe: &[String],
         keepalive: &Keepalive,
     ) -> Result<()> {
         let Feed {
@@ -567,8 +567,8 @@ impl Feed {
         // cadence into long dead periods.
         let mut ws = ws::connect(url).await?;
         tracing::info!("[{symbol}] {venue} stream connected: {url}");
-        if let Some(subscribe) = subscribe {
-            ws.send(Message::text(subscribe))
+        for subscribe in subscribe {
+            ws.send(Message::text(subscribe.as_str()))
                 .await
                 .wrap_err("subscribe failed")?;
         }

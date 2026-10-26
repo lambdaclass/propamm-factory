@@ -17,9 +17,9 @@ pub const DEFAULT_ENDPOINT: &str = "wss://stream.bybit.com/v5/public/spot";
 pub fn connection(endpoint: &str, symbol: &str) -> Connection {
     Connection::Stream {
         url: endpoint.trim_end_matches('/').to_owned(),
-        subscribe: Some(
+        subscribe: vec![
             json!({ "op": "subscribe", "args": [format!("orderbook.1.{symbol}")] }).to_string(),
-        ),
+        ],
         keepalive: Keepalive::Text(json!({ "op": "ping" }).to_string()),
     }
 }
@@ -100,8 +100,8 @@ mod tests {
             panic!("streams")
         };
         assert_eq!(
-            subscribe.unwrap(),
-            r#"{"args":["orderbook.1.ETHUSDC"],"op":"subscribe"}"#
+            subscribe,
+            [r#"{"args":["orderbook.1.ETHUSDC"],"op":"subscribe"}"#]
         );
         assert_eq!(keepalive, Keepalive::Text(r#"{"op":"ping"}"#.into()));
     }

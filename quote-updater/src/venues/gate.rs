@@ -29,7 +29,7 @@ fn ping() -> String {
 pub fn connection(endpoint: &str, symbol: &str) -> Connection {
     Connection::Stream {
         url: endpoint.to_owned(),
-        subscribe: Some(
+        subscribe: vec![
             json!({
                 "time": now_secs(),
                 "channel": "spot.book_ticker",
@@ -37,7 +37,7 @@ pub fn connection(endpoint: &str, symbol: &str) -> Connection {
                 "payload": [symbol],
             })
             .to_string(),
-        ),
+        ],
         keepalive: Keepalive::Fresh(ping),
     }
 }
@@ -102,7 +102,10 @@ mod tests {
             panic!("streams")
         };
         assert_eq!(url, DEFAULT_ENDPOINT);
-        let sub: serde_json::Value = serde_json::from_str(&subscribe.unwrap()).unwrap();
+        let [sub] = subscribe.as_slice() else {
+            panic!("one subscribe frame")
+        };
+        let sub: serde_json::Value = serde_json::from_str(sub).unwrap();
         assert_eq!(sub["channel"], "spot.book_ticker");
         assert_eq!(sub["event"], "subscribe");
         assert_eq!(sub["payload"], json!(["ETH_USDC"]));

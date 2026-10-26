@@ -16,13 +16,13 @@ pub const DEFAULT_ENDPOINT: &str = "wss://ws.okx.com:8443/ws/v5/public";
 pub fn connection(endpoint: &str, symbol: &str) -> Connection {
     Connection::Stream {
         url: endpoint.trim_end_matches('/').to_owned(),
-        subscribe: Some(
+        subscribe: vec![
             json!({
                 "op": "subscribe",
                 "args": [{ "channel": "tickers", "instId": symbol }],
             })
             .to_string(),
-        ),
+        ],
         keepalive: Keepalive::Text("ping".to_owned()),
     }
 }
@@ -93,7 +93,10 @@ mod tests {
         else {
             panic!("streams")
         };
-        let sub: serde_json::Value = serde_json::from_str(&subscribe.unwrap()).unwrap();
+        let [sub] = subscribe.as_slice() else {
+            panic!("one subscribe frame")
+        };
+        let sub: serde_json::Value = serde_json::from_str(sub).unwrap();
         assert_eq!(sub["args"][0]["channel"], "tickers");
         assert_eq!(sub["args"][0]["instId"], "ETH-USDC");
         assert_eq!(keepalive, Keepalive::Text("ping".into()));
