@@ -120,7 +120,6 @@ pub fn spawn(feeds: &Feeds, params: Params<'_>) -> Spawned {
                 Gated::new(venue_metrics.clone(), adopted.clone()),
                 recorder.clone(),
                 connected.clone(),
-                feed::Cadence::default(),
             );
             VenueFeed {
                 venue: source.venue,

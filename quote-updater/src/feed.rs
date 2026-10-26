@@ -364,28 +364,6 @@ const PING_INTERVAL: Duration = Duration::from_secs(10);
 /// socket answers well within this bound even while the book itself is quiet.
 const MAX_QUIET: Duration = Duration::from_secs(30);
 
-/// The stream loop's two clocks: how often the venue is pinged and how long the socket may
-/// go without an inbound frame. One value for the run, [`Cadence::default`], read from the
-/// two constants above; tests hand in shorter ones so a socket is seen going quiet in
-/// milliseconds rather than half a minute. A venue that states its own requirement
-/// (KuCoin's `bullet` answer carries a `pingInterval`) is the natural next source.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Cadence {
-    /// See [`PING_INTERVAL`].
-    pub ping_every: Duration,
-    /// See [`MAX_QUIET`].
-    pub max_quiet: Duration,
-}
-
-impl Default for Cadence {
-    fn default() -> Self {
-        Cadence {
-            ping_every: PING_INTERVAL,
-            max_quiet: MAX_QUIET,
-        }
-    }
-}
-
 /// Delay between reconnect attempts.
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
@@ -447,7 +425,6 @@ pub fn spawn_feed(
     metrics: Gated<VenueMetrics>,
     recorder: Option<Recorder>,
     connected: Connected,
-    cadence: Cadence,
 ) -> watch::Receiver<Option<PriceSample>> {
     let (tx, rx) = watch::channel(None);
     let feed = Feed {
@@ -464,7 +441,6 @@ pub fn spawn_feed(
         metrics,
         recorder,
         connected,
-        cadence,
         lag_floor: Default::default(),
     };
     tokio::spawn(async move {
@@ -565,8 +541,6 @@ struct Feed {
     recorder: Option<Recorder>,
     /// Whether this venue is connected right now; see [`Connected`].
     connected: Connected,
-    /// The stream loop's clocks; see [`Cadence`].
-    cadence: Cadence,
     /// The venue's usual lag behind its own stamps, across reconnects; see [`LagFloor`].
     lag_floor: std::sync::Mutex<LagFloor>,
 }
@@ -588,10 +562,6 @@ impl Feed {
         let Feed {
             venue, symbol, tx, ..
         } = self;
-        let Cadence {
-            ping_every,
-            max_quiet,
-        } = self.cadence;
         // Bounded by ws::CONNECT_TIMEOUT: without it a blackholed endpoint holds each redial
         // hostage for the OS connect timeout (minutes), stretching RECONNECT_DELAY's intended
         // cadence into long dead periods.
@@ -614,7 +584,7 @@ impl Feed {
         // arriving. See PING_INTERVAL. The first ping is one interval out: the subscribe
         // just went out and the venue has nothing to answer yet.
         let mut ping_ticker =
-            tokio::time::interval_at(tokio::time::Instant::now() + ping_every, ping_every);
+            tokio::time::interval_at(tokio::time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
         ping_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             let msg = tokio::select! {
@@ -632,8 +602,8 @@ impl Feed {
                 // grid is laid down at connect and a frame can land anywhere on it, so a
                 // check that ran only on ticks would hang up to one ping late. A fresh
                 // sleep per turn of the loop, which is one timer per inbound frame.
-                _ = tokio::time::sleep_until(last_inbound + max_quiet) => {
-                    bail!("no message in {max_quiet:?}");
+                _ = tokio::time::sleep_until(last_inbound + MAX_QUIET) => {
+                    bail!("no message in {MAX_QUIET:?}");
                 }
             };
             let Some(msg) = msg else {
@@ -1211,7 +1181,6 @@ mod tests {
             Gated::new(metrics.clone(), outgoing.clone()),
             None,
             outgoing_connected.clone(),
-            Cadence::default(),
         );
         tokio::time::timeout(Duration::from_secs(5), outgoing_rx.changed())
             .await
@@ -1234,7 +1203,6 @@ mod tests {
             Gated::new(metrics.clone(), incoming.clone()),
             None,
             incoming_connected.clone(),
-            Cadence::default(),
         );
         tokio::time::timeout(Duration::from_secs(5), incoming_rx.changed())
             .await
@@ -1314,7 +1282,6 @@ mod tests {
             adopted(&metrics),
             None,
             connected.clone(),
-            Cadence::default(),
         );
         tokio::time::timeout(Duration::from_secs(5), rx.changed())
             .await
@@ -1344,17 +1311,14 @@ mod tests {
     }
 
     /// A stream that never goes quiet is still pinged, in the venue's dialect, every
-    /// `ping_every`. The venues that require a client ping on a cadence close the socket
+    /// PING_INTERVAL. The venues that require a client ping on a cadence close the socket
     /// otherwise, while frames are still arriving, so a ping sent only after a silence is
     /// a ping those venues never see on a busy market. The mock streams a ticker every
-    /// 50ms, well inside the ping interval, and must still receive the venue's text ping.
-    /// Real time: a paused clock races ahead of the socket handshake and cuts it off.
+    /// 200ms, well inside PING_INTERVAL, and must still receive the venue's text ping.
+    /// Real time, so the test takes a PING_INTERVAL: a paused clock races ahead of the
+    /// socket handshake and cuts it off.
     #[tokio::test]
     async fn a_busy_stream_is_still_pinged_on_the_cadence() {
-        let cadence = Cadence {
-            ping_every: Duration::from_millis(250),
-            ..Default::default()
-        };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (pinged_tx, pinged_rx) = tokio::sync::oneshot::channel::<Duration>();
@@ -1363,7 +1327,7 @@ mod tests {
             let mut ws = accept_async(stream).await.unwrap();
             let started = Instant::now();
             let mut pinged_tx = Some(pinged_tx);
-            let mut frames = tokio::time::interval(Duration::from_millis(50));
+            let mut frames = tokio::time::interval(Duration::from_millis(200));
             loop {
                 tokio::select! {
                     _ = frames.tick() => {
@@ -1398,31 +1362,27 @@ mod tests {
             adopted(&test_metrics()),
             None,
             Default::default(),
-            cadence,
         );
-        let after = tokio::time::timeout(Duration::from_secs(5), pinged_rx)
+        let after = tokio::time::timeout(PING_INTERVAL * 2, pinged_rx)
             .await
             .expect("a busy stream was never pinged")
             .expect("the mock went away before a ping arrived");
         assert!(
-            after >= cadence.ping_every && after < cadence.ping_every * 2,
+            after >= PING_INTERVAL && after < PING_INTERVAL * 2,
             "the ping must follow the cadence, not the silence: arrived after {after:?}"
         );
     }
 
-    /// A socket that stops answering is hung up on `max_quiet` after its last inbound frame,
+    /// A socket that stops answering is hung up on MAX_QUIET after its last inbound frame,
     /// not at the next ping after that. The pings go out on a grid laid down at connect and
     /// a frame can land anywhere on it, so a check that ran only on the grid would declare
     /// the socket dead up to one ping late: a redial up to PING_INTERVAL later on every
     /// dead-socket event. The mock sends one ticker a quarter of a ping into the connection,
     /// then swallows every ping, and measures the silence from that ticker to the feed
-    /// hanging up. Real time, for the reason given on the busy-stream test.
+    /// hanging up. Real time, so the test takes a MAX_QUIET, for the reason given on the
+    /// busy-stream test.
     #[tokio::test]
     async fn a_dead_socket_is_hung_up_on_at_max_quiet_not_at_the_next_ping() {
-        let cadence = Cadence {
-            ping_every: Duration::from_millis(600),
-            max_quiet: Duration::from_millis(1200),
-        };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (silence_tx, silence_rx) = tokio::sync::oneshot::channel::<Duration>();
@@ -1430,7 +1390,7 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = accept_async(stream).await.unwrap();
             // Off the ping grid: a quarter of a ping in.
-            tokio::time::sleep(cadence.ping_every / 4).await;
+            tokio::time::sleep(PING_INTERVAL / 4).await;
             let ticker = r#"{"arg":{"channel":"tickers","instId":"ETH-USDC"},"data":[{"instId":"ETH-USDC","askPx":"1.0000","bidPx":"0.9998","ts":"1597026383085"}]}"#;
             ws.send(Message::text(ticker)).await.unwrap();
             let quiet_since = Instant::now();
@@ -1449,35 +1409,30 @@ mod tests {
             adopted(&test_metrics()),
             None,
             Default::default(),
-            cadence,
         );
-        let silence = tokio::time::timeout(Duration::from_secs(5), silence_rx)
+        let silence = tokio::time::timeout(MAX_QUIET + PING_INTERVAL, silence_rx)
             .await
             .expect("the feed never hung up on a dead socket")
             .expect("the mock went away before the feed hung up");
         assert!(
-            silence >= cadence.max_quiet,
-            "hung up before max_quiet: {silence:?} after the last frame"
+            silence >= MAX_QUIET,
+            "hung up before MAX_QUIET: {silence:?} after the last frame"
         );
         assert!(
-            silence < cadence.max_quiet + cadence.ping_every / 2,
+            silence < MAX_QUIET + PING_INTERVAL / 2,
             "the hang-up must follow the silence, not the ping grid: {silence:?} after the \
              last frame"
         );
     }
 
     /// A pong is liveness. On a quiet book the venue's answer to the ping is the only
-    /// inbound frame, and it must both keep the socket up past `max_quiet` and keep the
+    /// inbound frame, and it must both keep the socket up past MAX_QUIET and keep the
     /// retained sample fresh: a book that has not changed is still the book. The mock sends
     /// one ticker and then only answers pings, in OKX's dialect so the answer goes through
     /// the venue's parser as a no-price frame rather than through tungstenite's own pong
-    /// handling. Real time, as above.
+    /// handling. Real time, so the test takes a little over a MAX_QUIET, as above.
     #[tokio::test]
     async fn a_pong_is_liveness_on_a_quiet_socket() {
-        let cadence = Cadence {
-            ping_every: Duration::from_millis(100),
-            max_quiet: Duration::from_millis(300),
-        };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1505,20 +1460,19 @@ mod tests {
             adopted(&test_metrics()),
             None,
             Default::default(),
-            cadence,
         );
         let first = tokio::time::timeout(Duration::from_secs(5), rx.wait_for(|s| s.is_some()))
             .await
             .expect("no price from the mock")
             .unwrap()
             .unwrap();
-        // Well past max_quiet with no second ticker: the socket is still up only if the
-        // pongs counted, and the stamp has moved only if they refreshed the sample.
+        // Past MAX_QUIET with no second ticker: the socket is still up only if the pongs
+        // counted, and the stamp has moved only if they refreshed the sample.
         let refreshed = tokio::time::timeout(
-            Duration::from_secs(5),
+            MAX_QUIET + PING_INTERVAL * 2,
             rx.wait_for(|s| {
                 s.as_ref()
-                    .is_some_and(|s| s.at >= first.at + cadence.max_quiet * 2)
+                    .is_some_and(|s| s.at >= first.at + MAX_QUIET + PING_INTERVAL)
             }),
         )
         .await
@@ -1575,7 +1529,6 @@ mod tests {
             adopted(&metrics),
             None,
             connected.clone(),
-            Cadence::default(),
         );
         let first = tokio::time::timeout(Duration::from_secs(5), rx.wait_for(|s| s.is_some()))
             .await
@@ -1662,7 +1615,6 @@ mod tests {
             adopted(&metrics),
             None,
             Default::default(),
-            Cadence::default(),
         );
         let sample = tokio::time::timeout(Duration::from_secs(5), rx.wait_for(|s| s.is_some()))
             .await
@@ -1752,7 +1704,6 @@ mod tests {
             adopted(&metrics),
             None,
             connected.clone(),
-            Cadence::default(),
         );
         // MEXC polls once a second; two samples prove the loop keeps going.
         let second = tokio::time::timeout(
