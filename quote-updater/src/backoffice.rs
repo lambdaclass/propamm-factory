@@ -325,6 +325,10 @@ struct SourcesForm {
     #[serde(default)]
     weight_mexc: String,
     #[serde(default)]
+    symbol_ondo: String,
+    #[serde(default)]
+    weight_ondo: String,
+    #[serde(default)]
     min_sources: String,
 }
 
@@ -342,6 +346,7 @@ impl SourcesForm {
             VenueId::Bitget => (&self.symbol_bitget, &self.weight_bitget),
             VenueId::Gate => (&self.symbol_gate, &self.weight_gate),
             VenueId::Mexc => (&self.symbol_mexc, &self.weight_mexc),
+            VenueId::Ondo => (&self.symbol_ondo, &self.weight_ondo),
         }
     }
 
@@ -826,6 +831,7 @@ async fn lookup_pair(State(state): State<Backoffice>, Query(tokens): Query<Token
                 "volume_usd": row.and_then(|r| r.volume_usd),
                 "note": row.map(|r| r.note.clone()).unwrap_or_else(|| match venue {
                     VenueId::Mexc => "polled every second".to_owned(),
+                    VenueId::Ondo => ONDO_NOTE.to_owned(),
                     _ => String::new(),
                 }),
                 "stand_in": row.is_some_and(|r| r.note.starts_with("quoted in")),
@@ -1193,6 +1199,8 @@ struct EndpointsForm {
     endpoint_gate: String,
     #[serde(default)]
     endpoint_mexc: String,
+    #[serde(default)]
+    endpoint_ondo: String,
 }
 
 impl EndpointsForm {
@@ -1207,6 +1215,7 @@ impl EndpointsForm {
             VenueId::Bitget => &self.endpoint_bitget,
             VenueId::Gate => &self.endpoint_gate,
             VenueId::Mexc => &self.endpoint_mexc,
+            VenueId::Ondo => &self.endpoint_ondo,
         }
     }
 }
@@ -1328,7 +1337,7 @@ fn build_settings(form: &SaveSettings) -> Result<config::FileSettings> {
         let Some(url) = value else { continue };
         let parsed = url::Url::parse(&url)
             .map_err(|err| eyre!("{venue} endpoint {url:?} is not a URL: {err}"))?;
-        let streamed = !matches!(venue, VenueId::Kucoin | VenueId::Mexc);
+        let streamed = !matches!(venue, VenueId::Kucoin | VenueId::Mexc | VenueId::Ondo);
         let schemes: &[&str] = if streamed {
             &["ws", "wss"]
         } else {
@@ -1964,6 +1973,11 @@ const SOURCE_FIELDS: &[Field] = &[
     ),
 ];
 
+/// What the venue table says beside the `ondo` row: it is an issuer's price for its own
+/// stock token, not a market the lookup can list.
+const ONDO_NOTE: &str = "Ondo's own price for one of its stock tokens, polled every second \
+                         with the key in ONDO_API_KEY; the symbol is the token's, e.g. AAPLon";
+
 /// How many venues must have a fresh price before the pair publishes.
 const MIN_SOURCES_FIELD: Field = Field::new(
     "min_sources",
@@ -2444,6 +2458,7 @@ fn render_pair_form_with(
                 let (symbol, weight) = row.unwrap_or_default();
                 let note = match venue {
                     VenueId::Mexc => "polled every second",
+                    VenueId::Ondo => ONDO_NOTE,
                     _ => "",
                 };
                 SourceRow {

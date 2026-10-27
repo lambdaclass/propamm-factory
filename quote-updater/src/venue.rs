@@ -33,6 +33,8 @@ pub enum VenueId {
     Bitget,
     Gate,
     Mexc,
+    /// Ondo Global Markets' own price for one of its stock tokens: the issuer as a venue.
+    Ondo,
 }
 
 impl VenueId {
@@ -54,6 +56,7 @@ impl VenueId {
         VenueId::Bitget,
         VenueId::Gate,
         VenueId::Mexc,
+        VenueId::Ondo,
     ];
 
     /// The name a config file uses for this venue.
@@ -68,6 +71,7 @@ impl VenueId {
             VenueId::Bitget => "bitget",
             VenueId::Gate => "gate",
             VenueId::Mexc => "mexc",
+            VenueId::Ondo => "ondo",
         }
     }
 
@@ -84,6 +88,7 @@ impl VenueId {
             VenueId::Bitget => bitget::DEFAULT_ENDPOINT,
             VenueId::Gate => gate::DEFAULT_ENDPOINT,
             VenueId::Mexc => mexc::DEFAULT_ENDPOINT,
+            VenueId::Ondo => ondo::DEFAULT_ENDPOINT,
         }
     }
 
@@ -105,6 +110,7 @@ impl VenueId {
             VenueId::Bitget => bitget::connection(endpoint, symbol),
             VenueId::Gate => gate::connection(endpoint, symbol),
             VenueId::Mexc => mexc::connection(endpoint, symbol),
+            VenueId::Ondo => ondo::connection(endpoint, symbol)?,
         })
     }
 
@@ -123,6 +129,7 @@ impl VenueId {
             VenueId::Bitget => bitget::parse(text),
             VenueId::Gate => gate::parse(text),
             VenueId::Mexc => mexc::parse(text),
+            VenueId::Ondo => ondo::parse(text),
         }
     }
 
@@ -145,6 +152,7 @@ impl VenueId {
             VenueId::Gate => gate::parse_stamped(text),
             // Polled over REST, whose body carries no time: aged by the fetch.
             VenueId::Mexc => Ok(self.parse(text)?.map(|quote| (quote, None))),
+            VenueId::Ondo => ondo::parse_stamped(text),
         }
     }
 
@@ -161,6 +169,7 @@ impl VenueId {
             VenueId::Bitget => bitget::expected_symbol(base, quote),
             VenueId::Gate => gate::expected_symbol(base, quote),
             VenueId::Mexc => mexc::expected_symbol(base, quote),
+            VenueId::Ondo => ondo::expected_symbol(base, quote),
         }
     }
 }
@@ -265,11 +274,14 @@ pub enum Connection {
         keepalive: Keepalive,
     },
     /// An HTTP resource fetched every `every`, for venues that have no stream. Each fetch
-    /// that parses is a sample stamped at the fetch.
+    /// that parses is a sample stamped at the fetch, or at the body's own time when it
+    /// carries one. `follow_redirects` is false for a request that carries a key in its
+    /// headers, which a redirect would carry along.
     Poll {
         url: String,
         headers: Vec<(String, String)>,
         every: Duration,
+        follow_redirects: bool,
     },
 }
 
@@ -317,6 +329,8 @@ impl Eq for Keepalive {}
 pub enum Quote {
     /// The best bid and ask of an order book.
     Book { bid: String, ask: String },
+    /// One price with no book behind it (an issuer's own price): the mid, at no spread.
+    Mid(String),
 }
 
 #[cfg(test)]
@@ -340,13 +354,16 @@ mod tests {
     /// Every venue spells a wrapped token's market as the underlying's, in its own shape.
     #[test]
     fn every_venue_spells_the_weth_usdc_market() {
-        for venue in VenueId::ALL {
+        // Every exchange; Ondo is an issuer naming its own token, so it spells the token
+        // as it is.
+        for venue in VenueId::ALL.iter().filter(|v| **v != VenueId::Ondo) {
             let spelling = venue.expected_symbol("WETH", "USDC");
             assert!(
                 !spelling.contains("WETH"),
                 "{venue} spells the wrapped token: {spelling}"
             );
         }
+        assert_eq!(VenueId::Ondo.expected_symbol("AAPLon", "USDC"), "AAPLon");
         assert_eq!(VenueId::Binance.expected_symbol("WETH", "USDC"), "ETHUSDC");
         assert_eq!(
             VenueId::Coinbase.expected_symbol("WETH", "USDC"),
