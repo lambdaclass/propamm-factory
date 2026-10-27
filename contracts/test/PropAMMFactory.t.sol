@@ -313,6 +313,31 @@ contract PropAMMFactoryTest is Test {
         propAmm.pause();
         vm.expectRevert();
         propAmm.unpause();
+        vm.expectRevert();
+        propAmm.withdrawERC20(USDC, rando, 1);
+        vm.expectRevert();
+        propAmm.transferOwnership(rando);
         vm.stopPrank();
+    }
+
+    /// An instance is set up once, by the factory, and nobody can set it up again: not with
+    /// `initialize`, and not with a migration step. An instance pointed at a price source of a
+    /// caller's choosing fills at whatever price that source names, out of vaults that have
+    /// approved it, so the oracle must stay the owner's to change, through `setOracle`.
+    function test_nobodyCanReinitializeAFactoryInstance() public {
+        PropAMM propAmm = PropAMM(factory.createPropAMM(owner, PUR_ADDR, updaters, pairs));
+        address rando = makeAddr("rando");
+        address evilOracle = makeAddr("evil-oracle");
+
+        vm.startPrank(rando);
+        vm.expectRevert();
+        propAmm.initialize(rando, new address[](0), evilOracle, new PropAMM.PairConfig[](0));
+        // The migration step `reinitializeV2(address)` is gone: no function answers its selector.
+        (bool ok,) = address(propAmm).call(abi.encodeWithSignature("reinitializeV2(address)", evilOracle));
+        assertFalse(ok);
+        vm.stopPrank();
+
+        assertEq(address(propAmm.oracle()), PUR_ADDR);
+        assertEq(propAmm.owner(), owner);
     }
 }
