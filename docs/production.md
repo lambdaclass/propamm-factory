@@ -17,7 +17,7 @@ make deploy-factory DEPLOY_RPC_URL=https://... PRIVATE_KEY=0x... FACTORY_OWNER=0
 `FACTORY_OWNER` is the account that can call `disableCreation`, which stops the factory from
 creating any more PropAMMs, for good, and emits `CreationDisabled`. It defaults to the deployer.
 
-Note: on Ethereum mainnet the current factory's address is `0x7625E38581124da157586759466E87601416172c`.
+Note: on Ethereum mainnet the current factory's address is `0xBA50BE669293e456C127e19865aC05aeb9458F92`.
 
 Create your PropAMM contract by calling `createPropAMM` on the factory:
 
