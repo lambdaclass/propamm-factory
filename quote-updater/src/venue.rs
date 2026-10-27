@@ -127,7 +127,7 @@ impl VenueId {
     }
 
     /// [`Self::parse`], plus the exchange's own time for the price when the frame carries
-    /// one: Kraken's `timestamp` and Coinbase's `time` (RFC 3339), OKX's `ts`, Bybit's `ts`,
+    /// one: Kraken's and Coinbase's `timestamp` (RFC 3339), OKX's `ts`, Bybit's `ts`,
     /// KuCoin's `timestamp`, Bitget's `ts` and Gate's `t` (epoch milliseconds), and Binance's `E`
     /// on a stream that sends it (its spot bookTicker does not). `None` where there is none,
     /// and for MEXC, which is polled: those prices are aged by when they arrived. Kept
@@ -255,13 +255,14 @@ impl Endpoints {
 /// How a venue delivers a market's price.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Connection {
-    /// A WebSocket the venue pushes prices over. `subscribe`, when given, is the text frame
-    /// sent right after connecting; `keepalive` is the ping sent on a fixed cadence for as
-    /// long as the socket is open, whether or not frames are arriving (see
-    /// `feed::PING_INTERVAL`).
+    /// A WebSocket the venue pushes prices over. `subscribe` is the text frames sent right
+    /// after connecting, in order: none for a venue that names the market in the URL, more
+    /// than one for a venue that takes one channel per subscription. `keepalive` is the
+    /// ping sent on a fixed cadence for as long as the socket is open, whether or not
+    /// frames are arriving (see `feed::PING_INTERVAL`).
     Stream {
         url: String,
-        subscribe: Option<String>,
+        subscribe: Vec<String>,
         keepalive: Keepalive,
     },
     /// An HTTP resource fetched every `every`, for venues that have no stream. Each fetch
