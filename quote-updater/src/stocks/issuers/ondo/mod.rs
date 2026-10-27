@@ -238,11 +238,11 @@ const FIELDS: &[FormField] = &[
         "0.003",
         "the half-spread as a fraction of the mid: 0.003 is 30 bp.",
     ),
-    FormField::list(
+    FormField::choices(
         "sessions",
+        &TRADING_SESSIONS,
         "regular",
-        "the sessions Ondo reports in which the pair quotes, one per line: regular, \
-         premarket, postmarket, overnight, offhours. Blank is regular only.",
+        "the sessions Ondo reports in which the pair quotes. None ticked is regular only.",
     ),
     FormField::new(
         "api",
