@@ -5233,7 +5233,8 @@ api_key = "k"
             toml::from_str(include_str!("../../example/config.stocks.toml")).unwrap();
         let want = example.pairs[0].clone();
         let mut kinds = crate::kinds::Kinds::default();
-        kinds.insert("ondo", Arc::new(Ondo));
+        kinds.insert("feed", Arc::new(crate::pricing::Feed));
+        kinds.insert_guard("ondo", crate::kinds::quote_guard_factory(Ondo));
         kinds.insert_guard(
             "us_market_hours",
             crate::kinds::quote_guard_factory(UsMarketHoursFactory),
@@ -5258,7 +5259,13 @@ api_key = "k"
             let request = reloads.recv().await.expect("a reload must be requested");
             let _ = request.reply.send(Ok("reload: 1 started".to_owned()));
         });
-        let (pricing, hours, token) = (&want.pricing, &want.guards[0], &want.guards[1]);
+        let (pricing, ondo, hours, token) = (
+            &want.pricing,
+            &want.guards[0],
+            &want.guards[1],
+            &want.guards[2],
+        );
+        assert_eq!(ondo["kind"].as_str(), Some("ondo"));
         let text = |table: &toml::Table, key: &str| table[key].as_str().unwrap().to_owned();
         let lines = |key: &str| {
             hours[key]
@@ -5273,22 +5280,27 @@ api_key = "k"
             ("token0", want.tokens[0].clone()),
             ("token1", want.tokens[1].clone()),
             ("key_env", want.key_env.clone()),
+            ("symbol_ondo", want.sources[0].symbol.clone()),
+            ("weight_ondo", want.sources[0].weight.clone().unwrap()),
+            ("min_sources", String::new()),
+            ("max_source_lag_ms", want.max_source_lag_ms.clone().unwrap()),
             ("min_mid", want.min_mid.clone().unwrap()),
             ("max_mid", want.max_mid.clone().unwrap()),
-            ("max_deviation", String::new()),
+            ("max_deviation", want.max_deviation.clone().unwrap()),
             ("max_deviation_window", String::new()),
             ("max_deviation_window_blocks", String::new()),
-            ("allow_symbol_mismatch", "on".to_owned()),
-            ("pricing", "ondo".to_owned()),
-            ("pricing_ondo_symbol", text(pricing, "symbol")),
+            ("pricing", "feed".to_owned()),
+            ("pricing_feed_delta", text(pricing, "delta")),
+            ("guards_present", "1".to_owned()),
+            ("enabled_guard_ondo", "on".to_owned()),
+            ("guard_ondo_symbol", text(ondo, "symbol")),
             (
-                "pricing_ondo_api_key",
-                pricing["api_key"]["env"].as_str().unwrap().to_owned(),
+                "guard_ondo_api_key",
+                ondo["api_key"]["env"].as_str().unwrap().to_owned(),
             ),
-            ("pricing_ondo_delta", text(pricing, "delta")),
             (
-                "pricing_ondo_sessions",
-                pricing["sessions"]
+                "guard_ondo_sessions",
+                ondo["sessions"]
                     .as_array()
                     .unwrap()
                     .iter()
@@ -5296,7 +5308,6 @@ api_key = "k"
                     .collect::<Vec<_>>()
                     .join("\n"),
             ),
-            ("guards_present", "1".to_owned()),
             ("enabled_guard_us_market_hours", "on".to_owned()),
             (
                 "guard_us_market_hours_open_delay_secs",
@@ -5334,9 +5345,12 @@ api_key = "k"
             .find(|p| p.key_env == want.key_env)
             .expect("the stock pair was added");
         assert_eq!(pair.tokens, want.tokens);
+        assert_eq!(pair.sources, want.sources);
+        assert_eq!(pair.max_source_lag_ms, want.max_source_lag_ms);
+        assert_eq!(pair.max_deviation, want.max_deviation);
         assert_eq!(pair.min_mid, want.min_mid);
         assert_eq!(pair.max_mid, want.max_mid);
-        assert!(pair.allow_symbol_mismatch);
+        assert!(!pair.allow_symbol_mismatch);
         assert_eq!(pair.pricing, want.pricing);
         // Every guard runs and the most severe answer wins, so the order of the stanzas
         // carries nothing: a new pair's follow the registry's order, the example's its own.
@@ -5430,27 +5444,25 @@ api_key = "k"
     fn a_choices_field_renders_one_box_per_option_and_posts_the_ticked_ones_back() {
         use crate::stocks::issuers::ondo::Ondo;
         let mut kinds = crate::kinds::Kinds::default();
-        kinds.insert("ondo", Arc::new(Ondo));
+        kinds.insert_guard("ondo", crate::kinds::quote_guard_factory(Ondo));
         let kinds = Arc::new(kinds);
         let mut config = a_config();
-        let mut pricing = toml::Table::new();
-        pricing.insert("kind".to_owned(), toml::Value::String("ondo".to_owned()));
-        pricing.insert(
+        let mut ondo = guard_table("ondo", None);
+        ondo.insert(
             "symbol".to_owned(),
             toml::Value::String("AAPLon".to_owned()),
         );
-        pricing.insert("delta".to_owned(), toml::Value::String("0.003".to_owned()));
-        pricing.insert(
+        ondo.insert(
             "sessions".to_owned(),
             toml::Value::Array(vec![
                 toml::Value::String("regular".to_owned()),
                 toml::Value::String("overnight".to_owned()),
             ]),
         );
-        config.pairs[0].pricing = pricing.clone();
+        config.pairs[0].guards = vec![ondo.clone()];
         let form = render_pair_form(Some(&config.pairs[0]), &kinds);
         assert!(
-            form.contains(r#"<input type=hidden name="pricing_ondo_sessions" value="">"#),
+            form.contains(r#"<input type=hidden name="guard_ondo_sessions" value="">"#),
             "{form}"
         );
         for (option, checked) in [
@@ -5461,7 +5473,7 @@ api_key = "k"
             ("offhours", false),
         ] {
             let tag = format!(
-                r#"<input type=checkbox name="pricing_ondo_sessions__{option}"{}>"#,
+                r#"<input type=checkbox name="guard_ondo_sessions__{option}"{}>"#,
                 if checked { " checked" } else { "" }
             );
             assert!(form.contains(&tag), "{option}: {form}");
@@ -5469,21 +5481,21 @@ api_key = "k"
         // What the browser posts from that form rebuilds the list, in option order.
         let posted: std::collections::HashMap<String, String> =
             posted_fields(&form).into_iter().collect();
-        let fields = crate::pricing::Factory::fields(&Ondo);
-        let rebuilt = kind_stanza("pricing", fields, "ondo", Some(&pricing), &posted).unwrap();
-        assert_eq!(rebuilt["sessions"], pricing["sessions"]);
+        let fields = crate::pricing::QuoteGuardFactory::fields(&Ondo);
+        let rebuilt = kind_stanza("guard", fields, "ondo", Some(&ondo), &posted).unwrap();
+        assert_eq!(rebuilt["sessions"], ondo["sessions"]);
         // No box ticked is an empty list, the key present: the kind's default applies.
         let mut none = posted.clone();
-        none.retain(|key, _| !key.starts_with("pricing_ondo_sessions__"));
-        let rebuilt = kind_stanza("pricing", fields, "ondo", Some(&pricing), &none).unwrap();
+        none.retain(|key, _| !key.starts_with("guard_ondo_sessions__"));
+        let rebuilt = kind_stanza("guard", fields, "ondo", Some(&ondo), &none).unwrap();
         assert_eq!(rebuilt["sessions"], toml::Value::Array(Vec::new()));
         // A stanza without the key shows the default ticked.
-        pricing.remove("sessions");
-        config.pairs[0].pricing = pricing;
+        ondo.remove("sessions");
+        config.pairs[0].guards = vec![ondo];
         let form = render_pair_form(Some(&config.pairs[0]), &kinds);
         assert!(
-            form.contains(r#"name="pricing_ondo_sessions__regular" checked>"#)
-                && form.contains(r#"name="pricing_ondo_sessions__postmarket">"#),
+            form.contains(r#"name="guard_ondo_sessions__regular" checked>"#)
+                && form.contains(r#"name="guard_ondo_sessions__postmarket">"#),
             "{form}"
         );
     }
