@@ -525,7 +525,26 @@ pub(crate) fn kind_stanza(
         let Some(text) = posted.get(&key) else {
             continue;
         };
-        match field_toml(field, text)? {
+        let value = match field.kind {
+            // The page posts the key itself as a hidden input, so the field is known to be
+            // carried, and one `<key>__<option>` per ticked box. A post with no box at all
+            // (a scripted one) may name the options in the key's text instead.
+            crate::pricing::FieldKind::Choices(options)
+                if options
+                    .iter()
+                    .any(|option| posted.contains_key(&format!("{key}__{option}"))) =>
+            {
+                Some(toml::Value::Array(
+                    options
+                        .iter()
+                        .filter(|option| posted.contains_key(&format!("{key}__{option}")))
+                        .map(|option| toml::Value::String((*option).to_owned()))
+                        .collect(),
+                ))
+            }
+            _ => field_toml(field, text)?,
+        };
+        match value {
             Some(value) => table.insert(field.name.to_owned(), value),
             None => table.remove(field.name),
         };
@@ -623,6 +642,26 @@ fn field_toml(field: &crate::pricing::FormField, text: &str) -> Result<Option<to
                 .map(|line| toml::Value::String(line.to_owned()))
                 .collect(),
         )),
+        // As a list, when posted as text (no box ticked, or a scripted post): the options
+        // named, one per line or space-separated, held to the declared ones.
+        FieldKind::Choices(options) => Some(toml::Value::Array(
+            text.split(|c: char| c.is_whitespace() || c == ',')
+                .filter(|word| !word.is_empty())
+                .map(|word| {
+                    options
+                        .iter()
+                        .find(|option| option.eq_ignore_ascii_case(word))
+                        .map(|option| toml::Value::String((*option).to_owned()))
+                        .ok_or_else(|| {
+                            eyre!(
+                                "`{}` takes {}, not {word:?}",
+                                field.name,
+                                options.join(", ")
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        )),
         FieldKind::Env => match optional(text) {
             None => None,
             Some(name) => {
@@ -663,7 +702,7 @@ pub(crate) fn field_value(
     use crate::pricing::FieldKind;
     match (field.kind, value) {
         (_, None) => String::new(),
-        (FieldKind::List, Some(toml::Value::Array(items))) => items
+        (FieldKind::List | FieldKind::Choices(_), Some(toml::Value::Array(items))) => items
             .iter()
             .filter_map(toml::Value::as_str)
             .collect::<Vec<_>>()
@@ -673,7 +712,7 @@ pub(crate) fn field_value(
             .and_then(toml::Value::as_str)
             .unwrap_or_default()
             .to_owned(),
-        (FieldKind::Env | FieldKind::List, Some(_)) => String::new(),
+        (FieldKind::Env | FieldKind::List | FieldKind::Choices(_), Some(_)) => String::new(),
         (FieldKind::Text | FieldKind::Number, Some(scalar)) => match scalar {
             toml::Value::String(text) => text.clone(),
             toml::Value::Integer(int) => int.to_string(),
@@ -1899,6 +1938,17 @@ struct Filled {
     readonly: bool,
     /// A textarea rather than an input: a list field, one item per line.
     multiline: bool,
+    /// One checkbox per option rather than an input: a choices field. Empty for the rest.
+    choices: Vec<Choice>,
+}
+
+/// One option of a choices field, as the page renders it.
+struct Choice {
+    /// The checkbox's `name`: `<field name>__<option>`.
+    name: String,
+    /// The option, as the config spells it.
+    label: &'static str,
+    checked: bool,
 }
 
 impl Filled {
@@ -1912,6 +1962,7 @@ impl Filled {
             value: value.unwrap_or_default().to_owned(),
             readonly: false,
             multiline: false,
+            choices: Vec::new(),
         }
     }
 
@@ -1924,8 +1975,36 @@ impl Filled {
         field: &crate::pricing::FormField,
         value: Option<&toml::Value>,
     ) -> Self {
+        let name = format!("{prefix}_{kind}_{}", field.name);
+        let choices = match field.kind {
+            crate::pricing::FieldKind::Choices(options) => {
+                // The stanza's own list when it has one, else the kind's default, which the
+                // placeholder names.
+                let ticked: Vec<String> = match value.and_then(toml::Value::as_array) {
+                    Some(items) => items
+                        .iter()
+                        .filter_map(toml::Value::as_str)
+                        .map(str::to_owned)
+                        .collect(),
+                    None => field
+                        .placeholder
+                        .split_whitespace()
+                        .map(str::to_owned)
+                        .collect(),
+                };
+                options
+                    .iter()
+                    .map(|option| Choice {
+                        name: format!("{name}__{option}"),
+                        label: option,
+                        checked: ticked.iter().any(|t| t.eq_ignore_ascii_case(option)),
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
         Self {
-            name: format!("{prefix}_{kind}_{}", field.name),
+            name,
             label: field.name,
             placeholder: field.placeholder,
             hint: field.hint,
@@ -1933,6 +2012,7 @@ impl Filled {
             value: field_value(field, value),
             readonly: false,
             multiline: field.kind == crate::pricing::FieldKind::List,
+            choices,
         }
     }
 
@@ -5341,6 +5421,106 @@ api_key = "k"
                 && form.contains("spellcheck=false></textarea>"),
             "an absent list is an empty textarea: {form}"
         );
+    }
+
+    /// A choices field renders one checkbox per option, the stanza's ticked, and what the
+    /// rendered form posts writes the same list back; with no key in the stanza the
+    /// kind's default is ticked, which the placeholder names.
+    #[test]
+    fn a_choices_field_renders_one_box_per_option_and_posts_the_ticked_ones_back() {
+        use crate::stocks::issuers::ondo::Ondo;
+        let mut kinds = crate::kinds::Kinds::default();
+        kinds.insert("ondo", Arc::new(Ondo));
+        let kinds = Arc::new(kinds);
+        let mut config = a_config();
+        let mut pricing = toml::Table::new();
+        pricing.insert("kind".to_owned(), toml::Value::String("ondo".to_owned()));
+        pricing.insert(
+            "symbol".to_owned(),
+            toml::Value::String("AAPLon".to_owned()),
+        );
+        pricing.insert("delta".to_owned(), toml::Value::String("0.003".to_owned()));
+        pricing.insert(
+            "sessions".to_owned(),
+            toml::Value::Array(vec![
+                toml::Value::String("regular".to_owned()),
+                toml::Value::String("overnight".to_owned()),
+            ]),
+        );
+        config.pairs[0].pricing = pricing.clone();
+        let form = render_pair_form(Some(&config.pairs[0]), &kinds);
+        assert!(
+            form.contains(r#"<input type=hidden name="pricing_ondo_sessions" value="">"#),
+            "{form}"
+        );
+        for (option, checked) in [
+            ("regular", true),
+            ("premarket", false),
+            ("postmarket", false),
+            ("overnight", true),
+            ("offhours", false),
+        ] {
+            let tag = format!(
+                r#"<input type=checkbox name="pricing_ondo_sessions__{option}"{}>"#,
+                if checked { " checked" } else { "" }
+            );
+            assert!(form.contains(&tag), "{option}: {form}");
+        }
+        // What the browser posts from that form rebuilds the list, in option order.
+        let posted: std::collections::HashMap<String, String> =
+            posted_fields(&form).into_iter().collect();
+        let fields = crate::pricing::Factory::fields(&Ondo);
+        let rebuilt = kind_stanza("pricing", fields, "ondo", Some(&pricing), &posted).unwrap();
+        assert_eq!(rebuilt["sessions"], pricing["sessions"]);
+        // No box ticked is an empty list, the key present: the kind's default applies.
+        let mut none = posted.clone();
+        none.retain(|key, _| !key.starts_with("pricing_ondo_sessions__"));
+        let rebuilt = kind_stanza("pricing", fields, "ondo", Some(&pricing), &none).unwrap();
+        assert_eq!(rebuilt["sessions"], toml::Value::Array(Vec::new()));
+        // A stanza without the key shows the default ticked.
+        pricing.remove("sessions");
+        config.pairs[0].pricing = pricing;
+        let form = render_pair_form(Some(&config.pairs[0]), &kinds);
+        assert!(
+            form.contains(r#"name="pricing_ondo_sessions__regular" checked>"#)
+                && form.contains(r#"name="pricing_ondo_sessions__postmarket">"#),
+            "{form}"
+        );
+    }
+
+    /// A choices field posted as text (no box, as a scripted post does) names the options,
+    /// in any case, and is refused for one not declared.
+    #[test]
+    fn a_choices_field_posted_as_text_names_its_options() {
+        const FIELDS: &[crate::pricing::FormField] = &[crate::pricing::FormField::choices(
+            "sessions",
+            &["regular", "postmarket"],
+            "regular",
+            "",
+        )];
+        let stanza = |text: &str| {
+            kind_stanza(
+                "pricing",
+                FIELDS,
+                "ondo",
+                None,
+                &posted_map(&[("pricing_ondo_sessions", text)]),
+            )
+        };
+        // Written as the options are declared, in the order posted.
+        assert_eq!(
+            stanza("Postmarket\nregular").unwrap()["sessions"],
+            toml::Value::Array(vec![
+                toml::Value::String("postmarket".to_owned()),
+                toml::Value::String("regular".to_owned()),
+            ])
+        );
+        assert_eq!(
+            stanza("").unwrap()["sessions"],
+            toml::Value::Array(Vec::new())
+        );
+        let err = stanza("regular, weekend").unwrap_err();
+        assert!(format!("{err:#}").contains("weekend"), "{err:#}");
     }
 
     /// A float with no fraction reads back as a float (`1.0`), so an unrelated save does

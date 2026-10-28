@@ -80,6 +80,10 @@ pub enum FieldKind {
     /// The name of an environment variable, written as `{ env = "NAME" }`, the shape
     /// [`EnvSecret`] reads. The variable's value never reaches the page, in either direction.
     Env,
+    /// A fixed set of options, one checkbox each, written as an array of the ticked ones in
+    /// this order. The placeholder names the options ticked when the stanza has no key,
+    /// space-separated: the kind's default, so the page shows what the stanza means.
+    Choices(&'static [&'static str]),
 }
 
 impl FormField {
@@ -113,6 +117,18 @@ impl FormField {
     /// (`holidays = ["2026-11-26", ...]`).
     pub const fn list(name: &'static str, placeholder: &'static str, hint: &'static str) -> Self {
         Self::of(FieldKind::List, name, placeholder, hint)
+    }
+
+    /// A field whose value is a choice among `options`, one checkbox each, written as an
+    /// array of the ticked ones (`sessions = ["regular", "postmarket"]`). `placeholder`
+    /// names the options ticked when the stanza has no key, space-separated.
+    pub const fn choices(
+        name: &'static str,
+        options: &'static [&'static str],
+        placeholder: &'static str,
+        hint: &'static str,
+    ) -> Self {
+        Self::of(FieldKind::Choices(options), name, placeholder, hint)
     }
 
     /// A field holding the name of an environment variable, written as `{ env = "NAME" }`
