@@ -147,6 +147,6 @@ mod tests {
     #[test]
     fn the_market_is_the_tokens_own_symbol() {
         assert_eq!(expected_symbol("AAPLon", "USDC"), "AAPLon");
-        assert_eq!(expected_symbol("NVDAon", "USDT"), "NVDAon");
+        assert_eq!(expected_symbol("TSLAon", "USDT"), "TSLAon");
     }
 }
