@@ -872,6 +872,9 @@ const PREVIEW_REDIAL_GAP: std::time::Duration = std::time::Duration::from_secs(2
 struct PreviewVenue {
     source: config::Source,
     rx: Option<tokio::sync::watch::Receiver<Option<crate::feed::PriceSample>>>,
+    /// The connection's flag, where its feed task leaves the round trips it has timed;
+    /// a fresh one with every dial, so a redial starts its numbers over.
+    connected: crate::feed::Connected,
 }
 
 /// The pair form's live prices, over one websocket per open page. The page sends which
@@ -995,6 +998,8 @@ async fn preview_session(
                     if state.rx.is_some() || !due {
                         continue;
                     }
+                    // Timed: the latency column reads these round trips.
+                    state.connected = crate::feed::Connected::timed();
                     state.rx = Some(crate::feed::spawn_feed(
                         endpoints.http(),
                         *venue,
@@ -1007,7 +1012,7 @@ async fn preview_session(
                             adopted.clone(),
                         ),
                         None,
-                        Default::default(),
+                        state.connected.clone(),
                     ));
                     dialed.insert(*venue, now);
                 }
@@ -1083,6 +1088,7 @@ fn apply_preview_command(
                                 weight,
                             },
                             rx: None,
+                            connected: Default::default(),
                         },
                     );
                 }
@@ -1097,8 +1103,9 @@ fn apply_preview_command(
 }
 
 /// What the page is sent twice a second: each ticked venue's mid, in the venue's own
-/// orientation, and the composite of the fresh ones, averaged the way the pusher averages
-/// the number it publishes.
+/// orientation, its round trips so far (`latency`: median, p95 and mean in milliseconds,
+/// and how many; null before the first), and the composite of the fresh ones, averaged
+/// the way the pusher averages the number it publishes.
 fn preview_snapshot(
     venues: &std::collections::BTreeMap<VenueId, PreviewVenue>,
     inverted: bool,
@@ -1129,6 +1136,14 @@ fn preview_snapshot(
                 "mid": market(sample),
                 "age_ms": sample.map(|s| s.age_at(now, wall).as_millis() as u64),
                 "fresh": is_fresh,
+                "latency": state.connected.latency().map(|l| {
+                    serde_json::json!({
+                        "p50_ms": l.p50.as_millis() as u64,
+                        "p95_ms": l.p95.as_millis() as u64,
+                        "avg_ms": l.avg.as_millis() as u64,
+                        "samples": l.samples,
+                    })
+                }),
             })
         })
         .collect();
@@ -3662,6 +3677,20 @@ api_key = "k"
         assert!((found["venues"][0]["mid"].as_f64().unwrap() - 2000.0).abs() < 0.01);
         assert_eq!(found["venues"][1]["venue"], "bybit");
         assert!((found["venues"][1]["mid"].as_f64().unwrap() - 2100.0).abs() < 0.01);
+        // Each venue's round trip, timed from the ping sent right after subscribing.
+        let timed = snapshot_where(&mut page, |v| {
+            v["venues"].as_array().is_some_and(|rows| {
+                rows.iter()
+                    .all(|r| r["latency"]["samples"].as_u64() >= Some(1))
+            })
+        })
+        .await;
+        for row in timed["venues"].as_array().unwrap() {
+            let latency = &row["latency"];
+            assert!(latency["p50_ms"].as_u64().unwrap() < 1_000, "{row}");
+            assert!(latency["p95_ms"].as_u64().unwrap() >= latency["p50_ms"].as_u64().unwrap());
+            assert!(latency["avg_ms"].is_u64(), "{row}");
+        }
         // The inverted lane averages 1/2000 and 1/2100, so read back the way the venues
         // quote it the composite is their harmonic mean, 2048.78, not 2050.
         let composite = found["composite"].as_f64().unwrap();
