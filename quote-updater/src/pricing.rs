@@ -445,6 +445,9 @@ pub struct PairShape {
     /// How many venues the pair's `symbol`/`sources` stream from: 0 for a pair with no
     /// market, which a kind that reads one refuses in its `validate`.
     pub sources: usize,
+    /// How many of those quote one price with no book behind it (`ondo`, an issuer's own
+    /// price): their half-spread is zero, so a kind that copies the book's copies nothing.
+    pub mid_only_sources: usize,
     /// The pair's `min_mid`, in lane orientation, which the core holds every published mid
     /// to; a kind whose mid is a setting checks it here, so a mistake fails the file instead
     /// of every tick.
@@ -1214,6 +1217,7 @@ mod tests {
     fn pair(inverted: bool, price_decimals: u32) -> PairShape {
         PairShape {
             sources: 1,
+            mid_only_sources: 0,
             min_mid: None,
             max_mid: None,
             label: "WETH/USDC".into(),

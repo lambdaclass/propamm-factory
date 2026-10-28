@@ -2054,9 +2054,12 @@ const SOURCE_FIELDS: &[Field] = &[
 ];
 
 /// What the venue table says beside the `ondo` row: it is an issuer's price for its own
-/// stock token, not a market the lookup can list.
+/// stock token, not a market the lookup can list, and it has no spread for a blank delta
+/// to copy.
 const ONDO_NOTE: &str = "Ondo's own price for one of its stock tokens, polled every second \
-                         with the key in ONDO_API_KEY; the symbol is the token's, e.g. AAPLon";
+                         with the key in ONDO_API_KEY; the symbol is the token's, e.g. AAPLon. \
+                         It is one price with no spread: set a delta in the pricing, or a \
+                         blank one quotes at the mid";
 
 /// How many venues must have a fresh price before the pair publishes.
 const MIN_SOURCES_FIELD: Field = Field::new(
@@ -5435,6 +5438,20 @@ api_key = "k"
                 && form.contains("spellcheck=false></textarea>"),
             "an absent list is an empty textarea: {form}"
         );
+    }
+
+    /// Ondo answers one price with no spread, so a pair priced on it alone copies a spread
+    /// of zero unless the pricing states one: the venue table says so beside the row, where
+    /// the operator adding a stock pair fills it in.
+    #[test]
+    fn the_ondo_row_says_to_set_a_delta() {
+        let form = render_pair_form(None, &test_kinds());
+        let row = form
+            .split("<tr>")
+            .find(|row| row.contains(r#"name="symbol_ondo""#))
+            .expect("the venue table has an ondo row");
+        assert!(row.contains("no spread"), "{row}");
+        assert!(row.contains("set a delta"), "{row}");
     }
 
     /// A choices field renders one checkbox per option, the stanza's ticked, and what the

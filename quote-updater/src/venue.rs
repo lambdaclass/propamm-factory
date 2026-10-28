@@ -173,6 +173,13 @@ impl VenueId {
             VenueId::Ondo => ondo::expected_symbol(base, quote),
         }
     }
+
+    /// Whether the venue quotes a book, a best bid and ask. Ondo answers one price
+    /// ([`Quote::Mid`]), whose half-spread is zero: a kind that copies the book's spread
+    /// copies nothing from it.
+    pub fn quotes_a_book(self) -> bool {
+        self != VenueId::Ondo
+    }
 }
 
 impl fmt::Display for VenueId {
@@ -350,6 +357,15 @@ mod tests {
         }
         let err = "bogus".parse::<VenueId>().unwrap_err();
         assert!(err.to_string().contains("binance"), "{err}");
+    }
+
+    /// Every exchange quotes a book; Ondo, an issuer naming its own price, quotes one price
+    /// with no spread.
+    #[test]
+    fn only_ondo_quotes_without_a_book() {
+        for venue in VenueId::ALL {
+            assert_eq!(venue.quotes_a_book(), *venue != VenueId::Ondo, "{venue}");
+        }
     }
 
     /// Every venue spells a wrapped token's market as the underlying's, in its own shape.
