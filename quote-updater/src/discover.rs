@@ -56,6 +56,7 @@ impl Default for Rest {
             (VenueId::Bitget, "https://api.bitget.com"),
             (VenueId::Gate, "https://api.gateio.ws"),
             (VenueId::Mexc, "https://api.mexc.com"),
+            (VenueId::Ondo, crate::venues::ondo::DEFAULT_ENDPOINT),
         ]
         .into_iter()
         .map(|(v, h)| (v, h.to_owned()))
@@ -69,7 +70,7 @@ impl Rest {
     #[cfg(test)]
     pub fn all_at(host: &str) -> Self {
         Self {
-            hosts: exchanges().map(|v| (v, host.to_owned())).collect(),
+            hosts: VenueId::ALL.iter().map(|v| (*v, host.to_owned())).collect(),
         }
     }
 
@@ -241,6 +242,14 @@ pub async fn discover(
             }
         })
         .collect();
+    // Ondo lists no markets to read, but it prices its own tokens: a base token Ondo's API
+    // knows gets an ondo row, filled with the token's symbol as Ondo names it.
+    let ondo_key = std::env::var(crate::venues::ondo::API_KEY_VAR)
+        .ok()
+        .filter(|key| !key.is_empty());
+    if let Some(row) = ondo_row(http, rest, base, ondo_key.as_deref()).await {
+        rows.push(row);
+    }
     rows.sort_by_key(|r| VenueId::ALL.iter().position(|v| *v == r.venue));
 
     let listed = rows.len();
@@ -281,6 +290,47 @@ fn candidates<'a>(list: &'a [Market], base: &str, quote: &str) -> (Vec<&'a Marke
         .filter(|m| m.base == base && allowed.contains(&m.quote.as_str()))
         .collect();
     (stand_ins, false)
+}
+
+/// The `ondo` row for `base`, the token's on-chain symbol, when Ondo's API answers a price
+/// for it with `key`: Ondo names its tokens by that symbol (`AAPLon`), in any case. None
+/// without a key (`ONDO_API_KEY`), or for a symbol Ondo does not know, or when Ondo cannot
+/// be asked: the row is then the operator's to fill, as the note on it says.
+async fn ondo_row(
+    http: &reqwest::Client,
+    rest: &Rest,
+    base: &str,
+    key: Option<&str>,
+) -> Option<Found> {
+    let key = key?;
+    let host = rest.host(VenueId::Ondo).trim_end_matches('/');
+    if host.is_empty() {
+        return None;
+    }
+    let body = http
+        .get(format!("{host}/v1/assets/{base}/prices/latest"))
+        .header("x-api-key", key)
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    let (quote, _) = crate::venues::ondo::parse_stamped(&body).ok()??;
+    let last = match quote {
+        crate::venue::Quote::Mid(price) => price.parse().ok(),
+        crate::venue::Quote::Book { .. } => None,
+    };
+    Some(Found {
+        venue: VenueId::Ondo,
+        symbol: base.to_owned(),
+        weight: "1".to_owned(),
+        last,
+        volume_usd: None,
+        note: "Ondo's own price for the token".to_owned(),
+    })
 }
 
 async fn get_json(http: &reqwest::Client, url: &str) -> Result<Value> {
@@ -538,6 +588,39 @@ fn suggested_weight(volume: f64, max_volume: f64) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A token Ondo's API prices gets an ondo row filled with the token's own symbol and
+    /// Ondo's price, and no row without a key, or for a token Ondo does not know.
+    #[tokio::test]
+    async fn a_token_ondo_prices_gets_an_ondo_row() {
+        use crate::testing::MockApi;
+        let api = MockApi::serve(vec![(
+            "/v1/assets/AAPLon/prices/latest",
+            MockApi::json(
+                r#"{"primaryMarket":{"symbol":"AAPLon","price":"256.79"},"underlyingMarket":{"ticker":"AAPL","price":"256.24"},"timestamp":1791468000000}"#,
+            ),
+        )]);
+        let http = reqwest::Client::new();
+        let rest = Rest::all_at(&api.url);
+        let row = ondo_row(&http, &rest, "AAPLon", Some("smoke-key"))
+            .await
+            .expect("Ondo prices AAPLon");
+        assert_eq!(row.venue, VenueId::Ondo);
+        assert_eq!(row.symbol, "AAPLon");
+        assert_eq!(row.weight, "1");
+        assert_eq!(row.last, Some(256.79));
+        assert_eq!(row.volume_usd, None);
+        assert!(
+            ondo_row(&http, &rest, "AAPLon", None).await.is_none(),
+            "no key"
+        );
+        assert!(
+            ondo_row(&http, &rest, "WETH", Some("smoke-key"))
+                .await
+                .is_none(),
+            "a token Ondo does not know"
+        );
+    }
 
     fn market(base: &str, quote: &str, symbol: &str) -> Market {
         Market {

@@ -170,9 +170,9 @@ impl QuoteGuardFactory for UsMarketHoursFactory {
     }
 
     fn form_help(&self) -> &'static str {
-        "<p class=explain>Quotes only 09:30–16:00 New York time on NYSE trading days (13:00 \
-         on early closes), by the calendar listed here. Extend it before listed_through: \
-         past that day every quote is withdrawn.</p>"
+        "<p class=explain>Quotes only 09:30–16:00 New York time on NYSE trading days, by \
+         this calendar; past listed_through nothing is quoted. Leave it off to quote the \
+         other sessions.</p>"
     }
 
     fn validate(&self, cfg: &UsMarketHoursCfg, _pair: &PairShape) -> eyre::Result<()> {

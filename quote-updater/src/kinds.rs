@@ -336,10 +336,29 @@ pub(crate) struct Kinds {
     pricers: BTreeMap<&'static str, Arc<dyn ErasedPricer>>,
     /// Market and quote guards in one namespace.
     guards: BTreeMap<&'static str, Arc<dyn ErasedGuard>>,
+    /// Guard kinds kept for the pairs that still list them: built and run as any, but the
+    /// pair form offers them only on a pair whose stanza has one.
+    legacy_guards: std::collections::BTreeSet<&'static str>,
     errors: Vec<String>,
 }
 
 impl Kinds {
+    /// [`Self::insert_guard`], for a kind another kind has taken over: still registered,
+    /// so a pair that lists it keeps loading, but not offered on the form for a new pair.
+    pub(crate) fn insert_guard_legacy(
+        &mut self,
+        kind: &'static str,
+        factory: Arc<dyn ErasedGuard>,
+    ) {
+        self.insert_guard(kind, factory);
+        self.legacy_guards.insert(kind);
+    }
+
+    /// Whether `kind` is registered only for the pairs that still list it.
+    pub(crate) fn guard_is_legacy(&self, kind: &str) -> bool {
+        self.legacy_guards.contains(kind)
+    }
+
     pub(crate) fn insert_guard(&mut self, kind: &'static str, factory: Arc<dyn ErasedGuard>) {
         if BUILT_IN_GUARDS.contains(&kind) {
             self.errors.push(format!(
@@ -534,6 +553,10 @@ impl Kinds {
                     target: config.target,
                     sources: spec.feeds.as_ref().map_or(0, |f| f.sources.len()),
                     mid_only_sources: spec.feeds.as_ref().map_or(0, |f| f.mid_only_sources()),
+                    venue_symbols: spec
+                        .feeds
+                        .as_ref()
+                        .map_or_else(Vec::new, |f| f.venue_symbols()),
                     min_mid: spec.band.min,
                     max_mid: spec.band.max,
                 };

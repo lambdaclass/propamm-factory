@@ -225,16 +225,21 @@ impl UpdaterBuilder {
         )
     }
 
-    /// Registers a tokenized-stock issuer's two kinds, its status guard and its token
-    /// guard, under the names the issuer declares ([`crate::stocks::Issuer`]): `ondo` and
-    /// `ondo_token` for [`crate::stocks::issuers::ondo::Ondo`]. A binary names the issuers
-    /// it integrates, one call each, and nothing registers one implicitly. The explicit
+    /// Registers a tokenized-stock issuer's guard under the name the issuer declares
+    /// ([`crate::stocks::Issuer`]): `ondo` for [`crate::stocks::issuers::ondo::Ondo`], which
+    /// runs the issuer's status checks and the token's transfer rules as one. The token
+    /// guard's own name (`ondo_token`) stays registered for a pair that still lists it, and
+    /// the pair form offers it to no new pair. A binary names the issuers it integrates,
+    /// one call each, and nothing registers one implicitly. The explicit
     /// [`Self::quote_guard`] call remains for other names. The issuer's price is a venue
     /// (`ondo` in a pair's `sources`), which needs no registering.
-    pub fn stock_issuer<I: crate::stocks::Issuer>(self, issuer: I) -> Self {
+    pub fn stock_issuer<I: crate::stocks::Issuer>(mut self, issuer: I) -> Self {
         let token_guard = issuer.token_guard();
+        self.parts.kinds.insert_guard_legacy(
+            I::TOKEN_GUARD_KIND,
+            crate::kinds::quote_guard_factory(token_guard),
+        );
         self.quote_guard(I::STATUS_GUARD_KIND, issuer)
-            .quote_guard(I::TOKEN_GUARD_KIND, token_guard)
     }
 
     /// Registers an observer: a binary's code that is told what the run does

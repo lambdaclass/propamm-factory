@@ -27,6 +27,10 @@
 //! the valuation again on the next reload. The issuer's status still reports the asset's
 //! events, corporate actions included.
 //!
+//! - **The token would take the fill.** The design's [`RestrictionGuard`], run as part of
+//!   this guard: not paused, neither the vault nor the PropAMM on the issuer's lists, and a
+//!   transfer tried on the token as the PropAMM not refused.
+//!
 //! The stock token is listed first (`tokens = [stock, USDC]`), and the build checks it is the
 //! token the stanza's `symbol` names by the token's own `symbol()`.
 
@@ -41,6 +45,7 @@ use crate::{
     poll::{self, Failures, Stamped, lock, wall_clock_ms},
     stocks::{
         chain,
+        guard::{GuardCfg, RestrictionGuard, RestrictionGuardFactory},
         ports::{MarketStatus, Price, PriceSource, Shares, StatusFeed, Valuation},
     },
 };
@@ -253,6 +258,8 @@ pub struct StatusGuard {
     checks_multiplier: bool,
     /// The issuer's status, for a design whose issuer reports one.
     status: Option<Box<dyn MarketStatus>>,
+    /// The guard on the token's transfer rules, for a design that has them.
+    restriction: Option<RestrictionGuard>,
     h: Handles,
     /// Milliseconds since the epoch now: the wall clock in the run, a fixed instant in a test.
     clock: fn() -> i64,
@@ -400,11 +407,15 @@ impl StatusGuard {
 
 impl QuoteGuard for StatusGuard {
     /// Every tick, whatever the pricer did: a refusal here withdraws the quote, and on a
-    /// tick already refused it says the issuer's reason beside the core's.
+    /// tick already refused it says the issuer's reason beside the core's. The issuer's
+    /// status first, then the token's rules.
     fn check(&mut self, candidate: &Candidate<'_>, out: &mut Diagnostics) -> Gate {
-        match self.judge(candidate.tick().now(), out) {
-            Ok(()) => Gate::Allow,
-            Err(refusal) => Gate::Withdraw(refusal),
+        if let Err(refusal) = self.judge(candidate.tick().now(), out) {
+            return Gate::Withdraw(refusal);
+        }
+        match &mut self.restriction {
+            Some(restriction) => restriction.check(candidate, out),
+            None => Gate::Allow,
         }
     }
 }
@@ -424,6 +435,9 @@ pub struct Adapters {
     /// parse fails the build, not every tick. Opening it starts nothing: the build runs its
     /// refresh as one of the pair's tasks.
     pub status: Option<BoxFuture<'static, eyre::Result<StatusFeed>>>,
+    /// The guard on the token's transfer rules, for a design that has them, built and run
+    /// as part of this guard at its defaults (a read a block, trusted for a minute).
+    pub token_guard: Option<RestrictionGuardFactory>,
 }
 
 impl Adapters {
@@ -434,6 +448,7 @@ impl Adapters {
             prices,
             valuation,
             status: None,
+            token_guard: None,
         }
     }
 }
@@ -450,6 +465,7 @@ pub async fn build(
         prices,
         valuation,
         status,
+        token_guard,
     } = adapters;
     let chain = ctx.chain()?;
     let pair = ctx.pair().clone();
@@ -512,12 +528,17 @@ pub async fn build(
         ctx.spawn(poll_ratio(prices, settings.clone(), Arc::clone(&feeds)));
         ctx.spawn(poll_shares(valuation, token, Arc::clone(&feeds)));
     }
+    let restriction = match token_guard {
+        Some(factory) => Some(factory.build(&GuardCfg::default(), ctx).await?),
+        None => None,
+    };
     let guard = StatusGuard {
         settings,
         names,
         feeds,
         checks_multiplier,
         status,
+        restriction,
         h,
         clock: wall_clock_ms,
     };
@@ -626,7 +647,7 @@ pub mod testkit {
     /// The pair as the run shapes it: AAPLon first, so the lane is not inverted, with one
     /// venue, the issuer's.
     pub fn pair() -> PairShape {
-        let pair = testing::pair_for(
+        let mut pair = testing::pair_for(
             "AAPLon/USDC",
             (parse_address(AAPLON).unwrap(), parse_address(USDC).unwrap()),
             Address::repeat_byte(0x77),
@@ -634,6 +655,7 @@ pub mod testkit {
         );
         assert!(!pair.inverted, "AAPLon sorts before USDC");
         assert_eq!(pair.sources, 1);
+        pair.venue_symbols = vec![("ondo", "AAPLon".to_owned())];
         pair
     }
 
@@ -713,6 +735,7 @@ pub mod testkit {
                 })),
                 checks_multiplier: reads.listed,
                 status: reads.status,
+                restriction: None,
                 h,
                 clock: || NOW_MS,
             },

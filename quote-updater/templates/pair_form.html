@@ -21,9 +21,8 @@
   <hr>
   <div class=sources>
     <span class=key>mid sources</span>
-    <p class=explain>A venue that goes quiet drops out of the average until it is back. Leave every venue
-    unticked for a fixed mid, or for a pricing kind that brings its own mid. A stock pair's venue is
-    <code>ondo</code>, the issuer's own price for the token.</p>
+    <p class=explain>The mid is the average of the venues ticked; one that goes quiet drops out until it
+    is back. A stock token's venue is <code>ondo</code>, the issuer's own price.</p>
     <table class=venues>
       <thead><tr><th>venue<th>symbol<th>weight<th></tr></thead>
       <tbody>
@@ -68,8 +67,16 @@
       <code>[pairs.pricing]</code> in config.toml</p>
       {% else %}
       <div class=grid>
-        {% for field in kind.fields %}{% include "field.html" %}{% endfor %}
+        {% for field in kind.fields %}{% if !field.advanced %}{% include "field.html" %}{% endif %}{% endfor %}
       </div>
+      {% if kind.has_advanced %}
+      <details class=advanced>
+        <summary>advanced</summary>
+        <div class=grid>
+          {% for field in kind.fields %}{% if field.advanced %}{% include "field.html" %}{% endif %}{% endfor %}
+        </div>
+      </details>
+      {% endif %}
       {% endif %}
     </div>
     {% endfor %}
@@ -87,10 +94,11 @@
   <hr>
 
   {# One block per registered guard kind (a pair holds one stanza per kind), each with an
-     "enabled" checkbox: checked adds or keeps the stanza, unchecked removes it. A kind the
-     pair uses that this binary does not register is shown too, kept while checked. The
-     hidden input tells the handler this page has a guards section, so a page rendered
-     before it existed keeps the pair's guards. #}
+     "enabled" checkbox: checked adds or keeps the stanza, unchecked removes it, and the
+     stylesheet shows a guard's fields only while its box is checked. A kind the pair uses
+     that this binary does not register is shown too, kept while checked. The hidden input
+     tells the handler this page has a guards section, so a page rendered before it existed
+     keeps the pair's guards. #}
   <div class=guards>
     <span class=key>guards</span>
     <input type=hidden name=guards_present value=1>
@@ -106,8 +114,16 @@
       <code>[[pairs.guards]]</code> in config.toml</p>
       {% else %}
       <div class=grid>
-        {% for field in guard.fields %}{% include "field.html" %}{% endfor %}
+        {% for field in guard.fields %}{% if !field.advanced %}{% include "field.html" %}{% endif %}{% endfor %}
       </div>
+      {% if guard.has_advanced %}
+      <details class=advanced>
+        <summary>advanced</summary>
+        <div class=grid>
+          {% for field in guard.fields %}{% if field.advanced %}{% include "field.html" %}{% endif %}{% endfor %}
+        </div>
+      </details>
+      {% endif %}
       {% endif %}
     </div>
     {% endfor %}

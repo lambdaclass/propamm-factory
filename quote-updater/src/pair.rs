@@ -233,6 +233,10 @@ pub(crate) fn shape_of(resolved: &ResolvedPair, price_decimals: u32, target: Add
         target,
         sources: resolved.feeds.as_ref().map_or(0, |f| f.sources.len()),
         mid_only_sources: resolved.feeds.as_ref().map_or(0, |f| f.mid_only_sources()),
+        venue_symbols: resolved
+            .feeds
+            .as_ref()
+            .map_or_else(Vec::new, |f| f.venue_symbols()),
         min_mid: resolved.pair.band.min,
         max_mid: resolved.pair.band.max,
     }
@@ -481,6 +485,7 @@ pub(crate) async fn build_live(
                     .with_chain(chain_handle.clone())
                     .with_latch(latch.clone())
                     .with_http(endpoints.http())
+                    .with_endpoints(endpoints.clone())
             },
             metrics,
         )
@@ -581,6 +586,7 @@ pub(crate) async fn build_live(
                 .with_chain(chain_handle.clone())
                 .with_latch(latch.clone())
                 .with_http(endpoints.http())
+                .with_endpoints(endpoints.clone())
                 .with_pricer_diagnostics(names.clone())
         },
         metrics,
@@ -800,6 +806,10 @@ pub(crate) async fn collect_prices(
                 target: chain.1,
                 sources: spec.feeds.as_ref().map_or(0, |f| f.sources.len()),
                 mid_only_sources: spec.feeds.as_ref().map_or(0, |f| f.mid_only_sources()),
+                venue_symbols: spec
+                    .feeds
+                    .as_ref()
+                    .map_or_else(Vec::new, |f| f.venue_symbols()),
                 min_mid: spec.band.min,
                 max_mid: spec.band.max,
             };
@@ -843,7 +853,8 @@ pub(crate) async fn collect_prices(
                     let (client, target) = chain;
                     let mut ctx = BuildCtx::new(shape.clone())
                         .with_chain(Chain::new(client.clone(), target))
-                        .with_http(endpoints.http());
+                        .with_http(endpoints.http())
+                        .with_endpoints(endpoints.clone());
                     if spec.feeds.is_some() {
                         ctx = ctx.with_history(History::empty());
                     }
@@ -879,6 +890,7 @@ pub(crate) async fn collect_prices(
                     BuildCtx::new(shape.clone())
                         .with_chain(Chain::new(client.clone(), target))
                         .with_http(endpoints.http())
+                        .with_endpoints(endpoints.clone())
                 };
                 let market = build_market_guards(kinds, &spec.guards, &ctx_for, metrics).await;
                 // A quote guard binds to what the pricer declared. With no pricer built
@@ -1468,6 +1480,7 @@ mod tests {
             target: Address::zero(),
             sources: 1,
             mid_only_sources: 0,
+            venue_symbols: Vec::new(),
             min_mid: None,
             max_mid: None,
         };
@@ -1512,6 +1525,7 @@ mod tests {
             PairShape {
                 sources: 1,
                 mid_only_sources: 0,
+                venue_symbols: Vec::new(),
                 min_mid: None,
                 max_mid: None,
                 label: "CUSTOM/TEST".into(),
