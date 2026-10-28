@@ -303,6 +303,8 @@ mod tests {
                         ((mid - prev) / prev).abs()
                     };
                     self.m.breaker_armed.set(1.0);
+                    self.m.breaker_limit.set(limit);
+                    self.m.breaker_deviation.set(jump);
                     self.m.breaker_deviation_ratio.set(jump / limit);
 
                     // A crossed book every so often, so the rejected-ticks panel and
@@ -322,6 +324,7 @@ mod tests {
                     self.m.feed_last_tick.set(f64::NAN);
                     self.m.feed_sample_current.set(f64::NAN);
                     self.m.breaker_armed.set(0.0);
+                    self.m.breaker_limit.set(f64::NAN);
                 }
             }
 

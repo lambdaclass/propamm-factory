@@ -21,7 +21,7 @@ use ethrex_common::U256;
 use tokio::sync::Notify;
 
 use crate::{
-    feed::scaled_to_f64,
+    feed::{format_scaled, scaled_to_f64},
     pricing::{Diagnostics, PricerOutput, Refusal, TickCtx},
     update::Bound,
 };
@@ -302,6 +302,98 @@ impl SourceSample {
     pub fn half_spread(&self) -> f64 {
         scaled_to_f64(self.delta, self.decimals)
     }
+
+    /// The venue's mid in lane orientation and human units: how the reason line and the
+    /// recorder's row carry a mid.
+    fn lane_mid(&self) -> f64 {
+        scaled_to_f64(self.mid, self.decimals)
+    }
+}
+
+/// What a trip judged on the composite carries beside its reason: the sample it tripped
+/// on and the one judged before it, each with the venues that went into it. A reason
+/// quotes the averaged mids, which cannot say which venue moved; this can. The alarm line
+/// gets it rendered ([`MarketTrip::venues`]) and the recorder keeps it as a row
+/// (`feed.breaker_trips`), so it is on the record after the log has rotated.
+#[derive(Clone, Debug)]
+pub(crate) struct MarketTrip {
+    /// The sample judged before the one that tripped: `None` when the tripping sample was
+    /// the lane's first.
+    pub(crate) previous: Option<Judged>,
+    /// The sample that tripped.
+    pub(crate) current: Judged,
+}
+
+/// One judged composite sample as a trip keeps it: its mid in lane orientation and human
+/// units, like a reason's, and the fresh venues it averaged.
+#[derive(Clone, Debug)]
+pub(crate) struct Judged {
+    pub(crate) mid: f64,
+    pub(crate) sources: Vec<SourceSample>,
+}
+
+impl Judged {
+    /// The venues as the recorder stores them: one object each, mids in lane orientation
+    /// and human units, the half-spread as a fraction, the age in seconds.
+    pub(crate) fn sources_json(&self) -> serde_json::Value {
+        serde_json::Value::Array(
+            self.sources
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "venue": s.venue,
+                        "weight": s.weight,
+                        "mid": s.lane_mid(),
+                        "half_spread": s.half_spread(),
+                        "age_secs": s.age.as_secs_f64(),
+                    })
+                })
+                .collect(),
+        )
+    }
+}
+
+impl MarketTrip {
+    /// The venues of the tripping sample, each with its mid in the sample before:
+    /// `binance 1.001 -> 1.06 (weight 1.000, 0.2s old), okx 1.001 -> 1.001 (weight 0.001,
+    /// 0.8s old)`, mids exact and in lane orientation like the reason's own two. A venue
+    /// the previous sample did not have says so, and one it had that has since gone stale
+    /// is listed last.
+    pub(crate) fn venues(&self) -> String {
+        venue_moves(
+            self.previous.as_ref().map(|p| p.sources.as_slice()),
+            &self.current.sources,
+        )
+    }
+}
+
+/// [`MarketTrip::venues`], over the two venue lists.
+pub(crate) fn venue_moves(previous: Option<&[SourceSample]>, current: &[SourceSample]) -> String {
+    let before = |venue: &str| previous.and_then(|p| p.iter().find(|s| s.venue == venue));
+    let mut parts: Vec<String> = current
+        .iter()
+        .map(|s| {
+            let mid = format_scaled(s.mid, s.decimals);
+            let tail = format!("weight {:.3}, {:.1}s old", s.weight, s.age.as_secs_f64());
+            match before(s.venue) {
+                Some(p) => format!(
+                    "{} {} -> {mid} ({tail})",
+                    s.venue,
+                    format_scaled(p.mid, p.decimals)
+                ),
+                None => format!("{} {mid} (no earlier sample; {tail})", s.venue),
+            }
+        })
+        .collect();
+    if let Some(previous) = previous {
+        parts.extend(
+            previous
+                .iter()
+                .filter(|p| !current.iter().any(|s| s.venue == p.venue))
+                .map(|p| format!("{} {} -> stale", p.venue, format_scaled(p.mid, p.decimals))),
+        );
+    }
+    parts.join(", ")
 }
 
 /// Who tripped a latch, for the alarm line, the watchdog notice and `trip_source`.
@@ -392,6 +484,10 @@ struct Inner {
     /// right after the switch (see [`Latch::record_trip`]). A flag apart from `trip`,
     /// because a trip can be set while its recording is still gated off.
     recorded: AtomicBool,
+    /// The recorder a trip's row goes to, and the lane's label on it. Set when the lane is
+    /// built, if the run records at all; a trip finding none (a test's latch, a run without
+    /// a database) writes no row and says nothing of it.
+    recorder: OnceLock<(crate::record::Recorder, String)>,
 }
 
 /// Who a latch tells of its trip, and whether it has. One lock over both, taken by the trip
@@ -433,7 +529,30 @@ impl Latch {
 
     /// Trips the latch. `true` if this call did; `false` if it was already tripped, whose
     /// trip stands: the first judgement is the one the operator was shown.
-    pub fn trip(&self, source: &'static str, cause: Cause, mut reason: TripReason) -> bool {
+    pub fn trip(&self, source: &'static str, cause: Cause, reason: TripReason) -> bool {
+        self.latch(source, cause, reason, None)
+    }
+
+    /// [`Self::trip`] for a trip judged on the composite, with the two samples behind it:
+    /// the alarm line ends with the venues of both ([`MarketTrip::venues`]), and the
+    /// recorder's row carries the mids and the venues of each.
+    pub(crate) fn trip_judged(
+        &self,
+        source: &'static str,
+        cause: Cause,
+        reason: TripReason,
+        market: MarketTrip,
+    ) -> bool {
+        self.latch(source, cause, reason, Some(market))
+    }
+
+    fn latch(
+        &self,
+        source: &'static str,
+        cause: Cause,
+        mut reason: TripReason,
+        market: Option<MarketTrip>,
+    ) -> bool {
         // A registered guard's alarm names the guard, as the deviation guard's names itself
         // in its own wording: an operator reading `half-spread 1.23% over the cap` needs
         // to know which guard said so, and `trip_source` is a metric, not the line. The
@@ -441,6 +560,11 @@ impl Latch {
         // already names its kind.
         if cause == Cause::Guard && !BUILT_IN_GUARDS.contains(&source) {
             reason.alarm = format!("guard `{source}` tripped: {}", reason.alarm);
+        }
+        // The venues on the alarm line only: the header follows "withdrawn: " in a block
+        // summary and the re-arm tail follows "took N ago", neither a place for a list.
+        if let Some(market) = &market {
+            reason.alarm = format!("{}; venues: {}", reason.alarm, market.venues());
         }
         let tripped = self
             .0
@@ -465,9 +589,20 @@ impl Latch {
             // Once per latch, so the lock costs the quoting path nothing; `emit` never waits.
             if let Some(trip) = self.0.trip.get() {
                 self.telling().tell(trip);
+                // The row, from the trip as set: once per latch like the telling, and a
+                // mutex and a push, which `Recorder` keeps off the quoting path.
+                if let Some((recorder, label)) = self.0.recorder.get() {
+                    recorder.trip(crate::record::TripRow::new(label, trip, market));
+                }
             }
         }
         tripped
+    }
+
+    /// The recorder a trip's row goes to, as `label`. Once, at build; a later call changes
+    /// nothing.
+    pub(crate) fn attach_recorder(&self, recorder: crate::record::Recorder, label: String) {
+        let _ = self.0.recorder.set((recorder, label));
     }
 
     /// Records the trip's transition (`breaker_tripped`, `breaker_trips`, `trip_source`)
@@ -843,5 +978,99 @@ mod tests {
                 .await
                 .expect("already tripped: no wait");
         }
+    }
+
+    fn venue(name: &'static str, weight: f64, mid: u64, age_ms: u64) -> SourceSample {
+        SourceSample::new(
+            name,
+            weight,
+            U256::from(mid),
+            U256::from(10_000u64),
+            std::time::Duration::from_millis(age_ms),
+            false,
+            8,
+        )
+    }
+
+    /// The venue line pairs each venue of the tripping sample with its mid in the sample
+    /// before, so the one that moved is visible at a glance; a venue new since then says
+    /// so, and one that went stale in between is listed last rather than lost.
+    #[test]
+    fn the_venue_line_says_what_each_venue_read_then_and_now() {
+        let previous = [
+            venue("binance", 0.999, 100_117_500, 200),
+            venue("okx", 0.001, 100_115_500, 800),
+        ];
+        let current = [
+            venue("binance", 0.999, 101_117_500, 150),
+            venue("okx", 0.001, 100_115_500, 900),
+        ];
+        assert_eq!(
+            venue_moves(Some(&previous), &current),
+            "binance 1.001175 -> 1.011175 (weight 0.999, 0.1s old), \
+             okx 1.001155 -> 1.001155 (weight 0.001, 0.9s old)"
+        );
+        // The first sample has nothing before it.
+        assert_eq!(
+            venue_moves(None, &current[..1]),
+            "binance 1.011175 (no earlier sample; weight 0.999, 0.1s old)"
+        );
+        // A venue that dropped out between the two samples, and one that joined.
+        assert_eq!(
+            venue_moves(Some(&previous), &[venue("kraken", 1.0, 100_200_000, 50)]),
+            "kraken 1.002 (no earlier sample; weight 1.000, 0.1s old), \
+             binance 1.001175 -> stale, okx 1.001155 -> stale"
+        );
+    }
+
+    /// A trip judged on the composite ends its alarm with the venue line and leaves the
+    /// block header and the re-arm tail alone, which have no room for a list; a plain
+    /// trip's alarm is as it was.
+    #[test]
+    fn a_judged_trip_puts_the_venues_on_the_alarm_line_only() {
+        let latch = Latch::new();
+        let market = MarketTrip {
+            previous: Some(Judged {
+                mid: 1.001175,
+                sources: vec![venue("binance", 1.0, 100_117_500, 200)],
+            }),
+            current: Judged {
+                mid: 1.011175,
+                sources: vec![venue("binance", 1.0, 101_117_500, 100)],
+            },
+        };
+        assert!(latch.trip_judged(
+            "deviation",
+            Cause::Guard,
+            TripReason::new("circuit breaker tripped: mid moved 0.99% > 0.20%"),
+            market.clone(),
+        ));
+        let trip = latch.tripped().unwrap();
+        assert_eq!(
+            trip.reason.alarm,
+            "circuit breaker tripped: mid moved 0.99% > 0.20%; venues: \
+             binance 1.001175 -> 1.011175 (weight 1.000, 0.1s old)"
+        );
+        assert_eq!(
+            trip.reason.header,
+            "circuit breaker tripped: mid moved 0.99% > 0.20%"
+        );
+        assert_eq!(
+            trip.reason.rearm,
+            "(circuit breaker tripped: mid moved 0.99% > 0.20%)"
+        );
+        // A registered guard's prefix comes first, the venues last.
+        let registered = Latch::new();
+        registered.trip_judged(
+            "agreement",
+            Cause::Guard,
+            TripReason::new("venues 1.0% apart"),
+            market,
+        );
+        assert_eq!(
+            registered.tripped().unwrap().reason.alarm,
+            "guard `agreement` tripped: venues 1.0% apart; venues: \
+             binance 1.001175 -> 1.011175 (weight 1.000, 0.1s old)"
+        );
     }
 }
