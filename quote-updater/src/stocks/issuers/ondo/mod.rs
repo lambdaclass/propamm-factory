@@ -762,4 +762,19 @@ mod tests {
         let rebuilt = kind_stanza("pricing", fields, "ondo", Some(&stanza), &posted).unwrap();
         assert_eq!(rebuilt, stanza);
     }
+
+    /// The `sessions` field's placeholder is what the page ticks for a stanza without the
+    /// key, so it names, among the field's options, the sessions an absent key means.
+    #[test]
+    fn the_sessions_field_ticks_the_default_sessions() {
+        let field = FIELDS.iter().find(|f| f.name == "sessions").unwrap();
+        assert_eq!(
+            field.kind,
+            crate::pricing::FieldKind::Choices(&TRADING_SESSIONS)
+        );
+        assert_eq!(
+            field.placeholder.split_whitespace().collect::<Vec<_>>(),
+            default_sessions()
+        );
+    }
 }

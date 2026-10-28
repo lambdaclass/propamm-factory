@@ -81,8 +81,12 @@ pub enum FieldKind {
     /// [`EnvSecret`] reads. The variable's value never reaches the page, in either direction.
     Env,
     /// A fixed set of options, one checkbox each, written as an array of the ticked ones in
-    /// this order. The placeholder names the options ticked when the stanza has no key,
-    /// space-separated: the kind's default, so the page shows what the stanza means.
+    /// this order. The kind reads each entry trimmed and ignoring case, and no key and an
+    /// empty list as its default, which the placeholder names (spaces or commas between):
+    /// the boxes show what the stanza means, a save whose ticks mean the same leaves the
+    /// key as written, and one with no box ticked removes it. A box ticks with the `on` a
+    /// browser posts and refuses any other value, since it writes an option into the
+    /// config rather than switching a section on.
     Choices(&'static [&'static str]),
 }
 
@@ -121,13 +125,18 @@ impl FormField {
 
     /// A field whose value is a choice among `options`, one checkbox each, written as an
     /// array of the ticked ones (`sessions = ["regular", "postmarket"]`). `placeholder`
-    /// names the options ticked when the stanza has no key, space-separated.
+    /// names the kind's default, the options ticked when the stanza has no key or an
+    /// empty list; see [`FieldKind::Choices`].
     pub const fn choices(
         name: &'static str,
         options: &'static [&'static str],
         placeholder: &'static str,
         hint: &'static str,
     ) -> Self {
+        assert!(
+            !options.is_empty(),
+            "a choices field needs at least one option"
+        );
         Self::of(FieldKind::Choices(options), name, placeholder, hint)
     }
 
@@ -211,9 +220,10 @@ pub trait Factory: Send + Sync + 'static {
     }
 
     /// The stanza's keys as inputs on the backoffice's pair form, in the order shown. The
-    /// page posts each as text and writes it into the stanza as the field's [`FieldKind`]
-    /// says: a string, a number, a list or an env reference. Empty, the default, means the
-    /// stanza is edited in the file and the page says so.
+    /// page posts each as text, a choices field as its ticked boxes, and writes it into the
+    /// stanza as the field's [`FieldKind`] says: a string, a number, a list, an env
+    /// reference or the options ticked. Empty, the default, means the stanza is edited in
+    /// the file and the page says so.
     fn fields(&self) -> &'static [FormField] {
         &[]
     }
@@ -1429,5 +1439,13 @@ mod tests {
             toml::from_str("key = { env = \"QUOTE_UPDATER_TEST_NEVER_SET_7F3A\" }").unwrap();
         let err = format!("{:#}", unset.key.resolve().unwrap_err());
         assert!(err.contains("QUOTE_UPDATER_TEST_NEVER_SET_7F3A"), "{err}");
+    }
+
+    /// A choices field declares at least one option: with none the page has no box to
+    /// render, and the field nothing to write.
+    #[test]
+    #[should_panic(expected = "at least one option")]
+    fn a_choices_field_without_options_is_refused() {
+        let _ = FormField::choices("days", &[], "", "");
     }
 }

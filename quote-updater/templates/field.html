@@ -1,4 +1,4 @@
-{% if !field.choices.is_empty() %}
+{% if field.checkboxes %}
 <div class=field>
   <span class=key>{{ field.label }}</span>
   {# The key itself, so the post says the field was on the page even with no box ticked. #}
@@ -6,7 +6,7 @@
   <div class=choices>
     {% for choice in field.choices %}
     <label class=check>
-      <input type=checkbox name="{{ choice.name }}"{% if choice.checked %} checked{% endif %}>
+      <input type=checkbox name="{{ choice.name }}" autocomplete=off{% if choice.checked %} checked{% endif %}>
       <span class=choice-name>{{ choice.label }}</span>
     </label>
     {% endfor %}
