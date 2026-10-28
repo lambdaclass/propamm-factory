@@ -5362,8 +5362,8 @@ api_key = "k"
         assert_eq!(by_kind(&pair.guards), by_kind(&want.guards));
     }
 
-    /// A pair priced by a kind that sources its own mid (a stock pair) lists no venue, and
-    /// the add page takes it that way: no symbol, no sources.
+    /// A pair priced by a kind that sources its own mid lists no venue, and the add page
+    /// takes it that way: no symbol, no sources.
     #[tokio::test]
     async fn a_pair_whose_pricing_kind_sources_its_own_mid_saves_with_no_venue() {
         let (path, state, mut reloads) = config_on_disk("no-venue");

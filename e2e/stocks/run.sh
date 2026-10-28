@@ -134,8 +134,10 @@ text = text.replace(
     ondo, f'{ondo}api = "http://127.0.0.1:{api_port}"\nmultiplier_oracle = "{oracle}"\n'
 )
 if mode == "node":
-    # The first guard *table*: the header comment names [[pairs.guards]] too.
+    # The first guard *table*: the header comment names [[pairs.guards]] too. And the
+    # breaker, which node mode refuses: it has no live quote to withdraw.
     text = text[: re.search(r"(?m)^\[\[pairs\.guards\]\]", text).start()]
+    text = re.sub(r"(?m)^max_deviation = .*\n", "", text)
 if name == "halted":
     key_env = re.search(r"(?m)^key_env .*$", text).group(0)
     text = text.replace(key_env, f"{key_env}\nhalted  = true")
@@ -167,8 +169,8 @@ if ONDO_API_KEY=wrong run --config "$WORK/builder.toml" --check >"$WORK/badkey.o
   fail "--check passed with a wrong API key"
 fi
 # The venue's poll is refused with a 401 and the pair never gets a first price.
-grep -q "401" "$WORK/badkey.out" || { cat "$WORK/badkey.out"; fail "a wrong key was not reported as a 401"; }
-grep -m1 "401" "$WORK/badkey.out" | sed 's/^ */  wrong key: /'
+grep -q "401 Unauthorized" "$WORK/badkey.out" || { cat "$WORK/badkey.out"; fail "a wrong key was not reported as a 401"; }
+grep -m1 "401 Unauthorized" "$WORK/badkey.out" | sed 's/^ */  wrong key: /'
 # The oracle lists some tokens and not others: one it does not list is quoted on Ondo's
 # price alone, and the check passes saying so.
 send "$ORACLE" 'setMultiplier(address,uint128,uint256)' "$AAPLON" 0 0 --private-key "$DEPLOYER_KEY"
