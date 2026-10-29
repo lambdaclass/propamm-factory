@@ -133,6 +133,11 @@ pub(crate) fn adopt_metrics(live: &Live, price_decimals: u32, metrics: &crate::m
             }
         }
     }
+    // A pair without `[pairs.fx]` has no rate to report, and its registered 0s would read
+    // as one whose guard is not tripped.
+    if !live.venues.iter().any(|venue| venue.fx) {
+        m.fx_absent();
+    }
     // Every venue under the composite, for the same reason: what it delivered before this
     // generation owned the series was recorded nowhere. A venue with no sample yet keeps
     // its `up` flag's 0 (it has not connected, which is what 0 says) but not the registered
@@ -141,11 +146,10 @@ pub(crate) fn adopt_metrics(live: &Live, price_decimals: u32, metrics: &crate::m
         let v = &venue.metrics;
         // From here on the venue's `up` is its feed task's own flag, read at every scrape,
         // so a connect that happened before this generation owned the series still shows.
-        metrics.watch_venue(
-            &live.pair.label,
-            venue.venue.as_str(),
-            venue.connected.clone(),
-        );
+        metrics.watch_venue(&live.pair.label, &venue.series(), venue.connected.clone());
+        // Written only on a USD source's tick, so a venue an edit took off USD would keep
+        // the 1 the generation before left; this generation's ticks write it from here.
+        v.converted.set(0.0);
         match *venue.rx.borrow() {
             Some(sample) => {
                 v.mid.set(feed::scaled_to_f64(sample.mid, price_decimals));
@@ -550,6 +554,15 @@ pub(crate) async fn build_live(
         Some(feeds) => {
             let history = histories.for_symbol(&feeds.history_key());
             let spawned = composite::connect(feeds, params(Some(history.clone()))).await?;
+            if !spawned.silent_fx.is_empty() {
+                tracing::warn!(
+                    "[{}] no price from FX leg {} within {:?}; the USD sources stay out of the \
+                     average until it delivers. Wrong symbol or blocked endpoint?",
+                    resolved.pair.label,
+                    spawned.silent_fx.join(", "),
+                    composite::FIRST_PRICE_TIMEOUT
+                );
+            }
             (Some(spawned.rx), spawned.venues, Some(History(history)))
         }
         None => (None, Vec::new(), None),
@@ -823,6 +836,13 @@ pub(crate) async fn collect_prices(
             let sample = match (validated, &spec.feeds) {
                 (Err(err), _) => Err(format!("{err:#}")),
                 (Ok(()), Some(feeds)) => match composite::connect(feeds, params()).await {
+                    // The run starts on such a leg, warning; a check is where it is caught.
+                    Ok(spawned) if !spawned.silent_fx.is_empty() => Err(format!(
+                        "no price from FX leg {} within {:?}; wrong symbol or blocked \
+                         endpoint?",
+                        spawned.silent_fx.join(", "),
+                        composite::FIRST_PRICE_TIMEOUT
+                    )),
                     Ok(spawned) => {
                         venues = venue_lines(&spawned);
                         let sample = *spawned.rx.borrow();
@@ -1116,6 +1136,7 @@ mod tests {
                 rx,
                 metrics: metrics.for_venue("UP/TEST", name),
                 connected,
+                fx: false,
             }
         };
         let live = |okx: bool| Live {
@@ -1157,6 +1178,53 @@ mod tests {
         // A reload's new generation takes over: its own flags are what is read from then on.
         adopt_metrics(&live(false), 18, &metrics);
         assert_eq!(up("okx"), Some(0.0));
+    }
+
+    /// A reload keeps a pair's label and its venues', so the generation it starts takes over
+    /// the series the one before wrote. `converted` is written only on a USD source's tick,
+    /// so a venue the edit took off `quote = "USD"` would read the 1 its last conversion
+    /// left there for the life of the process. Adopted at 0, as a fresh process has it.
+    #[tokio::test]
+    async fn a_reload_starts_every_venue_unconverted() {
+        use ethrex_l2_rpc::signer::{LocalSigner, Signer};
+
+        let secret = secp256k1::SecretKey::from_slice(&[0x24; 32]).unwrap();
+        let metrics = metrics::Metrics::new().unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(None);
+        let (_venue_tx, venue_rx) = tokio::sync::watch::channel(None);
+        // What the generation before left: coinbase converted into its last average.
+        metrics.for_venue("FX/TEST", "coinbase").converted.set(1.0);
+        let live = Live {
+            pair: Pair {
+                tokens: (Address::zero(), Address::zero()),
+                lane: U256::from(5),
+                signer: Signer::from(LocalSigner::new(secret)),
+                label: "FX/TEST".to_owned(),
+                band: config::MidBand::default(),
+            },
+            values: ValueSource::feed_for_tests(rx, None, false, 18),
+            latch: crate::guard::Latch::new(),
+            armed: false,
+            guard_kinds: Vec::new(),
+            deviation: None,
+            metrics: metrics.for_pair("FX/TEST"),
+            venues: vec![crate::composite::VenueFeed {
+                venue: "coinbase".parse().unwrap(),
+                symbol: "ETH-USDT".to_owned(),
+                rx: venue_rx,
+                metrics: metrics.for_venue("FX/TEST", "coinbase"),
+                connected: feed::Connected::with(true),
+                fx: false,
+            }],
+            observers: Default::default(),
+        };
+
+        adopt_metrics(&live, 18, &metrics);
+
+        assert_eq!(
+            metrics.for_venue("FX/TEST", "coinbase").converted.get(),
+            0.0
+        );
     }
 
     /// A pair can arrive at adoption already tripped, because its feed has been reading and
