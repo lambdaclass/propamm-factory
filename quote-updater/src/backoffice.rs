@@ -1213,6 +1213,8 @@ struct SaveSettings {
     backoffice_addr: String,
     #[serde(default)]
     disable_cross_region: Option<String>,
+    #[serde(default)]
+    quote_id: Option<String>,
 }
 
 /// The venue table of the settings form: one endpoint override per venue,
@@ -1415,6 +1417,7 @@ fn build_settings(form: &SaveSettings) -> Result<config::FileSettings> {
         requote_ms: optional_number("requote_ms", &form.requote_ms)?,
         metrics_addr: optional(&form.metrics_addr),
         disable_cross_region: form.disable_cross_region.is_some().then_some(true),
+        quote_id: form.quote_id.is_some().then_some(true),
         backoffice_addr: optional(&form.backoffice_addr),
     })
 }
@@ -2286,6 +2289,7 @@ struct SettingsFormPage {
     fields: Vec<Filled>,
     endpoints: Vec<EndpointRow>,
     disable_cross_region: bool,
+    quote_id: bool,
 }
 
 /// One venue's row of the settings form's endpoint table.
@@ -2612,6 +2616,7 @@ fn render_settings_form(config: &RawConfig) -> String {
             })
             .collect(),
         disable_cross_region: s.disable_cross_region == Some(true),
+        quote_id: s.quote_id == Some(true),
     }
     .render()
     .unwrap_or_else(render_failed)
@@ -4275,6 +4280,7 @@ api_key = "k"
             requote_ms: Some(50),
             metrics_addr: Some("127.0.0.1:9464".to_owned()),
             disable_cross_region: Some(true),
+            quote_id: Some(true),
             backoffice_addr: Some("100.1.2.3:8088".to_owned()),
         };
         let rendered = toml::to_string_pretty(&full).unwrap();
@@ -4282,7 +4288,7 @@ api_key = "k"
             .lines()
             .filter_map(|line| line.split_once(" = ").map(|(key, _)| key))
             .collect();
-        assert_eq!(keys.len(), 11, "the struct grew: {keys:?}");
+        assert_eq!(keys.len(), 12, "the struct grew: {keys:?}");
 
         let mut config = a_config();
         config.settings = full;
@@ -4296,7 +4302,7 @@ api_key = "k"
             } else {
                 key
             };
-            // disable_cross_region is the checkbox, not a text input.
+            // disable_cross_region and quote_id are the checkboxes, not text inputs.
             let present = page.contains(&format!(r#"name="{key}""#))
                 || page.contains(&format!("name={key}>"))
                 || page.contains(&format!("name={key} "));
@@ -4332,6 +4338,7 @@ api_key = "k"
             metrics_addr: String::new(),
             backoffice_addr: String::new(),
             disable_cross_region: None,
+            quote_id: None,
         };
         let built = build_settings(&form).unwrap();
         assert_eq!(built.binance_ws, None, "moved into the table");
@@ -4395,6 +4402,7 @@ api_key = "k"
                 metrics_addr: "127.0.0.1:9464".to_owned(),
                 backoffice_addr: "100.1.2.3:8088".to_owned(),
                 disable_cross_region: None,
+                quote_id: None,
             }
         }
 
@@ -4405,6 +4413,7 @@ api_key = "k"
         assert_eq!(built.registry, None);
         assert_eq!(built.price_decimals, None);
         assert_eq!(built.disable_cross_region, None);
+        assert_eq!(built.quote_id, None);
 
         type Mutate = Box<dyn Fn(&mut SaveSettings)>;
         let cases: Vec<(&str, Mutate)> = vec![
