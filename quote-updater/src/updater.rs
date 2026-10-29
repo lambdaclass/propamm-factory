@@ -226,20 +226,24 @@ impl UpdaterBuilder {
     }
 
     /// Registers a tokenized-stock issuer's guard under the name the issuer declares
-    /// ([`crate::stocks::Issuer`]): `ondo` for [`crate::stocks::issuers::ondo::Ondo`], which
-    /// runs the issuer's status checks and the token's transfer rules as one. The token
+    /// ([`crate::stocks::Issuer`]): `ondo` for [`crate::stocks::issuers::ondo::Ondo`]. That
+    /// kind runs the issuer's status checks and the token's transfer rules as one
+    /// ([`crate::stocks::WithTokenRules`]), whatever the issuer's own build does. The token
     /// guard's own name (`ondo_token`) stays registered for a pair that still lists it, and
     /// the pair form offers it to no new pair. A binary names the issuers it integrates,
     /// one call each, and nothing registers one implicitly. The explicit
     /// [`Self::quote_guard`] call remains for other names. The issuer's price is a venue
     /// (`ondo` in a pair's `sources`), which needs no registering.
     pub fn stock_issuer<I: crate::stocks::Issuer>(mut self, issuer: I) -> Self {
-        let token_guard = issuer.token_guard();
         self.parts.kinds.insert_guard_legacy(
             I::TOKEN_GUARD_KIND,
-            crate::kinds::quote_guard_factory(token_guard),
+            I::STATUS_GUARD_KIND,
+            crate::kinds::quote_guard_factory(issuer.token_guard()),
         );
-        self.quote_guard(I::STATUS_GUARD_KIND, issuer)
+        self.quote_guard(
+            I::STATUS_GUARD_KIND,
+            crate::stocks::WithTokenRules::new(issuer),
+        )
     }
 
     /// Registers an observer: a binary's code that is told what the run does
@@ -806,6 +810,99 @@ mod tests {
         assert_eq!(kinds.guard_name("ondo"), Some("ondo"));
         assert_eq!(kinds.guard_name("ondo_token"), Some("ondo_token"));
         kinds.errors().unwrap();
+    }
+
+    /// An issuer's token rules run under its status guard's kind whatever its own build
+    /// does: a design whose factory wires nothing of the rules in still has its pairs
+    /// withdraw while the token would refuse the fill.
+    #[tokio::test]
+    async fn an_issuers_token_rules_run_under_its_status_guard_kind() {
+        use crate::{
+            config::GuardStanza,
+            guard::{Candidate, Gate, QuoteGuard},
+            pricing::{
+                BoxFuture, BuildCtx, Diagnostics, PricerOutput, QuoteGuardFactory, Refusal,
+                RefusalHandle,
+            },
+            stocks::Issuer,
+            testing,
+        };
+        #[derive(Default, serde::Deserialize)]
+        struct NoKnobs {}
+        /// A status guard with nothing to say.
+        struct Open;
+        impl QuoteGuard for Open {
+            fn check(&mut self, _: &Candidate<'_>, _: &mut Diagnostics) -> Gate {
+                Gate::Allow
+            }
+        }
+        /// Token rules that say the token is paused.
+        struct Paused(RefusalHandle);
+        impl QuoteGuard for Paused {
+            fn check(&mut self, _: &Candidate<'_>, _: &mut Diagnostics) -> Gate {
+                Gate::Withdraw(Refusal::new(&self.0, "the token is paused"))
+            }
+        }
+        struct Acme;
+        impl QuoteGuardFactory for Acme {
+            type Config = NoKnobs;
+            type Guard = Open;
+            fn build<'a>(
+                &'a self,
+                _: &'a NoKnobs,
+                _: &'a mut BuildCtx,
+            ) -> BoxFuture<'a, eyre::Result<Open>> {
+                Box::pin(async { Ok(Open) })
+            }
+        }
+        struct AcmeRules;
+        impl QuoteGuardFactory for AcmeRules {
+            type Config = NoKnobs;
+            type Guard = Paused;
+            fn build<'a>(
+                &'a self,
+                _: &'a NoKnobs,
+                ctx: &'a mut BuildCtx,
+            ) -> BoxFuture<'a, eyre::Result<Paused>> {
+                Box::pin(async move { Ok(Paused(ctx.refusal("token_paused")?)) })
+            }
+        }
+        impl Issuer for Acme {
+            const STATUS_GUARD_KIND: &'static str = "acme";
+            const TOKEN_GUARD_KIND: &'static str = "acme_token";
+            type TokenGuard = AcmeRules;
+            fn token_guard(&self) -> AcmeRules {
+                AcmeRules
+            }
+        }
+        let builder = Updater::builder().stock_issuer(Acme);
+        let stanzas = vec![GuardStanza {
+            kind: "acme".to_owned(),
+            config: toml::from_str(r#"kind = "acme""#).unwrap(),
+        }];
+        let pair = testing::pair();
+        let metrics = crate::metrics::Metrics::new().unwrap();
+        let mut guards = crate::pair::build_quote_guards(
+            &builder.parts.kinds,
+            &stanzas,
+            || testing::build_ctx(&pair),
+            &metrics,
+        )
+        .await
+        .unwrap();
+        assert_eq!(guards.len(), 1);
+        let market = testing::market(&pair, 4000.0, 0.0001);
+        let tick = testing::tick(&pair, Some(&market));
+        let priced = PricerOutput::new(crate::U256::zero(), market.mid);
+        let mut out = Diagnostics::new(0);
+        let seen = Diagnostics::new(0);
+        let gate = guards[0]
+            .guard
+            .check(&testing::candidate(&tick, Ok(&priced), &seen), &mut out);
+        match gate {
+            Gate::Withdraw(refusal) => assert_eq!(refusal.reason(), "token_paused"),
+            other => panic!("the token's rules did not run: {other:?}"),
+        }
     }
 
     #[test]

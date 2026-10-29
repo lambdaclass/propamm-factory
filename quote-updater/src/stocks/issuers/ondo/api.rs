@@ -6,11 +6,11 @@
 //! are cached for a second (prices) to a minute (status) on Ondo's side, so polling faster
 //! than once a second buys nothing.
 //!
-//! The key only goes over https ([`check_api`]; plain http to this machine, for the smoke
-//! test's mock), through a client of its own that never follows a redirect ([`client`]).
+//! The key only goes over https ([`crate::venues::ondo::check_endpoint`]; plain http to
+//! this machine, for the smoke test's mock), through a client that never follows a
+//! redirect ([`client`]), both the venue's.
 
-use std::{sync::OnceLock, time::Duration};
-
+pub use crate::venues::ondo::client;
 use crate::{eyre, prelude::BoxFuture, reqwest};
 use serde::Deserialize;
 
@@ -399,43 +399,6 @@ fn rfc3339_ms(written: &str) -> Option<i64> {
         .filter(|ms| *ms > 0)
 }
 
-/// Whether the key may be sent to `api`: over https, or plain http to this machine only (the
-/// smoke test's mock). Anywhere else, plain http would hand the key to the network.
-pub fn check_api(api: &str) -> Result<(), String> {
-    let url = reqwest::Url::parse(api).map_err(|err| format!("api {api:?} is not a URL: {err}"))?;
-    let host = url.host_str().unwrap_or_default();
-    match url.scheme() {
-        "https" if !host.is_empty() => Ok(()),
-        "http" if ["127.0.0.1", "localhost", "[::1]"].contains(&host) => Ok(()),
-        "http" => Err(format!(
-            "api {api:?} is plain http: the key would cross the network in the clear (http is \
-             for this machine only)"
-        )),
-        _ => Err(format!("api {api:?} is not an https URL")),
-    }
-}
-
-/// How long one read of Ondo's API may take.
-const TIMEOUT: Duration = Duration::from_secs(10);
-
-/// The client every read of Ondo's API goes through: one for the process. Not the run's
-/// shared one, which follows redirects, and reqwest carries a custom header like
-/// `x-api-key` along to wherever a redirect points. Ondo's API has no reason to redirect,
-/// so one is refused (an error naming its status) rather than followed.
-pub fn client() -> reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(TIMEOUT)
-                .user_agent(concat!("propamm-quote-updater/", env!("CARGO_PKG_VERSION")))
-                .build()
-                .expect("a reqwest client with no redirects builds")
-        })
-        .clone()
-}
-
 /// `GET {api}{path}` with the key, answering the body of a 2xx and an error naming the status
 /// otherwise. The key is never part of an error.
 pub async fn get(http: &reqwest::Client, api: &str, path: &str, key: &str) -> eyre::Result<String> {
@@ -676,28 +639,6 @@ mod tests {
             judge(r#"[{"status":"active"}]"#).is_err(),
             "an event for no asset"
         );
-    }
-
-    #[test]
-    fn the_key_goes_over_https_or_to_this_machine_only() {
-        for good in [
-            "https://api.gm.ondo.finance",
-            "https://api.gm.ondo.finance/",
-            "http://127.0.0.1:8556",
-            "http://localhost:8556",
-            "http://[::1]:8556",
-        ] {
-            assert_eq!(check_api(good), Ok(()), "{good}");
-        }
-        for bad in [
-            "http://api.gm.ondo.finance",
-            "http://127.0.0.1.example.com",
-            "ftp://api.gm.ondo.finance",
-            "api.gm.ondo.finance",
-            "https://",
-        ] {
-            assert!(check_api(bad).is_err(), "{bad} was accepted");
-        }
     }
 
     #[test]

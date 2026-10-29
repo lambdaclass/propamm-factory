@@ -23,13 +23,41 @@ pub const API_KEY_VAR: &str = "ONDO_API_KEY";
 /// Ondo caches the price for a second, so polling faster buys nothing.
 pub const POLL_EVERY: Duration = Duration::from_secs(1);
 
+/// How long one read of Ondo's API through [`client`] may take.
+const TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The GM API key, from [`API_KEY_VAR`]: none when it is unset or empty. Every reader of
+/// Ondo's API (the venue, the `ondo` guard, the backoffice's lookup) takes it from here.
+pub fn api_key() -> Option<String> {
+    std::env::var(API_KEY_VAR)
+        .ok()
+        .filter(|key| !key.is_empty())
+}
+
+/// The client every keyed read of Ondo's API outside the venue's poll goes through (the
+/// guard's reads, the backoffice's lookup): one for the process. Not a shared one, which
+/// follows redirects, and reqwest carries a custom header like `x-api-key` along to
+/// wherever a redirect points. Ondo's API has no reason to redirect, so one is refused (an
+/// error naming its status) rather than followed.
+pub fn client() -> reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(TIMEOUT)
+                .user_agent(concat!("propamm-quote-updater/", env!("CARGO_PKG_VERSION")))
+                .build()
+                .expect("a reqwest client with no redirects builds")
+        })
+        .clone()
+}
+
 /// The poll of `symbol`'s latest price at `endpoint`, with the key from [`API_KEY_VAR`].
 /// Refused without a key, and on an endpoint the key must not cross the network to.
 pub fn connection(endpoint: &str, symbol: &str) -> Result<Connection> {
-    let key = std::env::var(API_KEY_VAR)
-        .ok()
-        .filter(|key| !key.is_empty())
-        .ok_or_else(|| eyre!("{API_KEY_VAR} is not set, and Ondo's API needs its key"))?;
+    let key =
+        api_key().ok_or_else(|| eyre!("{API_KEY_VAR} is not set, and Ondo's API needs its key"))?;
     let endpoint = endpoint.trim_end_matches('/');
     check_endpoint(endpoint).map_err(|err| eyre!(err))?;
     Ok(Connection::Poll {
@@ -136,12 +164,25 @@ mod tests {
 
     #[test]
     fn the_key_goes_over_https_or_to_this_machine_only() {
-        assert!(check_endpoint(DEFAULT_ENDPOINT).is_ok());
-        assert!(check_endpoint("http://127.0.0.1:8556").is_ok());
-        assert!(check_endpoint("http://localhost:8556/").is_ok());
-        assert!(check_endpoint("http://api.example.com").is_err());
-        assert!(check_endpoint("ftp://api.example.com").is_err());
-        assert!(check_endpoint("not a url").is_err());
+        for good in [
+            DEFAULT_ENDPOINT,
+            "https://api.gm.ondo.finance/",
+            "http://127.0.0.1:8556",
+            "http://localhost:8556/",
+            "http://[::1]:8556",
+        ] {
+            assert_eq!(check_endpoint(good), Ok(()), "{good}");
+        }
+        for bad in [
+            "http://api.gm.ondo.finance",
+            "http://127.0.0.1.example.com",
+            "ftp://api.gm.ondo.finance",
+            "api.gm.ondo.finance",
+            "https://",
+            "not a url",
+        ] {
+            assert!(check_endpoint(bad).is_err(), "{bad} was accepted");
+        }
     }
 
     #[test]

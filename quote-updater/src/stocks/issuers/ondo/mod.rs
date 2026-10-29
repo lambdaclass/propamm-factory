@@ -11,11 +11,12 @@
 //!   `SyntheticSharesOracle` ([`oracle::OndoOracle`]), checked against the `k` Ondo's own
 //!   price answer ([`api::OndoPrices`]) prices with, for a token that oracle lists (it holds
 //!   entries for some GM tokens and not others; one it does not list is guarded without
-//!   the multiplier gates); and the token's transfer rules, Ondo's pause manager, blocklist
-//!   and sanctions list ([`compliance::OndoCompliance`]), through the restriction guard
-//!   ([`crate::stocks::guard`]) it runs as its own. The token is the one the pair's `ondo`
-//!   venue names; the API key is `ONDO_API_KEY`, as the venue's; the API is the venue's
-//!   endpoint.
+//!   the multiplier gates); and beside it, under the same kind
+//!   ([`crate::stocks::WithTokenRules`]), the token's transfer rules, Ondo's pause manager,
+//!   blocklist and sanctions list ([`compliance::OndoCompliance`]), through the restriction
+//!   guard ([`crate::stocks::guard`]) at the stanza's `rules_poll_secs` and
+//!   `rules_max_age_secs`. The token is the one the pair's `ondo` venue names; the API key
+//!   is `ONDO_API_KEY`, as the venue's; the API is the venue's endpoint.
 //! - **`ondo_token`**, that restriction guard on its own, kept for a pair that still lists
 //!   it.
 //!
@@ -53,7 +54,7 @@ use crate::{
     stocks::chain::parse_address,
     stocks::ports::StatusFeed,
     stocks::{
-        guard::RestrictionGuardFactory,
+        guard::{GuardCfg, RestrictionGuardFactory},
         status::{self as status_guard, Adapters, Settings, Stanza, StatusGuard},
     },
 };
@@ -90,6 +91,24 @@ pub struct OndoCfg {
     /// The largest relative gap between Ondo's multiplier and the chain's (default 0.001).
     #[serde(default = "default_max_multiplier_gap")]
     pub max_multiplier_gap: f64,
+    /// Seconds between reads of the token's transfer rules (default 12, one block): the
+    /// old `ondo_token` stanza's `poll_secs`.
+    #[serde(default = "default_rules_poll_secs")]
+    pub rules_poll_secs: u64,
+    /// The oldest reading of the token's rules that is trusted (default 60): the old
+    /// `ondo_token` stanza's `max_age_secs`.
+    #[serde(default = "default_rules_max_age_secs")]
+    pub rules_max_age_secs: u64,
+    /// Keys a stanza carried when the guard named its own token, key and API, which the
+    /// pair's `ondo` venue now holds. Accepted so such a stanza keeps loading; the build
+    /// names them for removal, and a `symbol` naming another token than the venue's is
+    /// refused.
+    #[serde(default)]
+    symbol: Option<String>,
+    #[serde(default)]
+    api_key: Option<toml::Value>,
+    #[serde(default)]
+    api: Option<toml::Value>,
 }
 
 fn default_sessions() -> Vec<String> {
@@ -115,6 +134,12 @@ fn default_pause_lead_secs() -> u64 {
 }
 fn default_max_multiplier_gap() -> f64 {
     0.001
+}
+fn default_rules_poll_secs() -> u64 {
+    GuardCfg::default().poll_secs
+}
+fn default_rules_max_age_secs() -> u64 {
+    GuardCfg::default().max_age_secs
 }
 
 impl OndoCfg {
@@ -158,6 +183,19 @@ impl OndoCfg {
             })
     }
 
+    /// The keys this stanza sets that the pair's `ondo` venue holds now, in the order the
+    /// warning names them.
+    fn legacy_keys(&self) -> Vec<&'static str> {
+        [
+            ("symbol", self.symbol.is_some()),
+            ("api_key", self.api_key.is_some()),
+            ("api", self.api.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(key, set)| set.then_some(key))
+        .collect()
+    }
+
     /// The keys the core reads, as the core reads them, for `symbol`.
     fn stanza<'a>(&self, symbol: &'a str) -> Stanza<'a> {
         Stanza {
@@ -175,6 +213,14 @@ impl OndoCfg {
     /// core's settings, the oracle the multiplier is read from and the token's symbol.
     fn check(&self, pair: &PairShape) -> eyre::Result<(Settings, Address, String)> {
         let symbol = Self::symbol(pair)?;
+        if let Some(old) = &self.symbol {
+            eyre::ensure!(
+                old.eq_ignore_ascii_case(symbol),
+                "symbol = {old:?}, but the pair's ondo venue names {symbol}: the guard reads \
+                 the token from the venue now, so remove symbol, and fix the venue's if it \
+                 was {old}"
+            );
+        }
         let settings = Settings::new(&self.stanza(symbol), pair)?;
         self.sessions()?;
         eyre::ensure!(
@@ -192,16 +238,18 @@ impl OndoCfg {
 
     /// The GM API key, from the environment, as the venue reads it.
     fn api_key() -> eyre::Result<String> {
-        let var = crate::venues::ondo::API_KEY_VAR;
-        std::env::var(var)
-            .ok()
-            .filter(|key| !key.is_empty())
-            .ok_or_else(|| eyre::eyre!("{var} is not set, and Ondo's API needs its key"))
+        crate::venues::ondo::api_key().ok_or_else(|| {
+            eyre::eyre!(
+                "{} is not set, and Ondo's API needs its key",
+                crate::venues::ondo::API_KEY_VAR
+            )
+        })
     }
 }
 
-/// Ondo Global Markets: registered with [`crate::UpdaterBuilder::stock_issuer`] as
-/// `ondo` (the status guard) and `ondo_token` (the guard on the token's rules).
+/// Ondo Global Markets: registered with [`crate::UpdaterBuilder::stock_issuer`] as `ondo`
+/// (the status guard, with the token's rules beside it), and `ondo_token` (the rules on
+/// their own, for a pair that still lists them).
 pub struct Ondo;
 
 /// What the backoffice shows for the guard: the sessions in plain view, the tuning knobs
@@ -252,6 +300,20 @@ const FIELDS: &[FormField] = &[
         "the largest relative gap between Ondo's multiplier and the chain's. Blank is 0.001.",
     )
     .advanced(),
+    FormField::number(
+        "rules_poll_secs",
+        "12",
+        "seconds between reads of the token's transfer rules (paused, the lists). Blank is \
+         12, one block.",
+    )
+    .advanced(),
+    FormField::number(
+        "rules_max_age_secs",
+        "60",
+        "the oldest reading of the token's rules that is trusted, longer than \
+         rules_poll_secs. Blank is 60.",
+    )
+    .advanced(),
 ];
 
 impl QuoteGuardFactory for Ondo {
@@ -284,11 +346,22 @@ impl QuoteGuardFactory for Ondo {
     ) -> BoxFuture<'a, eyre::Result<StatusGuard>> {
         Box::pin(async move {
             let (settings, oracle, symbol) = cfg.check(ctx.pair())?;
+            let legacy = cfg.legacy_keys();
+            if !legacy.is_empty() {
+                tracing::warn!(
+                    "[{}] ondo: ignoring {} in the stanza, which can be removed: the token is \
+                     the ondo venue's ({symbol}), the key is {}, and the API is the venue's \
+                     endpoint",
+                    ctx.pair().label,
+                    legacy.join(", "),
+                    crate::venues::ondo::API_KEY_VAR
+                );
+            }
             let sessions = cfg.sessions()?;
             let key = OndoCfg::api_key()?;
             // Where the venue reads the price, the guard reads the status.
             let api = ctx.venue_endpoint(crate::venue::VenueId::Ondo);
-            api::check_api(&api).map_err(|err| eyre::eyre!(err))?;
+            crate::venues::ondo::check_endpoint(&api).map_err(|err| eyre::eyre!(err))?;
             let chain = ctx.chain()?;
             let token = ctx.pair().tokens.0;
             let every = Duration::from_secs(cfg.status_poll_secs);
@@ -313,7 +386,6 @@ impl QuoteGuardFactory for Ondo {
                         refresh: Box::pin(status::keep_fresh(shared)),
                     })
                 })),
-                token_guard: Some(self.token_guard()),
             };
             status_guard::build(ctx, settings, adapters).await
         })
@@ -325,12 +397,20 @@ impl Issuer for Ondo {
     const TOKEN_GUARD_KIND: &'static str = "ondo_token";
     type TokenGuard = RestrictionGuardFactory;
 
-    /// The restriction guard over Ondo's pause and lists: run by the `ondo` guard as its
-    /// own, and registered on its own name for a pair that still lists it.
+    /// The restriction guard over Ondo's pause and lists: run beside the `ondo` guard under
+    /// its kind, and registered on its own name for a pair that still lists it.
     fn token_guard(&self) -> RestrictionGuardFactory {
         RestrictionGuardFactory::new("Ondo", |chain, token| {
             Box::new(compliance::OndoCompliance { chain, token })
         })
+    }
+
+    /// The stanza's `rules_poll_secs` and `rules_max_age_secs`.
+    fn token_guard_cfg(&self, cfg: &OndoCfg) -> GuardCfg {
+        GuardCfg {
+            poll_secs: cfg.rules_poll_secs,
+            max_age_secs: cfg.rules_max_age_secs,
+        }
     }
 }
 
@@ -558,6 +638,70 @@ mod tests {
         .refusal();
         assert_eq!(refusal.reason(), "asset_event");
         assert!(refusal.message().contains("split"), "{}", refusal.message());
+    }
+
+    /// A stanza written when the guard named its token, key and API still loads: the three
+    /// keys are read from the venue now, so they are accepted, named for removal, and
+    /// otherwise ignored.
+    #[test]
+    fn a_stanza_with_the_keys_the_venue_now_holds_still_loads() {
+        let old: super::OndoCfg = toml::from_str(
+            r#"
+            symbol   = "AAPLon"
+            api_key  = { env = "ONDO_API_KEY" }
+            api      = "https://api.gm.ondo.finance"
+            sessions = ["regular"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(old.legacy_keys(), ["symbol", "api_key", "api"]);
+        assert!(Ondo.validate(&old, &testkit::pair()).is_ok());
+        // The venue's symbol in another case is the same token.
+        let lower: super::OndoCfg = toml::from_str(r#"symbol = "aaplon""#).unwrap();
+        assert!(Ondo.validate(&lower, &testkit::pair()).is_ok());
+        let current: super::OndoCfg = toml::from_str(r#"sessions = ["regular"]"#).unwrap();
+        assert!(current.legacy_keys().is_empty());
+    }
+
+    /// The token's transfer rules, which run beside the guard, poll and age at the stanza's
+    /// `rules_poll_secs` and `rules_max_age_secs`: the rules' own defaults when unset, so a
+    /// pair moving off the old `ondo_token` stanza keeps its tuning here.
+    #[test]
+    fn the_token_rules_run_at_the_stanzas_token_knobs() {
+        use crate::stocks::Issuer;
+        let unset: super::OndoCfg = toml::from_str("").unwrap();
+        let rules = Ondo.token_guard_cfg(&unset);
+        assert_eq!((rules.poll_secs, rules.max_age_secs), (12, 60));
+        let tuned: super::OndoCfg =
+            toml::from_str("rules_poll_secs = 30\nrules_max_age_secs = 300").unwrap();
+        let rules = Ondo.token_guard_cfg(&tuned);
+        assert_eq!((rules.poll_secs, rules.max_age_secs), (30, 300));
+    }
+
+    /// The rules' settings are checked with the stanza, as the old `ondo_token` stanza's
+    /// were: a reading stale before the next one comes in is refused at load, not at build.
+    #[test]
+    fn token_knobs_that_leave_every_reading_stale_are_refused() {
+        let kind = crate::stocks::WithTokenRules::new(Ondo);
+        let stale: super::OndoCfg =
+            toml::from_str("rules_poll_secs = 60\nrules_max_age_secs = 30").unwrap();
+        let err = kind.validate(&stale, &testkit::pair()).unwrap_err();
+        assert!(format!("{err:#}").contains("stale"), "{err:#}");
+        let fine: super::OndoCfg = toml::from_str("rules_max_age_secs = 300").unwrap();
+        assert!(kind.validate(&fine, &testkit::pair()).is_ok());
+    }
+
+    /// An old `symbol` naming another token than the pair's ondo venue is a stanza at odds
+    /// with its pair, not a stale key: refused, naming both.
+    #[test]
+    fn an_old_symbol_that_is_not_the_ondo_venues_is_refused() {
+        let old: super::OndoCfg = toml::from_str(r#"symbol = "TSLAon""#).unwrap();
+        let err = Ondo.validate(&old, &testkit::pair()).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("TSLAon") && message.contains("AAPLon"),
+            "{message}"
+        );
     }
 
     #[test]

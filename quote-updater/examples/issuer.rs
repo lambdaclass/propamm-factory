@@ -190,8 +190,8 @@ impl QuoteGuardFactory for Acme {
                     Box::pin(keep_fresh()),
                 ))
             }));
-            // The token's rules, run as part of this guard.
-            adapters.token_guard = Some(self.token_guard());
+            // The token's rules are not built here: `stock_issuer` runs them beside this
+            // guard, from `token_guard()` below.
             status::build(ctx, settings, adapters).await
         })
     }

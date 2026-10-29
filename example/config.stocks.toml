@@ -8,7 +8,7 @@
 #
 # Before it runs:
 # - ONDO_API_KEY: an Ondo GM API key (partner-only; Ondo onboarding). The `ondo` venue
-#   reads it from the environment; the `ondo` guard names it in its stanza.
+#   reads it from the environment, and the `ondo` guard reads it from there too.
 # - UPDATER_KEY_AAPLON_USDC: the pair's updater key, registered on the PropAMM.
 # - The vault holds AAPLon and USDC and has approved the PropAMM for both.
 # Then `my-propamm --config config.toml --check`, and without `--check` to run.
@@ -23,7 +23,7 @@ requote_ms = 50
 metrics_addr = "127.0.0.1:9464"
 
 [[pairs]]
-# The stock token first: the `ondo` guard checks it is the token `symbol` names.
+# The stock token first: the `ondo` guard checks it is the token the ondo venue names.
 tokens  = ["0x14c3abF95Cb9C93a8b82C1CdCB76D72Cb87b2d4c",   # AAPLon
            "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"]   # USDC
 key_env = "UPDATER_KEY_AAPLON_USDC"
@@ -62,6 +62,8 @@ sessions = ["regular"]
 # max_status_age_secs = 60
 # pause_lead_secs     = 300      # stop this long before a scheduled corporate action
 # max_multiplier_gap  = 0.001    # Ondo's multiplier against the chain's, for a token it lists
+# rules_poll_secs     = 12       # reads of the token's transfer rules: one a block
+# rules_max_age_secs  = 60       # older than this, the rules are unknown and the quote withdrawn
 
 [[pairs.guards]]
 kind              = "us_market_hours"

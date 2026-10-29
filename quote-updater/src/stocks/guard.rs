@@ -1,4 +1,6 @@
-//! The restriction guard every tokenized-stock design registers (`ondo_token` today): it
+//! The restriction guard every tokenized-stock design has, run beside its issuer's status
+//! guard under that guard's kind ([`super::WithTokenRules`]), and registered on its own
+//! name (`ondo_token` today) for a pair that still lists it as a guard of its own: it
 //! withdraws a stock pair's quote while the token would refuse the fill it offers: paused,
 //! or the vault or this PropAMM refused. Two reads answer that each poll: the design's
 //! reading of the token's transfer rules ([`Restrictions`]), which names the reason, and
@@ -11,6 +13,9 @@
 //! Withdrawing the quote is what makes `isActive` false from the next block, so routers stop
 //! sending fills that can only revert. Withdraw, not halt: when the issuer lifts the
 //! restriction, quoting resumes.
+//!
+//! Its two settings are the issuer stanza's (Ondo's `rules_poll_secs` and
+//! `rules_max_age_secs`), or, on the legacy stanza:
 //!
 //! ```toml
 //! [[pairs.guards]]
@@ -165,7 +170,9 @@ impl QuoteGuardFactory for RestrictionGuardFactory {
         "<p class=explain>Withdraws while the token would refuse the fill: paused, the vault \
          or the PropAMM on the issuer's lists, or a transfer tried on the token refused. The \
          issuer's own guard runs this check itself now; a pair that still lists this one \
-         can untick it.</p>"
+         can untick it, setting its two numbers on that guard instead \
+         (<code>rules_poll_secs</code> and <code>rules_max_age_secs</code> on \
+         <code>ondo</code>).</p>"
     }
 
     fn validate(&self, cfg: &GuardCfg, _pair: &PairShape) -> eyre::Result<()> {
