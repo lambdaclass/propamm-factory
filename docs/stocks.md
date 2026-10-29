@@ -25,22 +25,31 @@ not say, as guards:
   a corporate action Ondo has scheduled on chain and when the multiplier Ondo prices with
   (its token price over its stock price) and the chain's disagree by more than
   `max_multiplier_gap`; for a token it does not list, the build says so and those two checks
-  are skipped, read again on the next reload. Ondo's market-wide status is read once per
-  API, key and poll period, however many stock pairs share them, by the pairs' own tasks.
-  The stock's ticker comes from Ondo's price answer, or from the stanza's `ticker` when the
-  answer names none; with neither, the build fails, since events Ondo files under the
-  ticker would go unseen.
+  are skipped, read again on the next reload. And it withdraws while Ondo's token would
+  refuse the fill: the token paused, or the vault or the PropAMM on Ondo's blocklist or the
+  sanctions list; it also tries the transfer a fill makes, `transferFrom(vault, vault, 0)` as
+  the PropAMM, so a refusal none of those lists explains (a check Ondo adds to the token)
+  withdraws too, under the revert data it answers. Those rules are read every
+  `rules_poll_secs` (12, a block) and trusted for `rules_max_age_secs` (60). PropAMM can't
+  see any of it, so its `isActive` stays true until the quote is withdrawn. The token is the
+  one the pair's `ondo` venue names, the key is `ONDO_API_KEY` as the venue's, and the
+  status is read at the venue's endpoint, so the stanza carries none of the three. A stanza
+  written when it did (`symbol`, `api_key`, `api`) still loads, and the build says they can
+  be removed; a `symbol` naming another token than the venue's is refused. Ondo's
+  market-wide status is read once per API, key and poll period, however many stock pairs
+  share them, by the pairs' own tasks. The stock's ticker comes from Ondo's price answer, or
+  from the stanza's `ticker` when the answer names none; with neither, the build fails,
+  since events Ondo files under the ticker would go unseen.
 - **`us_market_hours`**, a quote guard. It withdraws outside 09:30–16:00 New York time on
   trading days (13:00 on early closes), by the holiday calendar the config lists, and past the
   calendar's `listed_through` date. It publishes the days the calendar has left
   (`calendar_days_left`, which `PusherStockCalendarEnding` alerts on a month out and
   `PusherStockCalendarEnded` once it has passed) and warns in its log once a day from then.
-- **`ondo_token`**, a quote guard. It withdraws while Ondo would refuse the fill: the token
-  paused, or the vault or the PropAMM on Ondo's blocklist or the sanctions list. It also
-  tries the transfer a fill makes, `transferFrom(vault, vault, 0)` as the PropAMM, so a
-  refusal none of those lists explains (a check Ondo adds to the token) withdraws too, under
-  the revert data it answers. PropAMM can't see any of it, so its `isActive` stays true until
-  the quote is withdrawn.
+- **`ondo_token`**, the token's transfer rules on their own: what the `ondo` guard runs as
+  its own check. Still registered, so a pair that lists it keeps loading, and the pair form
+  offers it only on such a pair, where it can be unticked; its `poll_secs` and
+  `max_age_secs` become the `ondo` guard's `rules_poll_secs` and `rules_max_age_secs`.
+  Listed beside `ondo` it repeats the check, and loading the pair says so.
 
 With the `ondo` guard at its default and `us_market_hours` on, it quotes the US regular
 session only, about a fifth of the week, while the tokens trade on chain around the clock.
@@ -54,13 +63,13 @@ measuring the open against the close.
 ```rust
 Updater::builder()
     .us_market_hours()                                        // the NYSE calendar guard
-    .stock_issuer(quote_updater::stocks::issuers::ondo::Ondo)  // "ondo" and "ondo_token"
+    .stock_issuer(quote_updater::stocks::issuers::ondo::Ondo)  // "ondo" (and "ondo_token" for a pair that lists it)
 ```
 
 `us_market_hours()` registers the calendar guard under the name the two calendar alerts
 match on; it is its own call because the calendar is the exchange's, not an issuer's.
-`stock_issuer(..)` takes an issuer and registers its status guard and its token guard under
-the names the issuer declares. A binary names the issuers it integrates, one call each, and
+`stock_issuer(..)` takes an issuer and registers its guard under the name the issuer
+declares, with the token guard's own name kept for a pair that still lists it. A binary names the issuers it integrates, one call each, and
 nothing registers one implicitly; the issuer's venue needs no registering. `example/` does
 both; `quote-updater/examples/stocks.rs` is the same from outside the crate, and
 `quote-updater/examples/issuer.rs` registers a second issuer of its own beside Ondo. The
@@ -78,11 +87,10 @@ You need:
 - the pair on the PropAMM (`addPair`), as for any pair ([production.md](production.md)).
 
 Then add the pair from the backoffice: its tokens and key variable; the `ondo` row of the
-venue table with the token's symbol (the lookup lists no Ondo markets, so it is typed, and
-the live preview shows Ondo's price); the breaker and the band; a pricing kind (`feed` with
-a `delta`); and in the guards section `ondo` with its fields (the API key as the name of the
-variable holding it, the sessions ticked), `us_market_hours` with its calendar and
-`ondo_token`, all three checked. Saving reloads the running updater. In the file, the stanza is the one in
+venue table, which the lookup fills in and ticks for a token Ondo's API knows (the live
+preview shows Ondo's price); the breaker and the band; a pricing kind (`feed` with a
+`delta`); and in the guards section `ondo` with the sessions ticked, plus `us_market_hours`
+with its calendar for the regular session alone. Saving reloads the running updater. In the file, the stanza is the one in
 [`example/config.stocks.toml`](../example/config.stocks.toml): copy it into your config and
 reload with a SIGHUP. Either way, `--check` first:
 
@@ -153,12 +161,20 @@ with the workspace, so that path cannot close unnoticed. An issuer is:
 3. a config struct for its `[[pairs.guards]]` stanza, `#[serde(deny_unknown_fields)]`, that
    fills the core's `Stanza` (`Stanza::new(kind, source, symbol)` carries the core's
    defaults; set the keys your kind lets the operator change) and is checked with
-   `Settings::new` plus its own rules;
+   `Settings::new` plus its own rules. A key a previous format of the stanza carried is
+   better accepted and named in a warning than refused (`OndoCfg` does so for `symbol`,
+   `api_key` and `api`), so an upgrade does not stop a pair from loading;
 4. a unit struct implementing `QuoteGuardFactory` over that config (its `build` hands
    `Adapters::new(prices, valuation)`, with `status` set when the issuer reports one, to
    `status::build`) and `Issuer`, which names its two kinds and gives the token guard:
    `RestrictionGuardFactory::new(issuer, closure)` for a design whose rules the core's guard
-   reads through `Restrictions`, the closure carrying any setting the rules need;
+   reads through `Restrictions`, the closure carrying any setting the rules need. Your
+   `build` does not build that guard: `stock_issuer` runs it beside yours under the status
+   guard's kind (`stocks::WithTokenRules`), at its defaults unless `token_guard_cfg` reads
+   its settings from your stanza (Ondo's `rules_poll_secs` and `rules_max_age_secs`). The
+   kind's form is your factory's `fields()`, so declare those keys there too, under names
+   that do not start with `token_`: the form names inputs `guard_<kind>_<field>`, and
+   `<status kind>_token_x` is the token kind's `x` (registration refuses such a pair);
 5. `fields()` and `form_help()` on the factory, so the backoffice edits the pair. The
    round-trip test beside `Ondo` is the template: every declared field is a key the config
    reads, and the example stanza survives the form unchanged. A key the config accepts but

@@ -376,6 +376,15 @@ impl Feeds {
             .count()
     }
 
+    /// Each source as `(venue, symbol)`, what [`crate::pricing::PairShape::venue_symbols`]
+    /// tells a guard.
+    pub fn venue_symbols(&self) -> Vec<(&'static str, String)> {
+        self.sources
+            .iter()
+            .map(|source| (source.venue.as_str(), source.symbol.clone()))
+            .collect()
+    }
+
     /// The one-line description the report and the backoffice print: `binance:ETHUSDC`, or
     /// `binance:ETHUSDC ×2 + coinbase:ETH-USD ×1` when there is more than one.
     pub fn describe(&self) -> String {

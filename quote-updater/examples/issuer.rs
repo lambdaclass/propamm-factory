@@ -29,12 +29,10 @@ use quote_updater::{
 use serde::Deserialize;
 
 /// The `[[pairs.guards]]` stanza for `kind = "acme"`: the core's keys it exposes, and the
-/// issuer's own.
+/// issuer's own. The token is the one the pair's first venue names.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AcmeCfg {
-    /// The token's `symbol()`.
-    symbol: String,
     /// The registry Acme pauses tokens on.
     registry: String,
     /// How often the status is read, in seconds; the core's default when absent.
@@ -44,8 +42,8 @@ struct AcmeCfg {
 
 impl AcmeCfg {
     /// The core's stanza: its defaults, then what this kind lets the operator set.
-    fn stanza(&self) -> Stanza<'_> {
-        let mut stanza = Stanza::new("acme", "Acme", &self.symbol);
+    fn stanza<'a>(&self, symbol: &'a str) -> Stanza<'a> {
+        let mut stanza = Stanza::new("acme", "Acme", symbol);
         if let Some(secs) = self.status_poll_secs {
             stanza.status_poll = Some(Duration::from_secs(secs));
         }
@@ -53,7 +51,14 @@ impl AcmeCfg {
     }
 
     fn check(&self, pair: &PairShape) -> eyre::Result<(Settings, Address)> {
-        let settings = Settings::new(&self.stanza(), pair)?;
+        // A real design reads the venue that is its own; this one has none and takes the
+        // pair's first.
+        let symbol = pair
+            .venue_symbols
+            .first()
+            .map(|(_, symbol)| symbol.as_str())
+            .ok_or_else(|| eyre::eyre!("the pair has no venue to name the token"))?;
+        let settings = Settings::new(&self.stanza(symbol), pair)?;
         let registry =
             parse_address(&self.registry).map_err(|err| eyre::eyre!("registry: {err}"))?;
         Ok((settings, registry))
@@ -153,7 +158,8 @@ impl Rules for AcmeRules {
     }
 }
 
-/// The issuer: registered as `acme` (the status guard) and `acme_token` (the token guard).
+/// The issuer: registered as `acme`, the guard that runs its status checks and its token's
+/// rules; `acme_token` stays registered for a pair that still lists the rules on their own.
 struct Acme;
 
 impl QuoteGuardFactory for Acme {
@@ -184,6 +190,8 @@ impl QuoteGuardFactory for Acme {
                     Box::pin(keep_fresh()),
                 ))
             }));
+            // The token's rules are not built here: `stock_issuer` runs them beside this
+            // guard, from `token_guard()` below.
             status::build(ctx, settings, adapters).await
         })
     }

@@ -222,3 +222,9 @@ pre.err {
 /* The pair form's guards section: one block per kind. */
 .guards { display: flex; flex-direction: column; gap: .5rem; }
 .guard { padding: .5rem 0; border-top: 1px solid var(--line, #ddd); }
+/* A guard's help and fields show only while its box is ticked: an unticked guard is one line. */
+.guard:not(:has(> .check > input:checked)) > :not(.check) { display: none; }
+/* The tuning knobs a kind marks advanced, under a line that opens on a click. */
+.advanced { margin-top: .6rem; }
+.advanced > summary { cursor: pointer; font-size: .78rem; color: var(--dim); }
+.advanced > .grid { margin-top: .6rem; }

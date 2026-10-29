@@ -121,12 +121,17 @@
       token1.value = a;
     }
     const keepSaved = firstLookup && saved.size > 0;
+    // The busiest venues get ticked, or the issuer's own price alone when there is one: a
+    // stock token is priced by its issuer, and the exchanges that list it follow that price.
+    const issuer = data.venues.find((v) => v.listed && v.venue === "ondo");
     const top = new Set(
-      data.venues
-        .filter((v) => v.listed)
-        .sort((a, b) => (b.volume_usd || 0) - (a.volume_usd || 0))
-        .slice(0, TICK_TOP)
-        .map((v) => v.venue)
+      issuer
+        ? [issuer.venue]
+        : data.venues
+            .filter((v) => v.listed)
+            .sort((a, b) => (b.volume_usd || 0) - (a.volume_usd || 0))
+            .slice(0, TICK_TOP)
+            .map((v) => v.venue)
     );
     for (const v of data.venues) {
       const row = rows.find((r) => r.venue === v.venue);
