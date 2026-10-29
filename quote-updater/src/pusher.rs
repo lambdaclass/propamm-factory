@@ -699,7 +699,7 @@ async fn run_inner(
                         tracing::warn!("SIGHUP ignored: --once has no running pair set to reload");
                         continue;
                     }
-                    let _ = service.reload_and_report(&done, &args.flags.config).await;
+                    let _ = service.reload_and_report(&done, &args.flags.config, None).await;
                 }
                 // The backoffice or the handle, which unlike SIGHUP wait for the verdict:
                 // a rejection means putting the operator's file back.
@@ -710,7 +710,13 @@ async fn run_inner(
                             "--once has no running pair set to reload".to_owned(),
                         ))
                     } else {
-                        service.reload_and_report(&done, &args.flags.config).await
+                        service
+                            .reload_and_report(
+                                &done,
+                                &args.flags.config,
+                                request.rearm_only.as_deref(),
+                            )
+                            .await
                     };
                     let _ = request.reply.send(outcome);
                 }

@@ -746,17 +746,21 @@ impl Service {
     /// Shared by SIGHUP and the backoffice, so the journal and the counters cannot drift
     /// apart. The return value is for the backoffice and the handle, which have to know
     /// whether to keep the edit they wrote: see [`ReloadFailure`].
+    ///
+    /// `rearm_only` names one pair's `key_env`: the reload then clears that pair's breaker
+    /// and no other, see [`Self::reload`].
     pub(crate) async fn reload_and_report(
         &mut self,
         done: &tokio::sync::mpsc::UnboundedSender<(U256, u64)>,
         config_path: &std::path::Path,
+        rearm_only: Option<&str>,
     ) -> std::result::Result<String, ReloadFailure> {
         // Held across the converge, so the watchdog does not read a count between two pair
         // sets. Cloned out first because the guard borrows it.
         let health = Arc::clone(&self.health);
         let outcome = {
             let _reloading = health.reloading();
-            self.reload(done).await
+            self.reload(done, rearm_only).await
         };
         match outcome {
             Ok(applied) => {
@@ -825,10 +829,23 @@ impl Service {
     /// all-or-nothing, because whether a feed comes up is not knowable without dialling it,
     /// and the startup rule of failing everything is exactly wrong here — at startup nothing
     /// is serving anyone yet, while here the other lanes are quoting to takers.
+    ///
+    /// A reload re-arms every lane halted on its breaker, which is the rule `reload::plan`
+    /// explains. `rearm_only` narrows that to one pair, named by its `key_env`: that lane
+    /// is re-armed and every other halted lane is left as it is, so an operator can bring
+    /// one pair back while another stays down. Everything else about the reload is the
+    /// same, so an edit waiting in the file is applied as any reload would apply it.
+    /// Refused, with nothing touched, when no running lane carries that `key_env` or the
+    /// lane is quoting: there is nothing to re-arm.
     async fn reload(
         &mut self,
         done: &tokio::sync::mpsc::UnboundedSender<(U256, u64)>,
+        rearm_only: Option<&str>,
     ) -> Result<Applied> {
+        let rearm = match rearm_only {
+            None => self.halted_lanes(),
+            Some(key_env) => rearm_scope(&self.running_specs(), &self.halted_lanes(), key_env)?,
+        };
         let (candidate, vault_pairs, halted_in_file) = self.candidate().await?;
         let specs: Vec<config::PairSpec> = candidate.iter().map(|(spec, _)| spec.clone()).collect();
 
@@ -842,12 +859,7 @@ impl Service {
         // vault to watch.
         self.vault_pairs.send_replace(vault_pairs);
 
-        let actions = reload::plan(
-            &self.running_specs(),
-            &specs,
-            &self.halted_lanes(),
-            builders_changed,
-        );
+        let actions = reload::plan(&self.running_specs(), &specs, &rearm, builders_changed);
         if actions.is_empty() {
             return Ok(Applied::default());
         }
@@ -1027,6 +1039,29 @@ impl Service {
     }
 }
 
+/// The lanes a reload asked to re-arm one pair treats as halted: that pair's lane, when it
+/// is halted on its breaker, and no other. The other halted lanes are left out of the set,
+/// so `reload::plan` sees them as running and matching the file and leaves them alone.
+///
+/// An error when the name matches no running lane, or the lane it matches is quoting:
+/// nothing to re-arm, said rather than reloading as if nothing had been asked.
+fn rearm_scope(
+    running: &std::collections::BTreeMap<U256, config::PairSpec>,
+    halted: &std::collections::BTreeSet<U256>,
+    key_env: &str,
+) -> Result<std::collections::BTreeSet<U256>> {
+    let lane = running
+        .iter()
+        .find(|(_, spec)| spec.key_env == key_env)
+        .map(|(lane, _)| *lane)
+        .ok_or_else(|| eyre::eyre!("no running pair has key_env {key_env}"))?;
+    ensure!(
+        halted.contains(&lane),
+        "the pair with key_env {key_env} is quoting; its breaker has not tripped"
+    );
+    Ok(std::collections::BTreeSet::from([lane]))
+}
+
 /// Why a reload did not leave every lane on the file, as the service answers a request
 /// for one. Two kinds, because the one who wrote the file has to do opposite things.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1140,9 +1175,25 @@ pub(crate) async fn change_config(
 pub(crate) async fn request_reload(
     reloads: &tokio::sync::mpsc::Sender<crate::backoffice::ReloadRequest>,
 ) -> std::result::Result<String, ReloadFailure> {
+    request(reloads, None).await
+}
+
+/// Asks the service to reload re-arming only the pair with this `key_env`, and waits for
+/// its verdict, as [`request_reload`] does.
+pub(crate) async fn request_rearm(
+    reloads: &tokio::sync::mpsc::Sender<crate::backoffice::ReloadRequest>,
+    key_env: &str,
+) -> std::result::Result<String, ReloadFailure> {
+    request(reloads, Some(key_env.to_owned())).await
+}
+
+async fn request(
+    reloads: &tokio::sync::mpsc::Sender<crate::backoffice::ReloadRequest>,
+    rearm_only: Option<String>,
+) -> std::result::Result<String, ReloadFailure> {
     let (reply, answer) = tokio::sync::oneshot::channel();
     reloads
-        .send(crate::backoffice::ReloadRequest { reply })
+        .send(crate::backoffice::ReloadRequest { reply, rearm_only })
         .await
         .map_err(|_| {
             ReloadFailure::Rejected("the pusher is shutting down and is not reloading".to_owned())
@@ -2548,7 +2599,7 @@ api_key = "k"
 
             std::fs::write(&path, file("", &builder.url)).unwrap();
             let first = service
-                .reload(&done)
+                .reload(&done, None)
                 .await
                 .expect("the first reload adds both lanes");
             assert_eq!(first.added.len(), 2, "{first:?}");
@@ -2556,7 +2607,7 @@ api_key = "k"
 
             std::fs::write(&path, file("broken = true", &builder.url)).unwrap();
             let second = service
-                .reload(&done)
+                .reload(&done, None)
                 .await
                 .expect("one failed lane does not fail the file");
             assert_eq!(second.failed.len(), 1, "A's build failed: {second:?}");
@@ -2574,13 +2625,16 @@ api_key = "k"
 
             std::fs::write(&path, file("", &builder.url)).unwrap();
             service
-                .reload(&done)
+                .reload(&done, None)
                 .await
                 .expect("the first reload adds both lanes");
             let before = specs(&service);
 
             std::fs::write(&path, file("invalid = true", &builder.url)).unwrap();
-            let err = format!("{:#}", service.reload(&done).await.expect_err("rejected"));
+            let err = format!(
+                "{:#}",
+                service.reload(&done, None).await.expect_err("rejected")
+            );
             assert!(err.contains("invalid is set"), "{err}");
             assert_eq!(specs(&service), before, "nothing changed");
         }
@@ -2595,14 +2649,14 @@ api_key = "k"
 
             std::fs::write(&path, file("", &builder.url)).unwrap();
             service
-                .reload(&done)
+                .reload(&done, None)
                 .await
                 .expect("the first reload adds both lanes");
             let before = specs(&service);
 
             std::fs::write(&path, file("panics_building = true", &builder.url)).unwrap();
             let second = service
-                .reload(&done)
+                .reload(&done, None)
                 .await
                 .expect("a panicking build fails its lane, not the reload");
             assert_eq!(second.failed.len(), 1, "{second:?}");
@@ -2618,7 +2672,7 @@ api_key = "k"
 
             std::fs::write(&path, file("", &builder.url)).unwrap();
             service
-                .reload(&done)
+                .reload(&done, None)
                 .await
                 .expect("the first reload adds both lanes");
             let before = specs(&service);
@@ -2628,12 +2682,81 @@ api_key = "k"
                 file("\n[[pairs.guards]]\nkind = \"m\"", &builder.url),
             )
             .unwrap();
-            let err = format!("{:#}", service.reload(&done).await.expect_err("rejected"));
+            let err = format!(
+                "{:#}",
+                service.reload(&done, None).await.expect_err("rejected")
+            );
             assert!(
                 err.contains("pair 1") && err.contains("`m` is a market guard"),
                 "{err}"
             );
             assert_eq!(specs(&service), before, "nothing changed");
+        }
+
+        /// Two lanes stopped on their breakers, and a reload asked to re-arm one of them
+        /// by its `key_env`: that lane is restarted and the other is left halted, where a
+        /// plain reload would have re-armed both. Asked for a lane that is quoting, or a
+        /// name no lane carries, it refuses and touches nothing.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_reload_scoped_to_one_pair_rearms_that_lane_alone() {
+            let (mut service, _rpc, builder, path) = setup("reload-rearm-one").await;
+            let (done, _done_rx) = tokio::sync::mpsc::unbounded_channel();
+
+            std::fs::write(&path, file("", &builder.url)).unwrap();
+            service
+                .reload(&done, None)
+                .await
+                .expect("the first reload adds both lanes");
+            let (lane_a, label_a) = lane_a(&service);
+            let (lane_b, label_b) = service
+                .running
+                .iter()
+                .find(|(lane, _)| **lane != lane_a)
+                .map(|(lane, pair)| (*lane, pair.label.clone()))
+                .expect("lane B is running");
+            halt_on_a(&service, lane_a);
+            halt_on_a(&service, lane_b);
+            assert_eq!(service.halted_lanes().len(), 2);
+
+            let err = format!(
+                "{:#}",
+                service
+                    .reload(&done, Some("KEY_NOBODY"))
+                    .await
+                    .expect_err("a name no lane carries is refused")
+            );
+            assert!(err.contains("KEY_NOBODY"), "{err}");
+            assert_eq!(service.halted_lanes().len(), 2, "a refusal touches nothing");
+
+            let applied = service
+                .reload(&done, Some("KEY_A"))
+                .await
+                .expect("re-arming lane A");
+            assert_eq!(applied.restarted, vec![label_a.clone()], "{applied:?}");
+            assert!(
+                !service.running[&lane_a].is_halted(),
+                "lane A is quoting again"
+            );
+            assert!(
+                service.running[&lane_b].is_halted(),
+                "lane B stays stopped on its breaker"
+            );
+
+            let err = format!(
+                "{:#}",
+                service
+                    .reload(&done, Some("KEY_A"))
+                    .await
+                    .expect_err("a quoting lane has nothing to re-arm")
+            );
+            assert!(err.contains("KEY_A"), "{err}");
+
+            let applied = service
+                .reload(&done, Some("KEY_B"))
+                .await
+                .expect("re-arming lane B");
+            assert_eq!(applied.restarted, vec![label_b], "{applied:?}");
+            assert!(service.halted_lanes().is_empty());
         }
 
         /// A re-armed lane that trips again at once, on the same source, before or as the
@@ -2647,7 +2770,7 @@ api_key = "k"
 
             std::fs::write(&path, file("", &builder.url)).unwrap();
             service
-                .reload(&done)
+                .reload(&done, None)
                 .await
                 .expect("the first reload adds both lanes");
             let (lane, label) = lane_a(&service);
@@ -2655,7 +2778,7 @@ api_key = "k"
 
             // A changed stanza whose build trips the new latch on the same source and cause.
             std::fs::write(&path, file("trips = true", &builder.url)).unwrap();
-            let applied = service.reload(&done).await.expect("applied");
+            let applied = service.reload(&done, None).await.expect("applied");
             assert_eq!(applied.restarted, vec![label.clone()], "{applied:?}");
             assert!(service.running[&lane].latch.tripped().is_some());
             assert_eq!(
@@ -2677,7 +2800,7 @@ api_key = "k"
 
             std::fs::write(&path, file("", &builder.url)).unwrap();
             service
-                .reload(&done)
+                .reload(&done, None)
                 .await
                 .expect("the first reload adds both lanes");
             let (lane, label) = lane_a(&service);
@@ -2694,7 +2817,7 @@ api_key = "k"
             );
 
             std::fs::write(&path, file("broken = false", &builder.url)).unwrap();
-            let applied = service.reload(&done).await.expect("applied");
+            let applied = service.reload(&done, None).await.expect("applied");
             assert_eq!(applied.restarted, vec![label.clone()], "{applied:?}");
             assert_eq!(
                 service.metrics.trip_source(&label, "a", "external").get(),
@@ -2704,7 +2827,7 @@ api_key = "k"
             assert_eq!(service.metrics.for_pair(&label).breaker_tripped.get(), 0.0);
 
             std::fs::write(&path, file_without_a(&builder.url)).unwrap();
-            let applied = service.reload(&done).await.expect("applied");
+            let applied = service.reload(&done, None).await.expect("applied");
             assert_eq!(applied.removed, vec![label.clone()], "{applied:?}");
             assert!(
                 service
@@ -2730,14 +2853,14 @@ api_key = "k"
             )
             .unwrap();
             service
-                .reload(&done)
+                .reload(&done, None)
                 .await
                 .expect("the first reload adds both lanes");
             let (_, label) = lane_a(&service);
             assert_eq!(service.metrics.for_pair(&label).guard("q").get(), 1.0);
 
             std::fs::write(&path, file("", &builder.url)).unwrap();
-            let applied = service.reload(&done).await.expect("applied");
+            let applied = service.reload(&done, None).await.expect("applied");
             assert_eq!(applied.restarted, vec![label.clone()], "{applied:?}");
             assert!(
                 service.metrics.for_pair(&label).guard("q").get().is_nan(),
@@ -2753,13 +2876,16 @@ api_key = "k"
 
             std::fs::write(&path, file("", &builder.url)).unwrap();
             service
-                .reload(&done)
+                .reload(&done, None)
                 .await
                 .expect("the first reload adds both lanes");
             let before = specs(&service);
 
             std::fs::write(&path, file("panics_validating = true", &builder.url)).unwrap();
-            let err = format!("{:#}", service.reload(&done).await.expect_err("rejected"));
+            let err = format!(
+                "{:#}",
+                service.reload(&done, None).await.expect_err("rejected")
+            );
             assert!(
                 err.contains("panicked") && err.contains("validate blew up"),
                 "{err}"

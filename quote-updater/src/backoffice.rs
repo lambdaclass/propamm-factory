@@ -37,6 +37,9 @@ use crate::venue::VenueId;
 /// operator's file back.
 pub(crate) struct ReloadRequest {
     pub(crate) reply: oneshot::Sender<std::result::Result<String, crate::service::ReloadFailure>>,
+    /// Set, the reload re-arms only the pair with this `key_env` and leaves every other
+    /// lane halted on its breaker as it is; unset, it re-arms them all, as a reload does.
+    pub(crate) rearm_only: Option<String>,
 }
 
 /// What the running pusher is doing with each pair, by `key_env`: for every pair that has
@@ -159,6 +162,7 @@ async fn bind_with(
         .route("/pairs/remove", post(remove_pair))
         .route("/pairs/halt", post(halt_pair))
         .route("/pairs/resume", post(resume_pair))
+        .route("/pairs/rearm", post(rearm_pair))
         .route("/pairs/halt-all", post(halt_all))
         .route("/settings", get(settings_page))
         .route("/settings/save", post(save_settings))
@@ -1671,6 +1675,29 @@ async fn resume_pair(
     .redirect()
 }
 
+/// Re-arms one pair's tripped breaker and no other: a reload the service scopes to that
+/// pair (see `Service::reload`). No edit to the file, so no write and nothing to put back;
+/// the service's own refusal (no such pair, or it is quoting) is the banner.
+async fn rearm_pair(
+    State(state): State<Backoffice>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Form(form): Form<RemovePair>,
+) -> Response {
+    let _guard = state.edits.lock().await;
+    let what = format!("re-armed pair {}", form.key_env);
+    let outcome = match crate::service::request_rearm(&state.reloads, &form.key_env).await {
+        Ok(summary) => {
+            tracing::info!("backoffice: {peer} {what}; {summary}");
+            Ok(format!("{what}. {summary}"))
+        }
+        Err(failure) => {
+            tracing::warn!("backoffice: {peer} {what} refused: {}", failure.line());
+            Err(failure)
+        }
+    };
+    Outcome::from(outcome).redirect()
+}
+
 async fn halt_all(
     State(state): State<Backoffice>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -2165,6 +2192,9 @@ impl ShortAddress {
 struct PairRow {
     key_env: String,
     halted: bool,
+    /// Running, not halted from the page, and stopped on its breaker: the row offers to
+    /// re-arm just this one.
+    tripped: bool,
     /// Why, when a binary's handle halted it; read-only here.
     halt_reason: Option<String>,
     /// What the running pusher is doing with the pair, and the badge colour for it.
@@ -2191,6 +2221,7 @@ impl PairRow {
         Self {
             key_env: pair.key_env.clone(),
             halted: pair.halted,
+            tripped: !pair.halted && running == Some(true),
             halt_reason: pair.halt_reason.clone(),
             status,
             status_class,
@@ -2795,9 +2826,18 @@ api_key = "k"
             .insert(key.clone(), Arc::clone(&tripped));
         assert!(page(&config, &states).contains(r#"class="status live">live"#));
 
-        // Its breaker tripped: the task still exists but it is not quoting.
+        // Its breaker tripped: the task still exists but it is not quoting, and the row
+        // offers to re-arm this one pair.
         tripped.store(true, Ordering::SeqCst);
-        assert!(page(&config, &states).contains(r#"class="status halted">breaker tripped"#));
+        let html = page(&config, &states);
+        assert!(html.contains(r#"class="status halted">breaker tripped"#));
+        assert!(html.contains("action=/pairs/rearm"), "{html}");
+        tripped.store(false, Ordering::SeqCst);
+        assert!(
+            !page(&config, &states).contains("action=/pairs/rearm"),
+            "a quoting pair has nothing to re-arm"
+        );
+        tripped.store(true, Ordering::SeqCst);
 
         // Halted from the page wins over whatever is running, and offers Resume.
         config.pairs[0].halted = true;
@@ -2805,6 +2845,59 @@ api_key = "k"
         assert!(html.contains(r#"class="status halted">halted"#), "{html}");
         assert!(html.contains("action=/pairs/resume"), "{html}");
         assert!(!html.contains("action=/pairs/halt\n"), "{html}");
+        assert!(
+            !html.contains("action=/pairs/rearm"),
+            "a page halt is cleared by Resume, not by a re-arm"
+        );
+    }
+
+    /// Re-arm asks the service for a reload scoped to the one pair, by its `key_env`, and
+    /// shows the service's answer. The file is not touched either way.
+    #[tokio::test]
+    async fn rearm_asks_the_service_for_that_one_pair() {
+        let (path, state, mut reloads) = config_on_disk("rearm");
+        let before = std::fs::read_to_string(&path).unwrap();
+        let (local, _task) = bind(
+            "127.0.0.1:0".parse().unwrap(),
+            path.clone(),
+            state.reloads.clone(),
+            test_client(),
+            PairStates::default(),
+            std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            test_kinds(),
+        )
+        .await
+        .unwrap();
+        // The service: re-arms the pair it is asked for, refuses any other name.
+        tokio::spawn(async move {
+            while let Some(request) = reloads.recv().await {
+                let answer = match request.rearm_only.as_deref() {
+                    Some("UPDATER_KEY_WETH_USDC") => Ok("reload: 1 restarted".to_owned()),
+                    Some(other) => Err(ReloadFailure::Rejected(format!(
+                        "no running pair has key_env {other}"
+                    ))),
+                    None => Ok("reload: no change".to_owned()),
+                };
+                let _ = request.reply.send(answer);
+            }
+        });
+
+        let (ok, banner) = post(local, "/pairs/rearm", "key_env=UPDATER_KEY_WETH_USDC").await;
+        assert!(ok, "{banner}");
+        assert!(
+            banner.contains("re-armed pair UPDATER_KEY_WETH_USDC")
+                && banner.contains("1 restarted"),
+            "{banner}"
+        );
+
+        let (ok, banner) = post(local, "/pairs/rearm", "key_env=UPDATER_KEY_NOPE").await;
+        assert!(!ok, "{banner}");
+        assert!(banner.contains("UPDATER_KEY_NOPE"), "{banner}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "a re-arm edits nothing"
+        );
     }
 
     /// In its own directory, so the writer's temp-file-and-rename has somewhere to work.
