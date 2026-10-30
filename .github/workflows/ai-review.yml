@@ -1,20 +1,18 @@
 name: AI Code Review
 
-# Five reviewers from lambdaclass/actions (its README lists their inputs), each posting its
+# Four reviewers from lambdaclass/actions (its README lists their inputs), each posting its
 # review as a PR comment. They review a PR once, when it opens or leaves draft; after that a
-# comment starting with /claude, /codex, /deepseek, /grok or /kimi from someone with write
-# access asks that one for another. Comment-triggered runs use this file as it is on main, so
-# the commands work once it is merged. PRs from forks are only reviewed on command: their
-# pull_request runs get no secrets.
+# comment starting with /codex, /deepseek, /grok or /kimi from someone with write access asks
+# that one for another. Comment-triggered runs use this file as it is on main, so the commands
+# work once it is merged. PRs from forks are only reviewed on command: their pull_request runs
+# get no secrets.
 #
-# Secrets, on the repository or the organization: ANTHROPIC_API_KEY, OPENAI_API_KEY,
-# DEEPSEEK_API_KEY, XAI_API_KEY, KIMI_API_KEY. A reviewer with no key fails on every PR, so
-# none of these jobs should be a required check. Claude also needs the Claude GitHub App on the
-# repository.
+# Secrets, on the repository or the organization: OPENAI_API_KEY, DEEPSEEK_API_KEY,
+# XAI_API_KEY, KIMI_API_KEY. A reviewer with no key fails on every PR, so none of these jobs
+# should be a required check.
 #
-# The review focus is .github/prompts/ai-review.md. Codex, DeepSeek, Grok and Kimi read it from
-# the PR's base branch, so a PR cannot rewrite the prompt that reviews it; Claude reads it from
-# the PR itself, so read what a fork PR does to it before typing /claude there.
+# The review focus is .github/prompts/ai-review.md, read from the PR's base branch so that a PR
+# cannot rewrite the prompt that reviews it.
 
 on:
   pull_request:
@@ -31,17 +29,6 @@ on:
 # The `if` on each job skips drafts: `opened` fires for a draft and `ready_for_review` fires again
 # when it is marked ready, which would pay for two reviews, one of them of an unfinished change.
 jobs:
-  claude:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
-    permissions:
-      contents: read
-      pull-requests: write
-      issues: read
-      id-token: write
-    uses: lambdaclass/actions/.github/workflows/ai-review-claude.yml@v1
-    secrets:
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-
   codex:
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     permissions:
