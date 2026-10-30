@@ -1,19 +1,20 @@
 name: AI Code Review
 
-# Four reviewers from lambdaclass/actions (its README lists their inputs), each posting its
+# Five reviewers from lambdaclass/actions (its README lists their inputs), each posting its
 # review as a PR comment. They review a PR once, when it opens or leaves draft; after that a
-# comment starting with /claude, /codex, /deepseek or /kimi from someone with write access asks
-# that one for another. Comment-triggered runs use this file as it is on main, so the commands
-# work once it is merged. PRs from forks are only reviewed on command: their pull_request runs
-# get no secrets.
+# comment starting with /claude, /codex, /deepseek, /grok or /kimi from someone with write
+# access asks that one for another. Comment-triggered runs use this file as it is on main, so
+# the commands work once it is merged. PRs from forks are only reviewed on command: their
+# pull_request runs get no secrets.
 #
 # Secrets, on the repository or the organization: ANTHROPIC_API_KEY, OPENAI_API_KEY,
-# DEEPSEEK_API_KEY, KIMI_API_KEY. A reviewer with no key fails on every PR, so none of these
-# jobs should be a required check. Claude also needs the Claude GitHub App on the repository.
+# DEEPSEEK_API_KEY, XAI_API_KEY, KIMI_API_KEY. A reviewer with no key fails on every PR, so
+# none of these jobs should be a required check. Claude also needs the Claude GitHub App on the
+# repository.
 #
-# The review focus is .github/prompts/ai-review.md. Codex, DeepSeek and Kimi read it from the PR's
-# base branch, so a PR cannot rewrite the prompt that reviews it; Claude reads it from the PR
-# itself, so read what a fork PR does to it before typing /claude there.
+# The review focus is .github/prompts/ai-review.md. Codex, DeepSeek, Grok and Kimi read it from
+# the PR's base branch, so a PR cannot rewrite the prompt that reviews it; Claude reads it from
+# the PR itself, so read what a fork PR does to it before typing /claude there.
 
 on:
   pull_request:
@@ -58,6 +59,15 @@ jobs:
     uses: lambdaclass/actions/.github/workflows/ai-review-deepseek.yml@v1
     secrets:
       DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+
+  grok:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    permissions:
+      contents: read
+      pull-requests: write
+    uses: lambdaclass/actions/.github/workflows/ai-review-grok.yml@v1
+    secrets:
+      XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
 
   kimi:
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
