@@ -9,7 +9,11 @@ name: AI Code Review
 #
 # Secrets, on the repository or the organization: ANTHROPIC_API_KEY, OPENAI_API_KEY,
 # DEEPSEEK_API_KEY, KIMI_API_KEY. A reviewer with no key fails on every PR, so none of these
-# jobs should be a required check. All four read the review focus from .github/prompts/ai-review.md.
+# jobs should be a required check. Claude also needs the Claude GitHub App on the repository.
+#
+# The review focus is .github/prompts/ai-review.md. Codex, DeepSeek and Kimi read it from the PR's
+# base branch, so a PR cannot rewrite the prompt that reviews it; Claude reads it from the PR
+# itself, so read what a fork PR does to it before typing /claude there.
 
 on:
   pull_request:

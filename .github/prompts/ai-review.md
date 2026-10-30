@@ -3,8 +3,8 @@ fills swaps at prices its maker publishes every block, rather than from an inven
 
 - `contracts/` (Solidity, Foundry): `PropAMMFactory` creates `PropAMM` instances, which are
   upgradeable. Each instance holds pairs, each pair has a vault that supplies its inventory, and
-  `swap` / `quote` / `quoteFillable` price a trade from the pair's oracle slots, with expiry,
-  spread, price-impact and vault-balance checks.
+  `swap` / `quote` / `quoteFillable` price a trade from the pair's oracle slots, with spread,
+  price-impact and vault-balance checks, and `swap` takes a deadline.
 - `quote-updater/` (Rust): the library that publishes those prices: exchange feeds, pricing
   models, guards, signing and sending an update every block to the builders, checking it landed,
   metrics, config reload, backoffice. `example/` is a program built on it.
@@ -15,8 +15,8 @@ decide whether a change is correct. Look for:
 
 1. **Security vulnerabilities**, labelled Critical / High / Medium / Low.
    - Contracts: who can call what (owner, updaters, anyone); initializers and upgrades that a
-     stranger can reach, or that break the storage layout; a price used after it expired, or read
-     from the wrong pair's slots; rounding in pricing and fill math that favours the trader over
+     stranger can reach, or that break the storage layout; a stale price used, or one read from
+     the wrong pair's slots; rounding in pricing and fill math that favours the trader over
      the vault; a fill beyond what the vault holds or has approved; token transfers that assume a
      standard ERC-20; anything `pause` should stop and does not.
    - Quote updater: signing keys or API keys reaching logs, metrics, errors or the backoffice; a
