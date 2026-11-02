@@ -209,8 +209,8 @@ pub fn write_raw_atomically(path: &Path, config: &RawConfig) -> Result<()> {
     }
     // Inside an enclave this file is on a filesystem that ends with the process: the host
     // keeps it between boots, sealed so it can neither read nor change it.
-    if let Some(link) = crate::enclave::link() {
-        link.config_written(path)?;
+    if let Some(host) = crate::enclave::host() {
+        host.config_written(path)?;
     }
     Ok(())
 }

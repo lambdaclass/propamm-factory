@@ -177,9 +177,9 @@ impl Sink {
             // Locked per line, as println! does; a failed write (a closed pipe) is dropped
             // rather than panicking the task that logged, which println! would.
             // Inside an enclave nothing reads the terminal: the line goes to the host.
-            Sink::Terminal if crate::enclave::link().is_some() => {
-                if let Some(link) = crate::enclave::link() {
-                    link.log(
+            Sink::Terminal if crate::enclave::host().is_some() => {
+                if let Some(host) = crate::enclave::host() {
+                    host.log(
                         match stream {
                             Stream::Stdout => "stdout",
                             Stream::Stderr => "stderr",

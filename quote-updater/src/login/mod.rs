@@ -676,17 +676,20 @@ mod tests {
         })
     }
 
+    /// A certificate and key for `localhost`, made in memory for this run of the tests.
+    fn localhost_certificate() -> (String, String) {
+        let made = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        (made.cert.pem(), made.key_pair.serialize_pem())
+    }
+
     /// The backoffice's front door, served over TLS with a throwaway localhost certificate:
     /// a page load without a session goes to the login, the login goes to Google with its
     /// state remembered, a change without a session is refused, and a session gets through.
     #[tokio::test]
     async fn the_front_door_serves_tls_and_lets_only_a_session_through() {
         use axum::serve::ListenerExt;
-        let tls = tls_config(
-            include_bytes!("testdata/localhost.crt"),
-            include_bytes!("testdata/localhost.key"),
-        )
-        .unwrap();
+        let (certificate, key) = localhost_certificate();
+        let tls = tls_config(certificate.as_bytes(), key.as_bytes()).unwrap();
         let login = login(allow_domain());
         let app = Router::new()
             .route("/", get(|| async { "the page" }))
@@ -767,10 +770,18 @@ mod tests {
 
     #[test]
     fn a_key_that_is_not_pem_is_refused_without_being_quoted() {
-        let err = tls_config(include_bytes!("testdata/localhost.crt"), b"secretstuff")
+        let (certificate, key) = localhost_certificate();
+        let err = tls_config(certificate.as_bytes(), b"secretstuff")
             .unwrap_err()
             .to_string();
         assert!(!err.contains("secretstuff"), "{err}");
-        assert!(tls_config(b"nothing", include_bytes!("testdata/localhost.key")).is_err());
+        assert!(tls_config(b"nothing", key.as_bytes()).is_err());
+        // A certificate and a key that do not belong together are refused: what stops a host
+        // that hands in some other certificate from having it served.
+        let (_, other_key) = localhost_certificate();
+        let err = tls_config(certificate.as_bytes(), other_key.as_bytes())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("do not go together"), "{err}");
     }
 }

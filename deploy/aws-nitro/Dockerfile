@@ -1,7 +1,7 @@
 # The quote updater for an AWS Nitro enclave: the crate in example/ built with the library's
-# `nitro` feature, packaged for `nitro-cli build-enclave`. The build context is the
+# `aws-nitro` feature, packaged for `nitro-cli build-enclave`. The build context is the
 # repository root. The enclave file and the hosts file come from the directory ENCLAVE_DIR
-# names (default deploy/enclave, which has only the examples): enclave.toml and hosts.
+# names (default deploy/aws-nitro, which has only the examples): enclave.toml and hosts.
 # Neither holds a secret; the secrets and the config arrive at boot from the host.
 ARG RUST_VERSION=1.98.1
 
@@ -10,11 +10,11 @@ WORKDIR /src
 COPY . .
 # --locked: the image's measurement must be a function of the commit and nothing else.
 RUN cargo build --release --locked --manifest-path example/Cargo.toml \
-      --features quote-updater/nitro --target-dir /build \
+      --features quote-updater/aws-nitro --target-dir /build \
  && install -m 0755 /build/release/my-propamm /quote-updater
 
 FROM debian:bookworm-slim
-ARG ENCLAVE_DIR=deploy/enclave
+ARG ENCLAVE_DIR=deploy/aws-nitro
 # ca-certificates: the certificates every TLS connection is checked against, sealed into the
 # image with everything else. iproute2: to bring the loopback interface up.
 RUN apt-get update \
@@ -23,5 +23,5 @@ RUN apt-get update \
 COPY --from=build /quote-updater /usr/local/bin/quote-updater
 COPY ${ENCLAVE_DIR}/enclave.toml /app/enclave.toml
 COPY ${ENCLAVE_DIR}/hosts /app/hosts
-COPY deploy/enclave/entrypoint.sh /app/entrypoint.sh
+COPY deploy/aws-nitro/entrypoint.sh /app/entrypoint.sh
 CMD ["/bin/sh", "/app/entrypoint.sh"]

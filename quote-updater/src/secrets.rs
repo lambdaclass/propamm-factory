@@ -1,7 +1,7 @@
 //! Where secrets are read from: the updater keys, a pricer's `EnvSecret`, a venue's API
 //! key. Normally the process environment. A run that was handed its secrets another way
 //! (an enclave, where there is no environment to put them in and they arrive decrypted at
-//! boot; see `enclave.rs`) installs them here once, and every read checks here first.
+//! boot; see `enclave/`) installs them here once, and every read checks here first.
 //!
 //! One map, set once, read everywhere: a secret has one source per process, decided at
 //! startup, and nothing later can change or add to it.

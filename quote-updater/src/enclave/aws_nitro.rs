@@ -1,7 +1,7 @@
-//! The AWS Nitro Enclaves release: KMS decrypts each secret only for a request carrying an
-//! attestation document whose measurements match its key policy, and returns the plaintext
-//! encrypted to a public key inside that document, so it crosses the host as ciphertext and
-//! only this process can open it.
+//! The `aws-nitro-kms` release: AWS KMS decrypts each secret only for a request carrying an
+//! AWS Nitro enclave's attestation document whose measurements match its key policy, and
+//! returns the plaintext encrypted to a public key inside that document, so it crosses the
+//! host as ciphertext and only this process can open it.
 //!
 //! Per boot: a fresh RSA key pair is generated in memory; the Nitro Security Module signs an
 //! attestation document carrying its public half and the image's measurements; each
@@ -20,15 +20,35 @@ use aws_sdk_kms::{
     types::{KeyEncryptionMechanism, RecipientInfo},
 };
 use eyre::{Result, WrapErr, bail, ensure, eyre};
+use futures_util::future::BoxFuture;
 use rsa::{Oaep, RsaPrivateKey, pkcs8::EncodePublicKey};
 use sha2::Sha256;
 
-use super::{Kms, protocol::Credentials};
+use super::{SecretRelease, protocol::Credentials};
+
+/// AWS KMS against this enclave's attestation. The boot message's credentials are an AWS
+/// role's: `access_key_id`, `secret_access_key` and, for temporary ones, `session_token`.
+pub struct AwsNitroKms {
+    /// The region the KMS key lives in.
+    pub region: String,
+    /// Where KMS is reached, when not its public endpoint.
+    pub endpoint: Option<String>,
+}
+
+impl SecretRelease for AwsNitroKms {
+    fn release<'a>(
+        &'a self,
+        credentials: &'a Credentials,
+        ciphertexts: &'a [Vec<u8>],
+    ) -> BoxFuture<'a, Result<Vec<Vec<u8>>>> {
+        Box::pin(decrypt_all(self, credentials, ciphertexts))
+    }
+}
 
 /// The plaintext of every ciphertext, in order, decrypted by KMS against this enclave's
 /// attestation.
-pub async fn decrypt_all(
-    kms: &Kms,
+async fn decrypt_all(
+    kms: &AwsNitroKms,
     credentials: &Credentials,
     ciphertexts: &[Vec<u8>],
 ) -> Result<Vec<Vec<u8>>> {
@@ -42,9 +62,9 @@ pub async fn decrypt_all(
     let document = attestation(public_der)?;
 
     let provider = aws_sdk_kms::config::Credentials::new(
-        credentials.access_key_id.clone(),
-        credentials.secret_access_key.clone(),
-        credentials.session_token.clone(),
+        credential(credentials, "access_key_id")?,
+        credential(credentials, "secret_access_key")?,
+        credentials.0.get("session_token").cloned(),
         None,
         "enclave-boot",
     );
@@ -80,6 +100,15 @@ pub async fn decrypt_all(
         );
     }
     Ok(plaintexts)
+}
+
+/// The credential under `name`, or why there is none.
+fn credential(credentials: &Credentials, name: &str) -> Result<String> {
+    credentials
+        .0
+        .get(name)
+        .cloned()
+        .ok_or_else(|| eyre!("the boot message's credentials have no {name}"))
 }
 
 /// An attestation document from the Nitro Security Module carrying `public_key`.

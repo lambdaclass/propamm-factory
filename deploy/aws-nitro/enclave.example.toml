@@ -1,42 +1,46 @@
-# The enclave file for `--enclave`: baked into the image, so the host cannot change it.
-# Holds no secret. See docs/enclave.md.
+# The enclave file for `--enclave` on AWS Nitro: baked into the image, so the host cannot
+# change it. Holds no secret. See docs/enclave.md.
 
-# The vsock port the host's boot helper connects to with the secrets and the sealed config.
-link_port = 5000
-
-# The KMS key's region, and where it is reached from inside: the name is pointed at a
-# [[forward]] below by the image's hosts file.
-[kms]
-region   = "eu-west-1"
-endpoint = "https://kms.eu-west-1.amazonaws.com"
+# How the run reaches its host. A Nitro enclave has a vsock to its host and nothing else.
+[link]
+kind = "vsock"
+port = 5000          # the boot helper connects here with the secrets and the sealed config
 
 # Outbound tunnels: a loopback address inside, piped to a vsock port on the host (cid 3),
 # where AWS's vsock-proxy dials the real host. One per host the updater connects to: KMS,
 # the RPC node, every builder, every venue a pair reads, Google (for the backoffice login),
 # CoinGecko if used. The hosts file maps each name to its `listen` address; two hosts on the
 # same port take two loopback addresses.
-[[forward]]
+[[link.forward]]
 listen = "127.0.0.2:443"     # kms.eu-west-1.amazonaws.com
 cid    = 3
 port   = 8001
 
-[[forward]]
+[[link.forward]]
 listen = "127.0.0.3:9443"    # stream.binance.com
 cid    = 3
 port   = 8002
 
-# Inbound tunnels: a vsock port on the enclave, piped to an address inside. The backoffice
+# Inbound tunnels: a vsock port on the enclave, piped to an address inside: the backoffice
 # (its `backoffice_addr` in the config) and the metrics scrape (`metrics_addr`).
-[[accept]]
+[[link.accept]]
 port = 8088
 to   = "127.0.0.1:8088"
 
-[[accept]]
+[[link.accept]]
 port = 9464
 to   = "127.0.0.1:9464"
 
+# How the secrets are decrypted: AWS KMS, only for this image's attestation. Needs a build
+# with the quote-updater `aws-nitro` feature. The endpoint's name is pointed at a
+# [[link.forward]] above by the image's hosts file.
+[release]
+kind     = "aws-nitro-kms"
+region   = "eu-west-1"
+endpoint = "https://kms.eu-west-1.amazonaws.com"
+
 # The backoffice serves its own HTTPS and asks for a Google login. The certificate is
-# handed in by the host at boot; its private key is the secret named here, released by KMS.
+# handed in by the host at boot; its private key is the secret named here.
 [backoffice]
 key_secret = "BACKOFFICE_TLS_KEY"
 

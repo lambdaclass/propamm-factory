@@ -1,7 +1,7 @@
 //! Seals a config file for the first boot of a run inside an enclave (`--enclave`). Inside
 //! an enclave the config is kept by the host only in sealed form, which the host can neither
 //! read nor change; the enclave seals every save itself, but the very first config has to be
-//! sealed by whoever holds the sealing key, before that key is encrypted for KMS.
+//! sealed by whoever holds the sealing key, before that key is encrypted for the key service.
 //!
 //! `CONFIG_SEAL_KEY=<64 hex digits> cargo run -p quote-updater --example seal_config -- config.toml > config.sealed`
 //!

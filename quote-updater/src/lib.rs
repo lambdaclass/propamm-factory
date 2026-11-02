@@ -43,7 +43,7 @@ pub mod calldata {
 /// Seals a config file for a run inside an enclave (`--enclave`): the base64 blob the host
 /// hands in at the first boot, before the enclave has ever saved one itself. Made by
 /// whoever holds the sealing key (`key_hex`, 32 bytes as hex) once, before that key is
-/// encrypted for KMS; see docs/enclave.md and `examples/seal_config.rs`.
+/// encrypted for the key service; see docs/enclave.md and `examples/seal_config.rs`.
 pub fn seal_config(key_hex: &str, config: &[u8]) -> eyre::Result<String> {
     use base64::Engine;
     let key = enclave::seal::parse_key(key_hex)?;

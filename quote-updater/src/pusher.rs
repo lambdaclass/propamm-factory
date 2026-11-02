@@ -84,11 +84,11 @@ pub(crate) async fn run(args: Args, parts: Parts) -> Result<Outcome> {
             let outcome = run_inner(args, parts, (stop, cancel), Arc::clone(&quoting)).await;
             // Inside an enclave nothing reads the process's stderr: the error that ends the
             // run goes to the host before the process exits, or nobody sees it.
-            if let Some(link) = crate::enclave::link() {
+            if let Some(host) = crate::enclave::host() {
                 if let Err(err) = &outcome {
-                    link.log("stderr", &format!("Error: {err:#}"));
+                    host.log("stderr", &format!("Error: {err:#}"));
                 }
-                link.flush().await;
+                host.flush().await;
             }
             outcome
         } => outcome,
@@ -145,12 +145,11 @@ async fn run_inner(
 
     // Inside an enclave the config and every secret come from the host before anything
     // else: the config is opened onto `--config`, and the secrets become what every key,
-    // pricer secret and venue key is looked up in. See enclave.rs.
+    // pricer secret and venue key is looked up in. See enclave/.
     let enclave = match args.flags.enclave.clone() {
         Some(path) => {
             let settings = crate::enclave::Settings::load(&path)?;
-            let release = crate::enclave::release(&settings.kms)?;
-            let booted = crate::enclave::boot(&settings, &args.flags.config, release).await?;
+            let booted = crate::enclave::boot(&settings, &args.flags.config).await?;
             tracing::info!(
                 "enclave: booted with {} secret(s): {}",
                 booted.secrets.len(),

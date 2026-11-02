@@ -91,9 +91,9 @@ jsonwebtoken = "9"
 hmac = "0.12"
 sha2 = "0.10"
 
-# The AWS Nitro Enclaves release of the secrets (enclave/nitro.rs): the attestation document
-# from the Nitro Security Module, KMS Decrypt with it, and the CMS envelope KMS answers
-# with. Behind the feature so a build without it carries none of the AWS SDK.
+# The `aws-nitro-kms` release of the secrets (enclave/aws_nitro.rs): the attestation
+# document from the Nitro Security Module, KMS Decrypt with it, and the CMS envelope KMS
+# answers with. Behind the feature so a build without it carries none of the AWS SDK.
 aws-nitro-enclaves-nsm-api = { version = "0.4", optional = true }
 aws-sdk-kms = { version = "1", optional = true }
 serde_bytes = { version = "0.11", optional = true }
@@ -105,8 +105,8 @@ der = { version = "0.7", optional = true, features = ["alloc"] }
 
 [features]
 default = []
-# The secrets of an `--enclave` run are released by KMS against the enclave's attestation.
-nitro = [
+# `[release] kind = "aws-nitro-kms"`: AWS KMS against an AWS Nitro enclave's attestation.
+aws-nitro = [
     "dep:aws-nitro-enclaves-nsm-api",
     "dep:aws-sdk-kms",
     "dep:serde_bytes",
@@ -117,14 +117,18 @@ nitro = [
     "dep:der",
 ]
 
-# vsock, the enclave's only channel to its host, exists on Linux only.
+# `[link] kind = "vsock"`, an AWS Nitro enclave's only channel to its host, exists on Linux
+# only.
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-vsock = "0.7"
 
 [dev-dependencies]
 # A directory for the files a test writes. Already in Cargo.lock through the ethrex tree.
 tempfile = "3"
-# For the `nitro` tests, which build a CMS envelope the way KMS does.
+# A throwaway certificate made in memory for the backoffice's HTTPS test, so no key is ever
+# committed. Test-only: never in a binary.
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+# For the `aws-nitro` tests, which build a CMS envelope the way KMS does.
 const-oid = { version = "0.9", features = ["db"] }
 spki = "0.7"
 # Only for tokio's paused clock (`#[tokio::test(start_paused = true)]`), which lets a

@@ -1,84 +1,144 @@
-//! Running inside an AWS Nitro enclave: a sealed compartment of the host with no network,
-//! no disk and no console, reachable only over a vsock. Everything the run needs crosses
-//! that one channel at boot, and everything it must keep crosses it back.
+//! Running inside an enclave: a compartment the host's own root cannot read or change (an
+//! AWS Nitro enclave, for one), whose only connection is a channel to the host. Everything
+//! the run needs crosses that channel at boot, and everything it must keep crosses it back,
+//! unreadable or unforgeable by the host.
 //!
-//! The sequence, driven by `--enclave <file>` (the file is baked into the enclave image):
+//! Two things differ from platform to platform, and each is a trait with one implementation
+//! per platform, chosen by `kind` in the enclave file:
 //!
-//! 1. The tunnels in the file are opened ([`forward`]), so the run can reach the venues,
-//!    the builders, the RPC node and KMS, and so the backoffice and the metrics scrape can
-//!    reach in.
-//! 2. The enclave listens on the link port and the host's boot helper connects, sending
-//!    one [`protocol::ToEnclave::Boot`]: temporary AWS credentials, every secret as KMS
+//! - [`SecretRelease`]: how the secrets the host hands in, encrypted, are decrypted by a key
+//!   service that releases them only to this exact program, as the platform proves it.
+//!   Shipped: `aws-nitro-kms` ([`aws_nitro`], behind the `aws-nitro` feature).
+//! - [`HostLink`]: how the run reaches its host, and whatever the platform needs for the
+//!   run's other connections. Shipped: `vsock` ([`vsock`], Linux only), with the tunnels a
+//!   compartment without a network needs.
+//!
+//! Everything else is the same everywhere. The sequence, driven by `--enclave <file>`
+//! (the file is part of the image, so the host cannot change it):
+//!
+//! 1. The link waits for the host, and the host's boot helper sends one
+//!    [`protocol::HostMessage::Boot`]: credentials for the key service, every secret as
 //!    ciphertext, the config sealed under one of those secrets, and the backoffice's
 //!    certificate.
-//! 3. The secrets are decrypted by KMS against the enclave's attestation document
-//!    ([`nitro`]): KMS releases them only to this image, wrapped so only this process can
-//!    read them. They are installed as the process's secrets ([`crate::secrets`]), so the
-//!    config's `key_env` names and every other secret name resolve as they would from an
-//!    environment.
-//! 4. The config is opened ([`seal`]) and written to `--config`, a path on the enclave's
-//!    in-memory filesystem, and the run proceeds exactly as it does outside an enclave.
-//! 5. For the rest of the run the link carries log lines out, the re-sealed config out
-//!    after every save, and reload and shutdown requests in, since nothing outside can
-//!    send the process a signal.
+//! 2. The release decrypts the secrets, which are installed as the process's secrets
+//!    ([`crate::secrets`]), so the config's `key_env` names and every other secret name
+//!    resolve as they would from an environment.
+//! 3. The config is opened ([`seal`]) and written to `--config`, and the run proceeds as it
+//!    does anywhere else.
+//! 4. For the rest of the run the link carries log lines out, the re-sealed config out
+//!    after every save, and reload and shutdown requests in, since nothing outside may be
+//!    able to send the process a signal.
 
+#[cfg(feature = "aws-nitro")]
+pub mod aws_nitro;
 pub mod protocol;
 pub mod seal;
-
 #[cfg(target_os = "linux")]
-pub mod forward;
-#[cfg(feature = "nitro")]
-pub mod nitro;
+pub mod vsock;
 
-use std::{collections::BTreeMap, net::SocketAddr, path::Path, sync::OnceLock};
+use std::{collections::BTreeMap, net::SocketAddr, path::Path, pin::Pin, sync::OnceLock};
 
 use base64::Engine;
-use eyre::{Result, WrapErr, bail, ensure, eyre};
+use eyre::{Result, WrapErr, ensure, eyre};
+use futures_util::future::BoxFuture;
 use serde::Deserialize;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::mpsc,
 };
 
-use protocol::{Credentials, FromEnclave, ToEnclave, read_frame, write_frame};
+use protocol::{Credentials, HostMessage, RunMessage, read_frame, write_frame};
 
 /// The secret the config is sealed under: 32 bytes as hex, released at boot like every
 /// other.
 pub const SEAL_KEY_SECRET: &str = "CONFIG_SEAL_KEY";
 
-/// The file `--enclave` points at, as written.
+/// How the secrets the host hands in are decrypted: by a key service that releases them
+/// only to this program, as proven by the platform it runs on.
+pub trait SecretRelease: Send + Sync {
+    /// The plaintext of every ciphertext, in the same order.
+    fn release<'a>(
+        &'a self,
+        credentials: &'a Credentials,
+        ciphertexts: &'a [Vec<u8>],
+    ) -> BoxFuture<'a, Result<Vec<Vec<u8>>>>;
+}
+
+/// How the run reaches its host: sets up what the platform needs for the run's own
+/// connections, then waits for the host's boot helper and answers with that connection.
+pub trait HostLink: Send + Sync {
+    /// The connection to the host, once it has connected.
+    fn accept(&self) -> BoxFuture<'_, Result<Stream>>;
+}
+
+/// One connection to the host, whatever carries it.
+pub type Stream = Pin<Box<dyn Connection>>;
+
+/// The two traits a [`Stream`] needs, as one for the trait object.
+pub trait Connection: AsyncRead + AsyncWrite + Send {}
+impl<T: AsyncRead + AsyncWrite + Send> Connection for T {}
+
+/// The enclave file, as written.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Raw {
-    link_port: u32,
-    kms: RawKms,
-    #[serde(default)]
-    forward: Vec<RawForward>,
-    #[serde(default)]
-    accept: Vec<RawAccept>,
+    link: LinkKind,
+    release: ReleaseKind,
     backoffice: Option<RawBackoffice>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawKms {
-    region: String,
-    endpoint: Option<String>,
+/// Which [`HostLink`] this run uses, and its settings.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum LinkKind {
+    /// A vsock to the host: what an AWS Nitro enclave has, and nothing else.
+    Vsock {
+        /// The port the host's boot helper connects to.
+        port: u32,
+        /// Outbound tunnels: how the run reaches anything at all.
+        #[serde(default)]
+        forward: Vec<Forward>,
+        /// Inbound tunnels: how the backoffice and the metrics scrape are reached.
+        #[serde(default)]
+        accept: Vec<Accept>,
+    },
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawForward {
-    listen: SocketAddr,
-    cid: u32,
-    port: u32,
+/// Which [`SecretRelease`] this run uses, and its settings.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum ReleaseKind {
+    /// AWS KMS, against an AWS Nitro enclave's attestation document.
+    AwsNitroKms {
+        /// The region the KMS key lives in.
+        region: String,
+        /// Where KMS is reached, when not its public endpoint.
+        #[serde(default)]
+        endpoint: Option<String>,
+    },
 }
 
-#[derive(Debug, Deserialize)]
+/// A loopback address inside, piped to a vsock port on the host, where a proxy dials the
+/// real destination.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawAccept {
-    port: u32,
-    to: SocketAddr,
+pub struct Forward {
+    /// The loopback address to listen on.
+    pub listen: SocketAddr,
+    /// The context id to connect to (the host is `3`).
+    pub cid: u32,
+    /// The vsock port there.
+    pub port: u32,
+}
+
+/// A vsock port accepted on, piped to an address inside.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Accept {
+    /// The vsock port.
+    pub port: u32,
+    /// The address inside it is piped to.
+    pub to: SocketAddr,
 }
 
 #[derive(Debug, Deserialize)]
@@ -100,37 +160,8 @@ struct RawGoogle {
     allowed_accounts: Vec<String>,
 }
 
-/// The KMS the secrets are decrypted by.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Kms {
-    /// The region the key lives in.
-    pub region: String,
-    /// Where KMS is reached, when not its public endpoint.
-    pub endpoint: Option<String>,
-}
-
-/// A loopback port tunnelled to a vsock port on the host.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Forward {
-    /// The loopback address to listen on.
-    pub listen: SocketAddr,
-    /// The context id to connect to (the host is `3`).
-    pub cid: u32,
-    /// The vsock port there.
-    pub port: u32,
-}
-
-/// A vsock port accepted on, piped to a port inside.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Accept {
-    /// The vsock port.
-    pub port: u32,
-    /// The address inside it is piped to.
-    pub to: SocketAddr,
-}
-
-/// How the backoffice authenticates inside an enclave: its own TLS, and a Google login
-/// checked in the process. See `backoffice::auth`.
+/// How the backoffice is reached in an enclave: its own HTTPS, and a Google login
+/// checked in the process. See `login.rs`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackofficeSettings {
     /// The secret holding the PEM private key of the certificate the host hands in.
@@ -150,15 +181,11 @@ pub struct BackofficeSettings {
 /// The enclave file, parsed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
-    /// The vsock port the host's boot helper connects to.
-    pub link_port: u32,
-    /// The KMS the secrets are decrypted by.
-    pub kms: Kms,
-    /// Outbound tunnels.
-    pub forward: Vec<Forward>,
-    /// Inbound tunnels.
-    pub accept: Vec<Accept>,
-    /// The backoffice's authentication, when it is served from inside.
+    /// How the run reaches its host.
+    pub link: LinkKind,
+    /// How the secrets are decrypted.
+    pub release: ReleaseKind,
+    /// The backoffice's login, when it is served from inside.
     pub backoffice: Option<BackofficeSettings>,
 }
 
@@ -173,98 +200,103 @@ impl Settings {
     /// Parses the file's text.
     pub fn parse(text: &str) -> Result<Self> {
         let raw: Raw = toml::from_str(text).wrap_err("enclave file")?;
-        let backoffice = raw.backoffice.map(|b| {
-            ensure!(
-                b.google.allowed_domain.is_some() || !b.google.allowed_accounts.is_empty(),
-                "[backoffice.google]: set allowed_domain or allowed_accounts, or nobody can log in"
-            );
-            ensure!(
-                b.google.redirect_url.starts_with("https://"),
-                "[backoffice.google]: redirect_url must be https://"
-            );
-            Ok::<_, eyre::Report>(BackofficeSettings {
-                key_secret: b.key_secret,
-                client_id: b.google.client_id,
-                client_secret_secret: b.google.client_secret_secret,
-                redirect_url: b.google.redirect_url,
-                allowed_domain: b.google.allowed_domain,
-                allowed_accounts: b.google.allowed_accounts,
-            })
-        });
-        let backoffice = match backoffice {
-            Some(result) => Some(result?),
+        let backoffice = match raw.backoffice {
             None => None,
+            Some(b) => {
+                ensure!(
+                    b.google.allowed_domain.is_some() || !b.google.allowed_accounts.is_empty(),
+                    "[backoffice.google]: set allowed_domain or allowed_accounts, or nobody \
+                     can log in"
+                );
+                ensure!(
+                    b.google.redirect_url.starts_with("https://"),
+                    "[backoffice.google]: redirect_url must be https://"
+                );
+                Some(BackofficeSettings {
+                    key_secret: b.key_secret,
+                    client_id: b.google.client_id,
+                    client_secret_secret: b.google.client_secret_secret,
+                    redirect_url: b.google.redirect_url,
+                    allowed_domain: b.google.allowed_domain,
+                    allowed_accounts: b.google.allowed_accounts,
+                })
+            }
         };
         Ok(Self {
-            link_port: raw.link_port,
-            kms: Kms {
-                region: raw.kms.region,
-                endpoint: raw.kms.endpoint,
-            },
-            forward: raw
-                .forward
-                .into_iter()
-                .map(|f| Forward {
-                    listen: f.listen,
-                    cid: f.cid,
-                    port: f.port,
-                })
-                .collect(),
-            accept: raw
-                .accept
-                .into_iter()
-                .map(|a| Accept {
-                    port: a.port,
-                    to: a.to,
-                })
-                .collect(),
+            link: raw.link,
+            release: raw.release,
             backoffice,
         })
     }
 }
 
-/// How the boot turns the host's ciphertexts into secrets: KMS against the enclave's
-/// attestation in production (`nitro`), given the credentials and the ciphertexts in the
-/// order asked, answering the plaintexts in that order.
-pub type Release = Box<
-    dyn Fn(
-            Credentials,
-            Vec<Vec<u8>>,
-        )
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Vec<u8>>>> + Send>>
-        + Send
-        + Sync,
->;
+impl LinkKind {
+    /// The link this kind names.
+    pub fn build(&self) -> Result<Box<dyn HostLink>> {
+        match self {
+            #[cfg(target_os = "linux")]
+            LinkKind::Vsock {
+                port,
+                forward,
+                accept,
+            } => Ok(Box::new(vsock::VsockLink {
+                port: *port,
+                forward: forward.clone(),
+                accept: accept.clone(),
+            })),
+            #[cfg(not(target_os = "linux"))]
+            LinkKind::Vsock { .. } => eyre::bail!("[link] kind = \"vsock\" exists on Linux only"),
+        }
+    }
+}
 
-/// The link to the host for the rest of the run, set once by [`boot`].
-static LINK: OnceLock<Link> = OnceLock::new();
+impl ReleaseKind {
+    /// The release this kind names, if this build has it.
+    pub fn build(&self) -> Result<Box<dyn SecretRelease>> {
+        match self {
+            #[cfg(feature = "aws-nitro")]
+            ReleaseKind::AwsNitroKms { region, endpoint } => Ok(Box::new(aws_nitro::AwsNitroKms {
+                region: region.clone(),
+                endpoint: endpoint.clone(),
+            })),
+            #[cfg(not(feature = "aws-nitro"))]
+            ReleaseKind::AwsNitroKms { .. } => eyre::bail!(
+                "[release] kind = \"aws-nitro-kms\" needs a build with the quote-updater \
+                 `aws-nitro` feature"
+            ),
+        }
+    }
+}
+
+/// The channel to the host for the rest of the run, set once by [`boot`].
+static HOST: OnceLock<Host> = OnceLock::new();
 
 /// The channel to the host, as the rest of the process uses it.
-pub struct Link {
+pub struct Host {
     out: mpsc::UnboundedSender<Outgoing>,
     seal_key: [u8; seal::KEY_LEN],
 }
 
 /// What the writer task is asked to do, in order.
 enum Outgoing {
-    Frame(FromEnclave),
+    Frame(RunMessage),
     /// Answered once every frame queued before it has been written.
     Flush(tokio::sync::oneshot::Sender<()>),
 }
 
-/// How long [`Link::flush`] waits for the host to take what is queued.
+/// How long [`Host::flush`] waits for the host to take what is queued.
 const FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// The link, if this run booted in an enclave.
-pub fn link() -> Option<&'static Link> {
-    LINK.get()
+/// The channel to the host, if this run booted in an enclave.
+pub fn host() -> Option<&'static Host> {
+    HOST.get()
 }
 
-impl Link {
+impl Host {
     /// Sends one log line to the host. Never blocks: the channel is unbounded and the
     /// writer task drains it.
     pub fn log(&self, stream: &str, line: &str) {
-        let _ = self.out.send(Outgoing::Frame(FromEnclave::Log {
+        let _ = self.out.send(Outgoing::Frame(RunMessage::Log {
             stream: stream.to_owned(),
             line: line.to_owned(),
         }));
@@ -285,7 +317,7 @@ impl Link {
         let text = std::fs::read(path)
             .wrap_err_with(|| format!("reading {} to seal it", path.display()))?;
         let sealed = seal::seal(&self.seal_key, &text)?;
-        let _ = self.out.send(Outgoing::Frame(FromEnclave::Config {
+        let _ = self.out.send(Outgoing::Frame(RunMessage::Config {
             sealed: base64::engine::general_purpose::STANDARD.encode(sealed),
         }));
         Ok(())
@@ -301,68 +333,37 @@ pub struct Booted {
     pub backoffice_certificate: Option<String>,
 }
 
-/// The release this build has: KMS against the enclave's attestation with the `nitro`
-/// feature, none without it.
-pub fn release(kms: &Kms) -> Result<Release> {
-    #[cfg(feature = "nitro")]
-    {
-        let kms = kms.clone();
-        Ok(Box::new(move |credentials, ciphertexts| {
-            let kms = kms.clone();
-            Box::pin(async move { nitro::decrypt_all(&kms, &credentials, &ciphertexts).await })
-        }))
-    }
-    #[cfg(not(feature = "nitro"))]
-    {
-        let _ = kms;
-        bail!("--enclave needs a build with the quote-updater `nitro` feature")
-    }
+/// Builds the file's link and release, waits for the host on the link, decrypts the
+/// secrets, installs them, writes the opened config to `config_path`, and keeps the
+/// channel to the host for the run.
+pub async fn boot(settings: &Settings, config_path: &Path) -> Result<Booted> {
+    let release = settings.release.build()?;
+    let link = settings.link.build()?;
+    let stream = link.accept().await?;
+    boot_on(config_path, stream, release.as_ref()).await
 }
 
-/// Opens the tunnels, waits for the host's boot message on the link, releases the secrets
-/// with `release`, installs them, writes the opened config to `config_path`, and keeps the
-/// link for the run.
-pub async fn boot(settings: &Settings, config_path: &Path, release: Release) -> Result<Booted> {
-    let stream = accept_link(settings).await?;
-    boot_on(config_path, stream, release).await
-}
-
-#[cfg(target_os = "linux")]
-async fn accept_link(settings: &Settings) -> Result<tokio_vsock::VsockStream> {
-    spawn_tunnels(settings);
-    let port = settings.link_port;
-    let listener = tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(
-        tokio_vsock::VMADDR_CID_ANY,
-        port,
-    ))
-    .wrap_err_with(|| format!("binding the link's vsock port {port}"))?;
-    tracing::info!("waiting for the boot helper on vsock port {port}");
-    let (stream, _) = listener.accept().await?;
-    Ok(stream)
-}
-
-/// Off Linux there is no vsock and so no enclave.
-#[cfg(not(target_os = "linux"))]
-async fn accept_link(_settings: &Settings) -> Result<tokio::io::DuplexStream> {
-    bail!("--enclave runs inside a Nitro enclave, which is Linux only")
-}
-
-/// [`boot`] on an already connected link: what the tests drive over a socket pair.
-pub async fn boot_on<S>(config_path: &Path, stream: S, release: Release) -> Result<Booted>
+/// [`boot`] on an already connected link, with a given release: what the tests drive over
+/// an in-memory connection.
+pub async fn boot_on<S>(
+    config_path: &Path,
+    stream: S,
+    release: &dyn SecretRelease,
+) -> Result<Booted>
 where
-    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    S: AsyncRead + AsyncWrite + Send + 'static,
 {
     let (mut reader, mut writer) = tokio::io::split(stream);
-    let first: ToEnclave = read_frame(&mut reader)
+    let first: HostMessage = read_frame(&mut reader)
         .await?
         .ok_or_else(|| eyre!("the boot helper closed the link before sending anything"))?;
     let outcome = match first {
-        ToEnclave::Boot {
+        HostMessage::Boot {
             credentials,
             secrets,
             config,
             backoffice_certificate,
-        } => install(config_path, credentials, secrets, config, release)
+        } => install(config_path, &credentials, secrets, config, release)
             .await
             .map(|(names, seal_key)| {
                 (
@@ -381,7 +382,7 @@ where
         Ok((booted, _)) => {
             write_frame(
                 &mut writer,
-                &FromEnclave::Ready {
+                &RunMessage::Ready {
                     secrets: booted.secrets.clone(),
                 },
             )
@@ -390,7 +391,7 @@ where
         Err(err) => {
             let _ = write_frame(
                 &mut writer,
-                &FromEnclave::Failed {
+                &RunMessage::Failed {
                     message: format!("{err:#}"),
                 },
             )
@@ -408,8 +409,8 @@ where
     ));
 
     let (out, mut pending) = mpsc::unbounded_channel();
-    LINK.set(Link { out, seal_key })
-        .map_err(|_| eyre!("the enclave link was set up twice"))?;
+    HOST.set(Host { out, seal_key })
+        .map_err(|_| eyre!("the channel to the host was set up twice"))?;
     tokio::spawn(async move {
         let mut up = true;
         while let Some(message) = pending.recv().await {
@@ -420,10 +421,10 @@ where
                         // can be done from inside, and quoting does not depend on it.
                         up = false;
                         // Not `tracing`: the operator layer would route the line back into
-                        // this link. The enclave's debug console is the one place left.
+                        // this channel. A debug console is the one place left.
                         #[allow(clippy::print_stderr)]
                         {
-                            eprintln!("the enclave link is down: {err:#}");
+                            eprintln!("the channel to the host is down: {err:#}");
                         }
                     }
                 }
@@ -436,15 +437,15 @@ where
     });
     tokio::spawn(async move {
         loop {
-            match read_frame::<_, ToEnclave>(&mut reader).await {
-                Ok(Some(ToEnclave::Reload)) => raise(libc::SIGHUP),
-                Ok(Some(ToEnclave::Shutdown)) => raise(libc::SIGINT),
-                Ok(Some(ToEnclave::Boot { .. })) => {
-                    tracing::warn!("a second boot message on the link; ignored")
+            match read_frame::<_, HostMessage>(&mut reader).await {
+                Ok(Some(HostMessage::Reload)) => raise(libc::SIGHUP),
+                Ok(Some(HostMessage::Shutdown)) => raise(libc::SIGINT),
+                Ok(Some(HostMessage::Boot { .. })) => {
+                    tracing::warn!("a second boot message from the host; ignored")
                 }
                 Ok(None) => break,
                 Err(err) => {
-                    tracing::warn!("the enclave link is unreadable: {err:#}");
+                    tracing::warn!("the channel to the host is unreadable: {err:#}");
                     break;
                 }
             }
@@ -453,10 +454,10 @@ where
     Ok(booted)
 }
 
-/// Refuses any endpoint that is not `https://` or `wss://`. Inside an enclave every
-/// connection is carried by the host, which reads and changes whatever is not under TLS
-/// opened from inside. Each entry is `(what, url)`; the error names `what` and never the
-/// URL, which can carry an API key.
+/// Refuses any endpoint that is not `https://` or `wss://`. In an enclave every
+/// connection may be carried by the host, which reads and changes whatever is not under
+/// TLS opened from inside. Each entry is `(what, url)`; the error names `what` and never
+/// the URL, which can carry an API key.
 pub fn require_tls(urls: &[(String, String)]) -> Result<()> {
     let plain: Vec<&str> = urls
         .iter()
@@ -468,8 +469,8 @@ pub fn require_tls(urls: &[(String, String)]) -> Result<()> {
         .collect();
     ensure!(
         plain.is_empty(),
-        "inside an enclave every endpoint must be https:// or wss://, since the host carries \
-         the bytes and could read or change anything else; not so: {}",
+        "in an enclave every endpoint must be https:// or wss://, since the host may \
+         carry the bytes and could read or change anything else; not so: {}",
         plain.join(", ")
     );
     Ok(())
@@ -487,10 +488,10 @@ fn raise(signal: libc::c_int) {
 
 async fn install(
     config_path: &Path,
-    credentials: Credentials,
+    credentials: &Credentials,
     ciphertexts: BTreeMap<String, String>,
     config: String,
-    release: Release,
+    release: &dyn SecretRelease,
 ) -> Result<(Vec<String>, [u8; seal::KEY_LEN])> {
     ensure!(
         !ciphertexts.is_empty(),
@@ -505,7 +506,8 @@ async fn install(
                 .map_err(|_| eyre!("a secret's ciphertext is not base64"))
         })
         .collect::<Result<Vec<_>>>()?;
-    let plaintexts = release(credentials, blobs)
+    let plaintexts = release
+        .release(credentials, &blobs)
         .await
         .wrap_err("releasing the secrets")?;
     ensure!(
@@ -554,45 +556,28 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-fn spawn_tunnels(settings: &Settings) {
-    for tunnel in &settings.forward {
-        let (listen, cid, port) = (tunnel.listen, tunnel.cid, tunnel.port);
-        tokio::spawn(async move {
-            if let Err(err) = forward::outbound(listen, cid, port).await {
-                tracing::error!("tunnel {listen}: {err:#}");
-            }
-        });
-    }
-    for tunnel in &settings.accept {
-        let (port, to) = (tunnel.port, tunnel.to);
-        tokio::spawn(async move {
-            if let Err(err) = forward::inbound(port, to).await {
-                tracing::error!("tunnel vsock {port}: {err:#}");
-            }
-        });
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const FILE: &str = r#"
-link_port = 5000
+[link]
+kind = "vsock"
+port = 5000
 
-[kms]
-region = "eu-west-1"
-endpoint = "https://127.0.0.1:8443"
-
-[[forward]]
+[[link.forward]]
 listen = "127.0.0.1:443"
 cid = 3
 port = 8001
 
-[[accept]]
+[[link.accept]]
 port = 9464
 to = "127.0.0.1:9464"
+
+[release]
+kind = "aws-nitro-kms"
+region = "eu-west-1"
+endpoint = "https://127.0.0.1:8443"
 
 [backoffice]
 key_secret = "BACKOFFICE_TLS_KEY"
@@ -630,18 +615,30 @@ google = { client_id = "id.apps.googleusercontent.com", client_secret_secret = "
     }
 
     #[test]
-    fn the_enclave_file_parses_and_names_its_mistakes() {
+    fn the_file_names_its_link_and_release_by_kind_and_its_mistakes_are_named() {
         let settings = Settings::parse(FILE).unwrap();
-        assert_eq!(settings.link_port, 5000);
-        assert_eq!(settings.kms.region, "eu-west-1");
-        assert_eq!(settings.forward[0].port, 8001);
-        assert_eq!(settings.accept[0].port, 9464);
+        let LinkKind::Vsock {
+            port,
+            forward,
+            accept,
+        } = &settings.link;
+        assert_eq!((*port, forward[0].port, accept[0].port), (5000, 8001, 9464));
+        let ReleaseKind::AwsNitroKms { region, .. } = &settings.release;
+        assert_eq!(region, "eu-west-1");
         let backoffice = settings.backoffice.unwrap();
         assert_eq!(backoffice.allowed_domain.as_deref(), Some("example.com"));
 
         let cases = [
-            (FILE.replace("link_port = 5000", ""), "link_port"),
-            (FILE.replace("region = \"eu-west-1\"", ""), "region"),
+            (
+                FILE.replace("kind = \"vsock\"", "kind = \"carrier-pigeon\""),
+                "unknown variant",
+            ),
+            (
+                FILE.replace("kind = \"aws-nitro-kms\"", "kind = \"other\""),
+                "unknown variant",
+            ),
+            (FILE.replace("port = 5000\n", ""), "port"),
+            (FILE.replace("region = \"eu-west-1\"\n", ""), "region"),
             (
                 FILE.replace(", allowed_domain = \"example.com\"", ""),
                 "allowed_domain",
@@ -658,10 +655,18 @@ google = { client_id = "id.apps.googleusercontent.com", client_secret_secret = "
         }
     }
 
-    /// A release that answers each ciphertext with the same bytes: what a test's host
-    /// sends is already the plaintext, and the boot's own steps are what is under test.
-    fn plain_release() -> Release {
-        Box::new(|_, ciphertexts| Box::pin(async move { Ok(ciphertexts) }))
+    /// A release that answers each ciphertext with the same bytes: what a test's host sends
+    /// is already the plaintext, and the boot's own steps are what is under test.
+    struct PlainRelease;
+
+    impl SecretRelease for PlainRelease {
+        fn release<'a>(
+            &'a self,
+            _credentials: &'a Credentials,
+            ciphertexts: &'a [Vec<u8>],
+        ) -> BoxFuture<'a, Result<Vec<Vec<u8>>>> {
+            Box::pin(async move { Ok(ciphertexts.to_vec()) })
+        }
     }
 
     fn b64(bytes: &[u8]) -> String {
@@ -669,23 +674,19 @@ google = { client_id = "id.apps.googleusercontent.com", client_secret_secret = "
     }
 
     #[tokio::test]
-    async fn a_boot_installs_the_secrets_opens_the_config_and_keeps_the_link() {
+    async fn a_boot_installs_the_secrets_opens_the_config_and_keeps_the_channel() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
         let seal_key_hex = "0303030303030303030303030303030303030303030303030303030303030303";
         let seal_key = seal::parse_key(seal_key_hex).unwrap();
         let sealed = seal::seal(&seal_key, b"[settings]\nrequote_ms = 40\n").unwrap();
 
-        let (host, enclave) = tokio::io::duplex(1 << 16);
-        let (mut host_reader, mut host_writer) = tokio::io::split(host);
+        let (host_end, run_end) = tokio::io::duplex(1 << 16);
+        let (mut host_reader, mut host_writer) = tokio::io::split(host_end);
         write_frame(
             &mut host_writer,
-            &ToEnclave::Boot {
-                credentials: Credentials {
-                    access_key_id: "a".into(),
-                    secret_access_key: "s".into(),
-                    session_token: None,
-                },
+            &HostMessage::Boot {
+                credentials: Credentials::default(),
                 secrets: [
                     (SEAL_KEY_SECRET.to_owned(), b64(seal_key_hex.as_bytes())),
                     ("QU_ENCLAVE_TEST_KEY".to_owned(), b64(b"0xabc\n")),
@@ -698,9 +699,7 @@ google = { client_id = "id.apps.googleusercontent.com", client_secret_secret = "
         .await
         .unwrap();
 
-        let booted = boot_on(&config_path, enclave, plain_release())
-            .await
-            .unwrap();
+        let booted = boot_on(&config_path, run_end, &PlainRelease).await.unwrap();
         assert_eq!(booted.secrets.len(), 2);
         assert_eq!(
             booted.backoffice_certificate.as_deref(),
@@ -714,23 +713,23 @@ google = { client_id = "id.apps.googleusercontent.com", client_secret_secret = "
             crate::secrets::lookup("QU_ENCLAVE_TEST_KEY").as_deref(),
             Some("0xabc")
         );
-        let ready: FromEnclave = read_frame(&mut host_reader).await.unwrap().unwrap();
+        let ready: RunMessage = read_frame(&mut host_reader).await.unwrap().unwrap();
         assert_eq!(
             ready,
-            FromEnclave::Ready {
+            RunMessage::Ready {
                 secrets: vec![SEAL_KEY_SECRET.to_owned(), "QU_ENCLAVE_TEST_KEY".to_owned()]
             }
         );
 
-        // The link carries log lines out, and a saved config back, sealed under the key.
-        // It is the process's one link, so while this test holds it the other tests running
-        // beside it log into it and write configs through it too: wait for our frames.
-        let link = link().expect("the boot kept the link");
-        link.log("stdout", "hello");
+        // The channel carries log lines out, and a saved config back, sealed under the key.
+        // It is the process's one channel, so while this test holds it the other tests
+        // running beside it log into it and write configs through it too: wait for ours.
+        let host = host().expect("the boot kept the channel");
+        host.log("stdout", "hello");
         loop {
-            let frame: FromEnclave = read_frame(&mut host_reader).await.unwrap().unwrap();
+            let frame: RunMessage = read_frame(&mut host_reader).await.unwrap().unwrap();
             if frame
-                == (FromEnclave::Log {
+                == (RunMessage::Log {
                     stream: "stdout".into(),
                     line: "hello".into(),
                 })
@@ -739,16 +738,16 @@ google = { client_id = "id.apps.googleusercontent.com", client_secret_secret = "
             }
         }
         std::fs::write(&config_path, "[settings]\nrequote_ms = 30\n").unwrap();
-        link.config_written(&config_path).unwrap();
+        host.config_written(&config_path).unwrap();
         loop {
-            let frame: FromEnclave = read_frame(&mut host_reader).await.unwrap().unwrap();
-            let FromEnclave::Config { sealed } = frame else {
+            let frame: RunMessage = read_frame(&mut host_reader).await.unwrap().unwrap();
+            let RunMessage::Config { sealed } = frame else {
                 continue;
             };
             let blob = base64::engine::general_purpose::STANDARD
                 .decode(sealed)
                 .unwrap();
-            // Every config is sealed under this link's key; ours is the one with our text.
+            // Every config is sealed under this channel's key; ours is the one with our text.
             if seal::open(&seal_key, &blob).unwrap() == b"[settings]\nrequote_ms = 30\n" {
                 break;
             }
@@ -759,16 +758,12 @@ google = { client_id = "id.apps.googleusercontent.com", client_secret_secret = "
     async fn a_boot_without_the_sealing_secret_or_with_a_tampered_config_fails_and_says_so() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
-        let (host, enclave) = tokio::io::duplex(1 << 16);
-        let (mut host_reader, mut host_writer) = tokio::io::split(host);
+        let (host_end, run_end) = tokio::io::duplex(1 << 16);
+        let (mut host_reader, mut host_writer) = tokio::io::split(host_end);
         write_frame(
             &mut host_writer,
-            &ToEnclave::Boot {
-                credentials: Credentials {
-                    access_key_id: "a".into(),
-                    secret_access_key: "s".into(),
-                    session_token: None,
-                },
+            &HostMessage::Boot {
+                credentials: Credentials::default(),
                 secrets: [("OTHER".to_owned(), b64(b"x"))].into(),
                 config: b64(b"not sealed"),
                 backoffice_certificate: None,
@@ -776,13 +771,13 @@ google = { client_id = "id.apps.googleusercontent.com", client_secret_secret = "
         )
         .await
         .unwrap();
-        let err = boot_on(&config_path, enclave, plain_release())
+        let err = boot_on(&config_path, run_end, &PlainRelease)
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains(SEAL_KEY_SECRET), "{err:#}");
-        let failed: FromEnclave = read_frame(&mut host_reader).await.unwrap().unwrap();
+        let failed: RunMessage = read_frame(&mut host_reader).await.unwrap().unwrap();
         assert!(
-            matches!(failed, FromEnclave::Failed { message } if message.contains(SEAL_KEY_SECRET))
+            matches!(failed, RunMessage::Failed { message } if message.contains(SEAL_KEY_SECRET))
         );
         assert!(!config_path.exists(), "nothing was written");
     }

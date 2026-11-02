@@ -41,6 +41,6 @@ builders, signer balance).
 ## Documentation
 
 - [Deep dive into the internals](docs/components.md)
-- [Running inside an AWS Nitro enclave, so root on the host cannot take the keys or change the config](docs/enclave.md)
+- [Running inside an enclave (AWS Nitro shipped), so root on the host cannot take the keys or change the config](docs/enclave.md)
 - [Pricing models: the shipped ones, and writing your own](docs/pricing.md)
 - [Tokenized stocks: Ondo's pairs, and adding an issuer](docs/stocks.md)
