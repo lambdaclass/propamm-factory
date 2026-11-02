@@ -31,6 +31,13 @@ error InvalidOracle(address oracle);
 error NotAToken(address token);
 /// A pair token whose `decimals()` is above `MAX_TOKEN_DECIMALS`.
 error UnsupportedDecimals(address token, uint8 decimals);
+/// `addUpdater` (or `initialize`) for a key `oracle` already authorizes for this instance: the
+/// registry would ignore it, and the event would record a change that did not happen.
+error UpdaterAlreadyAuthorized(address oracle, address updater);
+/// `removeUpdater` (or `removeUpdaterFrom`) for a key `oracle` does not authorize for this
+/// instance: the registry would ignore it, and the event would record a revocation that did not
+/// happen.
+error UpdaterNotAuthorized(address oracle, address updater);
 
 /// @dev `ERC165Upgradeable` holds no state, so adding it moved no storage slot.
 contract PropAMM is
@@ -70,8 +77,10 @@ contract PropAMM is
     event PairRemoved(address indexed token0, address indexed token1);
     event PairVaultChanged(address indexed token0, address indexed token1, address indexed vault);
     event OracleChanged(address indexed newOracle);
-    event UpdaterAdded(address indexed updater);
-    event UpdaterRemoved(address indexed updater);
+    /// @dev Both name the registry the change was made on: authorizations live per registry, and
+    /// a key revoked on one stays live on any other this instance has used.
+    event UpdaterAdded(address indexed updater, address indexed oracle);
+    event UpdaterRemoved(address indexed updater, address indexed oracle);
     event ERC20Withdrawn(address indexed token, address indexed to, uint256 amount);
 
     /// @dev Fixed-point scale the oracle publishes `mid` in. A `mid` of 1e18 means one whole
@@ -134,7 +143,7 @@ contract PropAMM is
         require(oracle_.code.length > 0, InvalidOracle(oracle_));
         oracle = IPrioUpdateRegistry(oracle_);
         for (uint256 i = 0; i < updaters.length; i++) {
-            oracle.addUpdater(updaters[i]);
+            _addUpdater(updaters[i]);
         }
         for (uint256 i = 0; i < pairs.length; i++) {
             _addPair(pairs[i].token0, pairs[i].token1, pairs[i].vault);
@@ -492,17 +501,38 @@ contract PropAMM is
     }
 
     /// @notice Adds a new updater to the oracle registry.
+    /// @dev Reverts if the change would be a no-op on the current registry, so every event
+    /// records a real change. The event names the registry.
     /// @param updater The address of the new updater.
     function addUpdater(address updater) external onlyOwner {
-        oracle.addUpdater(updater);
-        emit UpdaterAdded(updater);
+        _addUpdater(updater);
     }
 
     /// @notice Removes an updater from the oracle registry.
+    /// @dev Reverts if the change would be a no-op on the current registry, so every event
+    /// records a real change. The event names the registry.
     /// @param updater The address of the updater to remove.
     function removeUpdater(address updater) external onlyOwner {
-        oracle.removeUpdater(updater);
-        emit UpdaterRemoved(updater);
+        _removeUpdater(oracle, updater);
+    }
+
+    /// @notice Authorizes `updater` on the current registry. Shared by `addUpdater` and
+    /// `initialize`, so a key listed at creation is checked and logged like one added later.
+    /// @dev The registry is silent about a duplicate add, so its own `isUpdater` is asked first.
+    function _addUpdater(address updater) internal {
+        IPrioUpdateRegistry registry = oracle;
+        require(!registry.isUpdater(address(this), updater), UpdaterAlreadyAuthorized(address(registry), updater));
+        registry.addUpdater(updater);
+        emit UpdaterAdded(updater, address(registry));
+    }
+
+    /// @notice Revokes `updater` on `registry`, which need not be the current oracle.
+    /// @dev The registry is silent about removing a key it does not have, so its own `isUpdater`
+    /// is asked first.
+    function _removeUpdater(IPrioUpdateRegistry registry, address updater) internal {
+        require(registry.isUpdater(address(this), updater), UpdaterNotAuthorized(address(registry), updater));
+        registry.removeUpdater(updater);
+        emit UpdaterRemoved(updater, address(registry));
     }
 
     /// @notice Withdraws ERC20 tokens from the contract to a specified address.

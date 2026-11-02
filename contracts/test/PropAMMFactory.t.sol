@@ -3,7 +3,7 @@ pragma solidity ^0.8.35;
 
 import {Test} from "forge-std/Test.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-import {PropAMM, InvalidOracle, NotAToken} from "../src/PropAMM.sol";
+import {PropAMM, InvalidOracle, NotAToken, UpdaterAlreadyAuthorized} from "../src/PropAMM.sol";
 import {CreationIsDisabled, PropAMMFactory} from "../src/PropAMMFactory.sol";
 import {IPropAMM} from "../src/interfaces/IPropAMM.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
@@ -152,6 +152,16 @@ contract PropAMMFactoryTest is Test {
         p[0] = PropAMM.PairConfig({token0: ghost, token1: USDC, vault: vault});
         vm.expectRevert(abi.encodeWithSelector(NotAToken.selector, ghost));
         factory.createPropAMM(owner, PUR_ADDR, updaters, p);
+    }
+
+    /// `initialize` adds updaters the way `addUpdater` does, so a key listed twice is refused
+    /// rather than logged twice. Audit F-16.
+    function test_createPropAMM_refusesADuplicateUpdater() public {
+        address[] memory twice = new address[](2);
+        twice[0] = updater;
+        twice[1] = updater;
+        vm.expectRevert(abi.encodeWithSelector(UpdaterAlreadyAuthorized.selector, PUR_ADDR, updater));
+        factory.createPropAMM(owner, PUR_ADDR, twice, pairs);
     }
 
     /// Two events per creation, in this order: the instance's own PairAdded (emitted inside

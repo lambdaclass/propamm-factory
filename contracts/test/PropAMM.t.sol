@@ -10,7 +10,9 @@ import {
     NotAToken,
     PairAlreadyExists,
     UnsupportedDecimals,
-    UnsupportedPair
+    UnsupportedPair,
+    UpdaterAlreadyAuthorized,
+    UpdaterNotAuthorized
 } from "../src/PropAMM.sol";
 import {IPropAMM} from "../src/interfaces/IPropAMM.sol";
 import {MockPUR} from "./mocks/MockPUR.sol";
@@ -59,9 +61,21 @@ contract PropAMMTest is Test {
     //------------------------------
 
     function test_initialize_registersUpdatersWithTheOracle() public view {
-        assertTrue(MockPUR(ORACLE).isUpdater(updater));
+        assertTrue(MockPUR(ORACLE).isUpdater(address(propAmm), updater));
         // Only the addresses passed in, nothing else.
-        assertFalse(MockPUR(ORACLE).isUpdater(owner));
+        assertFalse(MockPUR(ORACLE).isUpdater(address(propAmm), owner));
+    }
+
+    /// The keys an instance starts with are on its own log, like the ones added later, so an
+    /// owner reading only the instance sees every key that can price it. Audit F-16 (and F-15).
+    function test_initialize_emitsUpdaterAddedForEachUpdater() public {
+        // The implementation's CREATE must not be the call the expectation guards.
+        address implementation = address(new PropAMM());
+        address[] memory ups = new address[](1);
+        ups[0] = makeAddr("first-updater");
+        vm.expectEmit(true, true, false, true);
+        emit PropAMM.UpdaterAdded(ups[0], ORACLE);
+        _proxy(implementation, ups, new PropAMM.PairConfig[](0));
     }
 
     function test_initialize_listsThePairsItIsGivenWithTheirVaults() public {
@@ -317,19 +331,48 @@ contract PropAMMTest is Test {
 
     function test_addUpdater_registersWithTheOracleAndEmits() public {
         address another = makeAddr("another-updater");
-        vm.expectEmit(true, false, false, true, address(propAmm));
-        emit PropAMM.UpdaterAdded(another);
+        vm.expectEmit(true, true, false, true, address(propAmm));
+        emit PropAMM.UpdaterAdded(another, ORACLE);
         vm.prank(owner);
         propAmm.addUpdater(another);
-        assertTrue(MockPUR(ORACLE).isUpdater(another));
+        assertTrue(MockPUR(ORACLE).isUpdater(address(propAmm), another));
     }
 
     function test_removeUpdater_unregistersFromTheOracleAndEmits() public {
-        vm.expectEmit(true, false, false, true, address(propAmm));
-        emit PropAMM.UpdaterRemoved(updater);
+        vm.expectEmit(true, true, false, true, address(propAmm));
+        emit PropAMM.UpdaterRemoved(updater, ORACLE);
         vm.prank(owner);
         propAmm.removeUpdater(updater);
-        assertFalse(MockPUR(ORACLE).isUpdater(updater));
+        assertFalse(MockPUR(ORACLE).isUpdater(address(propAmm), updater));
+    }
+
+    /// The registry ignores a duplicate add, so the instance must not log one. Audit F-16.
+    function test_addUpdater_refusesAKeyTheRegistryAlreadyHas() public {
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(UpdaterAlreadyAuthorized.selector, ORACLE, updater));
+        propAmm.addUpdater(updater);
+    }
+
+    /// The registry ignores a remove for a key it does not have, so the instance must not log
+    /// a revocation. Audit F-16.
+    function test_removeUpdater_refusesAKeyTheRegistryDoesNotHave() public {
+        address stranger = makeAddr("stranger");
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(UpdaterNotAuthorized.selector, ORACLE, stranger));
+        propAmm.removeUpdater(stranger);
+    }
+
+    /// The audit's PoC: after a move, removeUpdater reaches only the new registry, so it must not
+    /// log a revocation there while the key stays live on the old one. Audit F-16.
+    function test_removeUpdater_afterSetOracle_refusesToLogARevocationThatDidNotHappen() public {
+        address other = makeAddr("other-registry");
+        vm.etch(other, address(new MockPUR()).code);
+        vm.startPrank(owner);
+        propAmm.setOracle(other);
+        vm.expectRevert(abi.encodeWithSelector(UpdaterNotAuthorized.selector, other, updater));
+        propAmm.removeUpdater(updater);
+        vm.stopPrank();
+        assertTrue(MockPUR(ORACLE).isUpdater(address(propAmm), updater), "still live on the old registry");
     }
 
     function test_withdrawERC20_movesTheTokensAndEmits() public {
