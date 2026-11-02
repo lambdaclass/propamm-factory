@@ -838,10 +838,11 @@ impl EnvSecret {
     /// unit's `EnvironmentFile`, which a reload does not re-read: a new secret needs a
     /// restart, as a new updater key does.
     pub fn resolve(&self) -> eyre::Result<String> {
-        std::env::var(&self.env).map_err(|_| {
+        crate::secrets::lookup(&self.env).ok_or_else(|| {
             eyre::eyre!(
                 "{} is not set: a [pairs.pricing] secret is read from the environment when the \
-                 lane is built (under systemd, from the unit's EnvironmentFile)",
+                 lane is built (under systemd, from the unit's EnvironmentFile), or from the \
+                 secrets an enclave was handed",
                 self.env
             )
         })

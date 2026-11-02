@@ -17,9 +17,7 @@ pub const API_KEY_VAR: &str = "COINGECKO_API_KEY";
 
 /// The key in `COINGECKO_API_KEY`, if any.
 fn api_key() -> Option<String> {
-    std::env::var(API_KEY_VAR)
-        .ok()
-        .filter(|key| !key.is_empty())
+    crate::secrets::lookup(API_KEY_VAR).filter(|key| !key.is_empty())
 }
 
 /// The header that carries the key, when there is one.

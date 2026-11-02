@@ -207,6 +207,11 @@ pub fn write_raw_atomically(path: &Path, config: &RawConfig) -> Result<()> {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))
             .wrap_err_with(|| format!("failed to chmod 600 {}", path.display()))?;
     }
+    // Inside an enclave this file is on a filesystem that ends with the process: the host
+    // keeps it between boots, sealed so it can neither read nor change it.
+    if let Some(link) = crate::enclave::link() {
+        link.config_written(path)?;
+    }
     Ok(())
 }
 
@@ -1239,11 +1244,12 @@ impl ResolvedPair {
     }
 }
 
-/// Reads the process environment. Passed as `lookup` in production; tests inject their
-/// own closure instead, since `std::env::set_var` is unsafe in edition 2024 and process
-/// env is shared across test threads.
+/// Reads a secret by name: the secrets an enclave was handed, else the process
+/// environment (`secrets.rs`). Passed as `lookup` in production; tests inject their own
+/// closure instead, since `std::env::set_var` is unsafe in edition 2024 and process env is
+/// shared across test threads.
 pub fn env_lookup(name: &str) -> Option<String> {
-    std::env::var(name).ok()
+    crate::secrets::lookup(name)
 }
 
 /// Where a run reads updater keys from: [`env_lookup`] in production, a closure in tests,
@@ -1261,7 +1267,7 @@ pub fn resolve_keys<F: Fn(&str) -> Option<String>>(
         .iter()
         .map(|pair| {
             let name = &pair.key_env;
-            let raw = lookup(name).ok_or_else(|| eyre!("{name} is not set in the environment"))?;
+            let raw = lookup(name).ok_or_else(|| eyre!("{name} is not set"))?;
             let secret: SecretKey = raw
                 .strip_prefix("0x")
                 .unwrap_or(&raw)

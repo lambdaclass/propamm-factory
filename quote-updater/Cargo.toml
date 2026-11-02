@@ -22,7 +22,7 @@ secp256k1 = "0.30.0"
 serde = { version = "1", features = ["derive"] }
 # `raw_value` keeps a JSON number as the text the venue sent (kraken.rs, coingecko.rs).
 serde_json = { version = "1", features = ["raw_value"] }
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "net", "io-util"] }
 # Same version axum's ws feature already pulls in via ethrex-rpc, so this adds no new tree.
 #
 # native-tls and not rustls, deliberately. rustls here would not replace native-tls, it
@@ -76,7 +76,57 @@ reqwest = "0.12"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry", "std"] }
 
+# Running inside an enclave (enclave/): the config is sealed with AES-256-GCM before it
+# leaves the process, frames on the link are base64 JSON, and a request from the host to
+# reload or stop is delivered as the signal it stands for. All three already in Cargo.lock.
+aes-gcm = "0.10"
+base64 = "0.22"
+libc = "0.2"
+# The backoffice's own HTTPS and Google login inside an enclave (login/): TLS on the `ring`
+# provider already compiled in for jsonwebtoken, the ID token checked against Google's
+# keys, and the session cookie signed with HMAC-SHA256. All already in Cargo.lock.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+jsonwebtoken = "9"
+hmac = "0.12"
+sha2 = "0.10"
+
+# The AWS Nitro Enclaves release of the secrets (enclave/nitro.rs): the attestation document
+# from the Nitro Security Module, KMS Decrypt with it, and the CMS envelope KMS answers
+# with. Behind the feature so a build without it carries none of the AWS SDK.
+aws-nitro-enclaves-nsm-api = { version = "0.4", optional = true }
+aws-sdk-kms = { version = "1", optional = true }
+serde_bytes = { version = "0.11", optional = true }
+rsa = { version = "0.9", optional = true, features = ["sha2"] }
+cms = { version = "0.2", optional = true }
+aes = { version = "0.8", optional = true }
+cbc = { version = "0.1", optional = true, features = ["alloc"] }
+der = { version = "0.7", optional = true, features = ["alloc"] }
+
+[features]
+default = []
+# The secrets of an `--enclave` run are released by KMS against the enclave's attestation.
+nitro = [
+    "dep:aws-nitro-enclaves-nsm-api",
+    "dep:aws-sdk-kms",
+    "dep:serde_bytes",
+    "dep:rsa",
+    "dep:cms",
+    "dep:aes",
+    "dep:cbc",
+    "dep:der",
+]
+
+# vsock, the enclave's only channel to its host, exists on Linux only.
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-vsock = "0.7"
+
 [dev-dependencies]
+# A directory for the files a test writes. Already in Cargo.lock through the ethrex tree.
+tempfile = "3"
+# For the `nitro` tests, which build a CMS envelope the way KMS does.
+const-oid = { version = "0.9", features = ["db"] }
+spki = "0.7"
 # Only for tokio's paused clock (`#[tokio::test(start_paused = true)]`), which lets a
 # waited duration (a restart backoff, quoting.rs's shutdown bound) be asserted without
 # waiting it out. test-util = ["rt", "sync", "time"], all already enabled, so this adds

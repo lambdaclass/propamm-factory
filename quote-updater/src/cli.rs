@@ -83,6 +83,12 @@ pub(crate) struct Flags {
     #[arg(long, env = "CONFIG")]
     pub(crate) config: PathBuf,
 
+    /// Run inside an AWS Nitro enclave: before anything else, wait for the host to hand in
+    /// the secrets (released by KMS to this enclave only) and the sealed config over the
+    /// vsock this file names, and write the opened config to --config. See docs/enclave.md
+    #[arg(long, env = "ENCLAVE")]
+    pub(crate) enclave: Option<PathBuf>,
+
     /// Validate the config, the keys and the chain, print what each pair would publish,
     /// then exit without sending anything
     #[arg(long, env = "CHECK", value_parser = FalseyValueParser::new())]

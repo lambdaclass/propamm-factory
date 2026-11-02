@@ -80,7 +80,18 @@ pub(crate) async fn run(args: Args, parts: Parts) -> Result<Outcome> {
         // The run first, so a step that finished in the same poll as the shutdown is seen
         // to have raised `quoting` before the arm below reads it.
         biased;
-        outcome = run_inner(args, parts, (stop, cancel), Arc::clone(&quoting)) => outcome,
+        outcome = async {
+            let outcome = run_inner(args, parts, (stop, cancel), Arc::clone(&quoting)).await;
+            // Inside an enclave nothing reads the process's stderr: the error that ends the
+            // run goes to the host before the process exits, or nobody sees it.
+            if let Some(link) = crate::enclave::link() {
+                if let Err(err) = &outcome {
+                    link.log("stderr", &format!("Error: {err:#}"));
+                }
+                link.flush().await;
+            }
+            outcome
+        } => outcome,
         () = async {
             asked.wait().await;
             if quoting.load(std::sync::atomic::Ordering::SeqCst) {
@@ -131,6 +142,24 @@ async fn run_inner(
     // it would have authenticated must not start.
     let removed = removed_vars_present();
     ensure!(removed.is_empty(), "{}", removed_vars_error(&removed));
+
+    // Inside an enclave the config and every secret come from the host before anything
+    // else: the config is opened onto `--config`, and the secrets become what every key,
+    // pricer secret and venue key is looked up in. See enclave.rs.
+    let enclave = match args.flags.enclave.clone() {
+        Some(path) => {
+            let settings = crate::enclave::Settings::load(&path)?;
+            let release = crate::enclave::release(&settings.kms)?;
+            let booted = crate::enclave::boot(&settings, &args.flags.config, release).await?;
+            tracing::info!(
+                "enclave: booted with {} secret(s): {}",
+                booted.secrets.len(),
+                booted.secrets.join(", ")
+            );
+            Some((settings, booted))
+        }
+        None => None,
+    };
 
     // Before every check below: each reads a setting the file may supply.
     let file_settings = config::load_file_settings(&args.flags.config)?;
@@ -209,6 +238,30 @@ async fn run_inner(
 
     refuse_breakers_in_node_mode(args.flags.mode, &config)?;
     let target = config.target;
+
+    // Inside an enclave every connection is carried by the host, which reads and changes
+    // whatever is not under TLS opened from in here.
+    if enclave.is_some() {
+        let mut urls: Vec<(String, String)> = vec![("rpc_url".into(), args.flags.rpc_url.clone())];
+        if let Some(ws) = &args.flags.rpc_ws_url {
+            urls.push(("rpc_ws_url".into(), ws.clone()));
+        }
+        if let Some(binance) = binance_ws {
+            urls.push(("binance_ws".into(), binance.to_owned()));
+        }
+        for (venue, url) in &file_settings.endpoints {
+            urls.push((format!("endpoints.{venue}"), url.clone()));
+        }
+        if let Some((_, list)) = &builders {
+            for builder in &list.builders {
+                urls.push((
+                    format!("builder {}", builder.name),
+                    builder.endpoint.clone(),
+                ));
+            }
+        }
+        crate::enclave::require_tls(&urls)?;
+    }
 
     // One ctrl-c listener for the whole process, raised into a value every pair observes
     // whenever it next looks — including a pair between restarts, which has no future of
@@ -382,6 +435,12 @@ async fn run_inner(
     // Postgres is spawned below, once the shutdown signal it flushes on exists. A pusher
     // that is not a long-running service (--once) records nothing, like it serves no
     // metrics. The configuration this run starts from is its first row.
+    // The database URL carries a password; inside an enclave it is one of the secrets the
+    // host hands in rather than a variable of an environment there is none of.
+    if args.flags.record_db_url.is_none() && crate::secrets::installed() {
+        args.flags.record_db_url =
+            crate::secrets::lookup("RECORD_DB_URL").filter(|url| !url.is_empty());
+    }
     let recorder = args
         .flags
         .record_db_url
@@ -647,6 +706,20 @@ async fn run_inner(
                 let addr: SocketAddr = addr.parse().wrap_err_with(|| {
                     format!("[settings] backoffice_addr {addr:?} is not host:port")
                 })?;
+                // Inside an enclave with a `[backoffice]`, the page serves its own HTTPS and
+                // asks for a Google login, so the host carries nothing it can read or use.
+                let secure = enclave
+                    .as_ref()
+                    .and_then(|(settings, booted)| {
+                        settings.backoffice.as_ref().map(|backoffice| {
+                            crate::login::Secure::new(
+                                backoffice,
+                                booted.backoffice_certificate.as_deref(),
+                            )
+                        })
+                    })
+                    .transpose()?;
+                let scheme = if secure.is_some() { "https" } else { "http" };
                 let (local, task) = backoffice::bind(
                     addr,
                     args.flags.config.clone(),
@@ -655,9 +728,10 @@ async fn run_inner(
                     pair_states.clone(),
                     edits.clone(),
                     Arc::clone(&kinds),
+                    secure,
                 )
                 .await?;
-                tracing::info!("backoffice listening on http://{local}/");
+                tracing::info!("backoffice listening on {scheme}://{local}/");
                 tasks.adopt(&task);
                 Some(task)
             }

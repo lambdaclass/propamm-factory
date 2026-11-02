@@ -2738,6 +2738,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "memoffset"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2816,6 +2825,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]
@@ -3320,8 +3330,10 @@ dependencies = [
 name = "quote-updater"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "askama",
  "axum",
+ "base64 0.22.1",
  "clap",
  "ethrex-common",
  "ethrex-l2-common",
@@ -3332,15 +3344,22 @@ dependencies = [
  "eyre",
  "futures-util",
  "hex",
+ "hmac 0.12.1",
+ "jsonwebtoken",
+ "libc",
  "prometheus",
  "rand 0.8.8",
  "reqwest",
+ "rustls",
  "secp256k1",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tokio-postgres",
+ "tokio-rustls",
  "tokio-tungstenite",
+ "tokio-vsock",
  "toml",
  "tracing",
  "tracing-subscriber",
@@ -3682,7 +3701,9 @@ version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
+ "log",
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -4480,6 +4501,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-vsock"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b319ef9394889dab2e1b4f0085b45ba11d0c79dc9d1a9d1afc057d009d0f1c7"
+dependencies = [
+ "bytes",
+ "futures",
+ "libc",
+ "tokio",
+ "vsock",
+]
+
+[[package]]
 name = "toml"
 version = "1.1.6+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4793,6 +4827,16 @@ name = "vsimd"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
+
+[[package]]
+name = "vsock"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b7d4dba01e366e2ffbdf0700b1876f747c548db72dced534de41c54945c0148"
+dependencies = [
+ "libc",
+ "nix",
+]
 
 [[package]]
 name = "want"

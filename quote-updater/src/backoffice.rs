@@ -78,6 +78,7 @@ pub(crate) fn is_unspecified_bind(addr: SocketAddr) -> bool {
 /// Binds `addr` and serves the page. Fatal on failure: an operator who believes this is up
 /// and whose changes are going nowhere is worse off than one whose service refused to
 /// start.
+#[allow(clippy::too_many_arguments)] // one call site, in pusher::run
 pub async fn bind(
     addr: SocketAddr,
     config_path: PathBuf,
@@ -86,6 +87,7 @@ pub async fn bind(
     states: PairStates,
     edits: Arc<tokio::sync::Mutex<()>>,
     kinds: Arc<crate::kinds::Kinds>,
+    secure: Option<crate::login::Secure>,
 ) -> Result<(SocketAddr, JoinHandle<()>)> {
     bind_with(
         addr,
@@ -96,6 +98,7 @@ pub async fn bind(
         edits,
         kinds,
         crate::discover::Rest::default(),
+        secure,
     )
     .await
 }
@@ -111,6 +114,7 @@ async fn bind_with(
     edits: Arc<tokio::sync::Mutex<()>>,
     kinds: Arc<crate::kinds::Kinds>,
     rest: crate::discover::Rest,
+    secure: Option<crate::login::Secure>,
 ) -> Result<(SocketAddr, JoinHandle<()>)> {
     eyre::ensure!(
         !is_unspecified_bind(addr),
@@ -168,17 +172,40 @@ async fn bind_with(
         .route("/reload", post(reload_only))
         .with_state(state);
 
-    let task = tokio::spawn(async move {
-        // With connect info, so every mutation can be logged against its peer.
-        if let Err(err) = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-        {
-            tracing::warn!("backoffice listener stopped: {err}");
+    // With connect info, so every mutation can be logged against its peer.
+    let task = match secure {
+        None => tokio::spawn(async move {
+            if let Err(err) = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            {
+                tracing::warn!("backoffice listener stopped: {err}");
+            }
+        }),
+        // HTTPS terminated here and a login on every route but the login's own; see login.rs.
+        Some(secure) => {
+            use axum::serve::ListenerExt;
+            let app = app
+                .layer(axum::middleware::from_fn_with_state(
+                    Arc::clone(&secure.login),
+                    crate::login::require,
+                ))
+                .merge(crate::login::routes(Arc::clone(&secure.login)));
+            let listener = crate::login::TlsListener::spawn(listener, secure.tls)?.tap_io(|_| {});
+            tokio::spawn(async move {
+                if let Err(err) = axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .await
+                {
+                    tracing::warn!("backoffice listener stopped: {err}");
+                }
+            })
         }
-    });
+    };
 
     Ok((local, task))
 }
@@ -2989,6 +3016,7 @@ api_key = "k"
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
             test_kinds(),
+            None,
         )
         .await
         .expect_err("an unspecified bind must be refused");
@@ -3020,6 +3048,7 @@ api_key = "k"
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
             test_kinds(),
+            None,
         )
         .await
         .unwrap();
@@ -3131,6 +3160,7 @@ api_key = "k"
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
             test_kinds(),
+            None,
         )
         .await
         .unwrap();
@@ -3187,6 +3217,7 @@ api_key = "k"
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
             test_kinds(),
+            None,
         )
         .await
         .unwrap();
@@ -3285,6 +3316,7 @@ api_key = "k"
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
             test_kinds(),
+            None,
         )
         .await
         .unwrap();
@@ -3385,6 +3417,7 @@ api_key = "k"
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
             test_kinds(),
+            None,
         )
         .await
         .unwrap();
@@ -3499,6 +3532,7 @@ api_key = "k"
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
             test_kinds(),
             crate::discover::Rest::all_at(&format!("http://{exchanges}")),
+            None,
         )
         .await
         .unwrap();
@@ -3675,6 +3709,7 @@ api_key = "k"
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
             test_kinds(),
+            None,
         )
         .await
         .unwrap();
@@ -3948,6 +3983,7 @@ api_key = "k"
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
             test_kinds(),
+            None,
         )
         .await
         .unwrap();
@@ -3982,6 +4018,7 @@ api_key = "k"
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
             test_kinds(),
+            None,
         )
         .await
         .unwrap();
@@ -4610,6 +4647,7 @@ api_key = "k"
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
             test_kinds(),
+            None,
         )
         .await
         .unwrap();
@@ -4735,6 +4773,7 @@ api_key = "k"
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
             test_kinds(),
+            None,
         )
         .await
         .unwrap();
@@ -4779,6 +4818,7 @@ api_key = "k"
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
             test_kinds(),
+            None,
         )
         .await
         .unwrap();
@@ -5161,6 +5201,7 @@ api_key = "k"
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
             test_kinds(),
+            None,
         )
         .await
         .unwrap();
@@ -5198,6 +5239,7 @@ api_key = "k"
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
             test_kinds(),
+            None,
         )
         .await
         .unwrap();
@@ -5264,6 +5306,7 @@ api_key = "k"
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
             Arc::new(kinds),
+            None,
         )
         .await
         .unwrap();
@@ -5387,6 +5430,7 @@ api_key = "k"
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
             test_kinds(),
+            None,
         )
         .await
         .unwrap();

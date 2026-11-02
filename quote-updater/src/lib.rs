@@ -40,6 +40,17 @@ pub mod calldata {
     pub use ethrex_l2_sdk::calldata::{decode_calldata, encode_calldata};
 }
 
+/// Seals a config file for a run inside an enclave (`--enclave`): the base64 blob the host
+/// hands in at the first boot, before the enclave has ever saved one itself. Made by
+/// whoever holds the sealing key (`key_hex`, 32 bytes as hex) once, before that key is
+/// encrypted for KMS; see docs/enclave.md and `examples/seal_config.rs`.
+pub fn seal_config(key_hex: &str, config: &[u8]) -> eyre::Result<String> {
+    use base64::Engine;
+    let key = enclave::seal::parse_key(key_hex)?;
+    let sealed = enclave::seal::seal(&key, config)?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(sealed))
+}
+
 /// Everything a custom pricer and its binary name, in one import:
 /// `use quote_updater::prelude::*;`. Types and traits only: the `eyre` crate a
 /// [`pricing::Factory`] names in its signatures is `quote_updater::eyre`, imported beside
@@ -69,6 +80,7 @@ mod cli;
 mod composite;
 mod config;
 mod discover;
+mod enclave;
 mod exporter;
 mod feed;
 pub mod guard;
@@ -76,6 +88,7 @@ mod head;
 mod hints;
 mod kinds;
 mod landing;
+mod login;
 mod metrics;
 mod node;
 pub mod observe;
@@ -101,6 +114,7 @@ mod reload;
 mod rpc;
 #[cfg(test)]
 mod rpc_mock;
+mod secrets;
 mod service;
 pub mod stocks;
 mod supervisor;
