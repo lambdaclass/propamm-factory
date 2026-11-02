@@ -41,5 +41,6 @@ builders, signer balance).
 ## Documentation
 
 - [Deep dive into the internals](docs/components.md)
+- [Keeping the keys in a separate signer process, or in an enclave](quote-signer/README.md)
 - [Pricing models: the shipped ones, and writing your own](docs/pricing.md)
 - [Tokenized stocks: Ondo's pairs, and adding an issuer](docs/stocks.md)

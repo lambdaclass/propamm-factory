@@ -59,6 +59,15 @@ pricing model with which settings, and the name of the environment variable hold
 pair's signing key. `--check` validates all of it against the chain and prints what it would
 publish, without sending anything. [`manual.md`](manual.md) is the operating manual.
 
+**The signer** is where the keys live. By default each pair's key is in the updater's
+process, read from the environment variable its config names. The same variable can
+instead point at `quote-signer`, a separate process that holds the keys and signs what
+the updater sends it, after checking that each transaction is an update to the right
+registry, for a lane that key may quote, at a price near a reference it reads itself. On a
+plain host that keeps the keys out of the updater's process, config and logs; in an AWS
+Nitro enclave it keeps them where not even root on the machine can read them.
+[`quote-signer/README.md`](../quote-signer/README.md) has the details.
+
 **The backoffice** is a web page the updater serves. From it you add and remove pairs,
 pick the exchanges a pair follows and their weights, change a pair's pricing settings and
 its guards, add builders, and halt or resume a pair. Every change is written to the config file and applied

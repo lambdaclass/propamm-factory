@@ -69,7 +69,7 @@ api_key  = "<your maker key>"
 [[pairs]]
 tokens  = ["0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"]
 symbol  = "ETHUSDC"                      # the market to follow
-key_env = "UPDATER_KEY_WETH_USDC"        # env var holding this pair's signing key
+key_env = "UPDATER_KEY_WETH_USDC"        # env var holding this pair's signing key, or a signer endpoint
 
 [pairs.pricing]
 kind        = "skewed"                   # the name main.rs registered

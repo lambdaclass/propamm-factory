@@ -3,7 +3,9 @@
 #
 # This is the updater's whole configuration: the target, the settings, the pairs and the
 # builders. The one thing that is not here is the updater keys, which stay in the
-# environment and are named, never valued, by each pair's `key_env`. The builder API keys
+# environment and are named, never valued, by each pair's `key_env` (a variable that can
+# hold the key, or the endpoint of a separate signer process that holds it; see
+# quote-signer/README.md). The builder API keys
 # ARE here, so a filled-in copy of this file is a secret: keep it 0600 and out of git.
 #
 #   set -a && . ./.env && set +a

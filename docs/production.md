@@ -92,7 +92,10 @@ Edit the three files:
     falls back to polling whenever the socket is down.
   - `UPDATER_KEY_<PAIR>`: the private key of each wallet from step 2, one variable per pair.
     The name is yours to pick; the pair's config refers to it by that name (`key_env`).
-    For example `UPDATER_KEY_WETH_USDC=0x...` and `UPDATER_KEY_USDC_USDT=0x...`.
+    For example `UPDATER_KEY_WETH_USDC=0x...` and `UPDATER_KEY_USDC_USDT=0x...`. To keep
+    the keys out of the updater's process altogether, run them in the separate
+    `quote-signer` process (on the host, or in an AWS Nitro enclave) and point the variable
+    at its socket instead: see [`quote-signer/README.md`](../quote-signer/README.md).
   - `POSTGRES_PASSWORD`: password for the Postgres the updater records into. Any string.
   - `GRAFANA_ADMIN_PASSWORD`: password for Grafana's `admin` user.
   - `BACKOFFICE_BIND` and `GRAFANA_BIND`: the IP of this server the backoffice (port 8088)

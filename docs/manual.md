@@ -667,7 +667,9 @@ What goes in it:
   gives. Each key's address must be authorized by the target via `addUpdater`, and must hold
   ETH for base fee; `--check` reports both and prints the exact `addUpdater` calls that are
   missing. Keys pay no priority fee in builder mode, but still need base-fee ETH for the
-  updates that land.
+  updates that land. The variable can instead name a separate signer process that holds
+  the key (`unix:///run/quote-signer.sock?address=0x…`); see "Signing in a separate
+  process" below.
 Everything below is a `[settings]` key first and an environment variable second: the
 variable exists so a flag-driven run stays possible, and setting one overrides the file.
 
@@ -719,6 +721,41 @@ The equivalent slip today is forgetting `--mode node` on a hand-run command whil
 doing the wrong thing.
 
 `.env` is gitignored, and should stay that way: it holds live private keys.
+
+### Signing in a separate process
+
+A pair's key does not have to be in the updater's process at all. Set its variable to a
+signer endpoint instead of a key:
+
+```
+UPDATER_KEY_WETH_USDC=unix:///run/quote-signer/quote-signer.sock?address=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
+```
+
+and the updater sends each update's unsigned fields to the `quote-signer` process at that
+socket and gets the signature back. That process holds the key, and before signing it
+decodes the transaction and checks it is an `updateState` to the configured registry, for
+a lane that key may quote, at a mid within a band of a reference price it reads for itself.
+So the updater's process, config, environment and disk never hold a key, and a host that
+can reach the socket can get updates signed within that policy and nothing else. In an AWS
+Nitro enclave the same process holds keys that not even root on the instance can read.
+[`quote-signer/README.md`](../quote-signer/README.md) covers the policy, the config, the
+enclave build, and what the arrangement does and does not protect.
+
+The `address` in the endpoint is the key's: the updater needs it before it ever connects,
+to check authorization and balance and to report it. `--check` connects and fails the row
+if the signer is unreachable or holds no key for that address. At run time:
+
+- Each pair keeps one connection to the signer and signs over it; nothing in the config
+  beyond the variable changes, and `local` and remote pairs mix freely.
+- A signature's latency, local or remote, is `quote_updater_sign_duration_seconds`;
+  `PusherSigningSlow` pages when its p95 passes 10ms, a sizeable share of the requote
+  cadence.
+- A refusal, or a signer that does not answer, counts in `quote_updater_sign_errors_total`
+  (`PusherSigningFailing`), the update is not published that tick, and the updater's log
+  carries the reason the signer gave.
+- The updater checks every remote signature recovers to the pair's address before it
+  publishes it, so a signer answering with the wrong key's signature is an error, not a
+  transaction that fails to land.
 
 A `.env` (or shell) still exporting `TITAN_WS` or `TITAN_API_KEY` — the variables that used
 to configure the single-builder mode — is refused rather than silently ignored: startup
@@ -915,6 +952,10 @@ but every metric name, help string and label matches the registry as built in
 `quote-updater/src/metrics.rs`):
 
 ```
+# HELP quote_updater_sign_duration_seconds Time to sign one update, in this process or at a separate signer.
+# TYPE quote_updater_sign_duration_seconds histogram
+quote_updater_sign_duration_seconds_bucket{pair="WETH/USDC",le="0.00025"} 2210
+quote_updater_sign_duration_seconds_count{pair="WETH/USDC"} 2214
 # HELP quote_updater_feed_mid Latest mid observed on the feed, lane orientation.
 # TYPE quote_updater_feed_mid gauge
 quote_updater_feed_mid{pair="WETH/USDC"} 3542.11
