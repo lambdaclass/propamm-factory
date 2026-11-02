@@ -1,0 +1,48 @@
+# quote-signer config. Copy, fill in the addresses, and run `quote-signer --config <file>`.
+#
+# The file names no secrets: the keys come from `[keys]` (a file, or the Nitro release),
+# and everything here is what the signer agrees to sign with them.
+
+# Where the quote updater connects. One of the two.
+[listen]
+unix = "/run/quote-signer/quote-signer.sock"   # a plain host: the socket's permissions are the access control
+# vsock_port = 5000                            # an enclave: the updater uses vsock://<enclave cid>:5000
+
+# Where the keys come from. One of the two.
+[keys]
+file = "/etc/quote-signer/keys.txt"            # one hex key per line, `#` comments allowed
+# nitro = { boot_port = 5001, region = "eu-west-1", kms_endpoint = "https://kms.eu-west-1.amazonaws.com" }
+
+# The reference venue the price check reads. Binance's book-ticker shape; another venue
+# answering `GET <base_url>/api/v3/ticker/bookTicker?symbol=<symbol>` the same way works too.
+[reference]
+base_url = "https://api.binance.com"
+poll_ms  = 1000
+
+# What every signed transaction must be.
+[policy]
+registry             = "0x0000000000000000000000000000000000000000"   # the only contract it may call
+chain_id             = 1
+max_gas_limit        = 120000
+max_fee_per_gas_gwei = 500                                            # optional: no cap when absent
+
+# One entry per key. A released key the policy does not name is dropped; a named key that
+# was not released is a startup error.
+[[policy.keys]]
+address = "0x0000000000000000000000000000000000000000"   # the key, by the address it signs as
+target  = "0x0000000000000000000000000000000000000000"   # the PropAMM this key may update
+lanes   = ["0x0000000000000000000000000000000000000000000000000000000000000000"]  # the lanes it may quote
+# The price check: the published mid must be within max_distance (a fraction: 0.02 is 2%)
+# of the venue's price, read within max_age_secs. `inverted` when the lane prices the pair
+# the other way round from the venue (the updater's --check shows each lane's orientation).
+# price_decimals is the updater's --price-decimals. Without this table only the shape of
+# the transaction is checked, not its price.
+reference = { symbol = "ETHUSDC", inverted = true, price_decimals = 18, max_distance = "0.02", max_age_secs = 30 }
+
+# Inside an enclave only: loopback ports tunnelled to vsock ports on the host (cid 3), where
+# the AWS vsock-proxy dials the real service. The image's hosts file points each service's
+# name at the loopback address. Not needed on a plain host.
+# [[forward]]
+# listen = "127.0.0.1:443"
+# cid    = 3
+# port   = 8001

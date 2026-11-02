@@ -1,0 +1,84 @@
+[package]
+name = "quote-signer"
+version = "0.1.0"
+edition = "2024"
+description = "A separate signing process for a quote updater: holds the updater keys, judges every update before signing it"
+
+# A library (the wire protocol, the signing, the client the quote updater embeds, the
+# policy) and the binary that serves it. The library side is what `quote-updater` depends
+# on, so the two halves of the protocol are one definition.
+[lib]
+name = "quote_signer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "quote-signer"
+path = "src/main.rs"
+
+[features]
+default = []
+# The AWS Nitro Enclaves key release: the keys arrive as KMS ciphertext and are decrypted
+# by KMS against the enclave's attestation document. Everything it needs (the NSM driver,
+# the KMS client, the CMS envelope the plaintext comes back in) is behind this feature so
+# a build without it carries none of the AWS SDK.
+nitro = [
+    "dep:aws-nitro-enclaves-nsm-api",
+    "dep:aws-sdk-kms",
+    "dep:aws-config",
+    "dep:serde_bytes",
+    "dep:rsa",
+    "dep:cms",
+    "dep:aes",
+    "dep:cbc",
+    "dep:sha2",
+    "dep:der",
+    "dep:rand",
+]
+
+[dependencies]
+bytes = "1"
+clap = { version = "4.6.6", features = ["derive", "env"] }
+eyre = "0.6.13"
+hex = "0.4.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "time", "signal"] }
+toml = "1.1.4"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
+reqwest = { version = "0.12", features = ["json"] }
+url = "2"
+base64 = "0.22"
+# Must match the secp256k1 version of the pinned ethrex rev: SecretKey crosses the API boundary.
+secp256k1 = { version = "0.30.0", features = ["recovery", "global-context"] }
+# The transaction types and the RLP payload encoding, at the same rev as `quote-updater`,
+# so a transaction built there and signed here is one type.
+ethrex-common = { git = "https://github.com/lambdaclass/ethrex", rev = "73318b686fdc2c3951a67cea9721eb5378855ada" }
+ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex", rev = "73318b686fdc2c3951a67cea9721eb5378855ada" }
+
+# The Nitro key release (feature `nitro`).
+aws-nitro-enclaves-nsm-api = { version = "0.4", optional = true }
+aws-sdk-kms = { version = "1", optional = true }
+aws-config = { version = "1", optional = true, features = ["behavior-version-latest"] }
+serde_bytes = { version = "0.11", optional = true }
+rsa = { version = "0.9", optional = true, features = ["sha2"] }
+cms = { version = "0.2", optional = true }
+aes = { version = "0.8", optional = true }
+cbc = { version = "0.1", optional = true, features = ["alloc"] }
+sha2 = { version = "0.10", optional = true }
+der = { version = "0.7", optional = true, features = ["alloc"] }
+rand = { version = "0.8", optional = true }
+
+# vsock exists on Linux only; on any other host the signer listens on a Unix socket.
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-vsock = "0.7"
+
+[dev-dependencies]
+# The reference encoder for `updateState` calldata, so the policy's hand decoder is checked
+# against what the updater actually sends.
+ethrex-sdk = { git = "https://github.com/lambdaclass/ethrex", rev = "73318b686fdc2c3951a67cea9721eb5378855ada" }
+ethrex-l2-common = { git = "https://github.com/lambdaclass/ethrex", rev = "73318b686fdc2c3951a67cea9721eb5378855ada" }
+tempfile = "3"
+# For the `nitro` tests, which build a CMS envelope the way KMS does.
+const-oid = { version = "0.9", features = ["db"] }
+spki = "0.7"

@@ -1,7 +1,7 @@
 # The quote updater library and its examples. A binary built on it is a package of its own
 # that depends on `quote-updater` (see examples/ and the README).
 [workspace]
-members = ["quote-updater"]
+members = ["quote-updater", "quote-signer"]
 resolver = "3"
 
 [profile.release]
