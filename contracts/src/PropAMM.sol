@@ -78,9 +78,12 @@ contract PropAMM is
     event PairVaultChanged(address indexed token0, address indexed token1, address indexed vault);
     event OracleChanged(address indexed newOracle);
     /// @dev Both name the registry the change was made on: authorizations live per registry, and
-    /// a key revoked on one stays live on any other this instance has used.
-    event UpdaterAdded(address indexed updater, address indexed oracle);
-    event UpdaterRemoved(address indexed updater, address indexed oracle);
+    /// a key revoked on one stays live on any other this instance has used. Not `UpdaterAdded` /
+    /// `UpdaterRemoved`: with two addresses those would share topic0 with the registry's own
+    /// `UpdaterAdded(target, updater)` / `UpdaterRemoved(target, updater)`, logged in the same
+    /// transaction with the fields in other positions.
+    event UpdaterAuthorized(address indexed updater, address indexed oracle);
+    event UpdaterRevoked(address indexed updater, address indexed oracle);
     event ERC20Withdrawn(address indexed token, address indexed to, uint256 amount);
 
     /// @dev Fixed-point scale the oracle publishes `mid` in. A `mid` of 1e18 means one whole
@@ -516,6 +519,16 @@ contract PropAMM is
         _removeUpdater(oracle, updater);
     }
 
+    /// @notice Revokes `updater` on `registry`, which need not be the current oracle.
+    /// @dev The registry scopes authorizations to this instance's address, so keys stay live on a
+    /// registry the instance has moved away from until revoked here, and would price it again if
+    /// it ever pointed back. Reverts like `removeUpdater` for a key `registry` does not hold.
+    /// @param registry The registry to revoke on.
+    /// @param updater The address of the updater to remove.
+    function removeUpdaterFrom(address registry, address updater) external onlyOwner {
+        _removeUpdater(IPrioUpdateRegistry(registry), updater);
+    }
+
     /// @notice Authorizes `updater` on the current registry. Shared by `addUpdater` and
     /// `initialize`, so a key listed at creation is checked and logged like one added later.
     /// @dev The registry is silent about a duplicate add, so its own `isUpdater` is asked first.
@@ -523,16 +536,23 @@ contract PropAMM is
         IPrioUpdateRegistry registry = oracle;
         require(!registry.isUpdater(address(this), updater), UpdaterAlreadyAuthorized(address(registry), updater));
         registry.addUpdater(updater);
-        emit UpdaterAdded(updater, address(registry));
+        emit UpdaterAuthorized(updater, address(registry));
     }
 
     /// @notice Revokes `updater` on `registry`, which need not be the current oracle.
     /// @dev The registry is silent about removing a key it does not have, so its own `isUpdater`
-    /// is asked first.
+    /// is asked first, and a key it says it does not hold is refused. Revoking must stay possible
+    /// on a registry that cannot answer (an older build without `isUpdater`): when the question
+    /// itself reverts, the removal is forwarded unchecked, since a key that cannot be revoked is
+    /// worse than one event that may record a no-op.
     function _removeUpdater(IPrioUpdateRegistry registry, address updater) internal {
-        require(registry.isUpdater(address(this), updater), UpdaterNotAuthorized(address(registry), updater));
+        // Without code the `isUpdater` call below would fail in decoding, with no reason given.
+        require(address(registry).code.length > 0, InvalidOracle(address(registry)));
+        try registry.isUpdater(address(this), updater) returns (bool authorized) {
+            require(authorized, UpdaterNotAuthorized(address(registry), updater));
+        } catch {}
         registry.removeUpdater(updater);
-        emit UpdaterRemoved(updater, address(registry));
+        emit UpdaterRevoked(updater, address(registry));
     }
 
     /// @notice Withdraws ERC20 tokens from the contract to a specified address.

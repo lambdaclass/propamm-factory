@@ -3,6 +3,7 @@ pragma solidity ^0.8.35;
 
 import {Test} from "forge-std/Test.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {
     PropAMM,
     InvalidOracle,
@@ -23,6 +24,20 @@ import {MockERC20} from "./mocks/MockERC20.sol";
 contract NoDecimalsToken {
     fallback() external {
         revert();
+    }
+}
+
+/// A registry from before `isUpdater(address,address)`: it records keys per caller under another
+/// name, so a call to `isUpdater` reverts on the unknown selector.
+contract LegacyRegistry {
+    mapping(address target => mapping(address updater => bool)) public authorized;
+
+    function addUpdater(address updater) external {
+        authorized[msg.sender][updater] = true;
+    }
+
+    function removeUpdater(address updater) external {
+        authorized[msg.sender][updater] = false;
     }
 }
 
@@ -66,16 +81,24 @@ contract PropAMMTest is Test {
         assertFalse(MockPUR(ORACLE).isUpdater(address(propAmm), owner));
     }
 
-    /// The keys an instance starts with are on its own log, like the ones added later, so an
-    /// owner reading only the instance sees every key that can price it. Audit F-16 (and F-15).
-    function test_initialize_emitsUpdaterAddedForEachUpdater() public {
+    /// The keys an instance starts with are on its own log, like the ones added later. That holds
+    /// for instances created on this implementation; one upgraded from an earlier implementation
+    /// logged its creation keys nowhere of its own, so for it the registry's log is the record.
+    /// Audit F-16 (and F-15).
+    function test_initialize_emitsUpdaterAuthorizedForEachUpdater() public {
         // The implementation's CREATE must not be the call the expectation guards.
         address implementation = address(new PropAMM());
-        address[] memory ups = new address[](1);
+        address[] memory ups = new address[](2);
         ups[0] = makeAddr("first-updater");
-        vm.expectEmit(true, true, false, true);
-        emit PropAMM.UpdaterAdded(ups[0], ORACLE);
-        _proxy(implementation, ups, new PropAMM.PairConfig[](0));
+        ups[1] = makeAddr("second-updater");
+        // `_proxy` deploys the proxy with this contract's next CREATE, so the emitter is known.
+        address proxy = vm.computeCreateAddress(address(this), vm.getNonce(address(this)));
+        vm.expectEmit(true, true, false, true, proxy);
+        emit PropAMM.UpdaterAuthorized(ups[0], ORACLE);
+        vm.expectEmit(true, true, false, true, proxy);
+        emit PropAMM.UpdaterAuthorized(ups[1], ORACLE);
+        PropAMM instance = _proxy(implementation, ups, new PropAMM.PairConfig[](0));
+        assertEq(address(instance), proxy, "predicted emitter");
     }
 
     function test_initialize_listsThePairsItIsGivenWithTheirVaults() public {
@@ -286,12 +309,15 @@ contract PropAMMTest is Test {
         address tokenB = address(new MockERC20());
 
         address rando = makeAddr("rando");
+        // The exact error, not any revert, so a revert for any other reason cannot pass for
+        // access control.
+        bytes memory notOwner = abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, rando);
         vm.startPrank(rando);
-        vm.expectRevert();
+        vm.expectRevert(notOwner);
         propAmm.addPair(tokenA, tokenB, vault);
-        vm.expectRevert();
+        vm.expectRevert(notOwner);
         propAmm.setPairVault(USDC, USDT, rando);
-        vm.expectRevert();
+        vm.expectRevert(notOwner);
         propAmm.removePair(USDC, USDT);
         vm.stopPrank();
     }
@@ -329,10 +355,18 @@ contract PropAMMTest is Test {
         assertEq(address(propAmm.oracle()), ORACLE);
     }
 
+    /// The registry logs its own `UpdaterAdded(target, updater)` / `UpdaterRemoved(target,
+    /// updater)` in the same transaction as the instance's event. Sharing their topic0 with fields
+    /// in other positions would let a consumer filtering by topic alone read one as the other.
+    function test_updaterEvents_doNotShareATopicWithTheRegistrysEvents() public pure {
+        assertTrue(PropAMM.UpdaterAuthorized.selector != keccak256("UpdaterAdded(address,address)"), "added");
+        assertTrue(PropAMM.UpdaterRevoked.selector != keccak256("UpdaterRemoved(address,address)"), "removed");
+    }
+
     function test_addUpdater_registersWithTheOracleAndEmits() public {
         address another = makeAddr("another-updater");
         vm.expectEmit(true, true, false, true, address(propAmm));
-        emit PropAMM.UpdaterAdded(another, ORACLE);
+        emit PropAMM.UpdaterAuthorized(another, ORACLE);
         vm.prank(owner);
         propAmm.addUpdater(another);
         assertTrue(MockPUR(ORACLE).isUpdater(address(propAmm), another));
@@ -340,7 +374,7 @@ contract PropAMMTest is Test {
 
     function test_removeUpdater_unregistersFromTheOracleAndEmits() public {
         vm.expectEmit(true, true, false, true, address(propAmm));
-        emit PropAMM.UpdaterRemoved(updater, ORACLE);
+        emit PropAMM.UpdaterRevoked(updater, ORACLE);
         vm.prank(owner);
         propAmm.removeUpdater(updater);
         assertFalse(MockPUR(ORACLE).isUpdater(address(propAmm), updater));
@@ -375,6 +409,56 @@ contract PropAMMTest is Test {
         assertTrue(MockPUR(ORACLE).isUpdater(address(propAmm), updater), "still live on the old registry");
     }
 
+    /// The registry scopes keys to this instance's address, so a key stays live on a registry the
+    /// instance has left; the owner revokes it there without pointing the instance back. Audit F-16.
+    function test_removeUpdaterFrom_revokesOnARegistryTheInstanceLeft() public {
+        address other = makeAddr("other-registry");
+        vm.etch(other, address(new MockPUR()).code);
+        vm.startPrank(owner);
+        propAmm.setOracle(other);
+        vm.expectEmit(true, true, false, true, address(propAmm));
+        emit PropAMM.UpdaterRevoked(updater, ORACLE);
+        propAmm.removeUpdaterFrom(ORACLE, updater);
+        vm.stopPrank();
+        assertFalse(MockPUR(ORACLE).isUpdater(address(propAmm), updater));
+        assertEq(address(propAmm.oracle()), other, "the current oracle is untouched");
+    }
+
+    /// Revoking must never depend on the registry answering `isUpdater`: on one that cannot (an
+    /// older build), the removal is forwarded unchecked, so a compromised key can still be
+    /// revoked. Review of audit F-16.
+    function test_removeUpdaterFrom_revokesOnARegistryWithoutIsUpdater() public {
+        LegacyRegistry legacy = new LegacyRegistry();
+        // A key the instance authorized there before `isUpdater` was part of the interface.
+        vm.prank(address(propAmm));
+        legacy.addUpdater(updater);
+
+        vm.expectEmit(true, true, false, true, address(propAmm));
+        emit PropAMM.UpdaterRevoked(updater, address(legacy));
+        vm.prank(owner);
+        propAmm.removeUpdaterFrom(address(legacy), updater);
+        assertFalse(legacy.authorized(address(propAmm), updater));
+    }
+
+    /// A mistyped or zero registry gets the same named error `setOracle` gives it, not a bare
+    /// revert from decoding nothing. Review of audit F-16.
+    function test_removeUpdaterFrom_refusesARegistryWithoutCode() public {
+        address eoa = makeAddr("eoa-registry");
+        vm.startPrank(owner);
+        vm.expectRevert(abi.encodeWithSelector(InvalidOracle.selector, eoa));
+        propAmm.removeUpdaterFrom(eoa, updater);
+        vm.expectRevert(abi.encodeWithSelector(InvalidOracle.selector, address(0)));
+        propAmm.removeUpdaterFrom(address(0), updater);
+        vm.stopPrank();
+    }
+
+    function test_removeUpdaterFrom_refusesAKeyThatRegistryDoesNotHave() public {
+        address stranger = makeAddr("stranger");
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(UpdaterNotAuthorized.selector, ORACLE, stranger));
+        propAmm.removeUpdaterFrom(ORACLE, stranger);
+    }
+
     function test_withdrawERC20_movesTheTokensAndEmits() public {
         MockERC20 token = new MockERC20();
         token.mint(address(propAmm), 1_000);
@@ -393,14 +477,19 @@ contract PropAMMTest is Test {
         // A real oracle, so the only reason `setOracle` can revert below is the caller. Deployed
         // up front: a CREATE between expectRevert and the call it guards would consume the expectation.
         address newOracle = address(new MockPUR());
+        // The exact error, not any revert, so a revert for any other reason cannot pass for
+        // access control.
+        bytes memory notOwner = abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, rando);
         vm.startPrank(rando);
-        vm.expectRevert();
+        vm.expectRevert(notOwner);
         propAmm.setOracle(newOracle);
-        vm.expectRevert();
+        vm.expectRevert(notOwner);
         propAmm.addUpdater(rando);
-        vm.expectRevert();
+        vm.expectRevert(notOwner);
         propAmm.removeUpdater(updater);
-        vm.expectRevert();
+        vm.expectRevert(notOwner);
+        propAmm.removeUpdaterFrom(ORACLE, updater);
+        vm.expectRevert(notOwner);
         propAmm.withdrawERC20(USDC, rando, 1);
         vm.stopPrank();
     }

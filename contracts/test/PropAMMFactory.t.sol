@@ -164,10 +164,11 @@ contract PropAMMFactoryTest is Test {
         factory.createPropAMM(owner, PUR_ADDR, twice, pairs);
     }
 
-    /// Two events per creation, in this order: the instance's own PairAdded (emitted inside
-    /// initialize, so from the predicted address, before the proxy constructor returns), then the
-    /// factory's PropAMMCreated. The creation event names neither pairs nor vaults; PairAdded is
-    /// where indexers read them.
+    /// The instance's own events come first, from the predicted address, before the proxy
+    /// constructor returns: one UpdaterAuthorized per updater, then one PairAdded per pair. The
+    /// factory's PropAMMCreated comes last. The creation event names neither pairs nor vaults;
+    /// PairAdded is where indexers read them. (This test pins the PairAdded → PropAMMCreated order;
+    /// the UpdaterAuthorized events are pinned in PropAMM.t.sol.)
     function test_createPropAMM_emitsPairAddedThenCreated() public {
         address predicted = factory.computeAddress(address(this), owner, PUR_ADDR, updaters, pairs);
         vm.expectEmit(true, true, true, true, predicted);
@@ -339,6 +340,8 @@ contract PropAMMFactoryTest is Test {
         propAmm.addUpdater(rando);
         vm.expectRevert();
         propAmm.removeUpdater(updater);
+        vm.expectRevert();
+        propAmm.removeUpdaterFrom(PUR_ADDR, updater);
         vm.expectRevert();
         propAmm.addPair(_token("token-a"), _token("token-b"), vault);
         vm.expectRevert();
