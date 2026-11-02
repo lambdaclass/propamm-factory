@@ -102,6 +102,7 @@ mod rpc;
 #[cfg(test)]
 mod rpc_mock;
 mod service;
+pub mod signer;
 pub mod stocks;
 mod supervisor;
 mod tasks;

@@ -12,7 +12,6 @@ use ethrex_common::{
     types::{BlockHeader, EIP1559Transaction, TxType},
 };
 use ethrex_l2_common::calldata::Value;
-use ethrex_l2_rpc::signer::{Signable, Signer};
 use ethrex_l2_sdk::{build_generic_tx, calldata::encode_calldata};
 use ethrex_rlp::encode::RLPEncode;
 use ethrex_rpc::clients::eth::{EthClient, Overrides};
@@ -23,6 +22,7 @@ use crate::{
     feed::PriceSample,
     head::Head,
     pricing::{Diagnostics, Market, PairShape, Pricer, Refusal, TickCtx},
+    signer::{Signer, sign_transaction},
 };
 const UPDATE_STATE_SIG: &str = "updateState(address,uint256,uint32,uint256[])";
 
@@ -755,7 +755,7 @@ pub fn update_calldata(
 /// call at all.
 pub async fn sign_update_tx(
     client: &EthClient,
-    signer: &Signer,
+    signer: &dyn Signer,
     params: &UpdateParams,
     stamp: UpdateStamp,
     nonce: u64,
@@ -779,10 +779,9 @@ pub async fn sign_update_tx(
     )
     .await?;
     let mut raw: Vec<u8> = vec![TxType::EIP1559.into()];
-    let signed = EIP1559Transaction::try_from(tx)
-        .map_err(|err| eyre!("not an EIP-1559 transaction: {err:?}"))?
-        .sign(signer)
-        .await?;
+    let tx = EIP1559Transaction::try_from(tx)
+        .map_err(|err| eyre!("not an EIP-1559 transaction: {err:?}"))?;
+    let signed = sign_transaction(signer, tx).await?;
     signed.encode(&mut raw);
     Ok(raw)
 }

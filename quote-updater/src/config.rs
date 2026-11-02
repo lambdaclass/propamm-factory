@@ -8,15 +8,14 @@
 use std::{collections::HashSet, fs, path::Path, time::Duration};
 
 use ethrex_common::{Address, U256, utils::keccak};
-use ethrex_l2_rpc::signer::{LocalSigner, Signer};
 use eyre::{Result, WrapErr, bail, ensure, eyre};
-use secp256k1::SecretKey;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::{
     breaker::{BreakerConfig, WindowConfig, percent},
     feed::{format_scaled, parse_decimal_scaled},
+    signer::{SharedSigner, from_key_value},
     venue::VenueId,
 };
 
@@ -1193,13 +1192,12 @@ pub fn parse_config_with(
 /// replaces it.
 ///
 /// Derives `Debug` for test ergonomics (`unwrap_err` on a `Result<Vec<_>, _>`); this is
-/// safe because `Signer`'s `Debug` never prints the raw key, only a fingerprint hash or a
-/// redaction placeholder (see `secp256k1::SecretKey`'s `impl_display_secret!`).
+/// safe because a signer's `Debug` prints its address, never a key.
 #[derive(Clone, Debug)]
 pub struct Pair {
     pub tokens: (Address, Address),
     pub lane: U256,
-    pub signer: Signer,
+    pub signer: SharedSigner,
     pub label: String,
     /// Checked against every mid before it is published; see [`MidBand`].
     pub band: MidBand,
@@ -1250,25 +1248,20 @@ pub fn env_lookup(name: &str) -> Option<String> {
 /// shared by `run` and the `Service` it builds so both read keys the same way.
 pub(crate) type KeyLookup = std::sync::Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
-/// Resolves each pair's key independently, so a caller reporting a half-configured
-/// deployment (`--check`) can show every row. Errors never contain the key value.
+/// Resolves each pair's signer independently, so a caller reporting a half-configured
+/// deployment (`--check`) can show every row. The variable holds either the key or a
+/// signer endpoint (see [`crate::signer::from_key_value`]). Errors never contain the value.
 pub fn resolve_keys<F: Fn(&str) -> Option<String>>(
     config: &Config,
     lookup: F,
-) -> Vec<Result<Signer>> {
+) -> Vec<Result<SharedSigner>> {
     config
         .pairs
         .iter()
         .map(|pair| {
             let name = &pair.key_env;
             let raw = lookup(name).ok_or_else(|| eyre!("{name} is not set in the environment"))?;
-            let secret: SecretKey = raw
-                .strip_prefix("0x")
-                .unwrap_or(&raw)
-                .parse()
-                // Deliberately not wrapping the parse error: it can quote the input.
-                .map_err(|_| eyre!("{name} does not hold a valid secp256k1 private key"))?;
-            Ok(Signer::from(LocalSigner::new(secret)))
+            from_key_value(&raw).map_err(|err| eyre!("{name}: {err}"))
         })
         .collect()
 }

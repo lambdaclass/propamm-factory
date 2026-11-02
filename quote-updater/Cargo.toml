@@ -52,9 +52,12 @@ axum = { version = "0.8.9", features = ["ws"] }
 ethrex-common = { git = "https://github.com/lambdaclass/ethrex", rev = "73318b686fdc2c3951a67cea9721eb5378855ada" }
 ethrex-l2-common = { git = "https://github.com/lambdaclass/ethrex", rev = "73318b686fdc2c3951a67cea9721eb5378855ada" }
 ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex", rev = "73318b686fdc2c3951a67cea9721eb5378855ada" }
-ethrex-l2-rpc = { git = "https://github.com/lambdaclass/ethrex", rev = "73318b686fdc2c3951a67cea9721eb5378855ada" }
 ethrex-rpc = { git = "https://github.com/lambdaclass/ethrex", rev = "73318b686fdc2c3951a67cea9721eb5378855ada" }
 ethrex-sdk = { git = "https://github.com/lambdaclass/ethrex", rev = "73318b686fdc2c3951a67cea9721eb5378855ada" }
+# Who signs: the key in this process, or a separate signer process over a socket. The
+# protocol, the signing and the client are one crate shared with that process, so the two
+# halves can never disagree on the bytes under a signature.
+quote-signer = { path = "../quote-signer" }
 # The backoffice's HTML templates. Four new entries in Cargo.lock, all askama's own.
 askama = { version = "0.16.0", default-features = false, features = ["derive", "std", "urlencode"] }
 # The feed recorder's database client (record.rs): the Binance mid and the vault balances
@@ -77,6 +80,9 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry", "std"] }
 
 [dev-dependencies]
+# A directory for the socket a signer process test listens on. Already in Cargo.lock
+# through the ethrex tree, so this adds no package.
+tempfile = "3"
 # Only for tokio's paused clock (`#[tokio::test(start_paused = true)]`), which lets a
 # waited duration (a restart backoff, quoting.rs's shutdown bound) be asserted without
 # waiting it out. test-util = ["rt", "sync", "time"], all already enabled, so this adds

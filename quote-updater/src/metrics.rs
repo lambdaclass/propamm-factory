@@ -42,6 +42,13 @@ const EXTENSION_BUCKETS: &[f64] = &[
     0.00001, 0.000025, 0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05,
 ];
 
+/// Buckets for one signature, in seconds. A local signature is well under a millisecond;
+/// a remote signer adds a socket round trip. The ceiling is the requote cadence, past
+/// which a signature is costing blocks rather than microseconds.
+const SIGN_BUCKETS: &[f64] = &[
+    0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1,
+];
+
 const RPC_BUCKETS: &[f64] = &[
     0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 3.0,
 ];
@@ -294,6 +301,7 @@ pub struct Metrics {
     rpc_duration: HistogramVec,
     rpc_errors: IntCounterVec,
     sign_errors: IntCounterVec,
+    sign_duration: HistogramVec,
     target_blocks: IntCounterVec,
     signer_balance_wei: GaugeVec,
     signer_runway_updates: GaugeVec,
@@ -342,6 +350,8 @@ pub struct PairMetrics {
     rpc_duration: [Histogram; 3],
     rpc_errors: [IntCounter; 3],
     pub sign_errors: IntCounter,
+    /// `quote_updater_sign_duration_seconds`: one update's signature, local or remote.
+    pub sign_duration: Histogram,
     pub target_blocks: IntCounter,
     pub signer_balance_wei: Gauge,
     pub signer_runway_updates: Gauge,
@@ -772,6 +782,13 @@ impl Metrics {
                 "Update signing failures.",
                 pair,
             )?,
+            sign_duration: histogram(
+                &r,
+                "quote_updater_sign_duration_seconds",
+                "Time to sign one update, in this process or at a separate signer.",
+                pair,
+                SIGN_BUCKETS,
+            )?,
             target_blocks: counter(
                 &r,
                 "quote_updater_target_blocks_total",
@@ -1052,6 +1069,7 @@ impl Metrics {
             rpc_errors: RpcCall::ALL
                 .map(|c| self.rpc_errors.with_label_values(&[pair, c.as_str()])),
             sign_errors: self.sign_errors.with_label_values(p),
+            sign_duration: self.sign_duration.with_label_values(p),
             target_blocks: self.target_blocks.with_label_values(p),
             signer_balance_wei: self.signer_balance_wei.with_label_values(p),
             signer_runway_updates: self.signer_runway_updates.with_label_values(p),

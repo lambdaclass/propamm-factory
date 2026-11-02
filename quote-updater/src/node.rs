@@ -4,9 +4,13 @@
 
 use std::time::SystemTime;
 
-use ethrex_common::{H256, U256, types::TxType};
+use ethrex_common::{
+    H256, U256,
+    types::{EIP1559Transaction, TxType},
+};
 use ethrex_l2_common::calldata::Value;
-use ethrex_l2_sdk::{build_generic_tx, send_generic_transaction, wait_for_transaction_receipt};
+use ethrex_l2_sdk::{build_generic_tx, wait_for_transaction_receipt};
+use ethrex_rlp::encode::RLPEncode;
 use ethrex_rpc::{
     clients::eth::{EthClient, Overrides},
     types::block_identifier::{BlockIdentifier, BlockTag},
@@ -20,6 +24,7 @@ use crate::{
     pair::{Live, SendOpts},
     quote_id, record,
     rpc::{bounded, call_view, decode_return_data, raw_rpc},
+    signer::sign_transaction,
     update::{self, BLOCK_TIME_SECS, UpdateParams, UpdateStamp, next_block_max_fee},
 };
 
@@ -170,11 +175,27 @@ pub(crate) async fn push_update(
         },
     )
     .await?;
+    // Signed through the pair's signer, which may be a separate process, then sent raw.
     // Named rather than left to the pair label: this is the wrap that carries "insufficient
     // funds", and the address is what the operator tops up.
-    let sent = send_generic_transaction(client, tx, signer)
-        .await
-        .wrap_err_with(|| format!("failed to send updateState from {:#x}", signer.address()));
+    let sent = async {
+        let tx = EIP1559Transaction::try_from(tx)
+            .map_err(|err| eyre!("not an EIP-1559 transaction: {err:?}"))?;
+        let started = std::time::Instant::now();
+        let signed = sign_transaction(signer.as_ref(), tx).await;
+        live.metrics
+            .sign_duration
+            .observe(started.elapsed().as_secs_f64());
+        let signed = signed.inspect_err(|_| live.metrics.sign_errors.inc())?;
+        let mut raw: Vec<u8> = vec![TxType::EIP1559.into()];
+        signed.encode(&mut raw);
+        client
+            .send_raw_transaction(&raw)
+            .await
+            .map_err(|err| eyre!("{err}"))
+    }
+    .await
+    .wrap_err_with(|| format!("failed to send updateState from {:#x}", signer.address()));
     if opts.mine {
         // Mine even when the send failed: a transaction left sitting in the pool by an
         // earlier tick would otherwise wedge every later tick with "transaction already
@@ -393,8 +414,6 @@ mod tests {
     /// pricer recovers. Refused before the first RPC call, like an out-of-band mid.
     #[tokio::test]
     async fn node_mode_does_not_push_a_tripped_lane() {
-        use ethrex_l2_rpc::signer::{LocalSigner, Signer};
-
         let secret = secp256k1::SecretKey::from_slice(&[0x45; 32]).unwrap();
         let resolved = ResolvedPair {
             pair: Pair {
@@ -403,7 +422,7 @@ mod tests {
                     Address::from_slice(&[0xda; 20]),
                 ),
                 lane: U256::from(9),
-                signer: Signer::from(LocalSigner::new(secret)),
+                signer: crate::signer::local(secret),
                 label: "NODE/TEST".to_owned(),
                 band: config::MidBand {
                     min: None,
@@ -467,8 +486,6 @@ mod tests {
 
     #[tokio::test]
     async fn node_mode_records_an_unusable_price_before_it_gives_up() {
-        use ethrex_l2_rpc::signer::{LocalSigner, Signer};
-
         let secret = secp256k1::SecretKey::from_slice(&[0x44; 32]).unwrap();
         let resolved = ResolvedPair {
             pair: Pair {
@@ -477,7 +494,7 @@ mod tests {
                     Address::from_slice(&[0xda; 20]),
                 ),
                 lane: U256::from(9),
-                signer: Signer::from(LocalSigner::new(secret)),
+                signer: crate::signer::local(secret),
                 label: "NODE/TEST".to_owned(),
                 // The mid below sits an order of magnitude under this floor. The fixed
                 // kind would refuse the combination when it is built, so the pair is priced

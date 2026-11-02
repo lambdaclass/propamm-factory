@@ -1387,17 +1387,21 @@ async fn drive(
                     // Minted at the sign, not at the price: it says when these bytes were
                     // produced, and nothing before.
                     let quote_id = opts.quote_id.then(quote_id::mint);
-                    match sign_update_tx(
+                    let started = std::time::Instant::now();
+                    let signed = sign_update_tx(
                         client,
-                        &live.pair.signer,
+                        live.pair.signer.as_ref(),
                         params,
                         stamp,
                         nonce,
                         quote,
                         quote_id,
                     )
-                    .await
-                    {
+                    .await;
+                    live.metrics
+                        .sign_duration
+                        .observe(started.elapsed().as_secs_f64());
+                    match signed {
                         Ok(raw_tx) => {
                             gate.published(quote);
                             block_quote_id = quote_id;
@@ -1812,7 +1816,6 @@ mod tests {
         supervisor,
         update::ValueSource,
     };
-    use ethrex_l2_rpc::signer::{LocalSigner, Signer};
     use secp256k1::SecretKey;
 
     /// A throwaway registry: this test only needs somewhere for the pair's counters to land.
@@ -2123,7 +2126,7 @@ mod tests {
         // itself), and `live` carries the pair handle bound off that same registry, so a
         // counter asserted through either is the same series.
         let metrics = Arc::new(crate::metrics::Metrics::new().unwrap());
-        let signer = Signer::from(LocalSigner::new(SecretKey::from_slice(&[7u8; 32]).unwrap()));
+        let signer = crate::signer::local(SecretKey::from_slice(&[7u8; 32]).unwrap());
         let (token0, token1) = (
             Address::from_slice(&[0xa0; 20]),
             Address::from_slice(&[0xda; 20]),
@@ -3776,7 +3779,6 @@ mod tests {
             supervisor::shutdown_channel,
             update::ValueSource,
         };
-        use ethrex_l2_rpc::signer::{LocalSigner, Signer};
 
         let chain = ChainStub::spawn(99).await;
         let client = EthClient::new(Url::parse(&chain.url).unwrap()).unwrap();
@@ -3802,7 +3804,7 @@ mod tests {
                     Address::from_slice(&[0xda; 20]),
                 ),
                 lane,
-                signer: Signer::from(LocalSigner::new(secret)),
+                signer: crate::signer::local(secret),
                 label: "TEST".to_owned(),
                 band: MidBand {
                     min: None,
@@ -4000,7 +4002,6 @@ mod tests {
             supervisor::shutdown_channel,
             update::ValueSource,
         };
-        use ethrex_l2_rpc::signer::{LocalSigner, Signer};
 
         // What the loop said, for the alarm line: a current-thread runtime, so every task
         // of this test logs through this thread's default subscriber.
@@ -4034,7 +4035,7 @@ mod tests {
                     Address::from_slice(&[0xda; 20]),
                 ),
                 lane,
-                signer: Signer::from(LocalSigner::new(secret)),
+                signer: crate::signer::local(secret),
                 label: "TEST".to_owned(),
                 band: MidBand {
                     min: None,
@@ -4154,7 +4155,6 @@ mod tests {
             supervisor::shutdown_channel,
             update::ValueSource,
         };
-        use ethrex_l2_rpc::signer::{LocalSigner, Signer};
 
         let chain = ChainStub::spawn(99).await;
         let client = EthClient::new(Url::parse(&chain.url).unwrap()).unwrap();
@@ -4180,7 +4180,7 @@ mod tests {
                     Address::from_slice(&[0xda; 20]),
                 ),
                 lane,
-                signer: Signer::from(LocalSigner::new(secret)),
+                signer: crate::signer::local(secret),
                 label: "TEST".to_owned(),
                 band: MidBand {
                     min: None,
@@ -4403,7 +4403,6 @@ mod tests {
             supervisor::shutdown_channel,
             update::ValueSource,
         };
-        use ethrex_l2_rpc::signer::{LocalSigner, Signer};
 
         let chain = ChainStub::spawn(99).await;
         let client = EthClient::new(Url::parse(&chain.url).unwrap()).unwrap();
@@ -4420,7 +4419,7 @@ mod tests {
                     Address::from_slice(&[0xda; 20]),
                 ),
                 lane,
-                signer: Signer::from(LocalSigner::new(secret)),
+                signer: crate::signer::local(secret),
                 label: "TEST".to_owned(),
                 band: MidBand {
                     min: Some(U256::exp10(18)),
@@ -4528,7 +4527,6 @@ mod tests {
             supervisor::shutdown_channel,
             update::ValueSource,
         };
-        use ethrex_l2_rpc::signer::{LocalSigner, Signer};
 
         let chain = ChainStub::spawn(99).await;
         let client = EthClient::new(Url::parse(&chain.url).unwrap()).unwrap();
@@ -4546,7 +4544,7 @@ mod tests {
                     Address::from_slice(&[0xda; 20]),
                 ),
                 lane,
-                signer: Signer::from(LocalSigner::new(secret)),
+                signer: crate::signer::local(secret),
                 label: "TEST".to_owned(),
                 band: MidBand {
                     min: None,
@@ -4702,7 +4700,6 @@ mod tests {
             supervisor::shutdown_channel,
             update::ValueSource,
         };
-        use ethrex_l2_rpc::signer::{LocalSigner, Signer};
 
         let chain = ChainStub::spawn(99).await;
         let client = EthClient::new(Url::parse(&chain.url).unwrap()).unwrap();
@@ -4729,7 +4726,7 @@ mod tests {
                     Address::from_slice(&[0xda; 20]),
                 ),
                 lane,
-                signer: Signer::from(LocalSigner::new(secret)),
+                signer: crate::signer::local(secret),
                 label: "TEST".to_owned(),
                 band: MidBand {
                     min: None,

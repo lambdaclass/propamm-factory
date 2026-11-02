@@ -1038,8 +1038,6 @@ mod tests {
     /// written through.
     #[tokio::test]
     async fn a_feed_pair_is_adopted_from_the_sample_it_was_built_on() {
-        use ethrex_l2_rpc::signer::{LocalSigner, Signer};
-
         let secret = secp256k1::SecretKey::from_slice(&[0x22; 32]).unwrap();
         let metrics = metrics::Metrics::new().unwrap();
         let wall = std::time::SystemTime::now();
@@ -1053,7 +1051,7 @@ mod tests {
             pair: Pair {
                 tokens: (Address::zero(), Address::zero()),
                 lane: U256::from(3),
-                signer: Signer::from(LocalSigner::new(secret)),
+                signer: crate::signer::local(secret),
                 label: "FEED/TEST".to_owned(),
                 band: config::MidBand::default(),
             },
@@ -1105,8 +1103,6 @@ mod tests {
     /// as long as the socket stayed up. Read at scrape time, there is nothing to drop.
     #[tokio::test]
     async fn a_venues_up_is_read_from_its_feeds_own_flag() {
-        use ethrex_l2_rpc::signer::{LocalSigner, Signer};
-
         let secret = secp256k1::SecretKey::from_slice(&[0x23; 32]).unwrap();
         let metrics = metrics::Metrics::new().unwrap();
         let (_tx, rx) = tokio::sync::watch::channel(None);
@@ -1124,7 +1120,7 @@ mod tests {
             pair: Pair {
                 tokens: (Address::zero(), Address::zero()),
                 lane: U256::from(4),
-                signer: Signer::from(LocalSigner::new(secret)),
+                signer: crate::signer::local(secret),
                 label: "UP/TEST".to_owned(),
                 band: config::MidBand::default(),
             },
@@ -1168,8 +1164,6 @@ mod tests {
     /// is a page on exactly that gauge.
     #[tokio::test]
     async fn a_pair_that_tripped_before_anyone_was_listening_is_adopted_as_tripped() {
-        use ethrex_l2_rpc::signer::{LocalSigner, Signer};
-
         use crate::guard::{Cause, CompositeSample, MarketGuard, Verdict};
 
         let secret = secp256k1::SecretKey::from_slice(&[0x33; 32]).unwrap();
@@ -1213,7 +1207,7 @@ mod tests {
             pair: Pair {
                 tokens: (Address::zero(), Address::zero()),
                 lane: U256::from(9),
-                signer: Signer::from(LocalSigner::new(secret)),
+                signer: crate::signer::local(secret),
                 label: "TRIP/TEST".to_owned(),
                 band: config::MidBand::default(),
             },
@@ -1265,8 +1259,6 @@ mod tests {
     /// the latch there.
     #[test]
     fn a_trip_between_the_seed_and_the_switch_is_recorded_once_the_lane_owns_its_series() {
-        use ethrex_l2_rpc::signer::{LocalSigner, Signer};
-
         let secret = secp256k1::SecretKey::from_slice(&[0x44; 32]).unwrap();
         let metrics = std::sync::Arc::new(metrics::Metrics::new().unwrap());
         let pair_metrics = metrics.for_pair("RACE/TEST");
@@ -1283,7 +1275,7 @@ mod tests {
             pair: Pair {
                 tokens: (Address::zero(), Address::zero()),
                 lane: U256::from(9),
-                signer: Signer::from(LocalSigner::new(secret)),
+                signer: crate::signer::local(secret),
                 label: "RACE/TEST".to_owned(),
                 band: config::MidBand::default(),
             },
@@ -1359,8 +1351,6 @@ mod tests {
     /// the pair on.
     #[tokio::test]
     async fn a_static_pairs_live_carries_no_value_the_feed_or_signer_rules_would_fire_on() {
-        use ethrex_l2_rpc::signer::{LocalSigner, Signer};
-
         let secret = secp256k1::SecretKey::from_slice(&[0x11; 32]).unwrap();
         let resolved = ResolvedPair {
             pair: Pair {
@@ -1369,7 +1359,7 @@ mod tests {
                     Address::from_slice(&[0xda; 20]),
                 ),
                 lane: U256::from(7),
-                signer: Signer::from(LocalSigner::new(secret)),
+                signer: crate::signer::local(secret),
                 label: "STATIC/TEST".to_owned(),
                 band: config::MidBand {
                     min: None,

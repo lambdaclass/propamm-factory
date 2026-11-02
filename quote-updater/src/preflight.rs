@@ -799,6 +799,11 @@ pub async fn build_report(
             Ok(signer) => {
                 let updater = signer.address();
                 row.updater = Some(updater);
+                // A separate signer process is asked whether it is there and holds this
+                // key; a key in this process answers at once.
+                if let Err(err) = signer.probe().await {
+                    row.failures.push(format!("{err:#}"));
+                }
 
                 let calldata = encode_calldata(
                     IS_UPDATER_SIG,
