@@ -720,6 +720,12 @@ doing the wrong thing.
 
 `.env` is gitignored, and should stay that way: it holds live private keys.
 
+To keep the keys, the config and the backoffice out of reach of whoever gets root on the
+host, run the updater inside an AWS Nitro enclave with `--enclave`: the secrets arrive
+encrypted and only the enclave can have them decrypted, the host stores the config sealed,
+and the backoffice serves its own HTTPS behind a Google login. See
+[`enclave.md`](enclave.md).
+
 A `.env` (or shell) still exporting `TITAN_WS` or `TITAN_API_KEY` — the variables that used
 to configure the single-builder mode — is refused rather than silently ignored: startup
 names whichever one is set and points at the config file's `[[builder]]` entries as where

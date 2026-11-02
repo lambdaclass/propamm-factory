@@ -1,0 +1,4 @@
+# Appended to /etc/hosts inside the enclave: every host the updater connects to, pointed at
+# the loopback address its [[forward]] listens on in enclave.toml.
+127.0.0.2 kms.eu-west-1.amazonaws.com
+127.0.0.3 stream.binance.com
