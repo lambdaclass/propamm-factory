@@ -67,6 +67,13 @@ From the owner account, once per wallet:
 cast send $PROPAMM "addUpdater(address)" $UPDATER_ADDRESS --rpc-url $RPC_URL --private-key $OWNER_KEY
 ```
 
+`addUpdater` reverts with `UpdaterAlreadyAuthorized` for a wallet the registry already
+authorizes, and `removeUpdater` with `UpdaterNotAuthorized` for one it does not, so that every
+`UpdaterAuthorized`/`UpdaterRevoked` the PropAMM logs is a real change. Re-running this step for
+a wallet that is already there fails instead of doing nothing, and in a batch (a Safe multisend)
+one such call fails the whole batch. Check first with
+`cast call $REGISTRY "isUpdater(address,address)(bool)" $PROPAMM $UPDATER_ADDRESS --rpc-url $RPC_URL`.
+
 ## 4. Get API keys from the builders
 
 The api to send builders quote updates is permissioned, behind an API key. You will have to Ask each builder for one:
@@ -124,6 +131,50 @@ If you add a new pair (and thus a new updater), the new updater key goes in `.en
 
 Grafana is at `http://<IP from .env>:3000`. Day-to-day commands (reload, logs, updates) are in
 [`deploy/README.md`](../deploy/README.md).
+
+## Moving a PropAMM to another registry
+
+`setOracle` moves where the PropAMM reads prices from and where `addUpdater`/`removeUpdater`
+act. It neither copies nor revokes the wallets authorized on the old registry: the registry
+records them under the PropAMM's address, so they stay live there, and pointing the PropAMM back
+at the old registry would let every one of them price it again. The first mainnet registry
+(`0xDa7AfeeD01fe…8C5F`) has a known vulnerability, so never point a PropAMM back at it;
+`removeUpdaterFrom` revokes there without doing so. From the owner account, in this order:
+
+1. List the wallets on the old registry. Its own `UpdaterAdded(target, updater)` log, filtered
+   on the PropAMM as `target`, has every wallet ever added there (drop those a later
+   `UpdaterRemoved` revoked); or check the wallets you know, one by one:
+
+   ```bash
+   cast call $OLD_REGISTRY "isUpdater(address,address)(bool)" $PROPAMM $UPDATER_ADDRESS --rpc-url $RPC_URL
+   ```
+
+2. Point the PropAMM at the new registry. Quotes stop until step 3's wallets publish there: with
+   no fresh price on the new registry, every quote and swap reverts.
+
+   ```bash
+   cast send $PROPAMM "setOracle(address)" $NEW_REGISTRY --rpc-url $RPC_URL --private-key $OWNER_KEY
+   ```
+
+3. Authorize each wallet on the new registry; `addUpdater` now acts there.
+
+   ```bash
+   cast send $PROPAMM "addUpdater(address)" $UPDATER_ADDRESS --rpc-url $RPC_URL --private-key $OWNER_KEY
+   ```
+
+4. Revoke each wallet on the old registry, without pointing back at it.
+
+   ```bash
+   cast send $PROPAMM "removeUpdaterFrom(address,address)" $OLD_REGISTRY $UPDATER_ADDRESS --rpc-url $RPC_URL --private-key $OWNER_KEY
+   ```
+
+5. Point the quote updater at the new registry: `registry = "<NEW_REGISTRY>"` at the top of
+   `config/config.toml` (or `--registry`). Then `docker compose run --rm updater --check` asks
+   that registry whether each wallet is authorized, and `docker compose up -d` restarts it.
+
+A PropAMM still on an implementation without `removeUpdaterFrom` revokes on the old registry by
+pointing back at it, paused so nothing trades in between:
+`pause()`, `setOracle(OLD)`, `removeUpdater(wallet)` for each, `setOracle(NEW)`, `unpause()`.
 
 ## Next steps
 

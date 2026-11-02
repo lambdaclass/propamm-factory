@@ -19,7 +19,8 @@ creation back on. Instances already created keep working, and the factory's owne
 over them.
 
 `PropAMM` is the instance. The owner can add and remove pairs (`addPair`, `setPairVault`),
-add and remove updaters (`addUpdater`, `removeUpdater`) and pause it. Traders call `swap`;
+add and remove updaters (`addUpdater`, `removeUpdater`, and `removeUpdaterFrom` for a registry
+the instance has moved away from), point it at another registry (`setOracle`) and pause it. Traders call `swap`;
 anyone can call `quote` and `isActive` to see what a trade would get.
 
 Instances also implement `IPropAMMFillable`, advertised through ERC-165, which

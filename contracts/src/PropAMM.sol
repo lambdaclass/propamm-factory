@@ -494,7 +494,12 @@ contract PropAMM is
     }
 
     /// @notice Updates the oracle address used for price updates.
-    /// @dev Note that this does not transfer any updaters from the old oracle to the new one; the new oracle must be set up separately.
+    /// @dev Moves pricing and updater management to `newOracle`. Authorizations on the old
+    /// registry are not copied and not revoked: they stay live there for this instance, so
+    /// pointing back at it re-enables them. Revoke each old key with
+    /// `removeUpdaterFrom(oldRegistry, key)`; the old registry's own `UpdaterAdded(target,
+    /// updater)` log lists them. Authorize the keys the new registry needs with `addUpdater`
+    /// after this call.
     /// @param newOracle The new oracle address. Reverts with `InvalidOracle` for an address with
     /// no code.
     function setOracle(address newOracle) external onlyOwner {
