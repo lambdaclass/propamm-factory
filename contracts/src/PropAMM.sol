@@ -25,6 +25,8 @@ error InsufficientVaultBalance(address token, uint256 needed, uint256 available)
 /// A zero vault passed to `addPair` or `setPairVault`: a pair always names the account it fills
 /// from, because that account is also what registers it (see `pairVaults`).
 error NoVault(address token0, address token1);
+/// An oracle address with no code, given to `initialize` or `setOracle`.
+error InvalidOracle(address oracle);
 
 /// @dev `ERC165Upgradeable` holds no state, so adding it moved no storage slot.
 contract PropAMM is
@@ -110,7 +112,9 @@ contract PropAMM is
     /// proxy is the proxy itself, so the updaters registered here are the instance's own.
     /// @param owner The account that will own the instance.
     /// @param updaters The addresses allowed to push price updates for the instance's lanes.
-    /// @param oracle_ The oracle registry the instance will use for price updates.
+    /// @param oracle_ The oracle registry the instance will use for price updates. Reverts with
+    /// `InvalidOracle` for an address with no code: with no updaters nothing here would call it,
+    /// and the mistake would only show later, as an instance that never quotes.
     /// @param pairs The token pairs the instance starts out supporting, each with its vault.
     function initialize(address owner, address[] calldata updaters, address oracle_, PairConfig[] calldata pairs)
         external
@@ -119,6 +123,7 @@ contract PropAMM is
         __Ownable2Step_init();
         __Ownable_init(owner);
         __Pausable_init();
+        require(oracle_.code.length > 0, InvalidOracle(oracle_));
         oracle = IPrioUpdateRegistry(oracle_);
         for (uint256 i = 0; i < updaters.length; i++) {
             oracle.addUpdater(updaters[i]);
@@ -457,8 +462,10 @@ contract PropAMM is
 
     /// @notice Updates the oracle address used for price updates.
     /// @dev Note that this does not transfer any updaters from the old oracle to the new one; the new oracle must be set up separately.
-    /// @param newOracle The new oracle address.
+    /// @param newOracle The new oracle address. Reverts with `InvalidOracle` for an address with
+    /// no code.
     function setOracle(address newOracle) external onlyOwner {
+        require(newOracle.code.length > 0, InvalidOracle(newOracle));
         oracle = IPrioUpdateRegistry(newOracle);
         emit OracleChanged(newOracle);
     }

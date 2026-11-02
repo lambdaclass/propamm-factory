@@ -3,7 +3,7 @@ pragma solidity ^0.8.35;
 
 import {Test} from "forge-std/Test.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-import {PropAMM} from "../src/PropAMM.sol";
+import {PropAMM, InvalidOracle} from "../src/PropAMM.sol";
 import {CreationIsDisabled, PropAMMFactory} from "../src/PropAMMFactory.sol";
 import {IPropAMM} from "../src/interfaces/IPropAMM.sol";
 
@@ -128,6 +128,14 @@ contract PropAMMFactoryTest is Test {
         address propAmm = factory.createPropAMM(owner, PUR_ADDR, none, pairs);
         assertGt(propAmm.code.length, 0);
         assertFalse(RegistryStub(PUR_ADDR).isUpdater(propAmm, updater));
+    }
+
+    /// The documented creation flow passes no updaters, so nothing at creation would call the
+    /// oracle: the factory path has to refuse an address without code too. Audit F-12.
+    function test_createPropAMM_refusesAnOracleWithoutCode() public {
+        address eoa = makeAddr("eoa-oracle");
+        vm.expectRevert(abi.encodeWithSelector(InvalidOracle.selector, eoa));
+        factory.createPropAMM(owner, eoa, new address[](0), pairs);
     }
 
     /// Two events per creation, in this order: the instance's own PairAdded (emitted inside

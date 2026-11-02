@@ -30,7 +30,8 @@ cast send $FACTORY "createPropAMM(address,address,address[],(address,address,add
 - `OWNER`: the wallet that will manage the PropAMM afterwards (add pairs, add updaters,
   pause). Can be the same as the deployer.
 - `REGISTRY`: the priority update registry the PropAMM reads prices from. On mainnet it is
-  `0xDa7AfEeD021EAFC1c1Af9C362dE477DaD0396B81`.
+  `0xDa7AfEeD021EAFC1c1Af9C362dE477DaD0396B81`. It must be a deployed contract on this chain:
+  `createPropAMM` reverts with `InvalidOracle` otherwise.
 - `UPDATERS`: the wallets allowed to publish prices. Leave it empty, `"[]"`, and add them in
   step 3 once you have created them.
 - `PAIRS`: one entry per pair, `"[(TOKEN0,TOKEN1,VAULT)]"`, where `TOKEN0` and `TOKEN1` are

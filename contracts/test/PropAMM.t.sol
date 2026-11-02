@@ -3,7 +3,7 @@ pragma solidity ^0.8.35;
 
 import {Test} from "forge-std/Test.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
-import {PropAMM, NoVault, PairAlreadyExists, UnsupportedPair} from "../src/PropAMM.sol";
+import {PropAMM, InvalidOracle, NoVault, PairAlreadyExists, UnsupportedPair} from "../src/PropAMM.sol";
 import {IPropAMM} from "../src/interfaces/IPropAMM.sol";
 import {MockPUR} from "./mocks/MockPUR.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
@@ -81,6 +81,19 @@ contract PropAMMTest is Test {
     /// without re-running it lands on the same default: open for business.
     function test_initialize_startsUnpaused() public view {
         assertFalse(propAmm.paused());
+    }
+
+    /// With no updaters nothing else would ever call the oracle at creation, so an address
+    /// without code would only surface later, as an instance that never quotes. Audit F-12.
+    function test_initialize_refusesAnOracleWithoutCode() public {
+        // The implementation's CREATE must not be the call expectRevert guards.
+        address implementation = address(new PropAMM());
+        address eoa = makeAddr("eoa-oracle");
+        vm.expectRevert(abi.encodeWithSelector(InvalidOracle.selector, eoa));
+        new ERC1967Proxy(
+            implementation,
+            abi.encodeCall(PropAMM.initialize, (owner, new address[](0), eoa, new PropAMM.PairConfig[](0)))
+        );
     }
 
     //------------------------------
@@ -205,11 +218,31 @@ contract PropAMMTest is Test {
 
     function test_setOracle_storesTheNewOracleAndEmits() public {
         address newOracle = makeAddr("new-oracle");
+        // `setOracle` refuses an address without code. Etched before the expectation: a CREATE
+        // between expectEmit and the call it guards would consume the expectation itself.
+        vm.etch(newOracle, address(new MockPUR()).code);
         vm.expectEmit(true, false, false, true, address(propAmm));
         emit PropAMM.OracleChanged(newOracle);
         vm.prank(owner);
         propAmm.setOracle(newOracle);
         assertEq(address(propAmm.oracle()), newOracle);
+    }
+
+    /// An oracle without code leaves an instance that can never quote, and `isActive` reverting
+    /// on it. Audit F-12.
+    function test_setOracle_refusesAnAddressWithoutCode() public {
+        address eoa = makeAddr("eoa-oracle");
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(InvalidOracle.selector, eoa));
+        propAmm.setOracle(eoa);
+        assertEq(address(propAmm.oracle()), ORACLE);
+    }
+
+    function test_setOracle_refusesTheZeroAddress() public {
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(InvalidOracle.selector, address(0)));
+        propAmm.setOracle(address(0));
+        assertEq(address(propAmm.oracle()), ORACLE);
     }
 
     function test_addUpdater_registersWithTheOracleAndEmits() public {
