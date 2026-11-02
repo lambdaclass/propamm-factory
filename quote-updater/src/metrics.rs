@@ -453,11 +453,60 @@ pub struct ReloadMetrics {
     /// stanza would make it answer that question wrongly in exactly the case an operator
     /// needs it most.
     pub generation: Gauge,
+    /// What the last reload that moved a lane changed, one series per line the
+    /// `PusherConfigChanged` alert prints, valued by its place in that list so the alert
+    /// can `sort()` them back into order. See `config_diff` for the lines.
+    ///
+    /// Written for a partial reload too, unlike `generation`. The lanes that did move
+    /// moved, and the reload that later fixes the one that failed only moves that one, so
+    /// if a partial reload wrote nothing, what it changed would never be said anywhere but
+    /// the journal. Its failed lanes get a line of their own, and `outcome` says which
+    /// kind of reload it was.
+    ///
+    /// Free text in labels, which is usually the mistake it sounds like; here it is
+    /// bounded. Only the last reload's lines exist at a time ([`Self::show_changes`]
+    /// clears the previous ones), each value is clipped to `config_diff::MAX_VALUE_CHARS`
+    /// and each section to `config_diff::MAX_SETTINGS` settings. What does accumulate is
+    /// one stale series per line ever shown, at a few reloads a day.
+    ///
+    /// `reload` is a label so each reload is a different alert: Alertmanager tells alerts
+    /// apart by their labels only, so a second reload inside the first one's window would
+    /// otherwise change nothing it sends.
+    changes: GaugeVec,
+    /// Counts the lists `changes` has held, and is what the alert's window reads: unlike
+    /// `generation`, it moves on a partial reload, and unlike `reloads`, it does not move
+    /// on one that changed nothing — which would reopen the window over the previous
+    /// reload's lines and announce them again.
+    change_reloads: IntCounter,
 }
 
 impl ReloadMetrics {
     pub fn reloads(&self, result: Reload) -> &IntCounter {
         &self.reloads[result as usize]
+    }
+
+    /// Replaces the exported change list with this reload's, for a reload that moved a
+    /// lane (`outcome` applied or partial). The lines are written before the count they
+    /// are labelled with moves: the other order leaves a moment in which the alert's
+    /// window is open and the previous reload's lines are still the ones exported, and a
+    /// scrape there announces them again.
+    pub fn show_changes(&self, outcome: Reload, rows: &[crate::config_diff::Row]) {
+        self.changes.reset();
+        let reload = (self.change_reloads.get() + 1).to_string();
+        for (at, row) in rows.iter().enumerate() {
+            self.changes
+                .with_label_values(&[
+                    reload.as_str(),
+                    outcome.as_str(),
+                    &row.section,
+                    &row.setting,
+                    &row.old,
+                    &row.new,
+                    &row.note,
+                ])
+                .set((at + 1) as f64);
+        }
+        self.change_reloads.inc();
     }
 }
 
@@ -1194,12 +1243,31 @@ impl Metrics {
         )?;
         self.registry.register(Box::new(generation.clone()))?;
 
+        let changes = gauge(
+            &self.registry,
+            "quote_updater_config_change",
+            "One line of what the last reload that moved a lane changed, valued by its \
+             place in the list; replaced whole by the next one.",
+            &[
+                "reload", "outcome", "section", "setting", "old", "new", "note",
+            ],
+        )?;
+
+        let change_reloads = IntCounter::new(
+            "quote_updater_config_change_reloads_total",
+            "Reloads that moved a lane, applied in full or in part: each one's lines are \
+             quote_updater_config_change{reload=<this count>}.",
+        )?;
+        self.registry.register(Box::new(change_reloads.clone()))?;
+
         Ok(ReloadMetrics {
             // Pre-bound like every other bounded label set, so `rejected` reads 0 rather
             // than being absent until the first one fails — a rule that has never fired is
             // exactly what `increase(...) > 0` needs to be able to see.
             reloads: Reload::ALL.map(|r| reloads.with_label_values(&[r.as_str()])),
             generation,
+            changes,
+            change_reloads,
         })
     }
 
@@ -1878,6 +1946,77 @@ mod tests {
                 .contains(r#"quote_updater_build_info{version="0.1.0"} 1"#),
             "{}",
             m.render().unwrap()
+        );
+    }
+
+    /// Only the last reload's lines are exported: a second reload replaces the first's
+    /// rather than adding to them, which is what keeps free-text labels bounded.
+    #[test]
+    fn a_reload_replaces_the_previous_change_list() {
+        use crate::config_diff::Row;
+        let m = Metrics::new().unwrap();
+        let reload = m.register_reload().unwrap();
+        let row = |section: &str, setting: &str, old: &str, new: &str, note: &str| Row {
+            section: section.to_owned(),
+            setting: setting.to_owned(),
+            old: old.to_owned(),
+            new: new.to_owned(),
+            note: note.to_owned(),
+        };
+        let lines = |text: &str| -> Vec<String> {
+            text.lines()
+                .filter(|l| l.starts_with("quote_updater_config_change{"))
+                .map(str::to_owned)
+                .collect()
+        };
+
+        reload.show_changes(
+            Reload::Applied,
+            &[
+                row("WETH/USDC", "max_deviation", "0.02", "0.03", ""),
+                row("WETH/USDC", "pricing.delta", "0.0005", "0.0008", ""),
+            ],
+        );
+        let first = lines(&m.render().unwrap());
+        assert_eq!(first.len(), 2, "{first:?}");
+        assert!(
+            first
+                .iter()
+                .all(|l| l.contains(r#"reload="1""#) && l.contains(r#"outcome="applied""#)),
+            "{first:?}"
+        );
+        assert!(
+            first
+                .iter()
+                .any(|l| l.contains(r#"setting="pricing.delta""#) && l.ends_with(" 2")),
+            "{first:?}"
+        );
+
+        reload.show_changes(
+            Reload::Partial,
+            &[
+                row("SOL/USDC", "", "", "", "failed: kept its previous settings"),
+                row("USDC/USDT", "", "", "", "re-armed, settings unchanged"),
+            ],
+        );
+        let text = m.render().unwrap();
+        let second = lines(&text);
+        assert_eq!(second.len(), 2, "{second:?}");
+        assert!(
+            second
+                .iter()
+                .all(|l| l.contains(r#"reload="2""#) && l.contains(r#"outcome="partial""#)),
+            "{second:?}"
+        );
+        assert!(
+            second.iter().all(|l| !l.contains("WETH/USDC")),
+            "{second:?}"
+        );
+        // The count the alert's window reads moved once per list, the partial one included.
+        assert!(
+            text.lines()
+                .any(|l| l == "quote_updater_config_change_reloads_total 2"),
+            "{text}"
         );
     }
 

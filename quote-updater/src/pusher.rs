@@ -167,11 +167,13 @@ async fn run_inner(
     // With a backoffice an empty config is a fresh server about to be configured through
     // the page. Without one it is the mistake it has always been.
     let backoffice_bound = file_settings.backoffice_addr.is_some() && !args.flags.once;
-    let config = config::load_config(
+    let (config, raw) = config::load_config_and_raw(
         &args.flags.config,
         args.flags.price_decimals,
         backoffice_bound,
     )?;
+    // What the first reload says changed is measured from here.
+    let stanzas = crate::config_diff::stanzas_by_lane(&raw);
     // Every stanza names a registered kind and fits its config: checked with the file, before
     // anything connects.
     kinds.check(&config)?;
@@ -610,6 +612,7 @@ async fn run_inner(
             recorder: recorder.clone(),
             global: cancel.clone(),
             running: std::collections::BTreeMap::new(),
+            stanzas,
             outstanding: 0,
             next_id: 0,
             vault_pairs,

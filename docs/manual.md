@@ -614,6 +614,23 @@ can happen are counted by `quote_updater_config_reloads_total` and alerted on:
 on the new file, so reading it answers "is the file I am looking at live?" without having to
 also check that nothing failed.
 
+A reload that moves a lane says what it changed, a partial one included. Each restarted
+pair's journal line lists the settings that moved, in the file's own key names:
+
+```
+reload: [WETH/USDC] restarted: max_deviation 0.02 → 0.03, pricing.delta 0.0005 → 0.0008
+```
+
+`quote_updater_config_change` exports the same lines, one series each, for
+`PusherConfigChanged` to post: every pair that was added, removed, halted, re-armed or
+changed, and the builder list when it changed. After a partial reload the message is titled
+"Config partly reloaded" and lists each pair that failed as `failed: kept its previous
+settings`; that pair's stanza is still the old one as far as the next diff is concerned, so
+the reload that fixes it lists everything it changes. Credentials are redacted as the
+recorder redacts them (a changed key reads `changed (hidden)`), values are cut at 80
+characters, and a pair lists at most eight settings before pointing at the journal for the
+rest.
+
 Removing a pair takes its metrics with it: every per-pair gauge goes to `NaN` on the way out,
 so a lane deleted while halted does not leave `PusherBreakerTripped` firing for a pair that no
 longer exists. Its counters stop where they are, which `rate()` already reads as zero.
