@@ -228,3 +228,35 @@ tests:
             exp_annotations:
               summary: "ETH/USDT: okx has been delivering prices late for 5 minutes"
               description: "This venue's prices have been arriving later behind the exchange's own timestamps than max_source_lag_ms allows for five minutes, so it is out of the pair's average. quote_updater_venue_source_lag_ms says how far behind; a steady quote_updater_venue_future_stamps_total, or every stamped venue late by about the same amount, points at this host's clock instead."
+
+  # PusherSigningSlow: the p95 of one update's signature over five minutes. One pair whose
+  # signatures all land under 5ms stays quiet; one whose signatures sit in the 25ms bucket
+  # raises a ticket. Bucket series are cumulative counters, as a histogram exports them.
+  - interval: 1m
+    name: a pair whose signatures take tens of milliseconds raises a ticket
+    input_series:
+      - series: 'quote_updater_sign_duration_seconds_bucket{pair="FAST",le="0.005"}'
+        values: "0+100x10"
+      - series: 'quote_updater_sign_duration_seconds_bucket{pair="FAST",le="0.025"}'
+        values: "0+100x10"
+      - series: 'quote_updater_sign_duration_seconds_bucket{pair="FAST",le="+Inf"}'
+        values: "0+100x10"
+      - series: 'quote_updater_sign_duration_seconds_bucket{pair="SLOW",le="0.005"}'
+        values: "0+0x10"
+      - series: 'quote_updater_sign_duration_seconds_bucket{pair="SLOW",le="0.025"}'
+        values: "0+100x10"
+      - series: 'quote_updater_sign_duration_seconds_bucket{pair="SLOW",le="+Inf"}'
+        values: "0+100x10"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: PusherSigningSlow
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: PusherSigningSlow
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              pair: SLOW
+            exp_annotations:
+              summary: "SLOW: signing an update takes over 10ms at p95"
+              description: "One signature should take well under a millisecond, with a separate signer process adding about as much again. Sustained at this level it is eating the requote cadence. If the pair signs through a separate process, check that process's load and its reference-price fetches; if it signs in this process, the host is starved."

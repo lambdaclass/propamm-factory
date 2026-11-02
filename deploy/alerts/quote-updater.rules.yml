@@ -398,9 +398,11 @@ groups:
       # actual fault first, which is the whole reason it is a separate rule rather than a
       # panel.
       #
-      # Any signing failure at all, not a rate above some floor: signing is local, pure and
-      # deterministic — a key, a chain id, an RLP encode — so unlike an RPC call there is no
-      # such thing as a transient one. The `for` is what separates a real fault from a blip.
+      # Any signing failure at all, not a rate above some floor: signing in this process is
+      # pure and deterministic — a key, a chain id, an RLP encode — so there is no such thing
+      # as a transient one. With a separate signer process a failure is also a refusal (the
+      # update failed the signer's policy) or an unreachable signer, and neither clears by
+      # itself either. The `for` is what separates a real fault from a blip.
       - alert: PusherSigningFailing
         expr: rate(quote_updater_sign_errors_total[5m]) > 0
         for: 5m
@@ -411,7 +413,28 @@ groups:
             Nothing is being published for this pair and no builder has been told anything is
             wrong. Signing depends on the pair's key, the chain id fetched at startup, and the
             update's own encoding, none of which recover on their own — check the updater's
-            stderr for the error itself.
+            stderr for the error itself. With a separate signer process the error names
+            either the policy check that refused the update or the endpoint that did not
+            answer; the signer's own log says which.
+
+      # A signature that takes a sizeable share of the requote cadence is costing blocks: a
+      # key in this process signs in well under a millisecond, and a separate signer on the
+      # same host adds a socket round trip of comparable size, so tens of milliseconds means
+      # the signer, or the path to it, is in trouble.
+      - alert: PusherSigningSlow
+        expr: >-
+          histogram_quantile(0.95,
+            sum by (pair, le) (rate(quote_updater_sign_duration_seconds_bucket[5m]))) > 0.01
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.pair }}: signing an update takes over 10ms at p95"
+          description: >-
+            One signature should take well under a millisecond, with a separate signer
+            process adding about as much again. Sustained at this level it is eating the
+            requote cadence. If the pair signs through a separate process, check that
+            process's load and its reference-price fetches; if it signs in this process,
+            the host is starved.
 
       - alert: PusherFeedStale
         expr: time() - quote_updater_feed_last_tick_timestamp_seconds > 30
