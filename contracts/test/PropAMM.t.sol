@@ -3,10 +3,26 @@ pragma solidity ^0.8.35;
 
 import {Test} from "forge-std/Test.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
-import {PropAMM, InvalidOracle, NoVault, NotAToken, PairAlreadyExists, UnsupportedPair} from "../src/PropAMM.sol";
+import {
+    PropAMM,
+    InvalidOracle,
+    NoVault,
+    NotAToken,
+    PairAlreadyExists,
+    UnsupportedDecimals,
+    UnsupportedPair
+} from "../src/PropAMM.sol";
 import {IPropAMM} from "../src/interfaces/IPropAMM.sol";
 import {MockPUR} from "./mocks/MockPUR.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
+
+/// A contract with code whose every call reverts, `decimals()` included: listed, it could never
+/// be quoted, since `_pricing` reads its decimals on every quote.
+contract NoDecimalsToken {
+    fallback() external {
+        revert();
+    }
+}
 
 contract PropAMMTest is Test {
     address constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
@@ -156,6 +172,31 @@ contract PropAMMTest is Test {
         vm.prank(owner);
         propAmm.addPair(USDC, USDT, makeAddr("eoa-vault"));
         assertEq(propAmm.getPairs().length, 1);
+    }
+
+    /// `_pricing` multiplies by `10**decimals`; past 36 a pair can overflow on every quote, so it
+    /// is refused when listed rather than discovered at the first quote. Audit F-13.
+    function test_addPair_refusesMoreThan36Decimals() public {
+        MockERC20 wide = new MockERC20();
+        wide.setMeta("W", "W", 37);
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(UnsupportedDecimals.selector, address(wide), uint8(37)));
+        propAmm.addPair(address(wide), USDT, vault);
+    }
+
+    function test_addPair_accepts36Decimals() public {
+        MockERC20 wide = new MockERC20();
+        wide.setMeta("W", "W", 36);
+        vm.prank(owner);
+        propAmm.addPair(address(wide), USDT, vault);
+        assertEq(propAmm.getPairs().length, 1);
+    }
+
+    function test_addPair_refusesATokenWithoutDecimals() public {
+        address bad = address(new NoDecimalsToken());
+        vm.prank(owner);
+        vm.expectRevert();
+        propAmm.addPair(bad, USDT, vault);
     }
 
     //------------------------------

@@ -29,6 +29,8 @@ error NoVault(address token0, address token1);
 error InvalidOracle(address oracle);
 /// A pair token with no code, given to `addPair` or `initialize`.
 error NotAToken(address token);
+/// A pair token whose `decimals()` is above `MAX_TOKEN_DECIMALS`.
+error UnsupportedDecimals(address token, uint8 decimals);
 
 /// @dev `ERC165Upgradeable` holds no state, so adding it moved no storage slot.
 contract PropAMM is
@@ -83,6 +85,10 @@ contract PropAMM is
     /// @dev Price impact charged on a fill that would consume the vault's whole `tokenOut`
     /// balance, as a fraction at SPREAD_SCALE. Impact is linear in the share the fill consumes.
     uint256 constant IMPACT_FACTOR = 1e14; // 1bps
+    /// @dev The most decimals a pair token may have. `_pricing` multiplies `PRICE_SCALE` and `mid`
+    /// by `10**decimals`; 36 keeps both products well inside a word for any realistic `mid`,
+    /// where 60 already overflows `PRICE_SCALE * 10**decimals` on every quote.
+    uint256 constant MAX_TOKEN_DECIMALS = 36;
 
     /// @dev Retired: nothing reads or writes it. Kept so this layout matches instances created
     /// while it was in use, which can upgrade onto this implementation; removing it would move
@@ -430,6 +436,12 @@ contract PropAMM is
         // a codeless one fails only at decoding: listed, reported active, never quotable.
         require(token0.code.length > 0, NotAToken(token0));
         require(token1.code.length > 0, NotAToken(token1));
+        // Read once here so a token `_pricing` cannot price is refused now, not at every quote. A
+        // token whose `decimals()` reverts reverts here too: it could never be quoted.
+        uint8 decimals0 = IERC20Metadata(token0).decimals();
+        require(decimals0 <= MAX_TOKEN_DECIMALS, UnsupportedDecimals(token0, decimals0));
+        uint8 decimals1 = IERC20Metadata(token1).decimals();
+        require(decimals1 <= MAX_TOKEN_DECIMALS, UnsupportedDecimals(token1, decimals1));
 
         uint256 pairKey = _keyOf(token0, token1);
         require(pairVaults[pairKey] == address(0), PairAlreadyExists(token0, token1));
