@@ -142,14 +142,62 @@ contract PropAMM is
     }
 
     /// @inheritdoc IPropAMM
+    /// @dev Never reverts: an oracle without code, a failed call, or an answer that is not a
+    /// well-formed `(uint32, uint256[])` all read as inactive. A `try` cannot cover the last case,
+    /// because the decoder runs in this frame, after the call itself has succeeded.
     function isActive(address tokenIn, address tokenOut) external view override returns (bool active) {
         if (paused()) return false;
 
-        try oracle.getState(_pairKey(tokenIn, tokenOut), uint32(block.timestamp), uint32(block.timestamp)) {
-            return true;
-        } catch {
-            return false;
+        address registry = address(oracle);
+        // A call to an address without code succeeds with empty data, so the success flag alone
+        // would not tell a registry from an EOA.
+        if (registry.code.length == 0) return false;
+        (bool ok, bytes memory ret) = registry.staticcall(
+            abi.encodeCall(
+                IPrioUpdateRegistry.getState,
+                (_pairKey(tokenIn, tokenOut), uint32(block.timestamp), uint32(block.timestamp))
+            )
+        );
+        if (!ok) return false;
+        (active,,,) = _readState(ret);
+    }
+
+    /// @notice Reads a `getState` answer without trusting its shape.
+    /// @dev Accepts exactly the canonical encoding of `(uint32, uint256[])`: the timestamp word,
+    /// the offset 0x40, the length `n`, then `n` words; anything else is `wellFormed == false`.
+    /// Checked by hand rather than with `abi.decode`, which reverts on a malformed answer, and it
+    /// never reads past `ret`. The assembly only loads from `ret`, hence memory-safe; without that
+    /// annotation the optimizer treats memory conservatively across the whole contract, which
+    /// costs the quote and swap paths several hundred gas.
+    /// @return wellFormed Whether `ret` is a canonical encoding.
+    /// @return n How many slots it carries.
+    /// @return delta Slot 0, or zero when there is none.
+    /// @return mid Slot 1, or zero when there is none.
+    function _readState(bytes memory ret)
+        internal
+        pure
+        returns (bool wellFormed, uint256 n, uint256 delta, uint256 mid)
+    {
+        if (ret.length < 96) return (false, 0, 0, 0);
+        uint256 ts;
+        uint256 offset;
+        assembly ("memory-safe") {
+            ts := mload(add(ret, 0x20))
+            offset := mload(add(ret, 0x40))
+            n := mload(add(ret, 0x60))
         }
+        if (ts > type(uint32).max || offset != 0x40 || n > (ret.length - 96) / 32) return (false, 0, 0, 0);
+        if (n >= 1) {
+            assembly ("memory-safe") {
+                delta := mload(add(ret, 0x80))
+            }
+        }
+        if (n >= 2) {
+            assembly ("memory-safe") {
+                mid := mload(add(ret, 0xa0))
+            }
+        }
+        return (true, n, delta, mid);
     }
 
     /// @inheritdoc IPropAMM

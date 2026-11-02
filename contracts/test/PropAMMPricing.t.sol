@@ -19,6 +19,55 @@ import {IPropAMM} from "../src/interfaces/IPropAMM.sol";
 import {MockPUR} from "./mocks/MockPUR.sol";
 import {MockToken} from "./mocks/MockToken.sol";
 
+// Oracles that are not registries, for `isActive` (audit F-14). The ones that *return* something
+// that is not a `(uint32, uint256[])` used to escape its `try`: the decoder runs in the caller.
+
+/// Code, and every call succeeds with empty return data.
+contract EmptyReturnOracle {
+    fallback() external payable {}
+}
+
+/// Code, and every call returns one word.
+contract OneWordOracle {
+    fallback() external payable {
+        assembly {
+            mstore(0, 1)
+            return(0, 32)
+        }
+    }
+}
+
+/// Code, and every call reverts: the case `try` always caught.
+contract RevertingOracle {
+    fallback() external payable {
+        revert("nope");
+    }
+}
+
+/// 96 bytes whose first word does not fit a uint32: `abi.decode` would revert on it.
+contract HighBitsOracle {
+    fallback() external payable {
+        assembly {
+            mstore(0, not(0))
+            mstore(0x20, 0x40)
+            mstore(0x40, 0)
+            return(0, 0x60)
+        }
+    }
+}
+
+/// Claims two slots but returns only the head: reading them would run past the data.
+contract TruncatedArrayOracle {
+    fallback() external payable {
+        assembly {
+            mstore(0, 1)
+            mstore(0x20, 0x40)
+            mstore(0x40, 2)
+            return(0, 0x60)
+        }
+    }
+}
+
 /// Exercises `quote`/`swap` across pairs that differ in decimals, price and which token sorts
 /// first. Tokens sit at their mainnet addresses so the token0/token1 ordering the lane key and
 /// the quote direction depend on is the real one:
@@ -473,6 +522,43 @@ contract PropAMMPricingTest is Test {
         vm.prank(owner);
         propAmm.unpause();
         assertTrue(propAmm.isActive(WETH, USDT));
+    }
+
+    /// `isActive` is a `bool` probe: whatever sits at the oracle address, it answers `false`
+    /// rather than reverting, or a batch probe over several venues fails whole. Audit F-14.
+    /// Each test swaps the code at `ORACLE`; a plain call is the check, since a revert fails it.
+    function _etchOracle(address shape) internal {
+        vm.etch(ORACLE, shape.code);
+    }
+
+    function test_isActive_falseForAnOracleWithoutCode() public {
+        vm.etch(ORACLE, "");
+        assertFalse(propAmm.isActive(WETH, USDT));
+    }
+
+    function test_isActive_falseForAnEmptyReturnOracle() public {
+        _etchOracle(address(new EmptyReturnOracle()));
+        assertFalse(propAmm.isActive(WETH, USDT));
+    }
+
+    function test_isActive_falseForAOneWordOracle() public {
+        _etchOracle(address(new OneWordOracle()));
+        assertFalse(propAmm.isActive(WETH, USDT));
+    }
+
+    function test_isActive_falseForARevertingOracle() public {
+        _etchOracle(address(new RevertingOracle()));
+        assertFalse(propAmm.isActive(WETH, USDT));
+    }
+
+    function test_isActive_falseForAnUndecodableTimestamp() public {
+        _etchOracle(address(new HighBitsOracle()));
+        assertFalse(propAmm.isActive(WETH, USDT));
+    }
+
+    function test_isActive_falseForATruncatedArray() public {
+        _etchOracle(address(new TruncatedArrayOracle()));
+        assertFalse(propAmm.isActive(WETH, USDT));
     }
 
     function test_pause_onlyOwnerCanFlipIt() public {
