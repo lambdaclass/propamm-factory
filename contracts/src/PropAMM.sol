@@ -144,7 +144,10 @@ contract PropAMM is
     /// @inheritdoc IPropAMM
     /// @dev Never reverts: an oracle without code, a failed call, or an answer that is not a
     /// well-formed `(uint32, uint256[])` all read as inactive. A `try` cannot cover the last case,
-    /// because the decoder runs in this frame, after the call itself has succeeded.
+    /// because the decoder runs in this frame, after the call itself has succeeded. So do slots no
+    /// quote could use (fewer than two, `mid == 0`, `delta >= SPREAD_SCALE`), on which `_pricing`
+    /// and `_amountOut` revert. It still sees nothing of the vault: balance, allowance and token
+    /// transfer restrictions only show in `quote` and `swap`.
     function isActive(address tokenIn, address tokenOut) external view override returns (bool active) {
         if (paused()) return false;
 
@@ -159,7 +162,8 @@ contract PropAMM is
             )
         );
         if (!ok) return false;
-        (active,,,) = _readState(ret);
+        (bool wellFormed, uint256 n, uint256 delta, uint256 mid) = _readState(ret);
+        return wellFormed && n >= 2 && mid != 0 && delta < SPREAD_SCALE;
     }
 
     /// @notice Reads a `getState` answer without trusting its shape.

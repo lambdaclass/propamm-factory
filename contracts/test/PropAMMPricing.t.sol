@@ -561,6 +561,20 @@ contract PropAMMPricingTest is Test {
         assertFalse(propAmm.isActive(WETH, USDT));
     }
 
+    /// Each of these makes every quote revert (InvalidMid, SpreadTooWide, InsufficientOracleData),
+    /// so a probe documented as "a swap would succeed" must not say true.
+    function test_isActive_falseForSlotsNoQuoteCouldUse() public {
+        MockPUR(ORACLE).setState(5e14, 0);
+        assertFalse(propAmm.isActive(WETH, USDT), "mid == 0");
+        MockPUR(ORACLE).setState(1e18, 1e18);
+        assertFalse(propAmm.isActive(WETH, USDT), "delta == SPREAD_SCALE");
+        MockPUR(ORACLE).setState(5e14, 1e18);
+        MockPUR(ORACLE).setSlotCount(1);
+        assertFalse(propAmm.isActive(WETH, USDT), "one slot");
+        MockPUR(ORACLE).setSlotCount(2);
+        assertTrue(propAmm.isActive(WETH, USDT), "well-formed and quotable");
+    }
+
     function test_pause_onlyOwnerCanFlipIt() public {
         vm.prank(trader);
         vm.expectRevert(abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, trader));
