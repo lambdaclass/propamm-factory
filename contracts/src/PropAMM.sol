@@ -27,6 +27,8 @@ error InsufficientVaultBalance(address token, uint256 needed, uint256 available)
 error NoVault(address token0, address token1);
 /// An oracle address with no code, given to `initialize` or `setOracle`.
 error InvalidOracle(address oracle);
+/// A pair token with no code, given to `addPair` or `initialize`.
+error NotAToken(address token);
 
 /// @dev `ERC165Upgradeable` holds no state, so adding it moved no storage slot.
 contract PropAMM is
@@ -411,6 +413,7 @@ contract PropAMM is
     }
 
     /// @notice Adds a token pair, filled from `vault`.
+    /// @dev Reverts `NotAToken` if either token has no code. The vault may be an EOA.
     /// @param tokenX The first token in the pair.
     /// @param tokenY The second token in the pair.
     /// @param vault The account that holds this pair's inventory and has approved this instance.
@@ -423,6 +426,10 @@ contract PropAMM is
     function _addPair(address tokenX, address tokenY, address vault) internal {
         (address token0, address token1) = _sortTokens(tokenX, tokenY);
         require(vault != address(0), NoVault(token0, token1));
+        // The first call a token address otherwise gets is `decimals()` on the quote path, where
+        // a codeless one fails only at decoding: listed, reported active, never quotable.
+        require(token0.code.length > 0, NotAToken(token0));
+        require(token1.code.length > 0, NotAToken(token1));
 
         uint256 pairKey = _keyOf(token0, token1);
         require(pairVaults[pairKey] == address(0), PairAlreadyExists(token0, token1));

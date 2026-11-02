@@ -3,7 +3,7 @@ pragma solidity ^0.8.35;
 
 import {Test} from "forge-std/Test.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
-import {PropAMM, InvalidOracle, NoVault, PairAlreadyExists, UnsupportedPair} from "../src/PropAMM.sol";
+import {PropAMM, InvalidOracle, NoVault, NotAToken, PairAlreadyExists, UnsupportedPair} from "../src/PropAMM.sol";
 import {IPropAMM} from "../src/interfaces/IPropAMM.sol";
 import {MockPUR} from "./mocks/MockPUR.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
@@ -28,6 +28,10 @@ contract PropAMMTest is Test {
         // Same trick as `make local`'s anvil_setCode: a bare test chain has no code at the
         // PUR address under test, so initialize's addUpdater calls would go nowhere.
         vm.etch(ORACLE, address(new MockPUR()).code);
+        // Likewise for the two tokens the pair tests list: `_addPair` refuses a token address
+        // without code.
+        vm.etch(USDC, address(new MockERC20()).code);
+        vm.etch(USDT, address(new MockERC20()).code);
 
         address[] memory updaters = new address[](1);
         updaters[0] = updater;
@@ -131,6 +135,27 @@ contract PropAMMTest is Test {
         vm.expectRevert(abi.encodeWithSelector(PairAlreadyExists.selector, USDC, USDT));
         propAmm.addPair(USDT, USDC, otherVault);
         vm.stopPrank();
+    }
+
+    /// A token address with no code (a typo, another chain's token, zero) would be listed and
+    /// reported active while every quote reverts on `decimals()`, and would trade at the lane's
+    /// price for whatever is deployed there later. Audit F-13.
+    function test_addPair_refusesATokenWithoutCode() public {
+        address ghost = makeAddr("ghost");
+        vm.startPrank(owner);
+        vm.expectRevert(abi.encodeWithSelector(NotAToken.selector, ghost));
+        propAmm.addPair(ghost, USDT, vault);
+        vm.expectRevert(abi.encodeWithSelector(NotAToken.selector, address(0)));
+        propAmm.addPair(address(0), USDT, vault);
+        vm.stopPrank();
+        assertEq(propAmm.getPairs().length, 0);
+    }
+
+    /// The vault is an account, not a token: an EOA that holds inventory is a valid vault.
+    function test_addPair_acceptsAVaultWithoutCode() public {
+        vm.prank(owner);
+        propAmm.addPair(USDC, USDT, makeAddr("eoa-vault"));
+        assertEq(propAmm.getPairs().length, 1);
     }
 
     //------------------------------
