@@ -16,7 +16,7 @@ use eyre::{Result, ensure};
 use crate::{
     backoffice,
     config::{self, ResolvedPair},
-    feed, head, metrics,
+    config_diff, feed, head, metrics,
     pair::{Built, SendOpts, build_live, colliding_label},
     preflight, quoting, record, reload, supervisor, venue, volatile,
 };
@@ -113,6 +113,11 @@ pub(crate) struct Service {
     /// so a shutdown reaches a quoting lane even while this struct is busy inside a reload.
     pub(crate) global: supervisor::Shutdown,
     pub(crate) running: std::collections::BTreeMap<U256, RunningPair>,
+    /// Each lane's stanza as written, the last one applied to it: what a reload diffs the
+    /// file against to say what changed (`config_diff`). Kept beside `running` rather than
+    /// in it because a lane the file halts has one too, which is how a resume is told from
+    /// an add. Unredacted, like the recorder's `Unredacted`, and never printed as it is.
+    pub(crate) stanzas: std::collections::BTreeMap<U256, serde_json::Value>,
     /// Pair tasks still running. Only `--once` reads it — a service exits on its shutdown
     /// signal, not on running out of pairs, because a reload can always bring more back.
     pub(crate) outstanding: usize,
@@ -175,9 +180,43 @@ struct Applied {
     /// Lanes whose feed would not come up. They keep running on their old config (or stay
     /// absent, if they were being added), and this is what says so.
     failed: Vec<String>,
+    /// What changed, per lane that moved or failed and for the builder list: the lines
+    /// the `PusherConfigChanged` alert prints. Not part of `is_empty`, which the lists
+    /// above already decide: every section is about a lane in one of them.
+    sections: Vec<config_diff::Section>,
 }
 
 impl Applied {
+    /// A section that is only a note: a lane removed or halted.
+    fn note(&mut self, label: &str, note: String) {
+        self.sections.push(config_diff::Section {
+            heading: label.to_owned(),
+            notes: vec![note],
+            changes: Vec::new(),
+        });
+    }
+
+    /// The lines the alert prints: the builder list first, as the one change every lane
+    /// took, then the pairs by label.
+    fn rows(&self) -> Vec<config_diff::Row> {
+        let mut sections = self.sections.clone();
+        sections.sort_by(|a, b| {
+            (a.heading != config_diff::BUILDERS, &a.heading)
+                .cmp(&(b.heading != config_diff::BUILDERS, &b.heading))
+        });
+        config_diff::rows(&sections)
+    }
+
+    /// Whether any lane now runs something else: what decides that the alert has a change
+    /// to announce. A reload whose every action failed moved nothing, and
+    /// `PusherConfigReloadPartial` says so on its own.
+    fn moved(&self) -> bool {
+        !(self.added.is_empty()
+            && self.removed.is_empty()
+            && self.halted.is_empty()
+            && self.restarted.is_empty())
+    }
+
     fn is_empty(&self) -> bool {
         self.added.is_empty()
             && self.removed.is_empty()
@@ -626,12 +665,14 @@ impl Service {
         Vec<(config::PairSpec, ResolvedPair)>,
         Vec<(Address, Address)>,
         Vec<config::PairSpec>,
+        std::collections::BTreeMap<U256, serde_json::Value>,
     )> {
-        let config = config::load_config(
+        let (config, raw) = config::load_config_and_raw(
             &self.config_path,
             self.price_decimals,
             self.backoffice_bound,
         )?;
+        let stanzas = config_diff::stanzas_by_lane(&raw);
         // A reload naming an unregistered kind, or a stanza its kind cannot read, changes
         // nothing: refused here, before anything is stopped.
         self.kinds.check(&config)?;
@@ -697,6 +738,7 @@ impl Service {
             specs.into_iter().zip(resolved).collect(),
             vault_pairs,
             halted_in_file,
+            stanzas,
         ))
     }
 
@@ -768,6 +810,12 @@ impl Service {
                         _ => crate::observe::ReloadOutcome::Applied,
                     },
                 });
+                // What changed, for the alert: a partial reload too, since the lanes it
+                // moved did move, and the reload that later fixes the failed one moves
+                // only that one, so this is the one chance to say so.
+                if applied.moved() {
+                    self.reload_metrics.show_changes(result, &applied.rows());
+                }
                 // A partial reload leaves a pair on its old config, so the generation must
                 // not claim the file is live.
                 if result == metrics::Reload::Applied && !applied.is_empty() {
@@ -829,7 +877,7 @@ impl Service {
         &mut self,
         done: &tokio::sync::mpsc::UnboundedSender<(U256, u64)>,
     ) -> Result<Applied> {
-        let (candidate, vault_pairs, halted_in_file) = self.candidate().await?;
+        let (candidate, vault_pairs, halted_in_file, mut stanzas) = self.candidate().await?;
         let specs: Vec<config::PairSpec> = candidate.iter().map(|(spec, _)| spec.clone()).collect();
 
         // Before anything is stopped, and fatal if nothing connects: every lane is about to
@@ -852,9 +900,20 @@ impl Service {
             return Ok(Applied::default());
         }
 
+        let mut applied = Applied::default();
         // Before anything is spawned. Each running pair holds the `Arc` it was built with,
         // which is why they all have to be restarted.
         if let Some(builders) = new_builders {
+            let changes = config_diff::builder_changes(&self.builders.builders, &builders);
+            // Empty for a list that was only reordered, which still restarts every lane.
+            if !changes.is_empty() {
+                tracing::info!("reload: builder list: {}", config_diff::describe(&changes));
+            }
+            applied.sections.push(config_diff::Section {
+                heading: config_diff::BUILDERS.to_owned(),
+                notes: vec!["every pair restarted onto the new list".to_owned()],
+                changes,
+            });
             self.builders = Arc::new(config::BuildersConfig { builders });
         }
 
@@ -914,7 +973,6 @@ impl Service {
         ))
         .await;
 
-        let mut applied = Applied::default();
         for lane in removals {
             let (label, venues, guard_kinds) = self
                 .running
@@ -948,13 +1006,20 @@ impl Service {
                         "reload: [{label}] halted{reason}; its quote was withdrawn at every \
                          builder"
                     );
+                    applied.note(&label, format!("halted{reason}"));
                     applied.halted.push(label);
+                    // Kept, as the file keeps it: a resume is told from an add by it.
+                    if let Some(stanza) = stanzas.remove(&lane) {
+                        self.stanzas.insert(lane, stanza);
+                    }
                 }
                 None => {
                     tracing::info!(
                         "reload: [{label}] removed; its quote was withdrawn at every builder"
                     );
+                    applied.note(&label, "removed".to_owned());
                     applied.removed.push(label);
+                    self.stanzas.remove(&lane);
                 }
             }
         }
@@ -978,6 +1043,14 @@ impl Service {
                         "so it was not started"
                     };
                     tracing::warn!("reload: [{label}] {err:#}; {kept}");
+                    // No settings listed: none of them took. Its stanza is not replaced
+                    // either, so the reload that fixes it lists everything it changes.
+                    let note = if was_running {
+                        "failed: kept its previous settings"
+                    } else {
+                        "failed: not started"
+                    };
+                    applied.note(&label, note.to_owned());
                     applied.failed.push(label);
                     continue;
                 }
@@ -998,12 +1071,55 @@ impl Service {
             if let Some(pair) = self.running.get_mut(&lane) {
                 pair.trip_sources = stopped.trip_sources.clone();
             }
+            // What it ran before, against what it runs now. Replaced only here, once the new
+            // generation is running: a lane whose feed would not come up kept the old
+            // stanza, and its next diff is against that one.
+            let before = self.stanzas.remove(&lane);
+            let stanza = stanzas.remove(&lane).unwrap_or_default();
+            let resumed = !was_running && before.as_ref().is_some_and(config_diff::is_halted);
+            let changes = if was_running || resumed {
+                config_diff::pair_changes(before.as_ref(), &stanza)
+            } else {
+                Vec::new()
+            };
+            self.stanzas.insert(lane, stanza);
+            let detail = if changes.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", config_diff::describe(&changes))
+            };
             if was_running {
-                tracing::info!("reload: [{label}] restarted");
+                tracing::info!("reload: [{label}] restarted{detail}");
                 applied.restarted.push(label.clone());
+            } else if resumed {
+                tracing::info!("reload: [{label}] resumed{detail}");
+                applied.added.push(label.clone());
             } else {
                 tracing::info!("reload: [{label}] added");
                 applied.added.push(label.clone());
+            }
+            // The notes say what restarted it when its settings did not. A lane restarted
+            // only for a new builder list is not listed: the builders section says every
+            // lane was, and listing each one would bury the pairs that did change.
+            let note = if !was_running {
+                Some(if resumed { "resumed" } else { "added" })
+            } else if stopped.halted {
+                Some(if changes.is_empty() {
+                    "re-armed, settings unchanged"
+                } else {
+                    "re-armed"
+                })
+            } else if changes.is_empty() && !builders_changed {
+                Some("restarted")
+            } else {
+                None
+            };
+            if note.is_some() || !changes.is_empty() {
+                applied.sections.push(config_diff::Section {
+                    heading: label.clone(),
+                    notes: note.into_iter().map(str::to_owned).collect(),
+                    changes,
+                });
             }
             if stopped.halted {
                 // Never silent. A reload run for an unrelated edit also re-arms any halted
@@ -1610,6 +1726,7 @@ mod tests {
             registry: Address::zero(),
             global,
             running: std::collections::BTreeMap::new(),
+            stanzas: std::collections::BTreeMap::new(),
             outstanding: 0,
             next_id: 0,
             vault_pairs: tokio::sync::watch::channel(Vec::new()).0,
@@ -2032,6 +2149,39 @@ mod tests {
     /// see — the pairs stay healthy and no other series moves — so it must not be counted as
     /// a clean apply, and it must not advance the generation an operator reads as "the file
     /// I am looking at is live".
+    /// A reload whose every action failed changed nothing, so it has nothing for the
+    /// change alert; one that moved a lane does, whether or not another lane failed.
+    #[test]
+    fn only_a_reload_that_moved_a_lane_has_changes_to_announce() {
+        let failed_only = Applied {
+            failed: vec!["C/D".to_owned()],
+            ..Applied::default()
+        };
+        assert!(!failed_only.moved());
+        let partial = Applied {
+            restarted: vec!["A/B".to_owned()],
+            failed: vec!["C/D".to_owned()],
+            ..Applied::default()
+        };
+        assert!(partial.moved());
+        assert!(!Applied::default().moved());
+    }
+
+    /// The builder list first, as the change every lane took, then the pairs by label,
+    /// whatever order the reload met them in.
+    #[test]
+    fn the_change_lines_list_the_builders_first_then_pairs_by_label() {
+        let mut applied = Applied::default();
+        applied.note("WETH/USDC", "removed".to_owned());
+        applied.note(
+            config_diff::BUILDERS,
+            "every pair restarted onto the new list".to_owned(),
+        );
+        applied.note("DAI/USDC", "failed: kept its previous settings".to_owned());
+        let sections: Vec<String> = applied.rows().into_iter().map(|row| row.section).collect();
+        assert_eq!(sections, ["builders", "DAI/USDC", "WETH/USDC"]);
+    }
+
     #[test]
     fn a_reload_that_could_not_start_every_pair_is_not_counted_as_applied() {
         let clean = Applied {
@@ -2188,6 +2338,7 @@ pricing = { kind = "feed" }
             removed: Vec::new(),
             halted: vec!["I/J".to_owned()],
             failed: vec!["G/H".to_owned()],
+            sections: Vec::new(),
         };
         assert_eq!(
             applied.summary(),

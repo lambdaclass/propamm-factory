@@ -400,12 +400,18 @@ const CREDENTIAL_WORDS: &[&str] = &[
     "jwt",
 ];
 
+/// Whether a key's name says its value is a credential, by [`CREDENTIAL_WORDS`]. Shared
+/// with `config_diff`, which hides the same values from a reload's change lines.
+pub(crate) fn is_credential_name(key: &str) -> bool {
+    let name = key.to_ascii_lowercase();
+    CREDENTIAL_WORDS.iter().any(|word| name.contains(word))
+}
+
 /// Replaces the value of every key (at any depth) whose name suggests a credential, and
 /// scrubs every string left under the other names ([`redact_text`]).
 fn redact_secrets(table: &mut toml::Table) {
     for (key, value) in table.iter_mut() {
-        let name = key.to_ascii_lowercase();
-        if CREDENTIAL_WORDS.iter().any(|word| name.contains(word)) {
+        if is_credential_name(key) {
             *value = toml::Value::String("<redacted>".to_owned());
         } else {
             redact_within(value);
@@ -429,7 +435,7 @@ fn redact_within(value: &mut toml::Value) {
 /// host as `rpc_url` is, since a provider's key rides in the path (`/v2/<key>`), the query
 /// (`?apikey=`) or the userinfo, whatever the scheme. A string with no host (`BINANCE:X`,
 /// an address) is not a URL and stays.
-fn redact_text(text: &mut String) {
+pub(crate) fn redact_text(text: &mut String) {
     let lower = text.trim_start().to_ascii_lowercase();
     if lower.starts_with("bearer ") || lower.starts_with("basic ") {
         *text = "<redacted>".to_owned();

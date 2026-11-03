@@ -223,7 +223,7 @@ pub fn parse_file_settings(toml_text: &str) -> Result<FileSettings> {
 }
 
 /// Same, from a path, so a caller reading the file for its settings reports a missing or
-/// unreadable file the way `load_config` does.
+/// unreadable file the way `load_config_and_raw` does.
 pub fn load_file_settings(path: &Path) -> Result<FileSettings> {
     let text = std::fs::read_to_string(path)
         .wrap_err_with(|| format!("failed to read config {}", path.display()))?;
@@ -952,15 +952,24 @@ pub fn parse_address(s: &str) -> Result<Address> {
     s.parse().map_err(|e| eyre!("invalid address {s:?}: {e:?}"))
 }
 
-pub fn load_config(path: &Path, price_decimals: u32, allow_no_pairs: bool) -> Result<Config> {
+/// The parsed config, and the file as written, from one read of it: the stanzas a reload
+/// diffs (`config_diff`) have to be the ones it applied, not a second read that an edit
+/// could land between.
+pub fn load_config_and_raw(
+    path: &Path,
+    price_decimals: u32,
+    allow_no_pairs: bool,
+) -> Result<(Config, RawConfig)> {
     let text = std::fs::read_to_string(path)
         .wrap_err_with(|| format!("failed to read config {}", path.display()))?;
-    parse_config_with(&text, price_decimals, allow_no_pairs)
-        .wrap_err_with(|| format!("invalid config {}", path.display()))
+    let invalid = || format!("invalid config {}", path.display());
+    let config = parse_config_with(&text, price_decimals, allow_no_pairs).wrap_err_with(invalid)?;
+    let raw = toml::from_str(&text).wrap_err_with(invalid)?;
+    Ok((config, raw))
 }
 
 /// The strict parse: a config with no pairs is a mistake. Used by the tests, which are
-/// where every parse rule is pinned down; the binary goes through `load_config`.
+/// where every parse rule is pinned down; the binary goes through `load_config_and_raw`.
 #[cfg(test)]
 pub fn parse_config(toml_text: &str, price_decimals: u32) -> Result<Config> {
     parse_config_with(toml_text, price_decimals, false)
