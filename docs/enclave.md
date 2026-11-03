@@ -71,8 +71,11 @@ quote-updater --config /run/quote-updater/config.toml --enclave /app/enclave.tom
 3. The config is opened onto `--config`, and the run proceeds as it does anywhere else.
 4. From then on the same link carries every log line to the host, the sealed config to the
    host after every save, and the host's reload and shutdown requests to the run. The link
-   is accepted once: if the boot helper restarts, the run goes on quoting, but a save from
-   then on is refused as not kept, and the enclave needs a restart to be reached again.
+   is accepted once. If the boot helper restarts, or closes its end, the run goes on
+   quoting, and a change made from then on (a halt included) is still applied, but NOT
+   persisted to the host: the operator is told so, on the log and on the backoffice's
+   banner, and the change is lost at the next restart. The enclave needs a restart to be
+   reached again.
 
 ## The enclave file
 
@@ -201,26 +204,59 @@ What `kind = "vsock"` and `kind = "aws-nitro-kms"` need around them.
 
 ### The key policy
 
-`kms:Decrypt` for the instance role, only with an attestation document whose measurements
-match your image, and nothing else the host can reach:
+The whole policy: `kms:Decrypt` for the instance role, only with an attestation document
+whose measurements match your image; encryption for a principal the host never sees; key
+administration for another; and nothing else.
 
 ```json
-[
-  {
-    "Effect": "Allow",
-    "Principal": { "AWS": "arn:aws:iam::<account>:role/<instance role>" },
-    "Action": "kms:Decrypt",
-    "Resource": "*",
-    "Condition": { "StringEqualsIgnoreCase": { "kms:RecipientAttestation:PCR8": "<hash>" } }
-  },
-  {
-    "Effect": "Deny",
-    "Principal": { "AWS": "arn:aws:iam::<account>:role/<instance role>" },
-    "Action": ["kms:Encrypt", "kms:ReEncrypt*", "kms:GenerateDataKey*"],
-    "Resource": "*"
-  }
-]
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Administer the key, never use it",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::<account>:role/<key admin role>" },
+      "Action": [
+        "kms:Create*", "kms:Describe*", "kms:Enable*", "kms:List*", "kms:Put*",
+        "kms:Update*", "kms:Revoke*", "kms:Disable*", "kms:Get*", "kms:Delete*",
+        "kms:TagResource", "kms:UntagResource",
+        "kms:ScheduleKeyDeletion", "kms:CancelKeyDeletion"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "Encrypt the secrets, off the host",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::<account>:role/<secrets encryptor role>" },
+      "Action": "kms:Encrypt",
+      "Resource": "*"
+    },
+    {
+      "Sid": "Release the secrets to the enclave only",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::<account>:role/<instance role>" },
+      "Action": "kms:Decrypt",
+      "Resource": "*",
+      "Condition": { "StringEqualsIgnoreCase": { "kms:RecipientAttestation:PCR8": "<hash>" } }
+    },
+    {
+      "Sid": "The instance role never makes a ciphertext",
+      "Effect": "Deny",
+      "Principal": { "AWS": "arn:aws:iam::<account>:role/<instance role>" },
+      "Action": ["kms:Encrypt", "kms:ReEncrypt*", "kms:GenerateDataKey*"],
+      "Resource": "*"
+    }
+  ]
+}
 ```
+
+There is deliberately no `"Principal": { "AWS": "arn:aws:iam::<account>:root" }` statement
+(the "Enable IAM User Permissions" one the console adds by default). It hands the key to
+IAM: any identity policy in the account could then grant `kms:Decrypt` without the
+attestation condition, to the instance role or to anyone else. Without it, only this policy
+decides, which also means the key admin role is the only way back in: keep it, and the
+encryptor role, out of the host's reach. KMS refuses a policy that would lock out the
+principal setting it, so set it as the key admin role.
 
 The host has the instance role's credentials, and hands them in at boot. Anything they can
 do, the host can do without the enclave:
@@ -230,8 +266,8 @@ do, the host can do without the enclave:
   So no principal the host can reach may encrypt under the key: encrypt the secrets
   elsewhere, with credentials that never touch the host.
 - Decrypt without the attestation condition, and the host decrypts the secrets itself. No
-  other statement, and no IAM policy through the key policy's account statement, may
-  grant `kms:Decrypt` to the role.
+  other statement may grant `kms:Decrypt` to the role, and with no account statement no IAM
+  policy can.
 - Decrypt with any key (`kms:Decrypt` on `*` in the role's IAM policy). The enclave
   names `key_id` on every decrypt, so a ciphertext under the host's own key is refused,
   but keep the role's permissions to this key anyway.
@@ -259,7 +295,11 @@ vsock-proxy 8006 www.googleapis.com 443
 ```
 
 Every tunnelled connection holds file descriptors inside the enclave; the image's
-entrypoint raises the limit to the hard one.
+entrypoint raises the limit to the hard one, and the enclave serves at most 128 backoffice
+connections at once, each given 20 seconds to send a request and dropped after two minutes
+silent. That bounds what one client can hold, not how many there are: whatever accepts the
+backoffice's connections on the host (the proxy in front of its vsock port) should limit
+connections and their rate per source address, so one address cannot take every slot.
 
 ### The image
 
