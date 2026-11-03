@@ -829,14 +829,16 @@ impl<'de> serde::Deserialize<'de> for EnvSecret {
 }
 
 impl EnvSecret {
-    /// The variable this secret is read from.
+    /// The name this secret is read under: an environment variable, or inside an enclave
+    /// one of the secrets the host handed in.
     pub fn name(&self) -> &str {
         &self.env
     }
 
     /// The secret's value, or why there is none. Under systemd the variable comes from the
-    /// unit's `EnvironmentFile`, which a reload does not re-read: a new secret needs a
-    /// restart, as a new updater key does.
+    /// unit's `EnvironmentFile`, and inside an enclave from the secrets handed in at boot;
+    /// neither is re-read by a reload, so a new secret needs a restart, as a new updater key
+    /// does.
     pub fn resolve(&self) -> eyre::Result<String> {
         crate::secrets::lookup(&self.env).ok_or_else(|| {
             eyre::eyre!(

@@ -65,6 +65,10 @@ pub struct Args {
     pub(crate) given: Given,
 }
 
+/// The `--rpc-url` a run uses when neither a flag, a variable nor the file names one. Plain
+/// http, so inside an enclave, where every endpoint must be TLS, it is always refused.
+pub(crate) const DEFAULT_RPC_URL: &str = "http://localhost:8545";
+
 /// Quote one or more asset pairs, streaming each pair's price from Binance and publishing
 /// it as a priority update on its own lane of a single PropAMM. Every pair carries its own
 /// updater key, so their nonces stay independent and each lane lands on its own.
@@ -96,7 +100,7 @@ pub(crate) struct Flags {
     pub(crate) check: bool,
 
     /// JSON-RPC endpoint (an anvil node for local testing)
-    #[arg(long, env = "RPC_URL", default_value = "http://localhost:8545")]
+    #[arg(long, env = "RPC_URL", default_value = DEFAULT_RPC_URL)]
     pub(crate) rpc_url: String,
 
     /// WebSocket JSON-RPC endpoint (ws:// or wss://) for a newHeads subscription; builder
@@ -489,6 +493,24 @@ pub(crate) fn refuse_backoffice_in_node_mode(
     Ok(())
 }
 
+/// Inside an enclave the backoffice is reached through a tunnel the host carries, so it is
+/// served only behind the HTTPS and the login the enclave file's `[backoffice]` sets up.
+/// Without one the page would be the plain, unauthenticated one, and the host could use it
+/// to change the config and the pricing: refused, rather than served.
+pub(crate) fn refuse_open_backoffice_in_enclave(
+    backoffice_addr: Option<&str>,
+    login: bool,
+) -> Result<()> {
+    ensure!(
+        backoffice_addr.is_none() || login,
+        "[settings] backoffice_addr is set, but the enclave file has no [backoffice]: inside \
+         an enclave the page would be served without HTTPS or a login, to the host that \
+         carries its connections. Add [backoffice] to the enclave file (docs/enclave.md), or \
+         drop backoffice_addr."
+    );
+    Ok(())
+}
+
 /// Refuses a pair config that arms a circuit breaker under `--mode node`.
 ///
 /// Kept out of `validate_mode` because the setting is no longer a flag: it lives per pair
@@ -723,6 +745,20 @@ mod tests {
         );
         assert!(err.contains("backoffice_addr"), "{err}");
         assert!(err.contains("--mode builder"), "{err}");
+    }
+
+    /// Inside an enclave the page is reachable by the host; without the login the enclave
+    /// file sets up it would be the open one.
+    #[test]
+    fn an_open_backoffice_inside_an_enclave_is_refused() {
+        refuse_open_backoffice_in_enclave(None, false).expect("no page, nothing to protect");
+        refuse_open_backoffice_in_enclave(Some("127.0.0.1:8088"), true)
+            .expect("with [backoffice] it is served behind the login");
+        let err = format!(
+            "{:#}",
+            refuse_open_backoffice_in_enclave(Some("127.0.0.1:8088"), false).unwrap_err()
+        );
+        assert!(err.contains("[backoffice]"), "{err}");
     }
 
     /// A .env is only a complete configuration if nothing is flag-only, so a new argument

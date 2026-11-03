@@ -36,7 +36,16 @@ pub mod seal;
 #[cfg(target_os = "linux")]
 pub mod vsock;
 
-use std::{collections::BTreeMap, net::SocketAddr, path::Path, pin::Pin, sync::OnceLock};
+use std::{
+    collections::BTreeMap,
+    net::SocketAddr,
+    path::Path,
+    pin::Pin,
+    sync::{
+        Arc, LazyLock, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use base64::Engine;
 use eyre::{Result, WrapErr, ensure, eyre};
@@ -44,10 +53,10 @@ use futures_util::future::BoxFuture;
 use serde::Deserialize;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::mpsc,
+    sync::{mpsc, watch},
 };
 
-use protocol::{Credentials, HostMessage, RunMessage, read_frame, write_frame};
+use protocol::{Credentials, HostMessage, RunMessage, read_body, read_frame, write_frame};
 
 /// The secret the config is sealed under: 32 bytes as hex, released at boot like every
 /// other.
@@ -56,11 +65,14 @@ pub const SEAL_KEY_SECRET: &str = "CONFIG_SEAL_KEY";
 /// How the secrets the host hands in are decrypted: by a key service that releases them
 /// only to this program, as proven by the platform it runs on.
 pub trait SecretRelease: Send + Sync {
-    /// The plaintext of every ciphertext, in the same order.
+    /// The plaintext of every `(name, ciphertext)`, in the same order. The name is handed
+    /// over so the release can hold the key service to it: the host chooses which
+    /// ciphertext it sends under which name, and a ciphertext must open only under the
+    /// name it was made for.
     fn release<'a>(
         &'a self,
         credentials: &'a Credentials,
-        ciphertexts: &'a [Vec<u8>],
+        secrets: &'a [(String, Vec<u8>)],
     ) -> BoxFuture<'a, Result<Vec<Vec<u8>>>>;
 }
 
@@ -112,6 +124,10 @@ pub enum ReleaseKind {
     AwsNitroKms {
         /// The region the KMS key lives in.
         region: String,
+        /// The KMS key's full ARN. Every decrypt names it, so a ciphertext under any other
+        /// key (one the host made itself, in its own account or this one) is refused by
+        /// KMS rather than opened.
+        key_id: String,
         /// Where KMS is reached, when not its public endpoint.
         #[serde(default)]
         endpoint: Option<String>,
@@ -161,7 +177,7 @@ struct RawGoogle {
 }
 
 /// How the backoffice is reached in an enclave: its own HTTPS, and a Google login
-/// checked in the process. See `login.rs`.
+/// checked in the process. See `login/mod.rs`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackofficeSettings {
     /// The secret holding the PEM private key of the certificate the host hands in.
@@ -200,6 +216,26 @@ impl Settings {
     /// Parses the file's text.
     pub fn parse(text: &str) -> Result<Self> {
         let raw: Raw = toml::from_str(text).wrap_err("enclave file")?;
+        match &raw.release {
+            ReleaseKind::AwsNitroKms {
+                key_id, endpoint, ..
+            } => {
+                // An ARN names one key in one account; a bare id or an alias would let the
+                // decrypt resolve to whatever key the name points at when it runs.
+                ensure!(
+                    key_id.starts_with("arn:") && key_id.contains(":key/"),
+                    "[release] key_id must be the KMS key's full ARN \
+                     (arn:aws:kms:<region>:<account>:key/<id>), not an id or an alias"
+                );
+                if let Some(endpoint) = endpoint {
+                    ensure!(
+                        endpoint.to_ascii_lowercase().starts_with("https://"),
+                        "[release] endpoint must be https://: the request carries the \
+                         credentials and the attestation through the host"
+                    );
+                }
+            }
+        }
         let backoffice = match raw.backoffice {
             None => None,
             Some(b) => {
@@ -255,8 +291,13 @@ impl ReleaseKind {
     pub fn build(&self) -> Result<Box<dyn SecretRelease>> {
         match self {
             #[cfg(feature = "aws-nitro")]
-            ReleaseKind::AwsNitroKms { region, endpoint } => Ok(Box::new(aws_nitro::AwsNitroKms {
+            ReleaseKind::AwsNitroKms {
+                region,
+                key_id,
+                endpoint,
+            } => Ok(Box::new(aws_nitro::AwsNitroKms {
                 region: region.clone(),
+                key_id: key_id.clone(),
                 endpoint: endpoint.clone(),
             })),
             #[cfg(not(feature = "aws-nitro"))]
@@ -271,10 +312,36 @@ impl ReleaseKind {
 /// The channel to the host for the rest of the run, set once by [`boot`].
 static HOST: OnceLock<Host> = OnceLock::new();
 
+/// Raised by [`boot`] and never by [`boot_on`] alone: what the checks that hold only inside
+/// an enclave read (the TLS-only rule on a builder or a setting saved later, the Ondo API's
+/// https). Separate from [`HOST`] because the tests drive [`boot_on`] in the same process as
+/// every other test, whose mock endpoints are plain `ws://127.0.0.1`.
+static ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Whether this process booted inside an enclave.
+pub fn active() -> bool {
+    ACTIVE.load(Ordering::Relaxed)
+}
+
+/// Raised when the host asks the run to stop. A value rather than a signal, so the run's own
+/// shutdown path takes it whatever trigger the binary set, and one that arrives before the
+/// run is listening is still there when it looks.
+static SHUTDOWN: LazyLock<watch::Sender<bool>> = LazyLock::new(|| watch::channel(false).0);
+
+/// Resolves once the host has asked the run to stop; never outside an enclave.
+pub async fn shutdown_requested() {
+    let mut asked = SHUTDOWN.subscribe();
+    // Err only if the sender is dropped, which a static never is.
+    let _ = asked.wait_for(|asked| *asked).await;
+}
+
 /// The channel to the host, as the rest of the process uses it.
 pub struct Host {
     out: mpsc::UnboundedSender<Outgoing>,
     seal_key: [u8; seal::KEY_LEN],
+    /// Lowered by the writer the first time a frame fails to reach the host. From then on
+    /// nothing reaches it, so a save that depends on it says so instead of passing.
+    up: Arc<AtomicBool>,
 }
 
 /// What the writer task is asked to do, in order.
@@ -287,18 +354,20 @@ enum Outgoing {
 /// How long [`Host::flush`] waits for the host to take what is queued.
 const FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// The channel to the host, if this run booted in an enclave.
+/// The channel to the host, if this run booted in an enclave. Gated on [`active`] as well, so
+/// a test that drives [`boot_on`] does not route every other test's output and config writes
+/// into its channel.
 pub fn host() -> Option<&'static Host> {
-    HOST.get()
+    if active() { HOST.get() } else { None }
 }
 
 impl Host {
-    /// Sends one log line to the host. Never blocks: the channel is unbounded and the
-    /// writer task drains it.
+    /// Sends one log line to the host, every URL in it cut to its scheme and host (see
+    /// [`scrub_urls`]). Never blocks: the channel is unbounded and the writer task drains it.
     pub fn log(&self, stream: &str, line: &str) {
         let _ = self.out.send(Outgoing::Frame(RunMessage::Log {
             stream: stream.to_owned(),
-            line: line.to_owned(),
+            line: scrub_urls(line),
         }));
     }
 
@@ -311,9 +380,22 @@ impl Host {
         }
     }
 
+    /// Refuses once the link to the host is down: a config saved now would last only as long
+    /// as this run, and the next boot would start from the one before it.
+    pub fn ensure_up(&self) -> Result<()> {
+        ensure!(
+            self.up.load(Ordering::SeqCst),
+            "the link to the host is down, so a config saved now could not be kept: the host \
+             still holds the one before it, and a restart of the enclave would start from \
+             that. Restart the enclave once the host's boot helper is back"
+        );
+        Ok(())
+    }
+
     /// Seals the config at `path` as it now is and sends it to the host to keep. Called
     /// after every write of the config file.
     pub fn config_written(&self, path: &Path) -> Result<()> {
+        self.ensure_up()?;
         let text = std::fs::read(path)
             .wrap_err_with(|| format!("reading {} to seal it", path.display()))?;
         let sealed = seal::seal(&self.seal_key, &text)?;
@@ -340,7 +422,18 @@ pub async fn boot(settings: &Settings, config_path: &Path) -> Result<Booted> {
     let release = settings.release.build()?;
     let link = settings.link.build()?;
     let stream = link.accept().await?;
-    boot_on(config_path, stream, release.as_ref()).await
+    let booted = boot_on(config_path, stream, release.as_ref()).await?;
+    ACTIVE.store(true, Ordering::Relaxed);
+    // A panic's message goes to stderr, which nothing reads in here: send it where the
+    // operator looks, then do what the hook did before.
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some(host) = host() {
+            host.log("stderr", &info.to_string());
+        }
+        previous(info);
+    }));
+    Ok(booted)
 }
 
 /// [`boot`] on an already connected link, with a given release: what the tests drive over
@@ -392,7 +485,7 @@ where
             let _ = write_frame(
                 &mut writer,
                 &RunMessage::Failed {
-                    message: format!("{err:#}"),
+                    message: scrub_urls(&format!("{err:#}")),
                 },
             )
             .await;
@@ -409,17 +502,22 @@ where
     ));
 
     let (out, mut pending) = mpsc::unbounded_channel();
-    HOST.set(Host { out, seal_key })
-        .map_err(|_| eyre!("the channel to the host was set up twice"))?;
+    let up = Arc::new(AtomicBool::new(true));
+    HOST.set(Host {
+        out,
+        seal_key,
+        up: Arc::clone(&up),
+    })
+    .map_err(|_| eyre!("the channel to the host was set up twice"))?;
     tokio::spawn(async move {
-        let mut up = true;
         while let Some(message) = pending.recv().await {
             match message {
-                Outgoing::Frame(frame) if up => {
+                Outgoing::Frame(frame) if up.load(Ordering::SeqCst) => {
                     if let Err(err) = write_frame(&mut writer, &frame).await {
-                        // The host's end is gone; the run goes on without it. Nothing else
-                        // can be done from inside, and quoting does not depend on it.
-                        up = false;
+                        // The host's end is gone, and the link is never accepted again: the
+                        // run goes on without it, quoting does not depend on it, and a save
+                        // from now on says it was not kept (`config_written`).
+                        up.store(false, Ordering::SeqCst);
                         // Not `tracing`: the operator layer would route the line back into
                         // this channel. A debug console is the one place left.
                         #[allow(clippy::print_stderr)]
@@ -437,21 +535,108 @@ where
     });
     tokio::spawn(async move {
         loop {
-            match read_frame::<_, HostMessage>(&mut reader).await {
-                Ok(Some(HostMessage::Reload)) => raise(libc::SIGHUP),
-                Ok(Some(HostMessage::Shutdown)) => raise(libc::SIGINT),
-                Ok(Some(HostMessage::Boot { .. })) => {
-                    tracing::warn!("a second boot message from the host; ignored")
-                }
+            // A frame that arrived whole but does not parse (a kind this build does not know,
+            // from a newer helper) is skipped: the stream is still aligned on the next frame.
+            // Only a broken stream ends the loop.
+            let body = match read_body(&mut reader).await {
+                Ok(Some(body)) => body,
                 Ok(None) => break,
                 Err(err) => {
                     tracing::warn!("the channel to the host is unreadable: {err:#}");
                     break;
                 }
+            };
+            match serde_json::from_slice::<HostMessage>(&body) {
+                Ok(HostMessage::Reload) => raise(libc::SIGHUP),
+                Ok(HostMessage::Shutdown) => {
+                    SHUTDOWN.send_replace(true);
+                }
+                Ok(HostMessage::Boot { .. }) => {
+                    tracing::warn!("a second boot message from the host; ignored")
+                }
+                Err(err) => {
+                    tracing::warn!("a message from the host this run cannot read, ignored: {err}")
+                }
             }
         }
     });
     Ok(booted)
+}
+
+/// `text` with every URL in it cut to its scheme and host, the way the recorder cuts
+/// `rpc_url`: a provider's key rides in the path (`/v2/<key>`), the query or the userinfo,
+/// and an HTTP client's error quotes the whole URL (`... for url (https://...)`). Applied to
+/// everything that crosses to the host, which must not read the config's secrets.
+pub fn scrub_urls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("://") {
+        // The scheme: the letters, digits, `+`, `-` and `.` just before `://`.
+        let scheme_start = rest[..at]
+            .char_indices()
+            .rev()
+            .find(|(_, c)| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+            .map_or(0, |(i, c)| i + c.len_utf8());
+        // The URL runs to whitespace or a quote; a closing bracket or punctuation at its
+        // end is the sentence's, not the URL's, and is kept.
+        let tail = &rest[at + 3..];
+        let end = tail
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '<' | '>'))
+            .unwrap_or(tail.len());
+        let token = &tail[..end];
+        let kept = token.len() - token.trim_end_matches([')', ',', '.', ';', ':']).len();
+        let url = &rest[scheme_start..at + 3 + end - kept];
+        out.push_str(&rest[..scheme_start]);
+        if scheme_start == at {
+            // `://` with no scheme in front of it is not a URL.
+            out.push_str("://");
+            rest = tail;
+            continue;
+        }
+        match url::Url::parse(url) {
+            Ok(parsed) => match (parsed.host_str(), parsed.port()) {
+                (Some(host), Some(port)) => {
+                    out.push_str(&format!("{}://{host}:{port}", parsed.scheme()))
+                }
+                (Some(host), None) => out.push_str(&format!("{}://{host}", parsed.scheme())),
+                (None, _) => out.push_str(&format!("{}://<redacted>", parsed.scheme())),
+            },
+            Err(_) => out.push_str(&format!("{}://<redacted>", &rest[scheme_start..at])),
+        }
+        out.push_str(&token[token.len() - kept..]);
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Every endpoint the settings and builders name, as `(what, url)` for [`require_tls`]: the
+/// one list startup checks and the backoffice checks again before it saves, so the two
+/// cannot disagree about what a run inside an enclave will refuse.
+pub fn named_endpoints(
+    rpc_url: &str,
+    rpc_ws_url: Option<&str>,
+    binance_ws: Option<&str>,
+    endpoints: &BTreeMap<String, String>,
+    builders: &[crate::config::BuilderConfig],
+) -> Vec<(String, String)> {
+    let mut urls = vec![("rpc_url".to_owned(), rpc_url.to_owned())];
+    if let Some(ws) = rpc_ws_url {
+        urls.push(("rpc_ws_url".to_owned(), ws.to_owned()));
+    }
+    if let Some(binance) = binance_ws {
+        urls.push(("binance_ws".to_owned(), binance.to_owned()));
+    }
+    for (venue, url) in endpoints {
+        urls.push((format!("endpoints.{venue}"), url.clone()));
+    }
+    for builder in builders {
+        urls.push((
+            format!("builder {}", builder.name),
+            builder.endpoint.clone(),
+        ));
+    }
+    urls
 }
 
 /// Refuses any endpoint that is not `https://` or `wss://`. In an enclave every
@@ -476,11 +661,11 @@ pub fn require_tls(urls: &[(String, String)]) -> Result<()> {
     Ok(())
 }
 
-/// Sends the process the signal the host asked for, so a reload or a shutdown over the
-/// link goes through exactly the handlers SIGHUP and ctrl-c do.
+/// Sends the process the signal the host asked for, so a reload over the link goes through
+/// exactly the handler SIGHUP does. A shutdown is not a signal: see [`shutdown_requested`].
 fn raise(signal: libc::c_int) {
-    // SAFETY: `raise` takes a signal number and has no other precondition; the handlers for
-    // both are installed by the run.
+    // SAFETY: `raise` takes a signal number and has no other precondition; the boot
+    // registered a listener for SIGHUP, so its default action (ending the process) is off.
     unsafe {
         libc::raise(signal);
     }
@@ -499,10 +684,11 @@ async fn install(
     );
     let names: Vec<String> = ciphertexts.keys().cloned().collect();
     let blobs = ciphertexts
-        .values()
-        .map(|text| {
+        .into_iter()
+        .map(|(name, text)| {
             base64::engine::general_purpose::STANDARD
                 .decode(text.trim())
+                .map(|blob| (name, blob))
                 .map_err(|_| eyre!("a secret's ciphertext is not base64"))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -558,6 +744,8 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::AsyncWriteExt;
+
     use super::*;
 
     const FILE: &str = r#"
@@ -577,12 +765,22 @@ to = "127.0.0.1:9464"
 [release]
 kind = "aws-nitro-kms"
 region = "eu-west-1"
+key_id = "arn:aws:kms:eu-west-1:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab"
 endpoint = "https://127.0.0.1:8443"
 
 [backoffice]
 key_secret = "BACKOFFICE_TLS_KEY"
 google = { client_id = "id.apps.googleusercontent.com", client_secret_secret = "BACKOFFICE_OAUTH_SECRET", redirect_url = "https://quotes.example.com/auth/callback", allowed_domain = "example.com" }
 "#;
+
+    /// The shipped example is a file the parser takes, so the docs that point at it do not
+    /// point at something stale.
+    #[test]
+    fn the_example_enclave_file_parses() {
+        let example = include_str!("../../../deploy/aws-nitro/enclave.example.toml");
+        let settings = Settings::parse(example).unwrap();
+        assert!(settings.backoffice.is_some());
+    }
 
     #[test]
     fn only_tls_endpoints_pass_and_the_refusal_does_not_print_the_url() {
@@ -640,6 +838,14 @@ google = { client_id = "id.apps.googleusercontent.com", client_secret_secret = "
             (FILE.replace("port = 5000\n", ""), "port"),
             (FILE.replace("region = \"eu-west-1\"\n", ""), "region"),
             (
+                FILE.replace("arn:aws:kms:eu-west-1:111122223333:key/", "alias/"),
+                "ARN",
+            ),
+            (
+                FILE.replace("https://127.0.0.1:8443", "http://127.0.0.1:8443"),
+                "endpoint must be https",
+            ),
+            (
                 FILE.replace(", allowed_domain = \"example.com\"", ""),
                 "allowed_domain",
             ),
@@ -663,10 +869,79 @@ google = { client_id = "id.apps.googleusercontent.com", client_secret_secret = "
         fn release<'a>(
             &'a self,
             _credentials: &'a Credentials,
-            ciphertexts: &'a [Vec<u8>],
+            secrets: &'a [(String, Vec<u8>)],
         ) -> BoxFuture<'a, Result<Vec<Vec<u8>>>> {
-            Box::pin(async move { Ok(ciphertexts.to_vec()) })
+            Box::pin(async move { Ok(secrets.iter().map(|(_, blob)| blob.clone()).collect()) })
         }
+    }
+
+    /// A release that records what it was asked to open and opens nothing: the boot's side of
+    /// the binding is that each ciphertext reaches the release under the name the host sent
+    /// it with, for KMS to hold it to (the name is the encryption context).
+    struct RecordingRelease(std::sync::Mutex<Vec<(String, Vec<u8>)>>);
+
+    impl SecretRelease for RecordingRelease {
+        fn release<'a>(
+            &'a self,
+            _credentials: &'a Credentials,
+            secrets: &'a [(String, Vec<u8>)],
+        ) -> BoxFuture<'a, Result<Vec<Vec<u8>>>> {
+            self.0.lock().unwrap().extend_from_slice(secrets);
+            Box::pin(async move { Err(eyre!("InvalidCiphertextException")) })
+        }
+    }
+
+    #[tokio::test]
+    async fn each_ciphertext_reaches_the_release_under_its_own_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let release = RecordingRelease(Default::default());
+        let secrets: BTreeMap<String, String> = [
+            ("UPDATER_KEY_B".to_owned(), b64(b"ct-b")),
+            (SEAL_KEY_SECRET.to_owned(), b64(b"ct-seal")),
+            ("UPDATER_KEY_A".to_owned(), b64(b"ct-a")),
+        ]
+        .into();
+        let err = install(
+            &config_path,
+            &Credentials::default(),
+            secrets,
+            b64(b"sealed"),
+            &release,
+        )
+        .await
+        .unwrap_err();
+        // A refusal from the key service is a refused boot, with nothing written.
+        assert!(format!("{err:#}").contains("InvalidCiphertext"), "{err:#}");
+        assert!(!config_path.exists());
+        assert_eq!(
+            *release.0.lock().unwrap(),
+            [
+                (SEAL_KEY_SECRET.to_owned(), b"ct-seal".to_vec()),
+                ("UPDATER_KEY_A".to_owned(), b"ct-a".to_vec()),
+                ("UPDATER_KEY_B".to_owned(), b"ct-b".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_url_crossing_to_the_host_keeps_its_scheme_and_host_only() {
+        let line = "Error: failed to connect to RPC: reqwest error: error sending request for \
+                    url (https://eth-mainnet.g.alchemy.com/v2/k3yk3yk3y?x=1): connection closed";
+        let scrubbed = scrub_urls(line);
+        assert_eq!(
+            scrubbed,
+            "Error: failed to connect to RPC: reqwest error: error sending request for url \
+             (https://eth-mainnet.g.alchemy.com): connection closed"
+        );
+        assert_eq!(
+            scrub_urls("wss://user:pw@node.example:8546/ws, then postgres://u:p@db:5432/feed."),
+            "wss://node.example:8546, then postgres://db:5432."
+        );
+        // Text with no URL, a bare `://`, and a non-ASCII character before a scheme.
+        assert_eq!(scrub_urls("halted WETH/USDC"), "halted WETH/USDC");
+        assert_eq!(scrub_urls("a :// b"), "a :// b");
+        assert_eq!(scrub_urls("é https://h/k"), "é https://h");
     }
 
     fn b64(bytes: &[u8]) -> String {
@@ -721,37 +996,64 @@ google = { client_id = "id.apps.googleusercontent.com", client_secret_secret = "
             }
         );
 
-        // The channel carries log lines out, and a saved config back, sealed under the key.
-        // It is the process's one channel, so while this test holds it the other tests
-        // running beside it log into it and write configs through it too: wait for ours.
-        let host = host().expect("the boot kept the channel");
-        host.log("stdout", "hello");
-        loop {
-            let frame: RunMessage = read_frame(&mut host_reader).await.unwrap().unwrap();
-            if frame
-                == (RunMessage::Log {
-                    stream: "stdout".into(),
-                    line: "hello".into(),
-                })
-            {
-                break;
+        // The channel carries log lines out, URLs cut to their host, and a saved config back,
+        // sealed under the key. `HOST` directly: `host()` answers only in a process that
+        // booted for real, which a test process never is.
+        let host = HOST.get().expect("the boot kept the channel");
+        host.log("stdout", "hello from https://node.example/v2/key");
+        let frame: RunMessage = read_frame(&mut host_reader).await.unwrap().unwrap();
+        assert_eq!(
+            frame,
+            RunMessage::Log {
+                stream: "stdout".into(),
+                line: "hello from https://node.example".into(),
             }
-        }
+        );
         std::fs::write(&config_path, "[settings]\nrequote_ms = 30\n").unwrap();
         host.config_written(&config_path).unwrap();
-        loop {
-            let frame: RunMessage = read_frame(&mut host_reader).await.unwrap().unwrap();
-            let RunMessage::Config { sealed } = frame else {
-                continue;
-            };
-            let blob = base64::engine::general_purpose::STANDARD
-                .decode(sealed)
-                .unwrap();
-            // Every config is sealed under this channel's key; ours is the one with our text.
-            if seal::open(&seal_key, &blob).unwrap() == b"[settings]\nrequote_ms = 30\n" {
-                break;
+        let frame: RunMessage = read_frame(&mut host_reader).await.unwrap().unwrap();
+        let RunMessage::Config { sealed } = frame else {
+            panic!("expected the sealed config, got {frame:?}");
+        };
+        let blob = base64::engine::general_purpose::STANDARD
+            .decode(sealed)
+            .unwrap();
+        assert_eq!(
+            seal::open(&seal_key, &blob).unwrap(),
+            b"[settings]\nrequote_ms = 30\n"
+        );
+
+        // A frame this build cannot read is skipped, and the next one still arrives: a
+        // reload, delivered as the SIGHUP the boot made safe to raise.
+        let mut hangup =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).unwrap();
+        let unknown = br#"{"kind":"rotate_keys"}"#;
+        host_writer
+            .write_all(&(unknown.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        host_writer.write_all(unknown).await.unwrap();
+        write_frame(&mut host_writer, &HostMessage::Reload)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), hangup.recv())
+            .await
+            .expect("the reload after an unreadable frame was delivered");
+
+        // Once the host's end is gone, a save says it was not kept rather than passing.
+        drop((host_reader, host_writer));
+        let refused = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                host.log("stdout", "is anyone there");
+                if let Err(err) = host.config_written(&config_path) {
+                    break err;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-        }
+        })
+        .await
+        .expect("the writer noticed the link is down");
+        assert!(format!("{refused:#}").contains("link to the host is down"));
     }
 
     #[tokio::test]

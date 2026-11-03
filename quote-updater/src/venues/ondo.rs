@@ -17,7 +17,8 @@ use crate::venue::{Connection, Quote};
 
 pub const DEFAULT_ENDPOINT: &str = "https://api.gm.ondo.finance";
 
-/// The environment variable holding the GM API key.
+/// The name the GM API key is read under: an environment variable, or inside an enclave one
+/// of the secrets handed in.
 pub const API_KEY_VAR: &str = "ONDO_API_KEY";
 
 /// Ondo caches the price for a second, so polling faster buys nothing.

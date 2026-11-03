@@ -167,7 +167,18 @@ pub fn write_raw_atomically(path: &Path, config: &RawConfig) -> Result<()> {
     // A round-trip failure here would leave a file the loader cannot read. Cheap to catch
     // now, expensive at the next reload.
     parse_file_settings(&rendered).wrap_err("the rendered config does not parse back")?;
+    // Inside an enclave a change the host cannot be handed is refused before it is written,
+    // so the file and the host's copy never disagree because of it.
+    if let Some(host) = crate::enclave::host() {
+        host.ensure_up()?;
+    }
+    write_text_atomically(path, &rendered)
+}
 
+/// Writes `text` to `path` the way every config write goes: through a temporary file and a
+/// rename, readable by this process only, and sealed for the host inside an enclave. Also
+/// how a rejected change is put back, so the host's copy follows the revert too.
+pub fn write_text_atomically(path: &Path, text: &str) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let tmp = dir.join(format!(
         ".{}.tmp",
@@ -188,7 +199,7 @@ pub fn write_raw_atomically(path: &Path, config: &RawConfig) -> Result<()> {
         let mut file = options
             .open(&tmp)
             .wrap_err_with(|| format!("failed to open {}", tmp.display()))?;
-        file.write_all(rendered.as_bytes())
+        file.write_all(text.as_bytes())
             .wrap_err_with(|| format!("failed to write {}", tmp.display()))?;
         // Before the rename: otherwise a crash could leave an empty file at the real path.
         file.sync_all()
@@ -1413,8 +1424,14 @@ impl BuildersConfig {
 }
 
 /// Shape only, and deliberately not "there is at least one": whether an empty list is
-/// fatal depends on the mode, which the file does not know.
+/// fatal depends on the mode, which the file does not know. Inside an enclave a builder
+/// must be `wss://` as well: startup, a reload and the backoffice's add all come through
+/// here, so a plaintext builder is refused before it is connected, not at the next start.
 pub fn validate_builders(builders: &[BuilderConfig]) -> Result<()> {
+    validate_builders_in(builders, crate::enclave::active())
+}
+
+fn validate_builders_in(builders: &[BuilderConfig], enclave: bool) -> Result<()> {
     let mut seen = HashSet::new();
     for builder in builders {
         ensure!(
@@ -1437,6 +1454,12 @@ pub fn validate_builders(builders: &[BuilderConfig]) -> Result<()> {
              the scheme must be ws or wss",
             builder.name,
             url.scheme(),
+        );
+        ensure!(
+            !enclave || url.scheme() == "wss",
+            "builder {:?} has a ws:// endpoint; inside an enclave the host carries every \
+             connection, and would read its api_key and its updates: use wss://",
+            builder.name,
         );
         ensure!(
             !builder.api_key.is_empty(),
@@ -2271,6 +2294,25 @@ disable_cross_region = false
             let err = parse_err(&text, 18);
             assert!(err.contains(expected), "{case}: {err}");
         }
+    }
+
+    /// Inside an enclave the host carries the connection, so a plaintext builder would hand
+    /// it the api_key: refused wherever a list is checked, not just at startup.
+    #[test]
+    fn inside_an_enclave_a_builder_must_be_wss() {
+        let builder = |endpoint: &str| BuilderConfig {
+            name: "b".into(),
+            endpoint: endpoint.into(),
+            api_key: "k".into(),
+            disable_cross_region: None,
+        };
+        validate_builders_in(&[builder("ws://127.0.0.1:9000/ws")], false)
+            .expect("outside an enclave a local ws:// builder is fine");
+        validate_builders_in(&[builder("wss://eu.example/ws")], true).unwrap();
+        let err = validate_builders_in(&[builder("ws://eu.example:443/ws")], true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("use wss://"), "{err}");
     }
 
     /// Node mode has no builders and must not be forced to declare any: whether an empty

@@ -1117,8 +1117,10 @@ pub(crate) async fn change_config(
         }
         Err(ReloadFailure::Rejected(err)) => {
             // Put back before the rejection is reported, so by the time it is read the file
-            // already matches what is running again.
-            let restored = std::fs::write(path, &before);
+            // already matches what is running again. Through the same write as the change,
+            // so inside an enclave the host's copy is put back too: it was handed the
+            // rejected one, and would otherwise start the next boot from it.
+            let restored = config::write_text_atomically(path, &before);
             tracing::warn!("{by} {what} REJECTED, reverted: {err}");
             Err(ReloadFailure::Rejected(match restored {
                 Ok(()) => format!(
@@ -1127,8 +1129,9 @@ pub(crate) async fn change_config(
                 ),
                 Err(write_err) => format!(
                     "{what} was rejected ({err}) AND the config file could not be put back \
-                     ({write_err}). The file on disk no longer matches what is running: fix \
-                     it by hand before the next reload."
+                     ({write_err:#}). The file on disk, or inside an enclave the copy the host \
+                     keeps, no longer matches what is running: fix it before the next reload \
+                     or restart."
                 ),
             }))
         }

@@ -6,7 +6,7 @@
 //! address the server inside listens on. TLS runs end to end through both, so the host
 //! carries ciphertext either way.
 
-use std::net::SocketAddr;
+use std::{net::SocketAddr, time::Duration};
 
 use eyre::{Result, WrapErr};
 use futures_util::future::BoxFuture;
@@ -61,7 +61,13 @@ async fn outbound(listen: SocketAddr, cid: u32, port: u32) -> Result<()> {
         .wrap_err_with(|| format!("binding {listen}"))?;
     tracing::info!("tunnel: {listen} to vsock {cid}:{port}");
     loop {
-        let (mut inbound, _) = listener.accept().await?;
+        let mut inbound = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(err) => {
+                accept_failed(&format!("tunnel {listen}"), &err).await;
+                continue;
+            }
+        };
         tokio::spawn(async move {
             match VsockStream::connect(VsockAddr::new(cid, port)).await {
                 Ok(mut outbound) => {
@@ -83,7 +89,13 @@ async fn inbound(port: u32, to: SocketAddr) -> Result<()> {
         .wrap_err_with(|| format!("binding vsock port {port}"))?;
     tracing::info!("tunnel: vsock port {port} to {to}");
     loop {
-        let (mut inbound, _) = listener.accept().await?;
+        let mut inbound = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(err) => {
+                accept_failed(&format!("tunnel vsock {port}"), &err).await;
+                continue;
+            }
+        };
         tokio::spawn(async move {
             match TcpStream::connect(to).await {
                 Ok(mut outbound) => {
@@ -97,4 +109,12 @@ async fn inbound(port: u32, to: SocketAddr) -> Result<()> {
             }
         });
     }
+}
+
+/// A failed accept (out of file descriptors, a connection reset before it was taken) is
+/// that one connection's, not the tunnel's: returning would unbind the tunnel for the rest of
+/// the run. Said, then a pause so a persistent cause does not spin, as `TlsListener` does.
+async fn accept_failed(what: &str, err: &std::io::Error) {
+    tracing::warn!("{what}: accept failed, retrying: {err}");
+    tokio::time::sleep(Duration::from_millis(100)).await;
 }

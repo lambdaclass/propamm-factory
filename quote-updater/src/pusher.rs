@@ -15,8 +15,8 @@ use crate::{
     RUNWAY_CHECK_BLOCKS, backoffice,
     cli::{
         Args, Mode, apply_file_settings, refuse_backoffice_in_node_mode,
-        refuse_breakers_in_node_mode, removed_vars_error, removed_vars_present,
-        should_serve_metrics, validate_mode,
+        refuse_breakers_in_node_mode, refuse_open_backoffice_in_enclave, removed_vars_error,
+        removed_vars_present, should_serve_metrics, validate_mode,
     },
     config, exporter, head, metrics,
     node::push_update,
@@ -76,22 +76,11 @@ pub(crate) async fn run(args: Args, parts: Parts) -> Result<Outcome> {
     let (stop, cancel) = supervisor::shutdown_channel();
     let mut asked = cancel.clone();
     let quoting = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    tokio::select! {
+    let outcome = tokio::select! {
         // The run first, so a step that finished in the same poll as the shutdown is seen
         // to have raised `quoting` before the arm below reads it.
         biased;
-        outcome = async {
-            let outcome = run_inner(args, parts, (stop, cancel), Arc::clone(&quoting)).await;
-            // Inside an enclave nothing reads the process's stderr: the error that ends the
-            // run goes to the host before the process exits, or nobody sees it.
-            if let Some(host) = crate::enclave::host() {
-                if let Err(err) = &outcome {
-                    host.log("stderr", &format!("Error: {err:#}"));
-                }
-                host.flush().await;
-            }
-            outcome
-        } => outcome,
+        outcome = run_inner(args, parts, (stop, cancel), Arc::clone(&quoting)) => outcome,
         () = async {
             asked.wait().await;
             if quoting.load(std::sync::atomic::Ordering::SeqCst) {
@@ -103,7 +92,16 @@ pub(crate) async fn run(args: Args, parts: Parts) -> Result<Outcome> {
             Some(what) => Err(eyre!("shut down during startup, before {what} finished")),
             None => Ok(Outcome::Success),
         },
+    };
+    // Inside an enclave nothing reads the process's stderr: the error that ends the run, by
+    // either arm, goes to the host before the process exits, or nobody sees it.
+    if let Some(host) = crate::enclave::host() {
+        if let Err(err) = &outcome {
+            host.log("stderr", &format!("Error: {err:#}"));
+        }
+        host.flush().await;
     }
+    outcome
 }
 
 /// [`run`], minus the startup race: `shutdown_channel` is the one the race watches, and
@@ -130,7 +128,11 @@ async fn run_inner(
         unit,
     } = parts;
     // Before anything prints a hint: the unit is a fact about the process (see hints.rs).
-    if let Some(unit) = unit {
+    // Not inside an enclave, which no systemd unit on this side reaches: the hints there say
+    // to restart the process, which is the enclave.
+    if let Some(unit) = unit
+        && args.flags.enclave.is_none()
+    {
         crate::hints::set_unit(unit);
     }
     let kinds = Arc::new(kinds);
@@ -186,6 +188,12 @@ async fn run_inner(
         args.flags.builders.is_some(),
     )?;
     refuse_backoffice_in_node_mode(args.flags.mode, file_settings.backoffice_addr.as_deref())?;
+    if let Some((settings, _)) = &enclave {
+        refuse_open_backoffice_in_enclave(
+            file_settings.backoffice_addr.as_deref(),
+            settings.backoffice.is_some(),
+        )?;
+    }
 
     // Loaded before anything connects, though nothing here needs the chain: the file is
     // local, cheap and deterministic, while the RPC calls below are slow and can fail
@@ -239,27 +247,18 @@ async fn run_inner(
     let target = config.target;
 
     // Inside an enclave every connection is carried by the host, which reads and changes
-    // whatever is not under TLS opened from in here.
+    // whatever is not under TLS opened from in here. The backoffice, a reload and the Ondo
+    // issuer's `api` hold to the same rule (see `enclave::active`).
     if enclave.is_some() {
-        let mut urls: Vec<(String, String)> = vec![("rpc_url".into(), args.flags.rpc_url.clone())];
-        if let Some(ws) = &args.flags.rpc_ws_url {
-            urls.push(("rpc_ws_url".into(), ws.clone()));
-        }
-        if let Some(binance) = binance_ws {
-            urls.push(("binance_ws".into(), binance.to_owned()));
-        }
-        for (venue, url) in &file_settings.endpoints {
-            urls.push((format!("endpoints.{venue}"), url.clone()));
-        }
-        if let Some((_, list)) = &builders {
-            for builder in &list.builders {
-                urls.push((
-                    format!("builder {}", builder.name),
-                    builder.endpoint.clone(),
-                ));
-            }
-        }
-        crate::enclave::require_tls(&urls)?;
+        crate::enclave::require_tls(&crate::enclave::named_endpoints(
+            &args.flags.rpc_url,
+            args.flags.rpc_ws_url.as_deref(),
+            binance_ws,
+            &file_settings.endpoints,
+            builders
+                .as_ref()
+                .map_or(&[][..], |(_, list)| &list.builders[..]),
+        ))?;
     }
 
     // One ctrl-c listener for the whole process, raised into a value every pair observes
@@ -270,12 +269,19 @@ async fn run_inner(
     let (stop, mut cancel) = shutdown_channel;
     tasks.spawn(async move {
         // A binary's own trigger, if it set one, takes the same path as ctrl-c.
+        // So does the host's request to stop, inside an enclave, whichever the binary chose.
         let signal = match shutdown {
             Some(signal) => {
-                signal.await;
+                tokio::select! {
+                    () = signal => {}
+                    () = crate::enclave::shutdown_requested() => {}
+                }
                 Ok(())
             }
-            None => tokio::signal::ctrl_c().await,
+            None => tokio::select! {
+                signal = tokio::signal::ctrl_c() => signal,
+                () = crate::enclave::shutdown_requested() => Ok(()),
+            },
         };
         match signal {
             Ok(()) => {

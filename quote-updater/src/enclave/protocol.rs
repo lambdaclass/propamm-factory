@@ -113,6 +113,19 @@ where
     R: AsyncRead + Unpin,
     T: for<'de> Deserialize<'de>,
 {
+    match read_body(reader).await? {
+        Some(body) => Ok(Some(serde_json::from_slice(&body)?)),
+        None => Ok(None),
+    }
+}
+
+/// Reads one frame's JSON without parsing it, so a reader can tell a stream that broke
+/// (an error here) from a frame it does not understand (an error parsing what this returns),
+/// after which the stream is still aligned on the next frame.
+pub async fn read_body<R>(reader: &mut R) -> Result<Option<Vec<u8>>>
+where
+    R: AsyncRead + Unpin,
+{
     let mut len = [0u8; 4];
     match reader.read_exact(&mut len).await {
         Ok(_) => {}
@@ -126,7 +139,7 @@ where
     );
     let mut body = vec![0u8; len];
     reader.read_exact(&mut body).await?;
-    Ok(Some(serde_json::from_slice(&body)?))
+    Ok(Some(body))
 }
 
 #[cfg(test)]

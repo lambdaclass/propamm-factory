@@ -26,11 +26,17 @@ use sha2::Sha256;
 
 use super::{SecretRelease, protocol::Credentials};
 
+/// The encryption-context key every secret is encrypted and decrypted under, its value the
+/// secret's name.
+pub const ENCRYPTION_CONTEXT_KEY: &str = "secret";
+
 /// AWS KMS against this enclave's attestation. The boot message's credentials are an AWS
 /// role's: `access_key_id`, `secret_access_key` and, for temporary ones, `session_token`.
 pub struct AwsNitroKms {
     /// The region the KMS key lives in.
     pub region: String,
+    /// The key every secret must be under, as an ARN.
+    pub key_id: String,
     /// Where KMS is reached, when not its public endpoint.
     pub endpoint: Option<String>,
 }
@@ -39,18 +45,23 @@ impl SecretRelease for AwsNitroKms {
     fn release<'a>(
         &'a self,
         credentials: &'a Credentials,
-        ciphertexts: &'a [Vec<u8>],
+        secrets: &'a [(String, Vec<u8>)],
     ) -> BoxFuture<'a, Result<Vec<Vec<u8>>>> {
-        Box::pin(decrypt_all(self, credentials, ciphertexts))
+        Box::pin(decrypt_all(self, credentials, secrets))
     }
 }
 
 /// The plaintext of every ciphertext, in order, decrypted by KMS against this enclave's
 /// attestation.
+///
+/// Each decrypt names the key and carries the secret's name as its encryption context
+/// (`secret = <name>`), which the ciphertext was made with (`aws kms encrypt
+/// --encryption-context secret=<name>`). KMS refuses anything else: a ciphertext under a
+/// key the host made, and one the host relabelled to stand in for another secret.
 async fn decrypt_all(
     kms: &AwsNitroKms,
     credentials: &Credentials,
-    ciphertexts: &[Vec<u8>],
+    secrets: &[(String, Vec<u8>)],
 ) -> Result<Vec<Vec<u8>>> {
     let rsa = RsaPrivateKey::new(&mut rand::thread_rng(), 2048)
         .wrap_err("generating the recipient key")?;
@@ -77,10 +88,12 @@ async fn decrypt_all(
     }
     let client = Client::from_conf(config.build());
 
-    let mut plaintexts = Vec::with_capacity(ciphertexts.len());
-    for (index, ciphertext) in ciphertexts.iter().enumerate() {
+    let mut plaintexts = Vec::with_capacity(secrets.len());
+    for (name, ciphertext) in secrets {
         let output = client
             .decrypt()
+            .key_id(&kms.key_id)
+            .encryption_context(ENCRYPTION_CONTEXT_KEY, name)
             .ciphertext_blob(Blob::new(ciphertext.clone()))
             .recipient(
                 RecipientInfo::builder()
@@ -90,13 +103,13 @@ async fn decrypt_all(
             )
             .send()
             .await
-            .map_err(|err| eyre!("KMS Decrypt of secret #{}: {err}", index + 1))?;
+            .map_err(|err| eyre!("KMS Decrypt of secret {name}: {err}"))?;
         let envelope = output
             .ciphertext_for_recipient()
             .ok_or_else(|| eyre!("KMS answered without a ciphertext for the recipient"))?;
         plaintexts.push(
             unwrap_envelope(envelope.as_ref(), &rsa)
-                .wrap_err_with(|| format!("opening the envelope of secret #{}", index + 1))?,
+                .wrap_err_with(|| format!("opening the envelope of secret {name}"))?,
         );
     }
     Ok(plaintexts)

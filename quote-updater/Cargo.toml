@@ -77,8 +77,9 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry", "std"] }
 
 # Running inside an enclave (enclave/): the config is sealed with AES-256-GCM before it
-# leaves the process, frames on the link are base64 JSON, and a request from the host to
-# reload or stop is delivered as the signal it stands for. All three already in Cargo.lock.
+# leaves the process, frames on the link are length-prefixed JSON with base64 fields, and a
+# request from the host to reload is delivered as the SIGHUP it stands for. All three
+# already in Cargo.lock.
 aes-gcm = "0.10"
 base64 = "0.22"
 libc = "0.2"

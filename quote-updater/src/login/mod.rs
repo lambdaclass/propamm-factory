@@ -13,7 +13,9 @@
 
 use std::{
     net::SocketAddr,
+    pin::Pin,
     sync::Arc,
+    task::{Context, Poll},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -32,17 +34,20 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation, jwk::JwkSet};
 use serde::Deserialize;
 use sha2::Sha256;
 use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream},
-    sync::{RwLock, mpsc},
+    sync::{OwnedSemaphorePermit, RwLock, Semaphore, mpsc},
+    time::Sleep,
 };
 use tokio_rustls::{TlsAcceptor, rustls, server::TlsStream};
 
 use crate::enclave::BackofficeSettings;
 
-/// The session cookie.
-const SESSION_COOKIE: &str = "qu_session";
+/// The session cookie. `__Host-`: the browser takes it only from this exact origin over
+/// HTTPS, so a sibling subdomain cannot plant or overwrite one.
+const SESSION_COOKIE: &str = "__Host-qu_session";
 /// The cookie carrying a login in progress: its `state` and `nonce`.
-const LOGIN_COOKIE: &str = "qu_login";
+const LOGIN_COOKIE: &str = "__Host-qu_login";
 /// How long a session lasts before the login is asked again.
 const SESSION_LIFETIME: Duration = Duration::from_secs(12 * 60 * 60);
 /// How long a login may take between leaving for Google and coming back.
@@ -56,6 +61,14 @@ const GOOGLE_ISSUERS: [&str; 2] = ["https://accounts.google.com", "accounts.goog
 const KEYS_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 /// How long a TLS handshake may take before the connection is dropped.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a connection may go without a byte in either direction before it is dropped.
+/// The server applies no read timeout of its own, so without this a client that completes
+/// the handshake and then says nothing holds its connection for ever.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// The most connections served at once, handshakes included. Past it new ones wait in the
+/// kernel's queue: the backoffice has a handful of users, and an enclave has a fixed number
+/// of file descriptors that the run's own connections need too.
+const MAX_CONNECTIONS: usize = 128;
 
 /// The backoffice's TLS and login, built once at startup.
 pub struct Secure {
@@ -130,6 +143,8 @@ pub struct Login {
     client_id: String,
     client_secret: String,
     redirect_url: String,
+    /// `redirect_url`'s origin (`https://host[:port]`): the only one a change may come from.
+    origin: String,
     allow: Allow,
     session_key: [u8; 32],
     http: reqwest::Client,
@@ -138,10 +153,13 @@ pub struct Login {
 
 impl Login {
     fn new(settings: &BackofficeSettings, client_secret: String) -> Result<Self> {
+        let redirect = url::Url::parse(&settings.redirect_url)
+            .wrap_err("[backoffice.google] redirect_url is not a URL")?;
         Ok(Self {
             client_id: settings.client_id.clone(),
             client_secret,
             redirect_url: settings.redirect_url.clone(),
+            origin: redirect.origin().ascii_serialization(),
             allow: Allow {
                 domain: settings.allowed_domain.clone(),
                 accounts: settings.allowed_accounts.clone(),
@@ -327,25 +345,74 @@ fn set_cookie(name: &str, value: &str, max_age: Duration) -> HeaderValue {
     .expect("cookie values are base64 and digits")
 }
 
+/// The account a request was let through for, as [`require`] leaves it on the request:
+/// what the backoffice logs a change against, since every peer inside an enclave is the
+/// tunnel's loopback address.
+#[derive(Clone, Debug)]
+pub struct Account(pub String);
+
 /// Lets a request through with a valid session; otherwise sends a page load to the login
-/// and refuses anything else. Every change made through the page is logged with who made it.
-pub async fn require(State(login): State<Arc<Login>>, request: Request, next: Next) -> Response {
+/// and refuses anything else. A change (anything but GET and HEAD) must also come from this
+/// page's own origin: the session cookie is `SameSite=Lax`, which a browser that does not
+/// count the scheme as part of the site would still send with a form posted from
+/// `http://` at the same name, which whoever controls the host can serve.
+pub async fn require(
+    State(login): State<Arc<Login>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
     let email = cookie(request.headers(), SESSION_COOKIE)
         .and_then(|value| session_email(&login.session_key, value, unix_now()));
+    let change = request.method() != Method::GET && request.method() != Method::HEAD;
     match email {
         Some(email) => {
-            if request.method() != Method::GET && request.method() != Method::HEAD {
-                tracing::info!(
-                    "backoffice: {email} {} {}",
+            if change && !same_origin(request.headers(), &login.origin) {
+                tracing::warn!(
+                    "backoffice: {email} {} {} refused: not from this page's origin",
                     request.method(),
                     request.uri().path()
                 );
+                return (StatusCode::FORBIDDEN, "a change must come from this page")
+                    .into_response();
             }
+            request.extensions_mut().insert(Account(email));
             next.run(request).await
         }
         None if request.method() == Method::GET => Redirect::to("/auth/login").into_response(),
         None => (StatusCode::UNAUTHORIZED, "log in first: /auth/login").into_response(),
     }
+}
+
+/// Whether a request says it came from `origin`, scheme included: its `Origin` header, which
+/// every current browser sends on a form post, or failing that `Sec-Fetch-Site`.
+fn same_origin(headers: &HeaderMap, origin: &str) -> bool {
+    match headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(sent) => sent.eq_ignore_ascii_case(origin),
+        None => headers
+            .get("sec-fetch-site")
+            .is_some_and(|value| value == "same-origin"),
+    }
+}
+
+/// The headers every response of the HTTPS backoffice carries: stay on HTTPS for this name
+/// (so a later `http://` link is never followed to whatever the host serves there), and
+/// never be framed by another page.
+pub async fn harden(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::STRICT_TRANSPORT_SECURITY,
+        HeaderValue::from_static("max-age=31536000"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    response
 }
 
 /// The login's own routes, outside [`require`].
@@ -407,7 +474,9 @@ async fn callback(
             response
         }
         Err(reason) => {
-            tracing::warn!("backoffice: login refused: {reason}");
+            // Debug-formatted: `reason` can carry text from the query string, and a newline
+            // in it must not start a line of its own in the log.
+            tracing::warn!("backoffice: login refused: {reason:?}");
             (StatusCode::FORBIDDEN, format!("login refused: {reason}")).into_response()
         }
     }
@@ -420,7 +489,9 @@ async fn finish(
     answer: Callback,
 ) -> std::result::Result<String, String> {
     if let Some(error) = answer.error {
-        return Err(format!("Google answered {error}"));
+        // Anyone can send this: kept short, and quoted rather than echoed as it came.
+        let error: String = error.chars().take(64).collect();
+        return Err(format!("Google answered {error:?}"));
     }
     let pending = cookie(headers, LOGIN_COOKIE)
         .and_then(|value| open(&login.session_key, "login", value))
@@ -487,8 +558,9 @@ pub fn tls_config(certificate: &[u8], key: &[u8]) -> Result<Arc<rustls::ServerCo
 
 /// A TCP listener whose connections are handed on once their TLS handshake completes.
 /// Handshakes run on their own tasks, so one slow or stalled client holds up nobody else.
+/// At most [`MAX_CONNECTIONS`] at once, each dropped after [`IDLE_TIMEOUT`] of silence.
 pub struct TlsListener {
-    ready: mpsc::Receiver<(TlsStream<TcpStream>, SocketAddr)>,
+    ready: mpsc::Receiver<(Guarded<TlsStream<TcpStream>>, SocketAddr)>,
     local: SocketAddr,
 }
 
@@ -498,8 +570,13 @@ impl TlsListener {
         let local = tcp.local_addr().wrap_err("listener address")?;
         let acceptor = TlsAcceptor::from(config);
         let (tx, ready) = mpsc::channel(16);
+        let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
         tokio::spawn(async move {
             loop {
+                // Taken before the accept, so a connection past the bound costs nothing here.
+                let Ok(slot) = Arc::clone(&slots).acquire_owned().await else {
+                    return;
+                };
                 let (stream, peer) = match tcp.accept().await {
                     Ok(accepted) => accepted,
                     Err(err) => {
@@ -515,7 +592,7 @@ impl TlsListener {
                 tokio::spawn(async move {
                     match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
                         Ok(Ok(tls)) => {
-                            let _ = tx.send((tls, peer)).await;
+                            let _ = tx.send((Guarded::new(tls, slot), peer)).await;
                         }
                         Ok(Err(err)) => tracing::debug!("backoffice TLS from {peer}: {err}"),
                         Err(_) => tracing::debug!("backoffice TLS from {peer}: timed out"),
@@ -528,7 +605,7 @@ impl TlsListener {
 }
 
 impl axum::serve::Listener for TlsListener {
-    type Io = TlsStream<TcpStream>;
+    type Io = Guarded<TlsStream<TcpStream>>;
     type Addr = SocketAddr;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
@@ -541,6 +618,84 @@ impl axum::serve::Listener for TlsListener {
 
     fn local_addr(&self) -> std::io::Result<Self::Addr> {
         Ok(self.local)
+    }
+}
+
+/// A served connection that holds its slot under [`MAX_CONNECTIONS`] for as long as it lives,
+/// and fails once neither side has moved a byte for [`IDLE_TIMEOUT`].
+pub struct Guarded<S> {
+    inner: S,
+    idle: Pin<Box<Sleep>>,
+    _slot: OwnedSemaphorePermit,
+}
+
+impl<S> Guarded<S> {
+    fn new(inner: S, slot: OwnedSemaphorePermit) -> Self {
+        Self {
+            inner,
+            idle: Box::pin(tokio::time::sleep(IDLE_TIMEOUT)),
+            _slot: slot,
+        }
+    }
+
+    /// Called on every bit of progress: the connection is in use.
+    fn touch(&mut self) {
+        self.idle
+            .as_mut()
+            .reset(tokio::time::Instant::now() + IDLE_TIMEOUT);
+    }
+
+    /// While the inner stream is waiting: whether it has waited too long.
+    fn expired(&mut self, cx: &mut Context<'_>) -> bool {
+        self.idle.as_mut().poll(cx).is_ready()
+    }
+}
+
+fn idle_error() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::TimedOut, "backoffice connection idle")
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Guarded<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = &mut *self;
+        match Pin::new(&mut this.inner).poll_read(cx, buf) {
+            Poll::Ready(result) => {
+                this.touch();
+                Poll::Ready(result)
+            }
+            Poll::Pending if this.expired(cx) => Poll::Ready(Err(idle_error())),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Guarded<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = &mut *self;
+        match Pin::new(&mut this.inner).poll_write(cx, buf) {
+            Poll::Ready(result) => {
+                this.touch();
+                Poll::Ready(result)
+            }
+            Poll::Pending if this.expired(cx) => Poll::Ready(Err(idle_error())),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
@@ -653,9 +808,12 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.append(
             header::COOKIE,
-            HeaderValue::from_static("a=1; qu_session=xyz"),
+            HeaderValue::from_static("a=1; __Host-qu_session=xyz"),
         );
-        headers.append(header::COOKIE, HeaderValue::from_static("qu_login=abc"));
+        headers.append(
+            header::COOKIE,
+            HeaderValue::from_static("__Host-qu_login=abc"),
+        );
         assert_eq!(cookie(&headers, SESSION_COOKIE), Some("xyz"));
         assert_eq!(cookie(&headers, LOGIN_COOKIE), Some("abc"));
         assert_eq!(cookie(&headers, "qu"), None);
@@ -669,6 +827,7 @@ mod tests {
             client_id: CLIENT.into(),
             client_secret: "unused".into(),
             redirect_url: "https://localhost/auth/callback".into(),
+            origin: "https://localhost".into(),
             allow,
             session_key: [9u8; 32],
             http: reqwest::Client::new(),
@@ -698,7 +857,8 @@ mod tests {
                 Arc::clone(&login),
                 require,
             ))
-            .merge(routes(Arc::clone(&login)));
+            .merge(routes(Arc::clone(&login)))
+            .layer(axum::middleware::from_fn(harden));
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let listener = TlsListener::spawn(tcp, tls).unwrap();
         let addr = axum::serve::Listener::local_addr(&listener).unwrap();
@@ -720,6 +880,14 @@ mod tests {
         let page = client.get(client_at("/")).send().await.unwrap();
         assert_eq!(page.status(), StatusCode::SEE_OTHER);
         assert_eq!(page.headers()[header::LOCATION], "/auth/login");
+        assert!(
+            page.headers()
+                .contains_key(header::STRICT_TRANSPORT_SECURITY)
+        );
+        assert_eq!(
+            page.headers()[header::CONTENT_SECURITY_POLICY],
+            "frame-ancestors 'none'"
+        );
 
         let start = client.get(client_at("/auth/login")).send().await.unwrap();
         assert_eq!(start.status(), StatusCode::SEE_OTHER);
@@ -734,7 +902,7 @@ mod tests {
         );
         let set = start.headers()[header::SET_COOKIE].to_str().unwrap();
         assert!(
-            set.starts_with("qu_login=") && set.contains("Secure"),
+            set.starts_with("__Host-qu_login=") && set.contains("Secure"),
             "{set}"
         );
 
@@ -742,30 +910,66 @@ mod tests {
         assert_eq!(change.status(), StatusCode::UNAUTHORIZED);
 
         let session = session_value(&login.session_key, "ops@example.com", unix_now() + 60);
+        let cookie = format!("{SESSION_COOKIE}={session}");
         let page = client
             .get(client_at("/"))
-            .header(header::COOKIE, format!("qu_session={session}"))
+            .header(header::COOKIE, &cookie)
             .send()
             .await
             .unwrap();
         assert_eq!(page.status(), StatusCode::OK);
         assert_eq!(page.text().await.unwrap(), "the page");
-        let change = client
-            .post(client_at("/pairs/halt"))
-            .header(header::COOKIE, format!("qu_session={session}"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(change.status(), StatusCode::OK);
+        // A change with the session goes through from the page's own origin only: not from
+        // the same name over http, and not with no origin at all.
+        for (origin, expected) in [
+            (Some("https://localhost"), StatusCode::OK),
+            (Some("http://localhost"), StatusCode::FORBIDDEN),
+            (Some("https://evil.example"), StatusCode::FORBIDDEN),
+            (None, StatusCode::FORBIDDEN),
+        ] {
+            let mut request = client
+                .post(client_at("/pairs/halt"))
+                .header(header::COOKIE, &cookie);
+            if let Some(origin) = origin {
+                request = request.header(header::ORIGIN, origin);
+            }
+            let change = request.send().await.unwrap();
+            assert_eq!(change.status(), expected, "{origin:?}");
+        }
 
-        // A callback with no login in progress in this browser is refused.
+        // A callback with no login in progress in this browser is refused, and Google's
+        // error, which anyone can put in the query, comes back quoted on one line.
         let stray = client
             .get(client_at("/auth/callback?code=x&state=y"))
             .send()
             .await
             .unwrap();
         assert_eq!(stray.status(), StatusCode::FORBIDDEN);
+        let forged = client
+            .get(client_at(
+                "/auth/callback?error=x%0Aops%40example.com%20logged%20in",
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(forged.status(), StatusCode::FORBIDDEN);
+        assert!(!forged.text().await.unwrap().contains('\n'));
         server.abort();
+    }
+
+    /// A client that completes the handshake and then says nothing is dropped, and its slot
+    /// under the connection bound comes back with it.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_connection_is_dropped_and_frees_its_slot() {
+        use tokio::io::AsyncReadExt;
+        let slots = Arc::new(Semaphore::new(1));
+        let (_client, server) = tokio::io::duplex(64);
+        let mut served = Guarded::new(server, Arc::clone(&slots).acquire_owned().await.unwrap());
+        assert_eq!(slots.available_permits(), 0);
+        let err = served.read(&mut [0u8; 1]).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        drop(served);
+        assert_eq!(slots.available_permits(), 1);
     }
 
     #[test]
