@@ -44,6 +44,13 @@ The vault must hold the tokens and have approved the PropAMM to spend both of th
 PropAMM address does not exist until the call, so either approve it right after creating,
 or compute it beforehand with the factory's `computeAddress` (same arguments).
 
+Swaps are push payment: the router transfers the input to the PropAMM and calls `swap` in the
+same transaction. Never send tokens to a PropAMM any other way; whatever sits on it can be
+swapped by anyone. USDT carries a transfer fee Tether can switch on (currently 0). If it does,
+every USDT-in swap reverts and USDT-out swaps revert when the fee takes them below the caller's
+minimum: the pair stops trading rather than mispricing. Watch for it (the router's swaps on the
+pair start failing) and pause or remove the pair.
+
 So for a WETH/USDC pair on mainnet:
 
 ```bash

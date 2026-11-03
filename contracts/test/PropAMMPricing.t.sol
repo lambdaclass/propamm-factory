@@ -676,6 +676,43 @@ contract PropAMMPricingTest is Test {
         assertEq(fot.balanceOf(trader), delivered);
     }
 
+    /// Push payment cannot tell a payment from a stray transfer: tokens left on the instance can be
+    /// swapped by anyone. The vault is still paid in full; the loss is the sender's. Audit F-09.
+    function test_swap_aStrayBalanceIsSwappableByAnyone() public {
+        _setPrice(1600e18, 5e14);
+        _fundVault(USDT, 1_600_000e6);
+        MockToken(WETH).mint(address(propAmm), 1e18); // left behind, not paid for this swap
+        address stranger = makeAddr("stranger");
+        vm.prank(stranger);
+        uint256 out = propAmm.swap(WETH, USDT, 1e18, 0, stranger, block.timestamp);
+        assertGt(out, 0);
+        assertEq(MockToken(USDT).balanceOf(stranger), out, "the stranger was paid");
+        assertEq(MockToken(WETH).balanceOf(vault), 1e18, "the vault received the stray");
+    }
+
+    /// A fee-on-transfer tokenIn (USDT with its fee switch on) is not supported: the instance holds
+    /// less than amountIn and the swap reverts, so the vault never sells below the price. Audit F-09.
+    function test_swap_feeOnTransferTokenInReverts() public {
+        FeeOnTransferToken fot = new FeeOnTransferToken(18);
+        PropAMM.PairConfig[] memory pairs = new PropAMM.PairConfig[](1);
+        pairs[0] = PropAMM.PairConfig({token0: address(fot), token1: WETH, vault: vault});
+        PropAMM amm = PropAMM(
+            address(
+                new ERC1967Proxy(
+                    address(new PropAMM()), abi.encodeCall(PropAMM.initialize, (owner, new address[](0), ORACLE, pairs))
+                )
+            )
+        );
+        MockToken(WETH).mint(vault, 1_000e18);
+        vm.prank(vault);
+        MockToken(WETH).approve(address(amm), type(uint256).max);
+        MockPUR(ORACLE).setState(0, 1e18);
+        fot.mint(address(this), 100e18);
+        fot.transfer(address(amm), 100e18); // arrives as 99e18
+        vm.expectRevert();
+        amm.swap(address(fot), WETH, 100e18, 0, trader, block.timestamp);
+    }
+
     /// An instance of its own listing WETH against a token that charges 1% per transfer, its vault
     /// funded and approved in that token, priced at par with no spread.
     function _feeOnTransferOutputPair() internal returns (PropAMM amm, FeeOnTransferToken fot) {

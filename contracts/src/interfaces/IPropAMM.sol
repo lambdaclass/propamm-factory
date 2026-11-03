@@ -64,7 +64,10 @@ interface IPropAMM {
     /// @notice Swaps an exact `amountIn` of `tokenIn` for as much `tokenOut` as
     /// possible, delivering it to `recipient`.
     /// @dev Expects `amountIn` of `tokenIn` to have ALREADY been transferred to
-    /// the propAMM by the caller (push-payment).
+    /// the propAMM by the caller (push-payment). Push payment is atomic only
+    /// inside the caller's transaction: tokens left on the propAMM between
+    /// transactions can be swapped by anyone. Never transfer to it except
+    /// immediately before `swap` in the same transaction.
     /// SHALL revert if it cannot deliver at least `minAmountOut` of `tokenOut`
     /// to `recipient`. The Router makes that check too.
     /// @param tokenIn The address of the token being sold.
