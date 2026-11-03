@@ -17,7 +17,8 @@ use crate::venue::{Connection, Quote};
 
 pub const DEFAULT_ENDPOINT: &str = "https://api.gm.ondo.finance";
 
-/// The environment variable holding the GM API key.
+/// The name the GM API key is read under: an environment variable, or inside an enclave one
+/// of the secrets handed in.
 pub const API_KEY_VAR: &str = "ONDO_API_KEY";
 
 /// Ondo caches the price for a second, so polling faster buys nothing.
@@ -26,8 +27,7 @@ pub const POLL_EVERY: Duration = Duration::from_secs(1);
 /// The poll of `symbol`'s latest price at `endpoint`, with the key from [`API_KEY_VAR`].
 /// Refused without a key, and on an endpoint the key must not cross the network to.
 pub fn connection(endpoint: &str, symbol: &str) -> Result<Connection> {
-    let key = std::env::var(API_KEY_VAR)
-        .ok()
+    let key = crate::secrets::lookup(API_KEY_VAR)
         .filter(|key| !key.is_empty())
         .ok_or_else(|| eyre!("{API_KEY_VAR} is not set, and Ondo's API needs its key"))?;
     let endpoint = endpoint.trim_end_matches('/');

@@ -15,8 +15,8 @@ use crate::{
     RUNWAY_CHECK_BLOCKS, backoffice,
     cli::{
         Args, Mode, apply_file_settings, refuse_backoffice_in_node_mode,
-        refuse_breakers_in_node_mode, removed_vars_error, removed_vars_present,
-        should_serve_metrics, validate_mode,
+        refuse_breakers_in_node_mode, refuse_open_backoffice_in_enclave, removed_vars_error,
+        removed_vars_present, should_serve_metrics, validate_mode,
     },
     config, exporter, head, metrics,
     node::push_update,
@@ -76,7 +76,7 @@ pub(crate) async fn run(args: Args, parts: Parts) -> Result<Outcome> {
     let (stop, cancel) = supervisor::shutdown_channel();
     let mut asked = cancel.clone();
     let quoting = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    tokio::select! {
+    let outcome = tokio::select! {
         // The run first, so a step that finished in the same poll as the shutdown is seen
         // to have raised `quoting` before the arm below reads it.
         biased;
@@ -92,6 +92,34 @@ pub(crate) async fn run(args: Args, parts: Parts) -> Result<Outcome> {
             Some(what) => Err(eyre!("shut down during startup, before {what} finished")),
             None => Ok(Outcome::Success),
         },
+    };
+    // Inside an enclave nothing reads the process's stderr: the error that ends the run, by
+    // either arm, goes to the host before the process exits, or nobody sees it.
+    if let Some(host) = crate::enclave::host() {
+        if let Err(err) = &outcome {
+            host.log("stderr", &format!("Error: {err:#}"));
+        }
+        host.flush().await;
+    }
+    outcome
+}
+
+/// The next reload asked for: a SIGHUP on `signal`, or inside an enclave the host's request
+/// over the link. Never resolves without either, rather than resolving to nothing, which
+/// would spin the `select!` it is polled in.
+async fn next_reload(signal: &mut Option<tokio::signal::unix::Signal>) {
+    let hangup = async {
+        let delivered = match signal.as_mut() {
+            Some(stream) => stream.recv().await.is_some(),
+            None => false,
+        };
+        if !delivered {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::select! {
+        () = hangup => {}
+        () = crate::enclave::reload_requested() => {}
     }
 }
 
@@ -119,7 +147,11 @@ async fn run_inner(
         unit,
     } = parts;
     // Before anything prints a hint: the unit is a fact about the process (see hints.rs).
-    if let Some(unit) = unit {
+    // Not inside an enclave, which no systemd unit on this side reaches: the hints there say
+    // to restart the process, which is the enclave.
+    if let Some(unit) = unit
+        && args.flags.enclave.is_none()
+    {
         crate::hints::set_unit(unit);
     }
     let kinds = Arc::new(kinds);
@@ -131,6 +163,23 @@ async fn run_inner(
     // it would have authenticated must not start.
     let removed = removed_vars_present();
     ensure!(removed.is_empty(), "{}", removed_vars_error(&removed));
+
+    // Inside an enclave the config and every secret come from the host before anything
+    // else: the config is opened onto `--config`, and the secrets become what every key,
+    // pricer secret and venue key is looked up in. See enclave/.
+    let enclave = match args.flags.enclave.clone() {
+        Some(path) => {
+            let settings = crate::enclave::Settings::load(&path)?;
+            let booted = crate::enclave::boot(&settings, &args.flags.config).await?;
+            tracing::info!(
+                "enclave: booted with {} secret(s): {}",
+                booted.secrets.len(),
+                booted.secrets.join(", ")
+            );
+            Some((settings, booted))
+        }
+        None => None,
+    };
 
     // Before every check below: each reads a setting the file may supply.
     let file_settings = config::load_file_settings(&args.flags.config)?;
@@ -158,6 +207,12 @@ async fn run_inner(
         args.flags.builders.is_some(),
     )?;
     refuse_backoffice_in_node_mode(args.flags.mode, file_settings.backoffice_addr.as_deref())?;
+    if let Some((settings, _)) = &enclave {
+        refuse_open_backoffice_in_enclave(
+            file_settings.backoffice_addr.as_deref(),
+            settings.backoffice.is_some(),
+        )?;
+    }
 
     // Loaded before anything connects, though nothing here needs the chain: the file is
     // local, cheap and deterministic, while the RPC calls below are slow and can fail
@@ -210,6 +265,21 @@ async fn run_inner(
     refuse_breakers_in_node_mode(args.flags.mode, &config)?;
     let target = config.target;
 
+    // Inside an enclave every connection is carried by the host, which reads and changes
+    // whatever is not under TLS opened from in here. The backoffice, a reload and the Ondo
+    // issuer's `api` hold to the same rule (see `enclave::active`).
+    if enclave.is_some() {
+        crate::enclave::require_tls(&crate::enclave::named_endpoints(
+            &args.flags.rpc_url,
+            args.flags.rpc_ws_url.as_deref(),
+            binance_ws,
+            &file_settings.endpoints,
+            builders
+                .as_ref()
+                .map_or(&[][..], |(_, list)| &list.builders[..]),
+        ))?;
+    }
+
     // One ctrl-c listener for the whole process, raised into a value every pair observes
     // whenever it next looks — including a pair between restarts, which has no future of
     // its own registered anywhere. See supervisor::Shutdown for what that fixes. Up here,
@@ -217,28 +287,33 @@ async fn run_inner(
     // ends the run there (see `run`), so it has to be heard from the start.
     let (stop, mut cancel) = shutdown_channel;
     tasks.spawn(async move {
-        // A binary's own trigger, if it set one, takes the same path as ctrl-c.
-        let signal = match shutdown {
-            Some(signal) => {
-                signal.await;
-                Ok(())
+        // A binary's own trigger, if it set one, takes the same path as ctrl-c. So does the
+        // host's request to stop, inside an enclave, whichever the binary chose, and still
+        // when ctrl-c cannot be listened for.
+        let trigger = async {
+            match shutdown {
+                Some(signal) => signal.await,
+                None => {
+                    if let Err(err) = tokio::signal::ctrl_c().await {
+                        // Said out loud rather than left to be discovered by pressing
+                        // ctrl-c: with no handler installed the default kill-on-SIGINT
+                        // disposition still applies, so ctrl-c terminates the process
+                        // abruptly instead of withdrawing each pair's live quote first.
+                        tracing::warn!(
+                            "could not listen for ctrl-c ({err}); a SIGINT will kill the \
+                             process without cancelling live quotes"
+                        );
+                        std::future::pending::<()>().await;
+                    }
+                }
             }
-            None => tokio::signal::ctrl_c().await,
         };
-        match signal {
-            Ok(()) => {
-                tracing::info!("shutting down");
-                stop.send_replace(true);
-            }
-            // Said out loud rather than left to be discovered by pressing ctrl-c: with no
-            // handler installed the default kill-on-SIGINT disposition still applies, so
-            // ctrl-c terminates the process abruptly instead of withdrawing each pair's
-            // live quote first.
-            Err(err) => tracing::warn!(
-                "could not listen for ctrl-c ({err}); a SIGINT will kill the process without \
-                 cancelling live quotes"
-            ),
+        tokio::select! {
+            () = trigger => {}
+            () = crate::enclave::shutdown_requested() => {}
         }
+        tracing::info!("shutting down");
+        stop.send_replace(true);
     });
 
     // Built whether or not it is exported: the handles are threaded into every pair, so a run
@@ -382,6 +457,12 @@ async fn run_inner(
     // Postgres is spawned below, once the shutdown signal it flushes on exists. A pusher
     // that is not a long-running service (--once) records nothing, like it serves no
     // metrics. The configuration this run starts from is its first row.
+    // The database URL carries a password; inside an enclave it is one of the secrets the
+    // host hands in rather than a variable of an environment there is none of.
+    if args.flags.record_db_url.is_none() && crate::secrets::installed() {
+        args.flags.record_db_url =
+            crate::secrets::lookup("RECORD_DB_URL").filter(|url| !url.is_empty());
+    }
     let recorder = args
         .flags
         .record_db_url
@@ -647,6 +728,20 @@ async fn run_inner(
                 let addr: SocketAddr = addr.parse().wrap_err_with(|| {
                     format!("[settings] backoffice_addr {addr:?} is not host:port")
                 })?;
+                // Inside an enclave with a `[backoffice]`, the page serves its own HTTPS and
+                // asks for a Google login, so the host carries nothing it can read or use.
+                let secure = enclave
+                    .as_ref()
+                    .and_then(|(settings, booted)| {
+                        settings.backoffice.as_ref().map(|backoffice| {
+                            crate::login::Secure::new(
+                                backoffice,
+                                booted.backoffice_certificate.as_deref(),
+                            )
+                        })
+                    })
+                    .transpose()?;
+                let scheme = if secure.is_some() { "https" } else { "http" };
                 let (local, task) = backoffice::bind(
                     addr,
                     args.flags.config.clone(),
@@ -655,9 +750,10 @@ async fn run_inner(
                     pair_states.clone(),
                     edits.clone(),
                     Arc::clone(&kinds),
+                    secure,
                 )
                 .await?;
-                tracing::info!("backoffice listening on http://{local}/");
+                tracing::info!("backoffice listening on {scheme}://{local}/");
                 tasks.adopt(&task);
                 Some(task)
             }
@@ -683,13 +779,7 @@ async fn run_inner(
                         break;
                     }
                 }
-                Some(_) = async { match reloads.as_mut() {
-                    Some(stream) => stream.recv().await,
-                    // Never fires. `select!` still polls this arm, so it must be a future
-                    // that does not resolve rather than one that resolves to None, which
-                    // would spin the loop.
-                    None => std::future::pending().await,
-                } } => {
+                () = next_reload(&mut reloads) => {
                     if args.flags.once {
                         // `--once` is a batch invocation: the pairs publish once and the run
                         // ends. There is no desired state to converge onto and nothing that
@@ -806,10 +896,7 @@ async fn run_inner(
             // Node mode runs no supervised pair set, so there is nothing for a reload to
             // converge — but the signal must still be handled rather than left to its
             // default disposition, which is to kill this process. See `install_hangup`.
-            Some(_) = async { match reloads.as_mut() {
-                Some(stream) => stream.recv().await,
-                None => std::future::pending().await,
-            } } => {
+            () = next_reload(&mut reloads) => {
                 tracing::warn!(
                     "SIGHUP ignored: --mode node has no supervised pair set to reload, so \
                      changing {} needs a restart",

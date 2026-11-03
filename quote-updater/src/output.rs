@@ -174,13 +174,16 @@ pub(crate) enum Stream {
 impl Sink {
     fn write(&self, stream: Stream, line: &str) {
         match self {
-            // Locked per line, as println! does; a failed write (a closed pipe) is dropped
-            // rather than panicking the task that logged, which println! would.
-            Sink::Terminal => match stream {
-                Stream::Stdout => {
+            Sink::Terminal => match (crate::enclave::host(), stream) {
+                // Inside an enclave nothing reads the terminal: the line goes to the host.
+                (Some(host), Stream::Stdout) => host.log("stdout", line),
+                (Some(host), Stream::Stderr) => host.log("stderr", line),
+                // Locked per line, as println! does; a failed write (a closed pipe) is
+                // dropped rather than panicking the task that logged, which println! would.
+                (None, Stream::Stdout) => {
                     let _ = writeln!(std::io::stdout().lock(), "{line}");
                 }
-                Stream::Stderr => {
+                (None, Stream::Stderr) => {
                     let _ = writeln!(std::io::stderr().lock(), "{line}");
                 }
             },

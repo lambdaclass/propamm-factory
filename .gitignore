@@ -17,6 +17,8 @@
 /deploy/config/*
 !/deploy/config/.gitkeep
 /deploy/alertmanager/slack-webhook
+# The enclave image's own enclave file and hosts file (deploy/aws-nitro/Dockerfile).
+/deploy/aws-nitro/local/
 
 # direnv's cache of the flake shell.
 /.direnv/
