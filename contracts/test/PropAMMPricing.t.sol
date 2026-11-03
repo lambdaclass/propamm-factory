@@ -690,13 +690,35 @@ contract PropAMMPricingTest is Test {
         assertEq(MockToken(WETH).balanceOf(vault), 1e18, "the vault received the stray");
     }
 
-    /// A fee-on-transfer tokenIn (USDT with its fee switch on) is not supported: the instance holds
-    /// less than amountIn and the swap reverts, so the vault never sells below the price. Audit F-09.
+    /// A fee-on-transfer tokenIn (USDT with its fee switch on) is not supported: with nothing else on
+    /// the instance, it holds less than amountIn and the swap reverts. Audit F-09.
     function test_swap_feeOnTransferTokenInReverts() public {
-        FeeOnTransferToken fot = new FeeOnTransferToken(18);
+        (PropAMM amm, FeeOnTransferToken fot) = _feeOnTransferInputPair();
+        fot.mint(address(this), 100e18);
+        fot.transfer(address(amm), 100e18); // arrives as 99e18
+        vm.expectRevert();
+        amm.swap(address(fot), WETH, 100e18, 0, trader, block.timestamp);
+    }
+
+    /// ...but it does not fail closed: when the instance already holds the shortfall (a caller that
+    /// sends more than amountIn, or a stray), the swap fills, and the vault receives amountIn less
+    /// the token's fee, selling below its price. Documented, not prevented. Audit F-09 (review).
+    function test_swap_feeOnTransferTokenInFillsWhenTheShortfallIsHeld() public {
+        (PropAMM amm, FeeOnTransferToken fot) = _feeOnTransferInputPair();
+        fot.mint(address(this), 102e18);
+        fot.transfer(address(amm), 102e18); // arrives as 100.98e18, more than amountIn
+        uint256 out = amm.swap(address(fot), WETH, 100e18, 0, trader, block.timestamp);
+        assertGt(out, 99e18, "the vault sold about 100 WETH at par");
+        assertEq(fot.balanceOf(vault), 99e18, "and received amountIn less the 1% fee");
+    }
+
+    /// An instance of its own listing a token that charges 1% per transfer against WETH, its vault
+    /// funded and approved in WETH, priced at par with no spread.
+    function _feeOnTransferInputPair() internal returns (PropAMM amm, FeeOnTransferToken fot) {
+        fot = new FeeOnTransferToken(18);
         PropAMM.PairConfig[] memory pairs = new PropAMM.PairConfig[](1);
         pairs[0] = PropAMM.PairConfig({token0: address(fot), token1: WETH, vault: vault});
-        PropAMM amm = PropAMM(
+        amm = PropAMM(
             address(
                 new ERC1967Proxy(
                     address(new PropAMM()), abi.encodeCall(PropAMM.initialize, (owner, new address[](0), ORACLE, pairs))
@@ -707,10 +729,6 @@ contract PropAMMPricingTest is Test {
         vm.prank(vault);
         MockToken(WETH).approve(address(amm), type(uint256).max);
         MockPUR(ORACLE).setState(0, 1e18);
-        fot.mint(address(this), 100e18);
-        fot.transfer(address(amm), 100e18); // arrives as 99e18
-        vm.expectRevert();
-        amm.swap(address(fot), WETH, 100e18, 0, trader, block.timestamp);
     }
 
     /// An instance of its own listing WETH against a token that charges 1% per transfer, its vault

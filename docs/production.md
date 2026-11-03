@@ -47,9 +47,13 @@ or compute it beforehand with the factory's `computeAddress` (same arguments).
 Swaps are push payment: the router transfers the input to the PropAMM and calls `swap` in the
 same transaction. Never send tokens to a PropAMM any other way; whatever sits on it can be
 swapped by anyone. USDT carries a transfer fee Tether can switch on (currently 0). If it does,
-every USDT-in swap reverts and USDT-out swaps revert when the fee takes them below the caller's
-minimum: the pair stops trading rather than mispricing. Watch for it (the router's swaps on the
-pair start failing) and pause or remove the pair.
+USDT-out swaps revert when the fee takes them below the caller's minimum, and USDT-in swaps
+revert unless the PropAMM already holds the fee's worth of USDT (a stray balance, or a caller
+that sends more than it swaps): then they fill, and the vault receives the swapped amount less
+Tether's fee, selling below its price. The router routes around a PropAMM whose swap reverts,
+so this shows up as the pair filling less, not as failed transactions. Watch Tether's fee
+itself instead, `cast call 0xdAC17F958D2ee523a2206206994597C13D831ec7 "basisPointsRate()(uint256)"`
+(Tether announces a change with its `Params` event), and pause the pair if it is ever non-zero.
 
 So for a WETH/USDC pair on mainnet:
 
