@@ -4,6 +4,7 @@ pragma solidity ^0.8.35;
 import "forge-std/console.sol";
 import {Test} from "forge-std/Test.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import {
@@ -22,13 +23,6 @@ import {MockToken} from "./mocks/MockToken.sol";
 import {FeeOnTransferToken} from "./mocks/FeeOnTransferToken.sol";
 
 // Oracle shapes etched over `ORACLE` by the `isActive` tests (audit F-14).
-
-/// Every call reverts; etched over `tokenOut` (audit F-09).
-contract RevertingToken {
-    fallback() external {
-        revert();
-    }
-}
 
 /// Every call returns no data.
 contract EmptyReturnOracle {
@@ -72,6 +66,33 @@ contract TruncatedArrayOracle {
             mstore(0x20, 0x40)
             mstore(0x40, 2)
             return(0, 0x60)
+        }
+    }
+}
+
+// Tokens that are not ERC-20s, for the `balanceOf`/`allowance` reads `isActive` makes on
+// `tokenOut` (audit F-09). Each is etched over a pair's token.
+
+/// Code, and every call reverts.
+contract RevertingToken {
+    fallback() external {
+        revert();
+    }
+}
+
+/// Code, and every call succeeds with empty return data: decoding it as a `uint256` reverts, in
+/// the caller's frame.
+contract EmptyReturnToken {
+    fallback() external {}
+}
+
+/// Code, and every call returns 1: every account, address(0) included, holds and has approved
+/// a non-zero amount.
+contract AnswersOneToken {
+    fallback() external {
+        assembly {
+            mstore(0, 1)
+            return(0, 32)
         }
     }
 }
@@ -637,6 +658,16 @@ contract PropAMMPricingTest is Test {
         assertFalse(propAmm.isActive(WETH, USDT), "the lane still has a fresh price");
     }
 
+    /// The vault reads do not stand in for the listing check: on a pair that is not listed they
+    /// ask about address(0), and a token can answer non-zero for it. Audit F-09 (review).
+    function test_isActive_falseForARemovedPairWhateverTokenOutAnswers() public {
+        _setPrice(1600e18, 5e14);
+        vm.prank(owner);
+        propAmm.removePair(WETH, USDT);
+        vm.etch(USDT, address(new AnswersOneToken()).code);
+        assertFalse(propAmm.isActive(WETH, USDT));
+    }
+
     function test_isActive_checksTheOutputSideOnly() public {
         _setPrice(1600e18, 5e14);
         _fundVault(USDT, 1_600_000e6);
@@ -648,6 +679,15 @@ contract PropAMMPricingTest is Test {
         _setPrice(1600e18, 5e14);
         _fundVault(USDT, 1_600_000e6);
         vm.etch(USDT, address(new RevertingToken()).code);
+        assertFalse(propAmm.isActive(WETH, USDT));
+    }
+
+    /// The empty answer is the one a `try` would not catch: the call succeeds and the decode
+    /// reverts in `isActive`'s own frame. Audit F-09 (review).
+    function test_isActive_falseNotRevertWhenTokenOutAnswersEmpty() public {
+        _setPrice(1600e18, 5e14);
+        _fundVault(USDT, 1_600_000e6);
+        vm.etch(USDT, address(new EmptyReturnToken()).code);
         assertFalse(propAmm.isActive(WETH, USDT));
     }
 
@@ -696,7 +736,10 @@ contract PropAMMPricingTest is Test {
         (PropAMM amm, FeeOnTransferToken fot) = _feeOnTransferInputPair();
         fot.mint(address(this), 100e18);
         fot.transfer(address(amm), 100e18); // arrives as 99e18
-        vm.expectRevert();
+        // Paying the vault 100e18 burns the 1e18 fee first, leaving 98e18 for the 99e18 transfer.
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC20Errors.ERC20InsufficientBalance.selector, address(amm), 98e18, 99e18)
+        );
         amm.swap(address(fot), WETH, 100e18, 0, trader, block.timestamp);
     }
 

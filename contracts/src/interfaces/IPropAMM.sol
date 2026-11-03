@@ -9,14 +9,17 @@ pragma solidity ^0.8.35;
 /// consume that balance.
 interface IPropAMM {
     /// @notice Emitted once per successful swap after `tokenOut` is delivered to `recipient`.
-    /// @param sender The address that invoked the swap entrypoint and supplied
-    /// `amountIn` of `tokenIn`. Indexed so consumers can fetch a given account's
-    /// recent swaps.
+    /// @param sender The address that invoked the swap entrypoint. Under push
+    /// payment it is not necessarily the account that paid `amountIn`: `swap`
+    /// spends whatever `tokenIn` the propAMM holds. Indexed so consumers can
+    /// fetch a given account's recent swaps.
     /// @param tokenIn The token sold.
     /// @param tokenOut The token bought.
-    /// @param amountIn The exact amount of `tokenIn` pulled from `sender`.
+    /// @param amountIn The amount of `tokenIn` the propAMM passed on to its vault,
+    /// out of its own balance.
     /// @param amountOut The amount of `tokenOut` delivered to `recipient`,
-    /// measured as a balance delta.
+    /// measured as a balance delta. A token whose transfer hook credits the
+    /// recipient beyond the transfer can make it larger than what the vault sent.
     /// @param recipient The address that received `tokenOut`.
     event Swapped(
         address indexed sender,

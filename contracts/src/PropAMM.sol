@@ -164,7 +164,7 @@ contract PropAMM is
     /// @dev True when the pair is listed, the registry holds an update for its lane stamped with
     /// this block's timestamp, and the vault holds and has approved a non-zero amount of
     /// `tokenOut`. It does not read the registry's answer; `quote` does. Never reverts (audit
-    /// F-14, F-09).
+    /// F-14, F-09), but a registry or `tokenOut` answering megabytes can exhaust the gas.
     function isActive(address tokenIn, address tokenOut) external view override returns (bool active) {
         if (paused()) return false;
         uint256 pairKey = _pairKey(tokenIn, tokenOut);

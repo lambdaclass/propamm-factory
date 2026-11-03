@@ -44,6 +44,19 @@ The vault must hold the tokens and have approved the PropAMM to spend both of th
 PropAMM address does not exist until the call, so either approve it right after creating,
 or compute it beforehand with the factory's `computeAddress` (same arguments).
 
+So for a WETH/USDC pair on mainnet:
+
+```bash
+cast send $FACTORY "createPropAMM(address,address,address[],(address,address,address)[])" \
+  $OWNER 0xDa7AfEeD021EAFC1c1Af9C362dE477DaD0396B81 "[]" \
+  "[(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2,0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48,$VAULT)]" \
+  --rpc-url $RPC_URL --private-key $DEPLOYER_KEY
+```
+
+You do not need to add all the pairs upfront on contract creation. You can both and or remove pairs by having the owner calling the appropriate contract functions.
+
+### Tokens and transfers
+
 Swaps are push payment: the router transfers the input to the PropAMM and calls `swap` in the
 same transaction. Never send tokens to a PropAMM any other way; whatever sits on it can be
 swapped by anyone. USDT carries a transfer fee Tether can switch on (currently 0). If it does,
@@ -55,16 +68,10 @@ so this shows up as the pair filling less, not as failed transactions. Watch Tet
 itself instead, `cast call 0xdAC17F958D2ee523a2206206994597C13D831ec7 "basisPointsRate()(uint256)"`
 (Tether announces a change with its `Params` event), and pause the pair if it is ever non-zero.
 
-So for a WETH/USDC pair on mainnet:
-
-```bash
-cast send $FACTORY "createPropAMM(address,address,address[],(address,address,address)[])" \
-  $OWNER 0xDa7AfEeD021EAFC1c1Af9C362dE477DaD0396B81 "[]" \
-  "[(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2,0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48,$VAULT)]" \
-  --rpc-url $RPC_URL --private-key $DEPLOYER_KEY
-```
-
-You do not need to add all the pairs upfront on contract creation. You can both and or remove pairs by having the owner calling the appropriate contract functions.
+Tokens that keep balances as shares, such as stETH, round each transfer down, so a swap
+delivers a wei or two less than `quote`. A swap whose minimum is exactly the quote reverts:
+leave a few wei of slippage. As input, the PropAMM receives a wei or two less than the
+amount swapped, the fee case above.
 
 ## 2. Create one wallet per pair and fund it with ETH
 
