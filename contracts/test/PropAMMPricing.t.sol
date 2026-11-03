@@ -21,6 +21,13 @@ import {MockToken} from "./mocks/MockToken.sol";
 
 // Oracle shapes etched over `ORACLE` by the `isActive` tests (audit F-14).
 
+/// Every call reverts; etched over `tokenOut` (audit F-09).
+contract RevertingToken {
+    fallback() external {
+        revert();
+    }
+}
+
 /// Every call returns no data.
 contract EmptyReturnOracle {
     fallback() external payable {}
@@ -547,6 +554,7 @@ contract PropAMMPricingTest is Test {
     /// A malformed answer used to revert `isActive` in its decoder. Now the pair reads as active
     /// and `quote` rejects it.
     function test_isActive_leavesAMalformedAnswerToQuote() public {
+        _fundVault(USDT, 1_600_000e6);
         address[3] memory shapes =
             [address(new OneWordOracle()), address(new HighBitsOracle()), address(new TruncatedArrayOracle())];
         string[3] memory names = ["one word", "timestamp above uint32", "truncated array"];
@@ -561,6 +569,7 @@ contract PropAMMPricingTest is Test {
     /// A fresh lane reads as active whatever its slots hold; `quote` rejects the unusable ones.
     function test_isActive_doesNotReadTheSlots() public {
         uint256 pairKey = uint256(keccak256(abi.encodePacked(WETH, USDT)));
+        _fundVault(USDT, 1_600_000e6);
 
         MockPUR(ORACLE).setState(5e14, 0);
         assertTrue(propAmm.isActive(WETH, USDT), "mid == 0");
@@ -602,8 +611,50 @@ contract PropAMMPricingTest is Test {
         MockPUR(ORACLE).setState(delta, mid);
     }
 
+    /// isActive is documented as "True if a swap for the pair would succeed right now". Each of
+    /// these makes every swap revert while the oracle is fine. Audit F-09.
+    function test_isActive_falseWhenTheVaultHasNotApproved() public {
+        _setPrice(1600e18, 5e14);
+        MockToken(USDT).mint(vault, 1_600_000e6);
+        assertFalse(propAmm.isActive(WETH, USDT));
+    }
+
+    function test_isActive_falseWhenTheVaultIsEmpty() public {
+        _setPrice(1600e18, 5e14);
+        vm.prank(vault);
+        MockToken(USDT).approve(address(propAmm), type(uint256).max);
+        assertFalse(propAmm.isActive(WETH, USDT));
+    }
+
+    function test_isActive_falseForARemovedPair() public {
+        _setPrice(1600e18, 5e14);
+        _fundVault(USDT, 1_600_000e6);
+        assertTrue(propAmm.isActive(WETH, USDT));
+        vm.prank(owner);
+        propAmm.removePair(WETH, USDT);
+        assertFalse(propAmm.isActive(WETH, USDT), "the lane still has a fresh price");
+    }
+
+    function test_isActive_checksTheOutputSideOnly() public {
+        _setPrice(1600e18, 5e14);
+        _fundVault(USDT, 1_600_000e6);
+        assertTrue(propAmm.isActive(WETH, USDT));
+        assertFalse(propAmm.isActive(USDT, WETH));
+    }
+
+    function test_isActive_falseNotRevertWhenTokenOutCannotAnswer() public {
+        _setPrice(1600e18, 5e14);
+        _fundVault(USDT, 1_600_000e6);
+        vm.etch(USDT, address(new RevertingToken()).code);
+        assertFalse(propAmm.isActive(WETH, USDT));
+    }
+
+    /// Funds the vault and approves this instance from it, as a live vault would: `isActive`
+    /// reports a pair whose vault has not approved the instance as inactive (audit F-09).
     function _fundVault(address token, uint256 amount) internal {
         MockToken(token).mint(vault, amount);
+        vm.prank(vault);
+        MockToken(token).approve(address(propAmm), type(uint256).max);
     }
 
     /// Asserts `amountOut` is `midAmountOut` less `delta`, allowing for the impact term on top.
