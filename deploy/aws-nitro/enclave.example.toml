@@ -21,6 +21,29 @@ listen = "127.0.0.3:9443"    # stream.binance.com
 cid    = 3
 port   = 8002
 
+[[link.forward]]
+listen = "127.0.0.4:443"     # your RPC node, e.g. eth-mainnet.g.alchemy.com
+cid    = 3
+port   = 8003
+
+# Every builder in the config: one forward each (here Titan's EU endpoint).
+[[link.forward]]
+listen = "127.0.0.5:443"     # eu.rpc.titanbuilder.xyz
+cid    = 3
+port   = 8004
+
+# The backoffice login: the code exchange and Google's signing keys. The browser talks to
+# accounts.google.com itself, so that one needs no forward.
+[[link.forward]]
+listen = "127.0.0.6:443"     # oauth2.googleapis.com
+cid    = 3
+port   = 8005
+
+[[link.forward]]
+listen = "127.0.0.7:443"     # www.googleapis.com
+cid    = 3
+port   = 8006
+
 # Inbound tunnels: a vsock port on the enclave, piped to an address inside: the backoffice
 # (its `backoffice_addr` in the config) and the metrics scrape (`metrics_addr`).
 [[link.accept]]
@@ -37,6 +60,8 @@ to   = "127.0.0.1:9464"
 [release]
 kind     = "aws-nitro-kms"
 region   = "eu-west-1"
+# The key's full ARN: every decrypt names it, so a ciphertext under any other key is refused.
+key_id   = "arn:aws:kms:eu-west-1:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab"
 endpoint = "https://kms.eu-west-1.amazonaws.com"
 
 # The backoffice serves its own HTTPS and asks for a Google login. The certificate is
