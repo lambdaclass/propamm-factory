@@ -231,6 +231,15 @@ pub fn write_text_atomically(path: &Path, text: &str) -> Result<Persisted> {
         file.sync_all()
             .wrap_err_with(|| format!("failed to flush {}", tmp.display()))?;
     }
+    // On the temporary file, before the rename, which keeps it: a leftover one from an
+    // earlier run is reopened with its own mode, and a chmod after the rename could fail
+    // with the file already replaced, breaking the promise above.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))
+            .wrap_err_with(|| format!("failed to chmod 600 {}", tmp.display()))?;
+    }
     fs::rename(&tmp, path).wrap_err_with(|| {
         format!(
             "failed to replace {} with {}",
@@ -238,12 +247,6 @@ pub fn write_text_atomically(path: &Path, text: &str) -> Result<Persisted> {
             tmp.display()
         )
     })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .wrap_err_with(|| format!("failed to chmod 600 {}", path.display()))?;
-    }
     // Inside an enclave this file is on a filesystem that ends with the process: the host
     // keeps it between boots, sealed so it can neither read nor change it.
     match crate::enclave::host() {

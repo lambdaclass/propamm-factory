@@ -1562,7 +1562,9 @@ async fn edit_pair(
         .await
     };
     let outcome = match result {
-        Ok(message) => return Outcome::ok(message).redirect(),
+        // Through the `From` above, so an edit the host did not get is shown as the warning
+        // it is.
+        Ok(message) => return Outcome::from(Ok::<_, ReloadFailure>(message)).redirect(),
         // Written and applied to some lanes: not a rejection, and not the form again, which
         // would read as one. The list, saying it was saved and what the reload could not do.
         Err(ReloadFailure::Partial(line)) => {

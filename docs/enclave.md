@@ -205,7 +205,7 @@ What `kind = "vsock"` and `kind = "aws-nitro-kms"` need around them.
 ### The key policy
 
 The whole policy: `kms:Decrypt` for the instance role, only with an attestation document
-whose measurements match your image; encryption for a principal the host never sees; key
+from an image signed with your certificate (PCR8); encryption for a principal the host never sees; key
 administration for another; and nothing else.
 
 ```json
@@ -213,7 +213,7 @@ administration for another; and nothing else.
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "Administer the key, never use it",
+      "Sid": "Administer the key but never use it",
       "Effect": "Allow",
       "Principal": { "AWS": "arn:aws:iam::<account>:role/<key admin role>" },
       "Action": [
@@ -225,7 +225,7 @@ administration for another; and nothing else.
       "Resource": "*"
     },
     {
-      "Sid": "Encrypt the secrets, off the host",
+      "Sid": "Encrypt the secrets off the host",
       "Effect": "Allow",
       "Principal": { "AWS": "arn:aws:iam::<account>:role/<secrets encryptor role>" },
       "Action": "kms:Encrypt",
