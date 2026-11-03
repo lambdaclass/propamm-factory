@@ -202,6 +202,10 @@ contract PropAMM is
     }
 
     /// @inheritdoc IPropAMM
+    /// @dev `amountOut` is what `recipient` received, measured as a balance delta, and it is what
+    /// `minAmountOut` is checked against: a fee-on-transfer `tokenOut` delivers less than `quote`
+    /// and can revert here. A fee-on-transfer `tokenIn` is not supported: the instance receives
+    /// less than `amountIn` and the swap reverts (see the contract-level note on push payment).
     function swap(
         address tokenIn,
         address tokenOut,
@@ -220,12 +224,17 @@ contract PropAMM is
         // warm, and cheaper than threading the address out of the pricing function.
         address vault = pairVaults[_pairKey(tokenIn, tokenOut)];
 
+        // What `recipient` holds before, so the output is measured, not assumed: a token that
+        // charges a fee on transfer delivers less than `realAmountOut`.
+        uint256 before = IERC20(tokenOut).balanceOf(recipient);
         IERC20(tokenIn).safeTransfer(vault, amountIn);
         IERC20(tokenOut).safeTransferFrom(vault, recipient, realAmountOut);
+        uint256 delivered = IERC20(tokenOut).balanceOf(recipient) - before;
+        require(delivered >= minAmountOut, InsufficientOutput(minAmountOut, delivered));
 
-        emit Swapped(msg.sender, tokenIn, tokenOut, amountIn, realAmountOut, recipient);
+        emit Swapped(msg.sender, tokenIn, tokenOut, amountIn, delivered, recipient);
 
-        return realAmountOut;
+        return delivered;
     }
 
     /// @inheritdoc IPropAMMFillable

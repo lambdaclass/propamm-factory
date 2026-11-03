@@ -1,8 +1,8 @@
 {
   "quote": "38865",
-  "quoteFillable": "44160",
-  "quoteFillable_capped": "44354",
+  "quoteFillable": "44187",
+  "quoteFillable_capped": "44381",
   "quote_warm": "8865",
   "supportsInterface": "5038",
-  "swap": "65412"
+  "swap": "67445"
 }

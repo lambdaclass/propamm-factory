@@ -10,6 +10,7 @@ import {
     PropAMM,
     EmptyVault,
     InsufficientOracleData,
+    InsufficientOutput,
     InsufficientVaultBalance,
     InvalidMid,
     SpreadTooWide,
@@ -18,6 +19,7 @@ import {
 import {IPropAMM} from "../src/interfaces/IPropAMM.sol";
 import {MockPUR} from "./mocks/MockPUR.sol";
 import {MockToken} from "./mocks/MockToken.sol";
+import {FeeOnTransferToken} from "./mocks/FeeOnTransferToken.sol";
 
 // Oracle shapes etched over `ORACLE` by the `isActive` tests (audit F-14).
 
@@ -647,6 +649,55 @@ contract PropAMMPricingTest is Test {
         _fundVault(USDT, 1_600_000e6);
         vm.etch(USDT, address(new RevertingToken()).code);
         assertFalse(propAmm.isActive(WETH, USDT));
+    }
+
+    /// A fee-on-transfer tokenOut (USDT with its fee switch on): the recipient gets less than
+    /// computed, so `minAmountOut` must be checked against what it received. Audit F-09.
+    function test_swap_revertsWhenTheRecipientWouldReceiveLessThanMinAmountOut() public {
+        (PropAMM amm, FeeOnTransferToken fot) = _feeOnTransferOutputPair();
+        uint256 quoted = amm.quote(WETH, address(fot), 1_000e18);
+        _pushIn(amm, 1_000e18);
+        uint256 delivered = quoted - quoted / 100;
+        vm.expectRevert(abi.encodeWithSelector(InsufficientOutput.selector, quoted, delivered));
+        amm.swap(WETH, address(fot), 1_000e18, quoted, trader, block.timestamp);
+    }
+
+    /// `Swapped.amountOut` is documented as a balance delta, and the router-facing return value
+    /// should agree with it. Audit F-09.
+    function test_swap_returnsAndEmitsWhatTheRecipientReceived() public {
+        (PropAMM amm, FeeOnTransferToken fot) = _feeOnTransferOutputPair();
+        uint256 quoted = amm.quote(WETH, address(fot), 1_000e18);
+        _pushIn(amm, 1_000e18);
+        uint256 delivered = quoted - quoted / 100;
+        vm.expectEmit(true, true, true, true, address(amm));
+        emit IPropAMM.Swapped(address(this), WETH, address(fot), 1_000e18, delivered, trader);
+        uint256 out = amm.swap(WETH, address(fot), 1_000e18, 0, trader, block.timestamp);
+        assertEq(out, delivered);
+        assertEq(fot.balanceOf(trader), delivered);
+    }
+
+    /// An instance of its own listing WETH against a token that charges 1% per transfer, its vault
+    /// funded and approved in that token, priced at par with no spread.
+    function _feeOnTransferOutputPair() internal returns (PropAMM amm, FeeOnTransferToken fot) {
+        fot = new FeeOnTransferToken(18);
+        PropAMM.PairConfig[] memory pairs = new PropAMM.PairConfig[](1);
+        pairs[0] = PropAMM.PairConfig({token0: WETH, token1: address(fot), vault: vault});
+        amm = PropAMM(
+            address(
+                new ERC1967Proxy(
+                    address(new PropAMM()), abi.encodeCall(PropAMM.initialize, (owner, new address[](0), ORACLE, pairs))
+                )
+            )
+        );
+        fot.mint(vault, 1_000_000e18);
+        vm.prank(vault);
+        fot.approve(address(amm), type(uint256).max);
+        MockPUR(ORACLE).setState(0, 1e18);
+    }
+
+    /// Pays `amount` of WETH to the instance, as the router's push does before calling `swap`.
+    function _pushIn(PropAMM amm, uint256 amount) internal {
+        MockToken(WETH).mint(address(amm), amount);
     }
 
     /// Funds the vault and approves this instance from it, as a live vault would: `isActive`
