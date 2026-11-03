@@ -45,6 +45,12 @@ prometheus = "0.14.0"
 # The /metrics listener. Same measured cost: axum is already pulled in (with default
 # features) by ethrex-rpc via axum-extra, so this adds no package and no feature.
 axum = { version = "0.8.9", features = ["ws"] }
+# The enclave backoffice's HTTPS connections are served by hand rather than by axum::serve,
+# which takes no timer and so enforces no deadline on a request's head (login/mod.rs). The
+# three crates and these features are what axum already builds on: no new package.
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
 
 # ethrex has no standalone lightweight client crate yet, so the client (EthClient, calldata
 # encoding, signer) comes from the node's workspace crates. Pinned to one rev so the five
@@ -77,12 +83,10 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry", "std"] }
 
 # Running inside an enclave (enclave/): the config is sealed with AES-256-GCM before it
-# leaves the process, frames on the link are length-prefixed JSON with base64 fields, and a
-# request from the host to reload is delivered as the SIGHUP it stands for. All three
-# already in Cargo.lock.
+# leaves the process, and frames on the link are length-prefixed JSON with base64 fields.
+# Both already in Cargo.lock.
 aes-gcm = "0.10"
 base64 = "0.22"
-libc = "0.2"
 # The backoffice's own HTTPS and Google login inside an enclave (login/): TLS on the `ring`
 # provider already compiled in for jsonwebtoken, the ID token checked against Google's
 # keys, and the session cookie signed with HMAC-SHA256. All already in Cargo.lock.

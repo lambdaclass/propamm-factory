@@ -53,7 +53,7 @@ use futures_util::future::BoxFuture;
 use serde::Deserialize;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::{mpsc, watch},
+    sync::{Notify, mpsc, watch},
 };
 
 use protocol::{Credentials, HostMessage, RunMessage, read_body, read_frame, write_frame};
@@ -320,7 +320,7 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Whether this process booted inside an enclave.
 pub fn active() -> bool {
-    ACTIVE.load(Ordering::Relaxed)
+    ACTIVE.load(Ordering::SeqCst)
 }
 
 /// Raised when the host asks the run to stop. A value rather than a signal, so the run's own
@@ -328,19 +328,36 @@ pub fn active() -> bool {
 /// run is listening is still there when it looks.
 static SHUTDOWN: LazyLock<watch::Sender<bool>> = LazyLock::new(|| watch::channel(false).0);
 
+/// Notified when the host asks the run to reload. Not a SIGHUP: a signal reaches the whole
+/// process, and a test that drives [`boot_on`] would reload whatever else runs beside it.
+/// Several requests before the run looks are one reload, as several SIGHUPs are.
+static RELOAD: Notify = Notify::const_new();
+
 /// Resolves once the host has asked the run to stop; never outside an enclave.
 pub async fn shutdown_requested() {
+    if !active() {
+        return std::future::pending().await;
+    }
     let mut asked = SHUTDOWN.subscribe();
     // Err only if the sender is dropped, which a static never is.
     let _ = asked.wait_for(|asked| *asked).await;
+}
+
+/// Resolves when the host asks the run to reload; never outside an enclave. Taken alongside
+/// SIGHUP wherever the run waits for one.
+pub async fn reload_requested() {
+    if !active() {
+        return std::future::pending().await;
+    }
+    RELOAD.notified().await;
 }
 
 /// The channel to the host, as the rest of the process uses it.
 pub struct Host {
     out: mpsc::UnboundedSender<Outgoing>,
     seal_key: [u8; seal::KEY_LEN],
-    /// Lowered by the writer the first time a frame fails to reach the host. From then on
-    /// nothing reaches it, so a save that depends on it says so instead of passing.
+    /// Lowered the first time a frame fails to reach the host, or the host's end closes. From
+    /// then on nothing reaches it, so a save says it was not kept instead of passing.
     up: Arc<AtomicBool>,
 }
 
@@ -380,29 +397,32 @@ impl Host {
         }
     }
 
-    /// Refuses once the link to the host is down: a config saved now would last only as long
-    /// as this run, and the next boot would start from the one before it.
-    pub fn ensure_up(&self) -> Result<()> {
-        ensure!(
-            self.up.load(Ordering::SeqCst),
-            "the link to the host is down, so a config saved now could not be kept: the host \
-             still holds the one before it, and a restart of the enclave would start from \
-             that. Restart the enclave once the host's boot helper is back"
+    /// Seals the config at `path` as it now is and hands it to the host to keep. Called
+    /// after every write of the config file, which has been made and is applied whatever
+    /// this answers: `true` when it went to the host, `false` (and why, on the operator's
+    /// log) when it could not, so the change lasts only until the next restart. Never a
+    /// refusal: a halt has to take effect even when the host is gone.
+    #[must_use]
+    pub fn config_written(&self, path: &Path) -> bool {
+        let sealed = std::fs::read(path)
+            .wrap_err_with(|| format!("reading {} to seal it", path.display()))
+            .and_then(|text| seal::seal(&self.seal_key, &text));
+        let why = match sealed {
+            Err(err) => format!("{err:#}"),
+            Ok(_) if !self.up.load(Ordering::SeqCst) => "the link to the host is down".to_owned(),
+            Ok(sealed) => {
+                let _ = self.out.send(Outgoing::Frame(RunMessage::Config {
+                    sealed: base64::engine::general_purpose::STANDARD.encode(sealed),
+                }));
+                return true;
+            }
+        };
+        tracing::warn!(
+            "{} was changed, but NOT persisted to the host ({why}): the change is applied, and \
+             will be lost at the next restart of the enclave",
+            path.display()
         );
-        Ok(())
-    }
-
-    /// Seals the config at `path` as it now is and sends it to the host to keep. Called
-    /// after every write of the config file.
-    pub fn config_written(&self, path: &Path) -> Result<()> {
-        self.ensure_up()?;
-        let text = std::fs::read(path)
-            .wrap_err_with(|| format!("reading {} to seal it", path.display()))?;
-        let sealed = seal::seal(&self.seal_key, &text)?;
-        let _ = self.out.send(Outgoing::Frame(RunMessage::Config {
-            sealed: base64::engine::general_purpose::STANDARD.encode(sealed),
-        }));
-        Ok(())
+        false
     }
 }
 
@@ -422,8 +442,10 @@ pub async fn boot(settings: &Settings, config_path: &Path) -> Result<Booted> {
     let release = settings.release.build()?;
     let link = settings.link.build()?;
     let stream = link.accept().await?;
+    // Before the channel is set, so `host()` answers as soon as it exists. A boot that fails
+    // ends the process, so nothing reads this having been raised too early.
+    ACTIVE.store(true, Ordering::SeqCst);
     let booted = boot_on(config_path, stream, release.as_ref()).await?;
-    ACTIVE.store(true, Ordering::Relaxed);
     // A panic's message goes to stderr, which nothing reads in here: send it where the
     // operator looks, then do what the hook did before.
     let previous = std::panic::take_hook();
@@ -493,16 +515,9 @@ where
     }
     let (booted, seal_key) = outcome?;
 
-    // A reload asked for over the link is delivered as SIGHUP. Registering a listener now
-    // replaces the signal's default action, which is to end the process, so one that
-    // arrives before the run installs its own handler is dropped rather than fatal.
-    #[cfg(unix)]
-    drop(tokio::signal::unix::signal(
-        tokio::signal::unix::SignalKind::hangup(),
-    ));
-
     let (out, mut pending) = mpsc::unbounded_channel();
     let up = Arc::new(AtomicBool::new(true));
+    let reader_up = Arc::clone(&up);
     HOST.set(Host {
         out,
         seal_key,
@@ -516,7 +531,7 @@ where
                     if let Err(err) = write_frame(&mut writer, &frame).await {
                         // The host's end is gone, and the link is never accepted again: the
                         // run goes on without it, quoting does not depend on it, and a save
-                        // from now on says it was not kept (`config_written`).
+                        // from now on says it was not persisted (`config_written`).
                         up.store(false, Ordering::SeqCst);
                         // Not `tracing`: the operator layer would route the line back into
                         // this channel. A debug console is the one place left.
@@ -537,17 +552,24 @@ where
         loop {
             // A frame that arrived whole but does not parse (a kind this build does not know,
             // from a newer helper) is skipped: the stream is still aligned on the next frame.
-            // Only a broken stream ends the loop.
+            // Only a broken stream ends the loop, and with it the link: a helper that closed
+            // its end is not there to keep the next save either, so it is known now rather
+            // than at the next failed write.
             let body = match read_body(&mut reader).await {
                 Ok(Some(body)) => body,
-                Ok(None) => break,
+                Ok(None) => {
+                    reader_up.store(false, Ordering::SeqCst);
+                    tracing::warn!("the host closed the link; saves are no longer persisted");
+                    break;
+                }
                 Err(err) => {
+                    reader_up.store(false, Ordering::SeqCst);
                     tracing::warn!("the channel to the host is unreadable: {err:#}");
                     break;
                 }
             };
             match serde_json::from_slice::<HostMessage>(&body) {
-                Ok(HostMessage::Reload) => raise(libc::SIGHUP),
+                Ok(HostMessage::Reload) => RELOAD.notify_one(),
                 Ok(HostMessage::Shutdown) => {
                     SHUTDOWN.send_replace(true);
                 }
@@ -577,14 +599,19 @@ pub fn scrub_urls(text: &str) -> String {
             .rev()
             .find(|(_, c)| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
             .map_or(0, |(i, c)| i + c.len_utf8());
-        // The URL runs to whitespace or a quote; a closing bracket or punctuation at its
-        // end is the sentence's, not the URL's, and is kept.
+        // The URL runs to whitespace, a double quote or a bracket that cannot be in one; a
+        // closing bracket, a quote or punctuation at its end is the sentence's, not the URL's,
+        // and is kept. Not to a single quote: a path may carry one unencoded, and ending
+        // there would leave the rest of a key after it in the clear.
         let tail = &rest[at + 3..];
         let end = tail
-            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '<' | '>'))
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '`' | '<' | '>'))
             .unwrap_or(tail.len());
         let token = &tail[..end];
-        let kept = token.len() - token.trim_end_matches([')', ',', '.', ';', ':']).len();
+        let kept = token.len()
+            - token
+                .trim_end_matches([')', ',', '.', ';', ':', '\''])
+                .len();
         let url = &rest[scheme_start..at + 3 + end - kept];
         out.push_str(&rest[..scheme_start]);
         if scheme_start == at {
@@ -659,16 +686,6 @@ pub fn require_tls(urls: &[(String, String)]) -> Result<()> {
         plain.join(", ")
     );
     Ok(())
-}
-
-/// Sends the process the signal the host asked for, so a reload over the link goes through
-/// exactly the handler SIGHUP does. A shutdown is not a signal: see [`shutdown_requested`].
-fn raise(signal: libc::c_int) {
-    // SAFETY: `raise` takes a signal number and has no other precondition; the boot
-    // registered a listener for SIGHUP, so its default action (ending the process) is off.
-    unsafe {
-        libc::raise(signal);
-    }
 }
 
 async fn install(
@@ -942,6 +959,9 @@ google = { client_id = "id.apps.googleusercontent.com", client_secret_secret = "
         assert_eq!(scrub_urls("halted WETH/USDC"), "halted WETH/USDC");
         assert_eq!(scrub_urls("a :// b"), "a :// b");
         assert_eq!(scrub_urls("é https://h/k"), "é https://h");
+        // A quote inside the path is part of it; one closing the sentence is kept.
+        assert_eq!(scrub_urls("at https://h/v2/ab'cd now"), "at https://h now");
+        assert_eq!(scrub_urls("url 'https://h/v2/key'."), "url 'https://h'.");
     }
 
     fn b64(bytes: &[u8]) -> String {
@@ -1010,7 +1030,7 @@ google = { client_id = "id.apps.googleusercontent.com", client_secret_secret = "
             }
         );
         std::fs::write(&config_path, "[settings]\nrequote_ms = 30\n").unwrap();
-        host.config_written(&config_path).unwrap();
+        assert!(host.config_written(&config_path));
         let frame: RunMessage = read_frame(&mut host_reader).await.unwrap().unwrap();
         let RunMessage::Config { sealed } = frame else {
             panic!("expected the sealed config, got {frame:?}");
@@ -1023,10 +1043,10 @@ google = { client_id = "id.apps.googleusercontent.com", client_secret_secret = "
             b"[settings]\nrequote_ms = 30\n"
         );
 
-        // A frame this build cannot read is skipped, and the next one still arrives: a
-        // reload, delivered as the SIGHUP the boot made safe to raise.
-        let mut hangup =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).unwrap();
+        // A frame this build cannot read is skipped, and the next ones still arrive: a reload
+        // and a shutdown, each to the value the run waits on (not `reload_requested` and
+        // `shutdown_requested`, which only listen in a process that booted for real).
+        let mut stop = SHUTDOWN.subscribe();
         let unknown = br#"{"kind":"rotate_keys"}"#;
         host_writer
             .write_all(&(unknown.len() as u32).to_be_bytes())
@@ -1036,24 +1056,33 @@ google = { client_id = "id.apps.googleusercontent.com", client_secret_secret = "
         write_frame(&mut host_writer, &HostMessage::Reload)
             .await
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), hangup.recv())
+        tokio::time::timeout(std::time::Duration::from_secs(5), RELOAD.notified())
             .await
             .expect("the reload after an unreadable frame was delivered");
+        write_frame(&mut host_writer, &HostMessage::Shutdown)
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stop.wait_for(|stop| *stop),
+        )
+        .await
+        .expect("the shutdown was delivered")
+        .unwrap();
 
-        // Once the host's end is gone, a save says it was not kept rather than passing.
+        // Once the host closes its end, a save is still written but says it was not kept.
         drop((host_reader, host_writer));
-        let refused = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                host.log("stdout", "is anyone there");
-                if let Err(err) = host.config_written(&config_path) {
-                    break err;
-                }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while host.config_written(&config_path) {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("the writer noticed the link is down");
-        assert!(format!("{refused:#}").contains("link to the host is down"));
+        .expect("the reader noticed the host closed the link");
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            "[settings]\nrequote_ms = 30\n"
+        );
     }
 
     #[tokio::test]

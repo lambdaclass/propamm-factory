@@ -6,11 +6,14 @@
 //! address the server inside listens on. TLS runs end to end through both, so the host
 //! carries ciphertext either way.
 
-use std::{net::SocketAddr, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use eyre::{Result, WrapErr};
 use futures_util::future::BoxFuture;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::Semaphore,
+};
 use tokio_vsock::{VMADDR_CID_ANY, VsockAddr, VsockListener, VsockStream};
 
 use super::{Accept, Forward, HostLink, Stream};
@@ -83,12 +86,24 @@ async fn outbound(listen: SocketAddr, cid: u32, port: u32) -> Result<()> {
     }
 }
 
-/// Accepts on vsock `port` forever, piping each connection to `to` inside.
+/// The most connections one inbound tunnel carries at once: a little above what the
+/// backoffice serves ([`crate::login::MAX_CONNECTIONS`]), so the server's own bound is the one
+/// a browser meets. Past it a connection waits in the vsock backlog, holding no descriptor in
+/// here, instead of queueing inside the tunnel with two.
+const MAX_INBOUND: usize = crate::login::MAX_CONNECTIONS + 16;
+
+/// Accepts on vsock `port` forever, piping each connection to `to` inside, at most
+/// [`MAX_INBOUND`] at once.
 async fn inbound(port: u32, to: SocketAddr) -> Result<()> {
     let listener = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, port))
         .wrap_err_with(|| format!("binding vsock port {port}"))?;
     tracing::info!("tunnel: vsock port {port} to {to}");
+    let slots = Arc::new(Semaphore::new(MAX_INBOUND));
     loop {
+        // Taken before the accept, so a connection past the bound is not accepted at all.
+        let Ok(slot) = Arc::clone(&slots).acquire_owned().await else {
+            return Ok(());
+        };
         let mut inbound = match listener.accept().await {
             Ok((stream, _)) => stream,
             Err(err) => {
@@ -97,6 +112,7 @@ async fn inbound(port: u32, to: SocketAddr) -> Result<()> {
             }
         };
         tokio::spawn(async move {
+            let _slot = slot;
             match TcpStream::connect(to).await {
                 Ok(mut outbound) => {
                     if let Err(err) =

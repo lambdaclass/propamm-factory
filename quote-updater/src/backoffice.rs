@@ -188,7 +188,6 @@ async fn bind_with(
         // HTTPS terminated here, a login on every route but the login's own, and the
         // hardening headers on all of them; see login/mod.rs.
         Some(secure) => {
-            use axum::serve::ListenerExt;
             let app = app
                 .layer(axum::middleware::from_fn_with_state(
                     Arc::clone(&secure.login),
@@ -196,19 +195,8 @@ async fn bind_with(
                 ))
                 .merge(crate::login::routes(Arc::clone(&secure.login)))
                 .layer(axum::middleware::from_fn(crate::login::harden));
-            // `tap_io` does nothing to a connection; it is what gives a listener of our own
-            // axum's `ConnectInfo<SocketAddr>`, which the handlers extract.
-            let listener = crate::login::TlsListener::spawn(listener, secure.tls)?.tap_io(|_| {});
-            tokio::spawn(async move {
-                if let Err(err) = axum::serve(
-                    listener,
-                    app.into_make_service_with_connect_info::<SocketAddr>(),
-                )
-                .await
-                {
-                    tracing::warn!("backoffice listener stopped: {err}");
-                }
-            })
+            let listener = crate::login::TlsListener::spawn(listener, secure.tls)?;
+            tokio::spawn(crate::login::serve(listener, app))
         }
     };
 
@@ -313,6 +301,8 @@ struct Outcome {
 impl From<std::result::Result<String, ReloadFailure>> for Outcome {
     fn from(result: std::result::Result<String, ReloadFailure>) -> Self {
         match result {
+            // Applied, but gone at the next restart: shown as the warning it is.
+            Ok(message) if message.contains(config::NOT_PERSISTED) => Outcome::failed(message),
             Ok(message) => Outcome::ok(message),
             Err(failure) => Outcome::failed(failure.line().to_owned()),
         }
@@ -1353,10 +1343,21 @@ async fn save_settings(
     let changed = config.settings.changed_keys(&settings).join(", ");
     config.settings = settings;
 
-    if let Err(err) = config::write_raw_atomically(&state.config_path, &config) {
-        return Outcome::failed(format!("{err:#}")).redirect();
-    }
+    let persisted = match config::write_raw_atomically(&state.config_path, &config) {
+        Ok(persisted) => persisted,
+        Err(err) => return Outcome::failed(format!("{err:#}")).redirect(),
+    };
     tracing::info!("backoffice: {peer} changed [settings] {changed}; restart pending");
+    // A setting applies only at the restart, so one the host was not handed never applies.
+    if persisted != config::Persisted::Yes {
+        return Outcome::failed(format!(
+            "saved {changed} here, but NOT persisted to the host: the link to the host is \
+             down, and these settings apply only at a restart, which would start from the \
+             host's copy without them. Restart the enclave once its boot helper is back, then \
+             save again."
+        ))
+        .redirect();
+    }
     Outcome::ok(format!(
         "saved {changed}. These are read once at startup, so {} to apply them.",
         crate::hints::restart_instruction()
@@ -3735,7 +3736,7 @@ api_key = "k"
             .settings
             .endpoints
             .insert("bybit".to_owned(), format!("ws://{venues}{BYBIT}"));
-        config::write_raw_atomically(&path, &config).unwrap();
+        let _ = config::write_raw_atomically(&path, &config).unwrap();
         let (local, _task) = bind(
             "127.0.0.1:0".parse().unwrap(),
             path.clone(),

@@ -159,26 +159,52 @@ pub fn render_raw(config: &RawConfig) -> Result<String> {
     Ok(format!("{}\n{body}", written_header()))
 }
 
+/// Whether a config write reached everywhere the config is kept. Outside an enclave the file
+/// is all there is, so a write that succeeded always has. Inside one the host keeps the
+/// sealed copy the next boot starts from, and a write it could not be handed (the link is
+/// down) is applied but lasts only until the restart.
+#[must_use]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Persisted {
+    /// Kept everywhere.
+    Yes,
+    /// Written and applied here, but not handed to the host.
+    NotToTheHost,
+}
+
+/// What an operator is told after a change [`Persisted::NotToTheHost`]: it stands, and will
+/// not survive a restart.
+pub const NOT_PERSISTED: &str = "Applied, but NOT persisted to the host: the link to the host \
+                                 is down, so this change will be lost at the next restart of \
+                                 the enclave.";
+
+impl Persisted {
+    /// [`NOT_PERSISTED`], when there is something to warn of.
+    pub fn warning(self) -> Option<&'static str> {
+        match self {
+            Persisted::Yes => None,
+            Persisted::NotToTheHost => Some(NOT_PERSISTED),
+        }
+    }
+}
+
 /// Write-then-rename into the same directory, so a reload racing this sees the whole old
 /// file or the whole new one. 0600 throughout: it holds the builder API keys.
-pub fn write_raw_atomically(path: &Path, config: &RawConfig) -> Result<()> {
+pub fn write_raw_atomically(path: &Path, config: &RawConfig) -> Result<Persisted> {
     let rendered = render_raw(config)?;
 
     // A round-trip failure here would leave a file the loader cannot read. Cheap to catch
     // now, expensive at the next reload.
     parse_file_settings(&rendered).wrap_err("the rendered config does not parse back")?;
-    // Inside an enclave a change the host cannot be handed is refused before it is written,
-    // so the file and the host's copy never disagree because of it.
-    if let Some(host) = crate::enclave::host() {
-        host.ensure_up()?;
-    }
     write_text_atomically(path, &rendered)
 }
 
 /// Writes `text` to `path` the way every config write goes: through a temporary file and a
 /// rename, readable by this process only, and sealed for the host inside an enclave. Also
-/// how a rejected change is put back, so the host's copy follows the revert too.
-pub fn write_text_atomically(path: &Path, text: &str) -> Result<()> {
+/// how a rejected change is put back, so the host's copy follows the revert too. An `Err`
+/// means the file was not replaced; once it has been, the answer is whether it was also
+/// [`Persisted`], never an error.
+pub fn write_text_atomically(path: &Path, text: &str) -> Result<Persisted> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let tmp = dir.join(format!(
         ".{}.tmp",
@@ -220,10 +246,10 @@ pub fn write_text_atomically(path: &Path, text: &str) -> Result<()> {
     }
     // Inside an enclave this file is on a filesystem that ends with the process: the host
     // keeps it between boots, sealed so it can neither read nor change it.
-    if let Some(host) = crate::enclave::host() {
-        host.config_written(path)?;
+    match crate::enclave::host() {
+        Some(host) if !host.config_written(path) => Ok(Persisted::NotToTheHost),
+        _ => Ok(Persisted::Yes),
     }
-    Ok(())
 }
 
 /// Reads just the `[settings]` table. Separate from `parse_config` because

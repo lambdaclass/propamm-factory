@@ -104,6 +104,25 @@ pub(crate) async fn run(args: Args, parts: Parts) -> Result<Outcome> {
     outcome
 }
 
+/// The next reload asked for: a SIGHUP on `signal`, or inside an enclave the host's request
+/// over the link. Never resolves without either, rather than resolving to nothing, which
+/// would spin the `select!` it is polled in.
+async fn next_reload(signal: &mut Option<tokio::signal::unix::Signal>) {
+    let hangup = async {
+        let delivered = match signal.as_mut() {
+            Some(stream) => stream.recv().await.is_some(),
+            None => false,
+        };
+        if !delivered {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::select! {
+        () = hangup => {}
+        () = crate::enclave::reload_requested() => {}
+    }
+}
+
 /// [`run`], minus the startup race: `shutdown_channel` is the one the race watches, and
 /// `quoting` is raised just before the first pair may quote, which ends it.
 async fn run_inner(
@@ -268,35 +287,33 @@ async fn run_inner(
     // ends the run there (see `run`), so it has to be heard from the start.
     let (stop, mut cancel) = shutdown_channel;
     tasks.spawn(async move {
-        // A binary's own trigger, if it set one, takes the same path as ctrl-c.
-        // So does the host's request to stop, inside an enclave, whichever the binary chose.
-        let signal = match shutdown {
-            Some(signal) => {
-                tokio::select! {
-                    () = signal => {}
-                    () = crate::enclave::shutdown_requested() => {}
+        // A binary's own trigger, if it set one, takes the same path as ctrl-c. So does the
+        // host's request to stop, inside an enclave, whichever the binary chose, and still
+        // when ctrl-c cannot be listened for.
+        let trigger = async {
+            match shutdown {
+                Some(signal) => signal.await,
+                None => {
+                    if let Err(err) = tokio::signal::ctrl_c().await {
+                        // Said out loud rather than left to be discovered by pressing
+                        // ctrl-c: with no handler installed the default kill-on-SIGINT
+                        // disposition still applies, so ctrl-c terminates the process
+                        // abruptly instead of withdrawing each pair's live quote first.
+                        tracing::warn!(
+                            "could not listen for ctrl-c ({err}); a SIGINT will kill the \
+                             process without cancelling live quotes"
+                        );
+                        std::future::pending::<()>().await;
+                    }
                 }
-                Ok(())
             }
-            None => tokio::select! {
-                signal = tokio::signal::ctrl_c() => signal,
-                () = crate::enclave::shutdown_requested() => Ok(()),
-            },
         };
-        match signal {
-            Ok(()) => {
-                tracing::info!("shutting down");
-                stop.send_replace(true);
-            }
-            // Said out loud rather than left to be discovered by pressing ctrl-c: with no
-            // handler installed the default kill-on-SIGINT disposition still applies, so
-            // ctrl-c terminates the process abruptly instead of withdrawing each pair's
-            // live quote first.
-            Err(err) => tracing::warn!(
-                "could not listen for ctrl-c ({err}); a SIGINT will kill the process without \
-                 cancelling live quotes"
-            ),
+        tokio::select! {
+            () = trigger => {}
+            () = crate::enclave::shutdown_requested() => {}
         }
+        tracing::info!("shutting down");
+        stop.send_replace(true);
     });
 
     // Built whether or not it is exported: the handles are threaded into every pair, so a run
@@ -762,13 +779,7 @@ async fn run_inner(
                         break;
                     }
                 }
-                Some(_) = async { match reloads.as_mut() {
-                    Some(stream) => stream.recv().await,
-                    // Never fires. `select!` still polls this arm, so it must be a future
-                    // that does not resolve rather than one that resolves to None, which
-                    // would spin the loop.
-                    None => std::future::pending().await,
-                } } => {
+                () = next_reload(&mut reloads) => {
                     if args.flags.once {
                         // `--once` is a batch invocation: the pairs publish once and the run
                         // ends. There is no desired state to converge onto and nothing that
@@ -885,10 +896,7 @@ async fn run_inner(
             // Node mode runs no supervised pair set, so there is nothing for a reload to
             // converge — but the signal must still be handled rather than left to its
             // default disposition, which is to kill this process. See `install_hangup`.
-            Some(_) = async { match reloads.as_mut() {
-                Some(stream) => stream.recv().await,
-                None => std::future::pending().await,
-            } } => {
+            () = next_reload(&mut reloads) => {
                 tracing::warn!(
                     "SIGHUP ignored: --mode node has no supervised pair set to reload, so \
                      changing {} needs a restart",

@@ -61,14 +61,19 @@ const GOOGLE_ISSUERS: [&str; 2] = ["https://accounts.google.com", "accounts.goog
 const KEYS_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 /// How long a TLS handshake may take before the connection is dropped.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long a connection may go without a byte in either direction before it is dropped.
-/// The server applies no read timeout of its own, so without this a client that completes
-/// the handshake and then says nothing holds its connection for ever.
+/// How long a connection may go without a byte in either direction before it is dropped:
+/// a client that completes the handshake and then says nothing, or stops reading what it is
+/// sent. Also what bounds an open preview websocket that has gone quiet.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long a request's head may take to arrive, from when the server starts waiting for it
+/// (after the handshake, or after the previous response on a kept-alive connection). A
+/// deadline, not an idle time: a client trickling a byte at a time cannot push it back, so it
+/// also bounds how long a connection with no request in flight is kept open.
+const HEADER_TIMEOUT: Duration = Duration::from_secs(20);
 /// The most connections served at once, handshakes included. Past it new ones wait in the
 /// kernel's queue: the backoffice has a handful of users, and an enclave has a fixed number
 /// of file descriptors that the run's own connections need too.
-const MAX_CONNECTIONS: usize = 128;
+pub const MAX_CONNECTIONS: usize = 128;
 
 /// The backoffice's TLS and login, built once at startup.
 pub struct Secure {
@@ -415,7 +420,8 @@ pub async fn harden(request: Request, next: Next) -> Response {
     response
 }
 
-/// The login's own routes, outside [`require`].
+/// The login's own routes, outside [`require`]. Logging out is a change too, held to the
+/// same origin.
 pub fn routes(login: Arc<Login>) -> Router {
     Router::new()
         .route("/auth/login", get(start))
@@ -523,7 +529,10 @@ async fn finish(
     Ok(claims.email)
 }
 
-async fn logout() -> Response {
+async fn logout(State(login): State<Arc<Login>>, headers: HeaderMap) -> Response {
+    if !same_origin(&headers, &login.origin) {
+        return (StatusCode::FORBIDDEN, "a change must come from this page").into_response();
+    }
     let mut response = Redirect::to("/auth/login").into_response();
     response.headers_mut().append(
         header::SET_COOKIE,
@@ -561,13 +570,11 @@ pub fn tls_config(certificate: &[u8], key: &[u8]) -> Result<Arc<rustls::ServerCo
 /// At most [`MAX_CONNECTIONS`] at once, each dropped after [`IDLE_TIMEOUT`] of silence.
 pub struct TlsListener {
     ready: mpsc::Receiver<(Guarded<TlsStream<TcpStream>>, SocketAddr)>,
-    local: SocketAddr,
 }
 
 impl TlsListener {
     /// Starts accepting on `tcp` with `config`.
     pub fn spawn(tcp: TcpListener, config: Arc<rustls::ServerConfig>) -> Result<Self> {
-        let local = tcp.local_addr().wrap_err("listener address")?;
         let acceptor = TlsAcceptor::from(config);
         let (tx, ready) = mpsc::channel(16);
         let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
@@ -600,24 +607,47 @@ impl TlsListener {
                 });
             }
         });
-        Ok(Self { ready, local })
+        Ok(Self { ready })
     }
 }
 
-impl axum::serve::Listener for TlsListener {
-    type Io = Guarded<TlsStream<TcpStream>>;
-    type Addr = SocketAddr;
-
-    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        match self.ready.recv().await {
-            Some(accepted) => accepted,
-            // The accept task is gone: nothing will ever arrive.
-            None => std::future::pending().await,
-        }
+impl TlsListener {
+    /// The next connection whose handshake completed, with its peer; `None` once the accept
+    /// task is gone.
+    pub async fn next(&mut self) -> Option<(Guarded<TlsStream<TcpStream>>, SocketAddr)> {
+        self.ready.recv().await
     }
+}
 
-    fn local_addr(&self) -> std::io::Result<Self::Addr> {
-        Ok(self.local)
+/// Serves `app` on `listener`, each connection on a task of its own, HTTP/1.1 only (the TLS
+/// offers no other protocol). By hand rather than through `axum::serve`, which takes no timer
+/// and so enforces no [`HEADER_TIMEOUT`]: with it, a request's head must arrive by a deadline
+/// that a client sending a byte every so often cannot move. The peer reaches the handlers as
+/// `ConnectInfo<SocketAddr>`, as `axum::serve` would set it.
+pub async fn serve(mut listener: TlsListener, app: Router) {
+    use tower::ServiceExt;
+    while let Some((io, peer)) = listener.next().await {
+        let app = app.clone();
+        tokio::spawn(async move {
+            let service = hyper::service::service_fn(
+                move |mut request: hyper::Request<hyper::body::Incoming>| {
+                    request
+                        .extensions_mut()
+                        .insert(axum::extract::ConnectInfo(peer));
+                    app.clone().oneshot(request)
+                },
+            );
+            let served = hyper::server::conn::http1::Builder::new()
+                .timer(hyper_util::rt::TokioTimer::new())
+                .header_read_timeout(HEADER_TIMEOUT)
+                .serve_connection(hyper_util::rt::TokioIo::new(io), service)
+                // The pair form's preview is a websocket.
+                .with_upgrades()
+                .await;
+            if let Err(err) = served {
+                tracing::debug!("backoffice connection from {peer}: {err}");
+            }
+        });
     }
 }
 
@@ -690,12 +720,23 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Guarded<S> {
         }
     }
 
+    // A peer that stops reading stalls a flush and a close as surely as a write.
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+        let this = &mut *self;
+        match Pin::new(&mut this.inner).poll_flush(cx) {
+            Poll::Ready(result) => Poll::Ready(result),
+            Poll::Pending if this.expired(cx) => Poll::Ready(Err(idle_error())),
+            Poll::Pending => Poll::Pending,
+        }
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+        let this = &mut *self;
+        match Pin::new(&mut this.inner).poll_shutdown(cx) {
+            Poll::Ready(result) => Poll::Ready(result),
+            Poll::Pending if this.expired(cx) => Poll::Ready(Err(idle_error())),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -846,7 +887,6 @@ mod tests {
     /// state remembered, a change without a session is refused, and a session gets through.
     #[tokio::test]
     async fn the_front_door_serves_tls_and_lets_only_a_session_through() {
-        use axum::serve::ListenerExt;
         let (certificate, key) = localhost_certificate();
         let tls = tls_config(certificate.as_bytes(), key.as_bytes()).unwrap();
         let login = login(allow_domain());
@@ -860,15 +900,9 @@ mod tests {
             .merge(routes(Arc::clone(&login)))
             .layer(axum::middleware::from_fn(harden));
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp.local_addr().unwrap();
         let listener = TlsListener::spawn(tcp, tls).unwrap();
-        let addr = axum::serve::Listener::local_addr(&listener).unwrap();
-        let server = tokio::spawn(async move {
-            axum::serve(
-                listener.tap_io(|_| {}),
-                app.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await
-        });
+        let server = tokio::spawn(serve(listener, app));
         let client = reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
             .redirect(reqwest::redirect::Policy::none())
