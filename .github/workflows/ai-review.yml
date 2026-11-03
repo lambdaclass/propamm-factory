@@ -1,13 +1,13 @@
 name: AI Code Review
 
-# Four reviewers from lambdaclass/actions (its README lists their inputs), each posting its
+# Five reviewers from lambdaclass/actions (its README lists their inputs), each posting its
 # review as a PR comment. They run only on request: a PR comment starting with /review from
-# someone with write access runs all four. Comment-triggered runs use this file as it is on main,
+# someone with write access runs all five. Comment-triggered runs use this file as it is on main,
 # so the command works once it is merged.
 #
-# Secrets, on the repository or the organization: OPENAI_API_KEY, DEEPSEEK_API_KEY,
-# XAI_API_KEY, KIMI_API_KEY. A reviewer with no key fails on every run, so none of these jobs
-# should be a required check.
+# Secrets, on the repository or the organization: ANTHROPIC_API_KEY, OPENAI_API_KEY,
+# DEEPSEEK_API_KEY, XAI_API_KEY, KIMI_API_KEY. A reviewer with no key fails on every run, so none
+# of these jobs should be a required check.
 #
 # The review focus is .github/prompts/ai-review.md, read from the PR's base branch so that a PR
 # cannot rewrite the prompt that reviews it.
@@ -22,9 +22,18 @@ on:
 # A reusable workflow gets at most the token permissions its caller job grants, so each job grants
 # exactly what its reviewer declares rather than relying on the repository's default.
 #
-# Each reviewer also answers its own command (/codex, /deepseek, /grok, /kimi); the `if` on each
-# job narrows that to /review. The reviewer checks the commenter's write access itself.
+# Each reviewer also answers its own command (/claude, /codex, /deepseek, /grok, /kimi); the `if`
+# on each job narrows that to /review. The reviewer checks the commenter's write access itself.
 jobs:
+  claude:
+    if: github.event.issue.pull_request && startsWith(github.event.comment.body, '/review')
+    permissions:
+      contents: read
+      pull-requests: write
+    uses: lambdaclass/actions/.github/workflows/ai-review-claude.yml@v1
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
   codex:
     if: github.event.issue.pull_request && startsWith(github.event.comment.body, '/review')
     permissions:
