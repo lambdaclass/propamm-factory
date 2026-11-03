@@ -559,10 +559,10 @@ pub(crate) fn kind_stanza(
 /// come first, in their order: each is rebuilt from its block if its kind declares fields,
 /// kept as written if it declares none or nobody registered it (the page shows it as edited
 /// in the file), and dropped if its box is unchecked. Then every registered kind the pair
-/// did not have, if checked, appended; one unchecked but with text in its fields refuses the
-/// save, since its fields render blank and the text was typed for a guard that would be
-/// dropped without a word. A page rendered before the section existed posts no
-/// `guards_present`, and keeps the pair's guards as they were.
+/// did not have, if checked, appended; one unchecked is left out whatever its fields hold,
+/// since the page shows a guard's fields only while its box is checked. A page rendered
+/// before the section existed posts no `guards_present`, and keeps the pair's guards as
+/// they were.
 fn guard_stanzas(
     kinds: &crate::kinds::Kinds,
     existing: &[toml::Table],
@@ -595,26 +595,10 @@ fn guard_stanzas(
         if seen.contains(&kind) {
             continue;
         }
-        let fields = kinds.guard_fields(kind).unwrap_or(&[]);
         if !enabled(kind) {
-            let filled: Vec<&str> = fields
-                .iter()
-                .map(|field| field.name)
-                .filter(|name| {
-                    posted
-                        .get(&format!("guard_{kind}_{name}"))
-                        .is_some_and(|text| !text.trim().is_empty())
-                })
-                .collect();
-            if !filled.is_empty() {
-                bail!(
-                    "guard `{kind}` has {} filled in but its box is not ticked: tick it to \
-                     add the guard, or clear the fields",
-                    filled.join(", ")
-                );
-            }
             continue;
         }
+        let fields = kinds.guard_fields(kind).unwrap_or(&[]);
         guards.push(kind_stanza("guard", fields, kind, None, posted)?);
     }
     Ok(guards)
@@ -829,6 +813,14 @@ async fn lookup_pair(State(state): State<Backoffice>, Query(tokens): Query<Token
         )
             .into_response();
     };
+    // Ondo is asked where the run reads it, so the row comes from the API the pair will
+    // quote from.
+    let config = match read_config(&state.config_path) {
+        Ok(config) => config,
+        Err(response) => return *response,
+    };
+    let rest = state.rest.with_endpoints(&config.settings.endpoints);
+    let ondo_key = crate::venues::ondo::api_key();
     let (base_symbol, quote_symbol) = tokio::join!(
         crate::preflight::token_symbol(&state.client, base),
         crate::preflight::token_symbol(&state.client, quote),
@@ -838,9 +830,10 @@ async fn lookup_pair(State(state): State<Backoffice>, Query(tokens): Query<Token
             crate::discover::discover(
                 &state.http,
                 &state.lookups,
-                &state.rest,
+                &rest,
                 &base_symbol,
                 &quote_symbol,
+                ondo_key.as_deref(),
             )
             .await
         }
@@ -1943,6 +1936,8 @@ struct Filled {
     multiline: bool,
     /// One checkbox per option rather than an input: a choices field. Empty for the rest.
     choices: Vec<Choice>,
+    /// Under the section's collapsed "advanced" line rather than in plain view.
+    advanced: bool,
 }
 
 /// One option of a choices field, as the page renders it.
@@ -1966,6 +1961,7 @@ impl Filled {
             readonly: false,
             multiline: false,
             choices: Vec::new(),
+            advanced: false,
         }
     }
 
@@ -2016,6 +2012,7 @@ impl Filled {
             readonly: false,
             multiline: field.kind == crate::pricing::FieldKind::List,
             choices,
+            advanced: field.advanced,
         }
     }
 
@@ -2059,10 +2056,8 @@ const SOURCE_FIELDS: &[Field] = &[
 /// What the venue table says beside the `ondo` row: it is an issuer's price for its own
 /// stock token, not a market the lookup can list, and it has no spread for a blank delta
 /// to copy.
-const ONDO_NOTE: &str = "Ondo's own price for one of its stock tokens, polled every second \
-                         with the key in ONDO_API_KEY; the symbol is the token's, e.g. AAPLon. \
-                         It is one price with no spread: set a delta in the pricing, or a \
-                         blank one quotes at the mid";
+const ONDO_NOTE: &str = "Ondo's own price for the token (key in ONDO_API_KEY); one price with \
+                         no spread, so set a delta in the pricing";
 
 /// How many venues must have a fresh price before the pair publishes.
 const MIN_SOURCES_FIELD: Field = Field::new(
@@ -2376,6 +2371,10 @@ struct KindSection {
     checked: bool,
     help: &'static str,
     fields: Vec<Filled>,
+    /// Any of `fields` is advanced: the section has a collapsed line to put them under.
+    has_advanced: bool,
+    /// The pair's stanza sets one of the advanced fields: the line starts open.
+    advanced_set: bool,
     /// A kind with no declared fields: the page says the stanza is edited in the file.
     in_file: bool,
 }
@@ -2389,8 +2388,21 @@ struct GuardSection {
     enabled: bool,
     help: &'static str,
     fields: Vec<Filled>,
+    /// Any of `fields` is advanced: the section has a collapsed line to put them under.
+    has_advanced: bool,
+    /// The pair's stanza sets one of the advanced fields: the line starts open.
+    advanced_set: bool,
     /// A kind with no declared fields: the page says the stanza is edited in the file.
     in_file: bool,
+}
+
+/// Whether `stanza` sets any of `fields` that is advanced, so the section shows them.
+fn sets_advanced(fields: &[crate::pricing::FormField], stanza: Option<&toml::Table>) -> bool {
+    stanza.is_some_and(|stanza| {
+        fields
+            .iter()
+            .any(|field| field.advanced && stanza.contains_key(field.name))
+    })
 }
 
 fn render_pair_form(pair: Option<&RawPair>, kinds: &crate::kinds::Kinds) -> String {
@@ -2460,6 +2472,8 @@ fn render_pair_form_with(
                         Filled::kind_field("pricing", name, field, value)
                     })
                     .collect(),
+                has_advanced: fields.iter().any(|field| field.advanced),
+                advanced_set: mine && sets_advanced(fields, pair.map(|p| &p.pricing)),
                 in_file: fields.is_empty(),
             }
         })
@@ -2474,7 +2488,14 @@ fn render_pair_form_with(
                 .find(|g| g.get("kind").and_then(|k| k.as_str()) == Some(kind))
         })
     };
-    let mut guard_names: Vec<String> = kinds.guard_kinds().iter().map(|k| k.to_string()).collect();
+    // A legacy kind, one another kind has taken over, is offered only on a pair that still
+    // lists it, where it is kept until unticked.
+    let mut guard_names: Vec<String> = kinds
+        .guard_kinds()
+        .iter()
+        .filter(|kind| !kinds.guard_is_legacy(kind) || stanza_of(kind).is_some())
+        .map(|k| k.to_string())
+        .collect();
     for kind in pair
         .into_iter()
         .flat_map(|p| p.guards.iter())
@@ -2500,6 +2521,8 @@ fn render_pair_form_with(
                         Filled::kind_field("guard", name, field, value)
                     })
                     .collect(),
+                has_advanced: fields.iter().any(|field| field.advanced),
+                advanced_set: sets_advanced(fields, stanza),
                 in_file: fields.is_empty(),
             }
         })
@@ -5038,25 +5061,20 @@ api_key = "k"
         assert_eq!(written, existing);
     }
 
-    /// A registered guard the pair does not have, with text in its fields but its box not
-    /// ticked, refuses the save naming the fields; blank fields under an unticked box are
-    /// the page as rendered and pass. Unticking a guard the pair has removes it even though
-    /// its fields still carry the stanza's values.
+    /// A registered guard the pair does not have is added only with its box ticked: its
+    /// fields show only while it is, so text in them under an unticked box was typed and
+    /// then unticked, and the guard is left out without refusing the save. Unticking a
+    /// guard the pair has removes it even though its fields still carry the stanza's values.
     #[test]
-    fn a_filled_but_unticked_guard_refuses_the_save() {
+    fn an_unticked_guard_is_not_added_whatever_its_fields_hold() {
         let kinds = test_kinds();
-        let err = guard_stanzas(
+        let written = guard_stanzas(
             &kinds,
             &[],
             &posted_map(&[("guards_present", "1"), ("guard_cap_max_share", "0.8")]),
         )
-        .unwrap_err();
-        let message = format!("{err:#}");
-        assert!(
-            message.contains("guard `cap` has max_share filled in"),
-            "{message}"
-        );
-        assert!(message.contains("not ticked"), "{message}");
+        .unwrap();
+        assert_eq!(written, Vec::<toml::Table>::new());
         let written = guard_stanzas(
             &kinds,
             &[],
@@ -5240,20 +5258,16 @@ api_key = "k"
     /// stanza, the one the smoke test runs: nothing about a stock pair needs the file.
     #[tokio::test]
     async fn a_stock_pair_added_from_the_page_is_the_example_stanza() {
-        use crate::stocks::{Issuer, hours::UsMarketHoursFactory, issuers::ondo::Ondo};
+        use crate::stocks::hours::UsMarketHoursFactory;
         let example: config::RawConfig =
             toml::from_str(include_str!("../../example/config.stocks.toml")).unwrap();
         let want = example.pairs[0].clone();
         let mut kinds = crate::kinds::Kinds::default();
         kinds.insert("feed", Arc::new(crate::pricing::Feed));
-        kinds.insert_guard("ondo", crate::kinds::quote_guard_factory(Ondo));
+        register_ondo(&mut kinds);
         kinds.insert_guard(
             "us_market_hours",
             crate::kinds::quote_guard_factory(UsMarketHoursFactory),
-        );
-        kinds.insert_guard(
-            "ondo_token",
-            crate::kinds::quote_guard_factory(Ondo.token_guard()),
         );
         let (path, state, mut reloads) = config_on_disk("stock-pair");
         let (local, _task) = bind(
@@ -5271,13 +5285,13 @@ api_key = "k"
             let request = reloads.recv().await.expect("a reload must be requested");
             let _ = request.reply.send(Ok("reload: 1 started".to_owned()));
         });
-        let (pricing, ondo, hours, token) = (
-            &want.pricing,
-            &want.guards[0],
-            &want.guards[1],
-            &want.guards[2],
-        );
+        let (pricing, ondo, hours) = (&want.pricing, &want.guards[0], &want.guards[1]);
         assert_eq!(ondo["kind"].as_str(), Some("ondo"));
+        assert_eq!(
+            want.guards.len(),
+            2,
+            "the ondo guard runs the token's rules itself"
+        );
         let text = |table: &toml::Table, key: &str| table[key].as_str().unwrap().to_owned();
         let lines = |key: &str| {
             hours[key]
@@ -5305,11 +5319,6 @@ api_key = "k"
             ("pricing_feed_delta", text(pricing, "delta")),
             ("guards_present", "1".to_owned()),
             ("enabled_guard_ondo", "on".to_owned()),
-            ("guard_ondo_symbol", text(ondo, "symbol")),
-            (
-                "guard_ondo_api_key",
-                ondo["api_key"]["env"].as_str().unwrap().to_owned(),
-            ),
             (
                 "guard_ondo_sessions",
                 ondo["sessions"]
@@ -5334,12 +5343,6 @@ api_key = "k"
             (
                 "guard_us_market_hours_listed_through",
                 text(hours, "listed_through"),
-            ),
-            ("enabled_guard_ondo_token", "on".to_owned()),
-            ("guard_ondo_token_poll_secs", token["poll_secs"].to_string()),
-            (
-                "guard_ondo_token_max_age_secs",
-                token["max_age_secs"].to_string(),
             ),
         ];
         let body = fields
@@ -5475,10 +5478,6 @@ api_key = "k"
         let mut config = a_config();
         let mut ondo = guard_table("ondo", None);
         ondo.insert(
-            "symbol".to_owned(),
-            toml::Value::String("AAPLon".to_owned()),
-        );
-        ondo.insert(
             "sessions".to_owned(),
             toml::Value::Array(vec![
                 toml::Value::String("regular".to_owned()),
@@ -5524,6 +5523,146 @@ api_key = "k"
                 && form.contains(r#"name="guard_ondo_sessions__postmarket">"#),
             "{form}"
         );
+    }
+
+    /// The kinds a stock binary registers, as `stock_issuer` registers them: the issuer's
+    /// guard, and its token guard on its own name for a pair that still lists it.
+    fn stock_kinds() -> Arc<crate::kinds::Kinds> {
+        let mut kinds = crate::kinds::Kinds::default();
+        kinds.insert("feed", Arc::new(crate::pricing::Feed));
+        register_ondo(&mut kinds);
+        Arc::new(kinds)
+    }
+
+    /// Ondo's kinds, as `stock_issuer` registers them.
+    fn register_ondo(kinds: &mut crate::kinds::Kinds) {
+        use crate::stocks::{Issuer, WithTokenRules, issuers::ondo::Ondo};
+        kinds.insert_guard_legacy(
+            "ondo_token",
+            "ondo",
+            crate::kinds::quote_guard_factory(Ondo.token_guard()),
+        );
+        kinds.insert_guard(
+            "ondo",
+            crate::kinds::quote_guard_factory(WithTokenRules::new(Ondo)),
+        );
+    }
+
+    /// A guard kind another kind has taken over is offered to no new pair, and shown on a
+    /// pair that still lists it, where it can be unticked.
+    #[test]
+    fn a_legacy_guard_shows_only_on_a_pair_that_lists_it() {
+        let kinds = stock_kinds();
+        let mut config = a_config();
+        let form = render_pair_form(Some(&config.pairs[0]), &kinds);
+        assert!(form.contains(r#"name="enabled_guard_ondo""#), "{form}");
+        assert!(!form.contains("enabled_guard_ondo_token"), "{form}");
+        let form = render_pair_form(None, &kinds);
+        assert!(
+            !form.contains("enabled_guard_ondo_token"),
+            "a new pair: {form}"
+        );
+        config.pairs[0].guards = vec![guard_table("ondo_token", None)];
+        let form = render_pair_form(Some(&config.pairs[0]), &kinds);
+        assert!(
+            form.contains(r#"name="enabled_guard_ondo_token" checked>"#),
+            "{form}"
+        );
+    }
+
+    /// A kind's advanced fields sit under a collapsed line after its plain ones, so the
+    /// fields an operator must look at are the ones in view.
+    #[test]
+    fn advanced_fields_sit_under_a_collapsed_line() {
+        let kinds = stock_kinds();
+        let config = a_config();
+        let form = render_pair_form(Some(&config.pairs[0]), &kinds);
+        let sessions = form
+            .find("guard_ondo_sessions")
+            .expect("the sessions field");
+        let advanced = form
+            .find("<details class=advanced>")
+            .expect("an advanced line");
+        let oracle = form
+            .find("guard_ondo_multiplier_oracle")
+            .expect("the oracle field");
+        assert!(sessions < advanced && advanced < oracle, "{form}");
+        // Every one of the guard's knobs is under it; only the sessions are in plain view.
+        for knob in [
+            "ticker",
+            "status_poll_secs",
+            "max_status_age_secs",
+            "pause_lead_secs",
+            "max_multiplier_gap",
+        ] {
+            let at = form.find(&format!("guard_ondo_{knob}")).expect(knob);
+            assert!(at > advanced, "{knob} is in plain view");
+        }
+        // The stylesheet hides an unticked guard's help and fields.
+        assert!(
+            include_str!("../templates/style.css").contains(
+                ".guard:not(:has(> .check > input:checked)) > :not(.check) { display: none; }"
+            ),
+            "the guard rule"
+        );
+    }
+
+    /// Every guard input posts under a name of its own, on a page showing every stock guard:
+    /// inputs are named `guard_<kind>_<field>`, so a field of `ondo` whose name starts with
+    /// `token_` would post as a field of `ondo_token`, and the save would keep one value
+    /// for both.
+    #[test]
+    fn no_two_guard_inputs_post_under_one_name() {
+        let kinds = stock_kinds();
+        let mut config = a_config();
+        config.pairs[0].guards = vec![guard_table("ondo", None), guard_table("ondo_token", None)];
+        let form = render_pair_form(Some(&config.pairs[0]), &kinds);
+        let mut names: Vec<&str> = form
+            .match_indices("name=\"guard_")
+            .map(|(at, _)| {
+                let name = &form[at + "name=\"".len()..];
+                &name[..name.find('"').unwrap()]
+            })
+            .collect();
+        names.sort_unstable();
+        let shared: Vec<&str> = names
+            .windows(2)
+            .filter(|pair| pair[0] == pair[1])
+            .map(|pair| pair[0])
+            .collect();
+        assert!(shared.is_empty(), "inputs sharing a name: {shared:?}");
+        assert!(
+            names.contains(&"guard_ondo_token_max_age_secs"),
+            "{names:?}"
+        );
+    }
+
+    /// A pair that sets one of a kind's advanced knobs shows that kind's advanced line open,
+    /// so a value it overrides is in view; one that sets none shows it closed.
+    #[test]
+    fn the_advanced_line_is_open_when_the_pair_sets_one_of_its_knobs() {
+        let kinds = stock_kinds();
+        let mut config = a_config();
+        let advanced_line = |form: &str| {
+            let sessions = form.find("guard_ondo_sessions").expect("the ondo guard");
+            let at = sessions + form[sessions..].find("<details").expect("an advanced line");
+            form[at..].split('>').next().unwrap().to_owned()
+        };
+        let mut ondo = guard_table("ondo", None);
+        ondo.insert(
+            "sessions".to_owned(),
+            toml::Value::Array(vec![toml::Value::String("regular".to_owned())]),
+        );
+        config.pairs[0].guards = vec![ondo.clone()];
+        let form = render_pair_form(Some(&config.pairs[0]), &kinds);
+        assert_eq!(advanced_line(&form), "<details class=advanced");
+        ondo.insert(
+            "multiplier_oracle".to_owned(),
+            toml::Value::String("0x0ed2E86FcE2e5A7965f59708c01f88a722BC7f07".to_owned()),
+        );
+        config.pairs[0].guards = vec![ondo];
+        let form = render_pair_form(Some(&config.pairs[0]), &kinds);
+        assert_eq!(advanced_line(&form), "<details class=advanced open");
     }
 
     /// A choices field posted as text (no box, as a scripted post does) names the options,

@@ -7,7 +7,7 @@
 #
 #   bash e2e/stocks/run.sh   from anywhere; builds what it needs, exits 0 when every check holds
 #
-# 1. `--check` on a full builder-mode config (the ondo venue, the feed pricer and the three
+# 1. `--check` on a full builder-mode config (the ondo venue, the feed pricer and the two
 #    guards) passes, and passes with the pair halted, which the library labels by its lane.
 # 2. `--check` fails, naming why, on a wrong API key; and passes on a token the oracle does
 #    not list, saying the multiplier is not checked.
@@ -128,11 +128,10 @@ assert pairs in text, "the example config's pair moved"
 text = text.replace(
     pairs, f'[settings.endpoints]\nondo = "http://127.0.0.1:{api_port}"\n\n{pairs}', 1
 )
+# The guard reads the status where the venue reads the price; only the oracle is the mock's.
 ondo = 'kind    = "ondo"\n'
 assert ondo in text, "the example config's ondo guard stanza moved"
-text = text.replace(
-    ondo, f'{ondo}api = "http://127.0.0.1:{api_port}"\nmultiplier_oracle = "{oracle}"\n'
-)
+text = text.replace(ondo, f'{ondo}multiplier_oracle = "{oracle}"\n')
 if mode == "node":
     # The first guard *table*: the header comment names [[pairs.guards]] too. And the
     # breaker, which node mode refuses: it has no live quote to withdraw.

@@ -56,6 +56,7 @@ impl Default for Rest {
             (VenueId::Bitget, "https://api.bitget.com"),
             (VenueId::Gate, "https://api.gateio.ws"),
             (VenueId::Mexc, "https://api.mexc.com"),
+            (VenueId::Ondo, crate::venues::ondo::DEFAULT_ENDPOINT),
         ]
         .into_iter()
         .map(|(v, h)| (v, h.to_owned()))
@@ -69,8 +70,20 @@ impl Rest {
     #[cfg(test)]
     pub fn all_at(host: &str) -> Self {
         Self {
-            hosts: exchanges().map(|v| (v, host.to_owned())).collect(),
+            hosts: VenueId::ALL.iter().map(|v| (*v, host.to_owned())).collect(),
         }
+    }
+
+    /// These hosts, with Ondo's at the run's `[settings.endpoints] ondo` when it sets one:
+    /// the venue polls Ondo's REST API there, and the lookup asks the same API. Every other
+    /// endpoint in that table is an exchange's feed, a WebSocket, not its REST API, so the
+    /// exchanges' hosts stay.
+    pub fn with_endpoints(&self, endpoints: &std::collections::BTreeMap<String, String>) -> Rest {
+        let mut rest = self.clone();
+        if let Some(ondo) = endpoints.get(VenueId::Ondo.as_str()) {
+            rest.hosts.insert(VenueId::Ondo, ondo.clone());
+        }
+        rest
     }
 
     fn host(&self, venue: VenueId) -> &str {
@@ -138,19 +151,32 @@ impl Discovery {
     }
 }
 
-/// Looks the pair up at every exchange, from its two tokens' on-chain `symbol()`s. An
-/// exchange that cannot be asked is a note and an unknown row, never a failed lookup.
+/// Looks the pair up at every exchange, from its two tokens' on-chain `symbol()`s, and at
+/// Ondo with `ondo_key` (`ONDO_API_KEY`), which prices its own stock tokens; without a key
+/// Ondo is not asked. An exchange, or Ondo, that cannot be asked is a note and an unknown
+/// row, never a failed lookup.
 pub async fn discover(
     http: &reqwest::Client,
     cache: &Cache,
     rest: &Rest,
     base: &str,
     quote: &str,
+    ondo_key: Option<&str>,
 ) -> Result<Discovery> {
-    let lists = futures_util::future::join_all(
-        exchanges().map(|venue| async move { (venue, markets(http, cache, rest, venue).await) }),
-    )
-    .await;
+    // Ondo is asked about the first token beside the exchanges, so a slow answer adds
+    // nothing to the lookup.
+    let (lists, ondo_first) = tokio::join!(
+        futures_util::future::join_all(
+            exchanges()
+                .map(|venue| async move { (venue, markets(http, cache, rest, venue).await) }),
+        ),
+        async {
+            match ondo_key {
+                Some(key) => Some(ondo_row(rest, base, key).await),
+                None => None,
+            }
+        },
+    );
     let mut notes = Vec::new();
     let mut unreachable = Vec::new();
     let mut known: Vec<(VenueId, Arc<Vec<Market>>)> = Vec::new();
@@ -189,7 +215,7 @@ pub async fn discover(
             std::mem::swap(&mut base, &mut quote);
         }
     }
-    let (base_name, quote_name) = (name(base), name(quote));
+    let (mut base_name, mut quote_name) = (name(base), name(quote));
 
     // A ticker per candidate: the exact market, or every dollar stand-in, of which the one
     // that trades the most is kept.
@@ -241,6 +267,35 @@ pub async fn discover(
             }
         })
         .collect();
+    // Ondo lists no markets to read, but it prices its own tokens: a base token Ondo's API
+    // knows gets an ondo row, filled with the token's symbol as Ondo names it. The answer
+    // for the first token is the base's unless the exchanges turned the pair around. A
+    // stock token typed second, which no exchange lists, is turned around on Ondo's answer.
+    if let (Some(key), Some(first)) = (ondo_key, ondo_first) {
+        let mut asked = base;
+        let mut answer = if swapped {
+            ondo_row(rest, base, key).await
+        } else {
+            first
+        };
+        if !swapped && rows.is_empty() && matches!(answer, Ok(None)) {
+            asked = quote;
+            answer = ondo_row(rest, quote, key).await;
+            if matches!(answer, Ok(Some(_))) {
+                swapped = true;
+                std::mem::swap(&mut base, &mut quote);
+                (base_name, quote_name) = (name(base), name(quote));
+            }
+        }
+        match answer {
+            Ok(Some(row)) => rows.push(row),
+            Ok(None) => {}
+            Err(err) => {
+                notes.push(format!("ondo: could not ask for {asked} ({err:#})"));
+                unreachable.push(VenueId::Ondo);
+            }
+        }
+    }
     rows.sort_by_key(|r| VenueId::ALL.iter().position(|v| *v == r.venue));
 
     let listed = rows.len();
@@ -281,6 +336,51 @@ fn candidates<'a>(list: &'a [Market], base: &str, quote: &str) -> (Vec<&'a Marke
         .filter(|m| m.base == base && allowed.contains(&m.quote.as_str()))
         .collect();
     (stand_ins, false)
+}
+
+/// The `ondo` row for `symbol`, a token's on-chain symbol, when Ondo's API answers a price
+/// for it with `key`: Ondo names its tokens by that symbol (`AAPLon`). `None` when Ondo does
+/// not price the token: a 404, or an answer with no price in it (Ondo's "asset not found").
+/// An error when Ondo could not be asked, which the lookup says rather than read as the
+/// token not being Ondo's: any other status (a refused key, a redirect, which is never
+/// followed since the key would go along), no answer, or a host the key may not cross the
+/// network to.
+async fn ondo_row(rest: &Rest, symbol: &str, key: &str) -> Result<Option<Found>> {
+    use crate::venues::ondo;
+    let host = rest.host(VenueId::Ondo);
+    ondo::check_endpoint(host).map_err(|err| eyre!(err))?;
+    let mut url = reqwest::Url::parse(host).wrap_err("not a URL")?;
+    url.path_segments_mut()
+        .map_err(|()| eyre!("{host:?} cannot take a path"))?
+        .pop_if_empty()
+        .extend(["v1", "assets", symbol, "prices", "latest"]);
+    let response = ondo::client()
+        .get(url)
+        .header("x-api-key", key)
+        .send()
+        .await
+        .wrap_err("no answer")?;
+    let status = response.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    eyre::ensure!(status.is_success(), "HTTP {status}");
+    let body = response.text().await.wrap_err("reading the answer")?;
+    let Ok(Some((quote, _))) = ondo::parse_stamped(&body) else {
+        return Ok(None);
+    };
+    let last = match quote {
+        crate::venue::Quote::Mid(price) => price.parse().ok(),
+        crate::venue::Quote::Book { .. } => None,
+    };
+    Ok(Some(Found {
+        venue: VenueId::Ondo,
+        symbol: symbol.to_owned(),
+        weight: "1".to_owned(),
+        last,
+        volume_usd: None,
+        note: "Ondo's own price for the token".to_owned(),
+    }))
 }
 
 async fn get_json(http: &reqwest::Client, url: &str) -> Result<Value> {
@@ -539,6 +639,186 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Ondo's answer for AAPLon, as `e2e/stocks/ondo_api.py` gives it.
+    const AAPLON_PRICE: &str = r#"{"primaryMarket":{"symbol":"AAPLon","price":"256.79"},"underlyingMarket":{"ticker":"AAPL","price":"256.24"},"timestamp":1791468000000}"#;
+
+    /// A token Ondo's API prices gets an ondo row filled with the token's own symbol and
+    /// Ondo's price, and a token Ondo does not know (a 404) gets none.
+    #[tokio::test]
+    async fn a_token_ondo_prices_gets_an_ondo_row() {
+        use crate::testing::MockApi;
+        let api = MockApi::serve(vec![(
+            "/v1/assets/AAPLon/prices/latest",
+            MockApi::json(AAPLON_PRICE),
+        )]);
+        let rest = Rest::all_at(&api.url);
+        let row = ondo_row(&rest, "AAPLon", "smoke-key")
+            .await
+            .unwrap()
+            .expect("Ondo prices AAPLon");
+        assert_eq!(row.venue, VenueId::Ondo);
+        assert_eq!(row.symbol, "AAPLon");
+        assert_eq!(row.weight, "1");
+        assert_eq!(row.last, Some(256.79));
+        assert_eq!(row.volume_usd, None);
+        assert_eq!(
+            ondo_row(&rest, "WETH", "smoke-key").await.unwrap(),
+            None,
+            "a token Ondo does not know"
+        );
+    }
+
+    /// Without a key the lookup does not ask Ondo at all, and says nothing about it.
+    #[tokio::test]
+    async fn without_a_key_ondo_is_not_asked() {
+        use crate::testing::MockApi;
+        let api = MockApi::serve(vec![(
+            "/v1/assets/AAPLon/prices/latest",
+            MockApi::json(AAPLON_PRICE),
+        )]);
+        let rest = Rest::all_at(&api.url);
+        let found = discover(
+            &reqwest::Client::new(),
+            &Cache::default(),
+            &rest,
+            "AAPLon",
+            "USDC",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(api.hits("/v1/assets/AAPLon/prices/latest"), 0);
+        assert_eq!(found.row(VenueId::Ondo), None);
+        assert!(!found.unreachable.contains(&VenueId::Ondo), "{found:?}");
+    }
+
+    /// Ondo refusing the key, or failing, is not Ondo not knowing the token: the lookup
+    /// says Ondo could not be asked, with its status, as for an exchange.
+    #[tokio::test]
+    async fn an_ondo_that_cannot_be_asked_is_unreachable_with_its_status() {
+        use crate::testing::MockApi;
+        let api = MockApi::serve(vec![(
+            "/v1/assets/AAPLon/prices/latest",
+            MockApi::answer("401 Unauthorized", &[], r#"{"error":"UNAUTHORIZED"}"#),
+        )]);
+        let rest = Rest::all_at(&api.url);
+        let found = discover(
+            &reqwest::Client::new(),
+            &Cache::default(),
+            &rest,
+            "AAPLon",
+            "USDC",
+            Some("expired"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(found.row(VenueId::Ondo), None);
+        assert!(found.unreachable.contains(&VenueId::Ondo), "{found:?}");
+        let note = found
+            .notes
+            .iter()
+            .find(|note| note.starts_with("ondo:"))
+            .unwrap_or_else(|| panic!("no ondo note: {:?}", found.notes));
+        assert!(note.contains("401"), "{note}");
+        assert!(!note.contains("expired"), "the key is in the note: {note}");
+    }
+
+    /// A stock pair typed quote first, which no exchange lists either way round, is turned
+    /// around on Ondo's answer for the second token, as an exchange's answer turns it.
+    #[tokio::test]
+    async fn a_stock_token_typed_second_is_found_and_swapped() {
+        use crate::testing::MockApi;
+        let api = MockApi::serve(vec![(
+            "/v1/assets/AAPLon/prices/latest",
+            MockApi::json(AAPLON_PRICE),
+        )]);
+        let rest = Rest::all_at(&api.url);
+        let found = discover(
+            &reqwest::Client::new(),
+            &Cache::default(),
+            &rest,
+            "USDC",
+            "AAPLon",
+            Some("smoke-key"),
+        )
+        .await
+        .unwrap();
+        assert!(found.swapped, "{found:?}");
+        assert_eq!(found.base_symbol, "AAPLON");
+        assert_eq!(found.quote_symbol, "USDC");
+        assert_eq!(
+            found.row(VenueId::Ondo).map(|r| r.symbol.as_str()),
+            Some("AAPLon")
+        );
+        assert_eq!(api.hits("/v1/assets/USDC/prices/latest"), 1);
+    }
+
+    /// A token's `symbol()` is whatever its contract says, so it goes into Ondo's path as
+    /// one escaped segment, not as more path or a query.
+    #[tokio::test]
+    async fn the_symbol_is_one_escaped_segment_of_the_path() {
+        use crate::testing::MockApi;
+        let api = MockApi::serve(Vec::new());
+        let rest = Rest::all_at(&api.url);
+        assert_eq!(ondo_row(&rest, "AA/on?x", "k").await.unwrap(), None);
+        assert_eq!(api.hits("/v1/assets/AA%2Fon%3Fx/prices/latest"), 1);
+    }
+
+    /// The key never goes to a host over plain http that is not this machine.
+    #[tokio::test]
+    async fn the_key_is_not_sent_over_plain_http_to_another_host() {
+        let mut rest = Rest::default();
+        rest.hosts
+            .insert(VenueId::Ondo, "http://ondo.invalid".to_owned());
+        let err = ondo_row(&rest, "AAPLon", "secret").await.unwrap_err();
+        assert!(format!("{err:#}").contains("plain http"), "{err:#}");
+    }
+
+    /// The lookup asks Ondo where the run reads it, `[settings.endpoints] ondo`, and where
+    /// it would anyway without one. An exchange's endpoint there is its feed, a WebSocket,
+    /// so the lookup's REST host for it does not move.
+    #[test]
+    fn the_lookup_asks_ondo_where_the_run_points_it() {
+        let rest = Rest::all_at("http://127.0.0.1:9");
+        let endpoints = [
+            ("ondo".to_owned(), "http://127.0.0.1:8566".to_owned()),
+            ("binance".to_owned(), "ws://127.0.0.1:8546/ws".to_owned()),
+        ]
+        .into();
+        let run = rest.with_endpoints(&endpoints);
+        assert_eq!(run.host(VenueId::Ondo), "http://127.0.0.1:8566");
+        assert_eq!(run.host(VenueId::Binance), "http://127.0.0.1:9");
+        let unset = rest.with_endpoints(&Default::default());
+        assert_eq!(unset.host(VenueId::Ondo), "http://127.0.0.1:9");
+    }
+
+    /// The lookup sends the key, so a redirect from Ondo's host is refused, not followed:
+    /// reqwest carries `x-api-key` along to wherever a redirect points.
+    #[tokio::test]
+    async fn the_ondo_lookup_does_not_follow_a_redirect_with_the_key() {
+        use crate::testing::MockApi;
+        let elsewhere = MockApi::serve(vec![(
+            "/collect",
+            MockApi::json(
+                r#"{"primaryMarket":{"symbol":"AAPLon","price":"256.79"},"timestamp":1791468000000}"#,
+            ),
+        )]);
+        let location = format!("{}/collect", elsewhere.url);
+        let api = MockApi::serve(vec![(
+            "/v1/assets/AAPLon/prices/latest",
+            MockApi::answer("302 Found", &[("location", &location)], ""),
+        )]);
+        let rest = Rest::all_at(&api.url);
+        let err = ondo_row(&rest, "AAPLon", "secret").await.unwrap_err();
+        assert!(format!("{err:#}").contains("302"), "{err:#}");
+        assert_eq!(api.hits("/v1/assets/AAPLon/prices/latest"), 1);
+        assert_eq!(
+            elsewhere.hits("/collect"),
+            0,
+            "the key followed the redirect"
+        );
+    }
+
     fn market(base: &str, quote: &str, symbol: &str) -> Market {
         Market {
             base: base.into(),
@@ -776,6 +1056,7 @@ mod live {
             &super::Rest::default(),
             "WETH",
             quote,
+            None,
         )
         .await
         .unwrap();

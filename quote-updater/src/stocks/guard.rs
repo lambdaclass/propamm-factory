@@ -1,4 +1,6 @@
-//! The restriction guard every tokenized-stock design registers (`ondo_token` today): it
+//! The restriction guard every tokenized-stock design has, run beside its issuer's status
+//! guard under that guard's kind ([`super::WithTokenRules`]), and registered on its own
+//! name (`ondo_token` today) for a pair that still lists it as a guard of its own: it
 //! withdraws a stock pair's quote while the token would refuse the fill it offers: paused,
 //! or the vault or this PropAMM refused. Two reads answer that each poll: the design's
 //! reading of the token's transfer rules ([`Restrictions`]), which names the reason, and
@@ -11,6 +13,9 @@
 //! Withdrawing the quote is what makes `isActive` false from the next block, so routers stop
 //! sending fills that can only revert. Withdraw, not halt: when the issuer lifts the
 //! restriction, quoting resumes.
+//!
+//! Its two settings are the issuer stanza's (Ondo's `rules_poll_secs` and
+//! `rules_max_age_secs`), or, on the legacy stanza:
 //!
 //! ```toml
 //! [[pairs.guards]]
@@ -56,6 +61,17 @@ fn default_poll_secs() -> u64 {
 }
 fn default_max_age_secs() -> u64 {
     60
+}
+
+impl Default for GuardCfg {
+    /// A read a block, trusted for a minute: what the issuer-status guard builds this
+    /// check with when it runs it as its own.
+    fn default() -> GuardCfg {
+        GuardCfg {
+            poll_secs: default_poll_secs(),
+            max_age_secs: default_max_age_secs(),
+        }
+    }
 }
 
 /// The latest reading: everything that would revert a fill now, and when it was read.
@@ -152,8 +168,11 @@ impl QuoteGuardFactory for RestrictionGuardFactory {
 
     fn form_help(&self) -> &'static str {
         "<p class=explain>Withdraws while the token would refuse the fill: paused, the vault \
-         or the PropAMM refused by the issuer's lists, or a transfer tried on the token as \
-         the PropAMM refused for a reason no list names.</p>"
+         or the PropAMM on the issuer's lists, or a transfer tried on the token refused. The \
+         issuer's own guard runs this check itself now; a pair that still lists this one \
+         can untick it, setting its two numbers on that guard instead \
+         (<code>rules_poll_secs</code> and <code>rules_max_age_secs</code> on \
+         <code>ondo</code>).</p>"
     }
 
     fn validate(&self, cfg: &GuardCfg, _pair: &PairShape) -> eyre::Result<()> {
@@ -688,8 +707,10 @@ mod tests {
         testing::assert_rejects_unknown_fields::<GuardCfg>("poll_secs = 12");
     }
 
-    /// Every field the form declares is a key the stanza reads, and every key the example
-    /// stanza sets is declared, so a form round trip rebuilds the stanza unchanged.
+    /// Every field the form declares is a key the stanza reads, and every key a full
+    /// stanza sets is declared, so a form round trip rebuilds the stanza unchanged. The
+    /// example config lists this guard no more (the issuer's guard runs it), so the stanza
+    /// here is the default one written out.
     #[test]
     fn every_declared_field_is_a_key_the_stanza_reads_and_every_key_is_declared() {
         use crate::{
@@ -712,17 +733,8 @@ mod tests {
         let table = kind_stanza("guard", fields, "ondo_token", None, &posted).unwrap();
         typed::<GuardCfg>(&table).unwrap();
 
-        let example: toml::Value =
-            toml::from_str(include_str!("../../../example/config.stocks.toml")).unwrap();
-        let stanza = example["pairs"][0]["guards"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|g| g["kind"].as_str() == Some("ondo_token"))
-            .expect("the example has the guard")
-            .as_table()
-            .unwrap()
-            .clone();
+        let stanza: toml::Table =
+            toml::from_str("kind = \"ondo_token\"\npoll_secs = 12\nmax_age_secs = 60").unwrap();
         let posted: std::collections::HashMap<String, String> = fields
             .iter()
             .map(|f| {

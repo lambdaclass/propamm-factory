@@ -8,7 +8,7 @@
 #
 # Before it runs:
 # - ONDO_API_KEY: an Ondo GM API key (partner-only; Ondo onboarding). The `ondo` venue
-#   reads it from the environment; the `ondo` guard names it in its stanza.
+#   reads it from the environment, and the `ondo` guard reads it from there too.
 # - UPDATER_KEY_AAPLON_USDC: the pair's updater key, registered on the PropAMM.
 # - The vault holds AAPLon and USDC and has approved the PropAMM for both.
 # Then `my-propamm --config config.toml --check`, and without `--check` to run.
@@ -23,7 +23,7 @@ requote_ms = 50
 metrics_addr = "127.0.0.1:9464"
 
 [[pairs]]
-# The stock token first: the `ondo` guard checks it is the token `symbol` names.
+# The stock token first: the `ondo` guard checks it is the token the ondo venue names.
 tokens  = ["0x14c3abF95Cb9C93a8b82C1CdCB76D72Cb87b2d4c",   # AAPLon
            "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"]   # USDC
 key_env = "UPDATER_KEY_AAPLON_USDC"
@@ -47,21 +47,23 @@ max_mid = "400"
 kind  = "feed"
 delta = "0.003"                 # 30 bp half-spread on Ondo's mid: fixed, so sized for the open
 
+# Ondo's checks on the token the ondo venue names: the sessions to quote in, Ondo's halts,
+# splits and dividends, and the token's transfer rules. The key is ONDO_API_KEY, as the
+# venue's; the API is the venue's endpoint.
 [[pairs.guards]]
 kind    = "ondo"
-symbol  = "AAPLon"
-api_key = { env = "ONDO_API_KEY" }
 # The Ondo sessions to quote in: any of regular, premarket, postmarket, overnight, offhours.
 # Ondo trades the tokens in all of them; the default is the regular session alone.
 sessions = ["regular"]
 # Defaults, written out:
 # ticker              = "AAPL"   # unset: Ondo's price answer names it (the build fails if not)
-# api                 = "https://api.gm.ondo.finance"
 # multiplier_oracle   = "0x9BC39DB6fbB44B91a48b8D5A6C208B82B1741bE6"   # SyntheticSharesOracle
 # status_poll_secs    = 15
 # max_status_age_secs = 60
 # pause_lead_secs     = 300      # stop this long before a scheduled corporate action
 # max_multiplier_gap  = 0.001    # Ondo's multiplier against the chain's, for a token it lists
+# rules_poll_secs     = 12       # reads of the token's transfer rules: one a block
+# rules_max_age_secs  = 60       # older than this, the rules are unknown and the quote withdrawn
 
 [[pairs.guards]]
 kind              = "us_market_hours"
@@ -75,11 +77,6 @@ holidays     = ["2026-11-26", "2026-12-25",
                 "2027-06-18", "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24"]
 early_closes = ["2026-11-27", "2026-12-24", "2027-11-26"]
 listed_through = "2027-12-31"
-
-[[pairs.guards]]
-kind         = "ondo_token"
-poll_secs    = 12
-max_age_secs = 60
 
 [[builder]]
 name = "titan-eu"

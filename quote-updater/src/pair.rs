@@ -233,6 +233,10 @@ pub(crate) fn shape_of(resolved: &ResolvedPair, price_decimals: u32, target: Add
         target,
         sources: resolved.feeds.as_ref().map_or(0, |f| f.sources.len()),
         mid_only_sources: resolved.feeds.as_ref().map_or(0, |f| f.mid_only_sources()),
+        venue_symbols: resolved
+            .feeds
+            .as_ref()
+            .map_or_else(Vec::new, |f| f.venue_symbols()),
         min_mid: resolved.pair.band.min,
         max_mid: resolved.pair.band.max,
     }
@@ -256,13 +260,14 @@ pub(crate) async fn build_custom(
     history: Option<History>,
     latch: crate::guard::Latch,
     readers: &vault::InventoryReaders,
-    http: Arc<reqwest::Client>,
+    endpoints: &crate::venue::Endpoints,
 ) -> Result<ValueSource> {
     let mut ctx = BuildCtx::new(shape.clone())
         .with_chain(chain)
         .with_latch(latch)
         .with_readers(readers.clone())
-        .with_http(http);
+        .with_http(endpoints.http())
+        .with_endpoints(endpoints.clone());
     if let Some(history) = history {
         ctx = ctx.with_history(history);
     }
@@ -481,6 +486,7 @@ pub(crate) async fn build_live(
                     .with_chain(chain_handle.clone())
                     .with_latch(latch.clone())
                     .with_http(endpoints.http())
+                    .with_endpoints(endpoints.clone())
             },
             metrics,
         )
@@ -566,7 +572,7 @@ pub(crate) async fn build_live(
         history,
         latch.clone(),
         readers,
-        endpoints.http(),
+        endpoints,
     )
     .await?;
     // The quote guards last, after the pricer, whose diagnostics a quote guard's build may
@@ -581,6 +587,7 @@ pub(crate) async fn build_live(
                 .with_chain(chain_handle.clone())
                 .with_latch(latch.clone())
                 .with_http(endpoints.http())
+                .with_endpoints(endpoints.clone())
                 .with_pricer_diagnostics(names.clone())
         },
         metrics,
@@ -800,6 +807,10 @@ pub(crate) async fn collect_prices(
                 target: chain.1,
                 sources: spec.feeds.as_ref().map_or(0, |f| f.sources.len()),
                 mid_only_sources: spec.feeds.as_ref().map_or(0, |f| f.mid_only_sources()),
+                venue_symbols: spec
+                    .feeds
+                    .as_ref()
+                    .map_or_else(Vec::new, |f| f.venue_symbols()),
                 min_mid: spec.band.min,
                 max_mid: spec.band.max,
             };
@@ -843,7 +854,8 @@ pub(crate) async fn collect_prices(
                     let (client, target) = chain;
                     let mut ctx = BuildCtx::new(shape.clone())
                         .with_chain(Chain::new(client.clone(), target))
-                        .with_http(endpoints.http());
+                        .with_http(endpoints.http())
+                        .with_endpoints(endpoints.clone());
                     if spec.feeds.is_some() {
                         ctx = ctx.with_history(History::empty());
                     }
@@ -879,6 +891,7 @@ pub(crate) async fn collect_prices(
                     BuildCtx::new(shape.clone())
                         .with_chain(Chain::new(client.clone(), target))
                         .with_http(endpoints.http())
+                        .with_endpoints(endpoints.clone())
                 };
                 let market = build_market_guards(kinds, &spec.guards, &ctx_for, metrics).await;
                 // A quote guard binds to what the pricer declared. With no pricer built
@@ -1470,6 +1483,7 @@ mod tests {
             target: Address::zero(),
             sources: 1,
             mid_only_sources: 0,
+            venue_symbols: Vec::new(),
             min_mid: None,
             max_mid: None,
         };
@@ -1514,6 +1528,7 @@ mod tests {
             PairShape {
                 sources: 1,
                 mid_only_sources: 0,
+                venue_symbols: Vec::new(),
                 min_mid: None,
                 max_mid: None,
                 label: "CUSTOM/TEST".into(),
@@ -1604,6 +1619,41 @@ mod tests {
             assert!(err.contains("unknown guard kind `nope`"), "{err}");
         }
 
+        /// A pricer built for the run is told where the run dials each venue, as it is under
+        /// `--check`: the `[settings.endpoints]` override, not the default.
+        #[tokio::test]
+        async fn a_pricer_built_for_the_run_sees_the_runs_endpoints() {
+            use crate::venue::{Endpoints, VenueId};
+            let seen = Arc::new(std::sync::Mutex::new(String::new()));
+            let mut kinds = Kinds::default();
+            let record = Arc::clone(&seen);
+            kinds.insert(
+                "looks",
+                fn_factory(move |_: NoConfig, ctx: &mut BuildCtx| {
+                    *record.lock().unwrap() = ctx.venue_endpoint(VenueId::Ondo);
+                    Ok(Idle)
+                }),
+            );
+            let metrics = metrics::Metrics::new().unwrap();
+            let endpoints = Endpoints::single(VenueId::Ondo, "http://127.0.0.1:8566".to_owned());
+            let _values = build_custom(
+                &kinds,
+                "looks",
+                &stanza("looks"),
+                shape(),
+                None,
+                &metrics,
+                no_chain(),
+                None,
+                crate::guard::Latch::new(),
+                &Default::default(),
+                &endpoints,
+            )
+            .await
+            .unwrap();
+            assert_eq!(*seen.lock().unwrap(), "http://127.0.0.1:8566");
+        }
+
         /// A background task that panics trips the lane with `cause = panic`, naming the
         /// pricer's kind: whatever it fed is not coming back, and the operator gets a halt
         /// with a reason rather than a value quietly ageing out.
@@ -1634,7 +1684,7 @@ mod tests {
                 None,
                 latch.clone(),
                 &Default::default(),
-                Arc::new(reqwest::Client::new()),
+                &crate::venue::Endpoints::resolve(None, &Default::default()).unwrap(),
             )
             .await
             .unwrap();
@@ -1683,7 +1733,7 @@ mod tests {
                 None,
                 latch.clone(),
                 &Default::default(),
-                Arc::new(reqwest::Client::new()),
+                &crate::venue::Endpoints::resolve(None, &Default::default()).unwrap(),
             )
             .await
             .unwrap();
@@ -1768,7 +1818,7 @@ mod tests {
                 None,
                 crate::guard::Latch::new(),
                 &Default::default(),
-                Arc::new(reqwest::Client::new()),
+                &crate::venue::Endpoints::resolve(None, &Default::default()).unwrap(),
             )
             .await
             .unwrap();
@@ -1814,7 +1864,7 @@ mod tests {
                         None,
                         crate::guard::Latch::new(),
                         &readers,
-                        Arc::new(reqwest::Client::new()),
+                        &crate::venue::Endpoints::resolve(None, &Default::default()).unwrap(),
                     )
                     .await
                     .unwrap(),
@@ -1888,7 +1938,7 @@ mod tests {
             let rpc = crate::rpc_mock::MockRpc::spawn(100).await;
             let client = EthClient::new(url::Url::parse(&rpc.url).unwrap()).unwrap();
             let metrics = metrics::Metrics::new().unwrap();
-            let http = Arc::new(reqwest::Client::new());
+            let endpoints = crate::venue::Endpoints::resolve(None, &Default::default()).unwrap();
             for _ in 0..2 {
                 build_custom(
                     &kinds,
@@ -1901,7 +1951,7 @@ mod tests {
                     None,
                     crate::guard::Latch::new(),
                     &crate::vault::InventoryReaders::default(),
-                    Arc::clone(&http),
+                    &endpoints,
                 )
                 .await
                 .unwrap();
@@ -1909,7 +1959,9 @@ mod tests {
             let grabbed = grabbed.lock().unwrap();
             assert_eq!(grabbed.len(), 2);
             assert!(
-                grabbed.iter().all(|got| Arc::ptr_eq(got, &http)),
+                grabbed
+                    .iter()
+                    .all(|got| Arc::ptr_eq(got, &endpoints.http())),
                 "both lanes were handed the run's client"
             );
             let bare = BuildCtx::new(shape());
@@ -2238,7 +2290,7 @@ mod tests {
                 None,
                 crate::guard::Latch::new(),
                 &Default::default(),
-                Arc::new(reqwest::Client::new()),
+                &crate::venue::Endpoints::resolve(None, &Default::default()).unwrap(),
             )
             .await
             .unwrap();
@@ -2293,7 +2345,7 @@ mod tests {
                 None,
                 crate::guard::Latch::new(),
                 &Default::default(),
-                Arc::new(reqwest::Client::new()),
+                &crate::venue::Endpoints::resolve(None, &Default::default()).unwrap(),
             )
             .await
             .unwrap();
@@ -2351,7 +2403,7 @@ mod tests {
                 None,
                 latch.clone(),
                 &Default::default(),
-                Arc::new(reqwest::Client::new()),
+                &crate::venue::Endpoints::resolve(None, &Default::default()).unwrap(),
             )
             .await
             .unwrap();
@@ -2427,7 +2479,7 @@ mod tests {
                 None,
                 crate::guard::Latch::new(),
                 &Default::default(),
-                Arc::new(reqwest::Client::new()),
+                &crate::venue::Endpoints::resolve(None, &Default::default()).unwrap(),
             )
             .await
             .unwrap();

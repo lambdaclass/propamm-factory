@@ -62,6 +62,9 @@ pub struct FormField {
     pub hint: &'static str,
     /// How the input's text is written into the stanza, and read back.
     pub kind: FieldKind,
+    /// Shown under a collapsed "advanced" line: a tuning knob with a default nobody has to
+    /// look at. See [`FormField::advanced`].
+    pub advanced: bool,
 }
 
 /// How a [`FormField`]'s input is written into the stanza, and read back from it. More
@@ -98,7 +101,16 @@ impl FormField {
             placeholder,
             hint,
             kind,
+            advanced: false,
         }
+    }
+
+    /// This field under the form's collapsed "advanced" line rather than in plain view: for
+    /// a knob with a default that is right until proven otherwise, so the fields an operator
+    /// must look at are the ones they see.
+    pub const fn advanced(mut self) -> Self {
+        self.advanced = true;
+        self
     }
 
     /// A field whose value is written as a string, as a `const` so a kind declares its list
@@ -448,6 +460,9 @@ pub struct PairShape {
     /// How many of those quote one price with no book behind it (`ondo`, an issuer's own
     /// price): their half-spread is zero, so a kind that copies the book's copies nothing.
     pub mid_only_sources: usize,
+    /// Each source as `(venue, symbol)`, in the pair's order: `("binance", "ETHUSDC")`,
+    /// `("ondo", "AAPLon")`. A guard that reads an issuer finds its token here.
+    pub venue_symbols: Vec<(&'static str, String)>,
     /// The pair's `min_mid`, in lane orientation, which the core holds every published mid
     /// to; a kind whose mid is a setting checks it here, so a mistake fails the file instead
     /// of every tick.
@@ -878,6 +893,9 @@ pub struct BuildCtx {
     /// The run's HTTP client, shared with the polled venues; `None` under a test build
     /// context, which hands out a default one.
     http: Option<Arc<reqwest::Client>>,
+    /// Where the run dials each venue: the `[settings.endpoints]` overrides over the
+    /// defaults; `None` under a test build context, which answers the defaults.
+    endpoints: Option<crate::venue::Endpoints>,
     /// The lane's landings: the sender goes into the lane's `ValueSource`, where the quote
     /// loop reports each block's read-back; every feed handed out here reads it.
     landings: (
@@ -905,6 +923,7 @@ impl BuildCtx {
             inventory: None,
             readers: None,
             http: None,
+            endpoints: None,
             landings: tokio::sync::watch::channel(None),
             pricer_diagnostics: None,
             latch: crate::guard::Latch::new(),
@@ -915,6 +934,21 @@ impl BuildCtx {
     pub(crate) fn with_http(mut self, http: Arc<reqwest::Client>) -> BuildCtx {
         self.http = Some(http);
         self
+    }
+
+    /// Where the run dials each venue, for the run.
+    pub(crate) fn with_endpoints(mut self, endpoints: crate::venue::Endpoints) -> BuildCtx {
+        self.endpoints = Some(endpoints);
+        self
+    }
+
+    /// Where the run dials `venue`: its `[settings.endpoints]` override, or its default. A
+    /// guard that reads the same issuer as a venue reads it where the venue does.
+    pub(crate) fn venue_endpoint(&self, venue: crate::venue::VenueId) -> String {
+        self.endpoints.as_ref().map_or_else(
+            || venue.default_endpoint().to_owned(),
+            |e| e.for_venue(venue).to_owned(),
+        )
     }
 
     /// The diagnostics the lane's pricer declared, for a quote guard's build; empty for a
@@ -1218,6 +1252,7 @@ mod tests {
         PairShape {
             sources: 1,
             mid_only_sources: 0,
+            venue_symbols: Vec::new(),
             min_mid: None,
             max_mid: None,
             label: "WETH/USDC".into(),

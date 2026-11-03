@@ -27,8 +27,14 @@
 //! the valuation again on the next reload. The issuer's status still reports the asset's
 //! events, corporate actions included.
 //!
+//! Beside this guard, under the same kind, the core runs the design's token guard
+//! ([`crate::stocks::WithTokenRules`]): the token would take the fill, not paused, neither
+//! the vault nor the PropAMM on the issuer's lists, and a transfer tried on the token as
+//! the PropAMM not refused.
+//!
 //! The stock token is listed first (`tokens = [stock, USDC]`), and the build checks it is the
-//! token the stanza's `symbol` names by the token's own `symbol()`.
+//! token the guard's symbol names (for Ondo, the pair's `ondo` venue's) by the token's own
+//! `symbol()`.
 
 use std::{
     sync::{Arc, Mutex},
@@ -168,14 +174,14 @@ impl Settings {
     }
 }
 
-/// That the stanza's `symbol` is the pair's first token's, `first` (its on-chain symbol()),
-/// in any case, as every symbol compare in the stocks module. It is what stops a TSLAon
-/// stanza guarding AMZNon.
+/// That the guard's symbol (Ondo's: the pair's `ondo` venue's) is the pair's first token's,
+/// `first` (its on-chain symbol()), in any case, as every symbol compare in the stocks
+/// module. It is what stops a TSLAon venue guarding AMZNon.
 fn check_symbol(symbol: &str, first: &str) -> eyre::Result<()> {
     eyre::ensure!(
         first.eq_ignore_ascii_case(symbol),
         "symbol {symbol} is not the pair's first token, whose symbol() is {first}: the stock \
-         token is listed first (tokens = [stock, USDC]) and the stanza guards it"
+         token is listed first (tokens = [stock, USDC]) and the guard guards it"
     );
     Ok(())
 }
@@ -626,7 +632,7 @@ pub mod testkit {
     /// The pair as the run shapes it: AAPLon first, so the lane is not inverted, with one
     /// venue, the issuer's.
     pub fn pair() -> PairShape {
-        let pair = testing::pair_for(
+        let mut pair = testing::pair_for(
             "AAPLon/USDC",
             (parse_address(AAPLON).unwrap(), parse_address(USDC).unwrap()),
             Address::repeat_byte(0x77),
@@ -634,6 +640,7 @@ pub mod testkit {
         );
         assert!(!pair.inverted, "AAPLon sorts before USDC");
         assert_eq!(pair.sources, 1);
+        pair.venue_symbols = vec![("ondo", "AAPLon".to_owned())];
         pair
     }
 

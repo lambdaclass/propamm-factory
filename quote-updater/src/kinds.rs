@@ -336,10 +336,42 @@ pub(crate) struct Kinds {
     pricers: BTreeMap<&'static str, Arc<dyn ErasedPricer>>,
     /// Market and quote guards in one namespace.
     guards: BTreeMap<&'static str, Arc<dyn ErasedGuard>>,
+    /// Guard kinds kept for the pairs that still list them, each with the kind that took it
+    /// over: built and run as any, but the pair form offers them only on a pair whose
+    /// stanza has one.
+    legacy_guards: BTreeMap<&'static str, &'static str>,
     errors: Vec<String>,
 }
 
 impl Kinds {
+    /// [`Self::insert_guard`], for a kind `successor` has taken over: still registered, so a
+    /// pair that lists it keeps loading, but not offered on the form for a new pair.
+    pub(crate) fn insert_guard_legacy(
+        &mut self,
+        kind: &'static str,
+        successor: &'static str,
+        factory: Arc<dyn ErasedGuard>,
+    ) {
+        self.insert_guard(kind, factory);
+        self.legacy_guards.insert(kind, successor);
+    }
+
+    /// Whether `kind` is registered only for the pairs that still list it.
+    pub(crate) fn guard_is_legacy(&self, kind: &str) -> bool {
+        self.legacy_guards.contains_key(kind)
+    }
+
+    /// Each legacy kind in `guards` listed beside the kind that took it over, with that kind:
+    /// the pair runs the legacy kind's check twice.
+    pub(crate) fn superseded(&self, guards: &[GuardStanza]) -> Vec<(&'static str, &'static str)> {
+        let listed = |kind: &str| guards.iter().any(|stanza| stanza.kind == kind);
+        self.legacy_guards
+            .iter()
+            .filter(|(legacy, successor)| listed(legacy) && listed(successor))
+            .map(|(legacy, successor)| (*legacy, *successor))
+            .collect()
+    }
+
     pub(crate) fn insert_guard(&mut self, kind: &'static str, factory: Arc<dyn ErasedGuard>) {
         if BUILT_IN_GUARDS.contains(&kind) {
             self.errors.push(format!(
@@ -348,6 +380,32 @@ impl Kinds {
         } else if self.guards.insert(kind, factory).is_some() {
             self.errors
                 .push(format!("guard kind `{kind}` registered twice"));
+        } else {
+            self.refuse_shared_inputs(kind);
+        }
+    }
+
+    /// The pair form names a guard's inputs `guard_<kind>_<field>`: refuses `kind` when one
+    /// of its fields would post under the name of another kind's field (`acme`'s `token_x`
+    /// and `acme_token`'s `x`), since the save would then write one value to both.
+    fn refuse_shared_inputs(&mut self, kind: &'static str) {
+        let fields = self.guards[kind].fields();
+        for (other, factory) in &self.guards {
+            if *other == kind {
+                continue;
+            }
+            for mine in fields {
+                for theirs in factory.fields() {
+                    let input = format!("{kind}_{}", mine.name);
+                    if input == format!("{other}_{}", theirs.name) {
+                        self.errors.push(format!(
+                            "guard `{kind}`'s field `{}` and guard `{other}`'s field `{}` would \
+                             both post as `guard_{input}` on the pair form; rename one",
+                            mine.name, theirs.name
+                        ));
+                    }
+                }
+            }
         }
     }
 
@@ -534,6 +592,10 @@ impl Kinds {
                     target: config.target,
                     sources: spec.feeds.as_ref().map_or(0, |f| f.sources.len()),
                     mid_only_sources: spec.feeds.as_ref().map_or(0, |f| f.mid_only_sources()),
+                    venue_symbols: spec
+                        .feeds
+                        .as_ref()
+                        .map_or_else(Vec::new, |f| f.venue_symbols()),
                     min_mid: spec.band.min,
                     max_mid: spec.band.max,
                 };
@@ -597,6 +659,14 @@ impl Kinds {
                 factory.validate(&stanza.config, shape)
             })
             .wrap_err_with(|| format!("{}: [[pairs.guards]] `{}`", shape.label, stanza.kind))?;
+        }
+        // Not refused: such a pair kept loading when the check moved, and runs it twice.
+        for (legacy, successor) in self.superseded(guards) {
+            tracing::warn!(
+                "[{}] [[pairs.guards]] `{legacy}` repeats a check `{successor}` runs itself; \
+                 remove it, moving any settings it has to `{successor}`",
+                shape.label
+            );
         }
         Ok(())
     }
@@ -1197,5 +1267,97 @@ api_key = "k"
         assert_eq!(kinds.guard_form_help("cap"), Some("<p>cap</p>"));
         assert!(kinds.guard_fields("plain").is_some_and(|f| f.is_empty()));
         assert_eq!(kinds.guard_fields("nobody"), None);
+    }
+
+    /// The pair form names a guard's inputs `guard_<kind>_<field>`, so a field `token_x` of
+    /// `acme` and a field `x` of `acme_token` would post under one name, and a save would
+    /// write one value to both. Registering the two is refused, in either order, naming the
+    /// input; kind names that merely share a prefix are fine.
+    #[test]
+    fn guard_fields_that_would_post_under_one_name_are_refused() {
+        #[derive(serde::Deserialize)]
+        struct Empty {}
+        struct AllowAll;
+        impl crate::guard::QuoteGuard for AllowAll {
+            fn check(
+                &mut self,
+                _: &crate::guard::Candidate<'_>,
+                _: &mut crate::pricing::Diagnostics,
+            ) -> crate::guard::Gate {
+                crate::guard::Gate::Allow
+            }
+        }
+        struct Declares(&'static [FormField]);
+        impl QuoteGuardFactory for Declares {
+            type Config = Empty;
+            type Guard = AllowAll;
+            fn fields(&self) -> &'static [FormField] {
+                self.0
+            }
+            fn build<'a>(
+                &'a self,
+                _: &'a Empty,
+                _: &'a mut BuildCtx,
+            ) -> BoxFuture<'a, Result<AllowAll>> {
+                Box::pin(std::future::ready(Ok(AllowAll)))
+            }
+        }
+        const STATUS: &[FormField] = &[FormField::number("token_x", "1", "")];
+        const RENAMED: &[FormField] = &[FormField::number("rules_x", "1", "")];
+        const RULES: &[FormField] = &[FormField::number("x", "1", "")];
+        let registered = |first: (&'static str, &'static [FormField]),
+                          second: (&'static str, &'static [FormField])| {
+            let mut kinds = Kinds::default();
+            kinds.insert_guard(first.0, quote_guard_factory(Declares(first.1)));
+            kinds.insert_guard(second.0, quote_guard_factory(Declares(second.1)));
+            kinds.errors()
+        };
+        let err = registered(("acme", STATUS), ("acme_token", RULES)).unwrap_err();
+        assert!(format!("{err:#}").contains("guard_acme_token_x"), "{err:#}");
+        assert!(registered(("acme_token", RULES), ("acme", STATUS)).is_err());
+        registered(("acme", RENAMED), ("acme_token", RULES)).unwrap();
+    }
+
+    /// A pair that lists a legacy guard beside the kind that took it over runs one check
+    /// twice; such a pair is named so its validation can say so. Either alone is not.
+    #[test]
+    fn a_legacy_guard_beside_the_kind_that_took_it_over_is_named() {
+        #[derive(Clone, serde::Deserialize)]
+        struct Empty {}
+        struct AllowAll;
+        impl crate::guard::QuoteGuard for AllowAll {
+            fn check(
+                &mut self,
+                _: &crate::guard::Candidate<'_>,
+                _: &mut crate::pricing::Diagnostics,
+            ) -> crate::guard::Gate {
+                crate::guard::Gate::Allow
+            }
+        }
+        let mut kinds = Kinds::default();
+        kinds.insert_guard(
+            "issuer",
+            quote_guard_fn(|_: Empty, _: &mut BuildCtx| Ok(AllowAll)),
+        );
+        kinds.insert_guard_legacy(
+            "issuer_token",
+            "issuer",
+            quote_guard_fn(|_: Empty, _: &mut BuildCtx| Ok(AllowAll)),
+        );
+        let stanzas = |kinds: &[&str]| -> Vec<GuardStanza> {
+            kinds
+                .iter()
+                .map(|kind| GuardStanza {
+                    kind: kind.to_string(),
+                    config: toml::from_str(&format!("kind = \"{kind}\"")).unwrap(),
+                })
+                .collect()
+        };
+        assert_eq!(
+            kinds.superseded(&stanzas(&["issuer", "issuer_token"])),
+            [("issuer_token", "issuer")]
+        );
+        assert!(kinds.superseded(&stanzas(&["issuer_token"])).is_empty());
+        assert!(kinds.superseded(&stanzas(&["issuer"])).is_empty());
     }
 }
