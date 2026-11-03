@@ -10,21 +10,34 @@ What that buys, against someone with root on the host:
 
 - **The keys never leave the enclave.** Every secret is stored on the host encrypted by a
   key service that releases it only to an enclave running your image, as the platform
-  proves it. At boot the secrets are decrypted into the enclave, wrapped so they cross the
-  host unreadable.
-- **The config cannot be read or changed.** The host stores it sealed (AES-256-GCM under a
-  key only the enclave has). A changed byte fails the seal, and the run refuses to start.
-- **The backoffice cannot be used.** It serves its own HTTPS from inside, with a Google login
-  checked inside on every request.
+  proves it, and only under the name it was encrypted for. At boot the secrets are
+  decrypted into the enclave, wrapped so they cross the host unreadable.
+- **The config cannot be changed, and its secrets cannot be read.** The host stores it
+  sealed (AES-256-GCM under a key only the enclave has). A changed byte fails the seal, and
+  the run refuses to start. Every URL in a line that leaves for the host is cut to its scheme
+  and host, so an RPC key in a URL's path does not ride out on an error message.
+- **The backoffice cannot be used.** Inside an enclave it is served only with a
+  `[backoffice]` in the enclave file: its own HTTPS from inside, and a Google login checked
+  inside on every request. A `backoffice_addr` without one is refused at startup.
 - **The price streams cannot be replaced.** Every connection to a venue, a builder, the RPC
   node or the key service is TLS opened from inside and verified against the certificates
   in the image; the host only copies encrypted bytes. A plain `http://` or `ws://` endpoint
-  is refused at startup inside an enclave.
+  is refused inside an enclave: at startup, and when the backoffice or a reload would add
+  one.
 
-What the host can still do: stop the enclave or cut its connections (quoting stops); restart
-it with an older sealed config it copied earlier; read the log lines and metrics; and read or
-change what the recorder writes to Postgres, which goes over plain TCP and feeds dashboards,
-not quoting.
+What the host can still do:
+
+- Stop the enclave or cut its connections (quoting stops).
+- Restart it with an older sealed config it copied earlier.
+- Read the log lines and the metrics. They say which pairs run and what they publish, and
+  who changed what through the backoffice.
+- Read and change what the recorder writes to Postgres, which goes over plain TCP and feeds
+  dashboards, not quoting. That includes a copy of the config with its credentials removed
+  (builder API keys, the RPC URLs cut to their host, credential-named pricer keys): the
+  pairs, their parameters and the venue and builder endpoints are readable there.
+- Read the recorder's database password. The connection is plain TCP, so the host's end of
+  the tunnel can ask for the password in the clear. Give `RECORD_DB_URL` a role of its own
+  that can only insert into the recorder's tables, on a database used for nothing else.
 
 These hold only on a platform where root on the host really cannot reach into the enclave.
 An AWS Nitro enclave is one. A confidential VM is not, for this purpose: it is protected from
@@ -53,17 +66,20 @@ quote-updater --config /run/quote-updater/config.toml --enclave /app/enclave.tom
    message: credentials for the key service, every secret as ciphertext, the sealed config,
    and the backoffice certificate.
 2. The release decrypts the secrets. They become what every secret lookup reads: a pair's
-   `key_env`, a pricer's secret, `ONDO_API_KEY`, `COINGECKO_API_KEY`, `RECORD_DB_URL`, and the
-   names the enclave file gives.
+   `key_env`, a pricer's secret, `ONDO_API_KEY`, `COINGECKO_API_KEY`, `RECORD_DB_URL` (whose
+   password the host can still learn, see above), and the names the enclave file gives.
 3. The config is opened onto `--config`, and the run proceeds as it does anywhere else.
 4. From then on the same link carries every log line to the host, the sealed config to the
-   host after every save, and the host's reload and shutdown requests to the run.
+   host after every save, and the host's reload and shutdown requests to the run. The link
+   is accepted once: if the boot helper restarts, the run goes on quoting, but a save from
+   then on is refused as not kept, and the enclave needs a restart to be reached again.
 
 ## The enclave file
 
 Part of the image, so the host cannot change it. Holds no secret.
 [`deploy/aws-nitro/enclave.example.toml`](../deploy/aws-nitro/enclave.example.toml) is a
-complete one for AWS Nitro.
+complete one for AWS Nitro, with a forward for KMS, Binance, an RPC node, a builder and the
+two Google hosts the login needs; add one for every other host your config names.
 
 ```toml
 [link]
@@ -82,6 +98,7 @@ to   = "127.0.0.1:8088"
 [release]
 kind     = "aws-nitro-kms"
 region   = "eu-west-1"
+key_id   = "arn:aws:kms:eu-west-1:111122223333:key/…"   # the key's full ARN
 endpoint = "https://kms.eu-west-1.amazonaws.com"
 
 [backoffice]
@@ -109,8 +126,10 @@ The host sends, once, on connecting:
 - `credentials`: what the release's key service is called with, by name. For
   `aws-nitro-kms`, the instance role's temporary credentials from the instance metadata
   service. Used once, at boot.
-- `secrets`: each value as the key service encrypted it (`aws kms encrypt`). `CONFIG_SEAL_KEY`
-  is required.
+- `secrets`: each value as the key service encrypted it, with the secret's name as its
+  encryption context (below). `CONFIG_SEAL_KEY` is required. A ciphertext sent under a name
+  other than the one it was encrypted for, or under another key, is refused by KMS and the
+  boot fails.
 - `config`: the last sealed config the enclave sent back. For the very first boot, seal the
   config yourself (below).
 - `backoffice_certificate`: the PEM chain, when the enclave file has a `[backoffice]`.
@@ -120,20 +139,27 @@ The enclave answers `{"kind":"ready","secrets":[…names…]}`, or
 `{"kind":"log","stream":"stdout","line":"…"}` for every operator line and
 `{"kind":"config","sealed":"…"}` after every save, which the helper writes over the stored
 config. The helper may send `{"kind":"reload"}` (what `systemctl reload` is elsewhere) and
-`{"kind":"shutdown"}` (withdraw every quote and exit).
+`{"kind":"shutdown"}` (withdraw every quote and exit). A message the run does not know is
+logged and skipped. Every URL in a `log` or `failed` line is cut to its scheme and host.
 
 ## The first sealed config
 
 The enclave seals every config it saves, but the first one has to be sealed by whoever
-creates the sealing key, once, before that key is encrypted for the key service:
+creates the sealing key, once, before that key is encrypted for the key service. Do this,
+and every other `aws kms encrypt`, off the host, with credentials the host never sees (see
+the key policy below):
 
 ```bash
 export CONFIG_SEAL_KEY=$(openssl rand -hex 32)
 cargo run -p quote-updater --example seal_config -- config.toml > config.sealed
-printf '%s' "$CONFIG_SEAL_KEY" | aws kms encrypt --key-id <key> --plaintext fileb:///dev/stdin \
+printf '%s' "$CONFIG_SEAL_KEY" | aws kms encrypt --key-id <key ARN> \
+  --encryption-context secret=CONFIG_SEAL_KEY --plaintext fileb:///dev/stdin \
   --query CiphertextBlob --output text > CONFIG_SEAL_KEY.b64
 unset CONFIG_SEAL_KEY
 ```
+
+Every other secret the same way, its own name as the context
+(`--encryption-context secret=UPDATER_KEY_WETH_USDC` for `UPDATER_KEY_WETH_USDC`).
 
 Put the secrets the config would otherwise read from the environment (the RPC URL, builder
 API keys) in the config itself: inside an enclave it is sealed.
@@ -144,12 +170,16 @@ With `[backoffice]` in the enclave file, the backoffice serves HTTPS itself with
 certificate the host hands in and the private key the release decrypts (the two must match,
 or it does not start), and asks for a Google login on every page:
 
-- A request without a session is sent to Google; the answer comes back to `redirect_url`
-  (`https://<your backoffice name>/auth/callback`, registered on the OAuth client).
+- A page load without a session is sent to Google; the answer comes back to `redirect_url`
+  (`https://<your backoffice name>/auth/callback`, registered on the OAuth client). Any
+  other request without a session is refused.
 - The ID token's signature is checked against Google's published keys, with its audience,
   issuer, expiry and nonce. The account needs a verified email and either Google saying
   `allowed_domain` administers it, or an address in `allowed_accounts`.
 - The session is a cookie signed with a key made at startup: a restart logs everyone out.
+- A change is accepted only from the page's own origin (`https://` and the name in
+  `redirect_url`), and every response tells the browser to stay on HTTPS for the name and
+  never to show the page inside another one.
 - Every change made through the page is logged with the account that made it.
 
 The certificate is handed in at boot rather than built into the image so a renewal needs
@@ -172,17 +202,39 @@ What `kind = "vsock"` and `kind = "aws-nitro-kms"` need around them.
 ### The key policy
 
 `kms:Decrypt` for the instance role, only with an attestation document whose measurements
-match your image:
+match your image, and nothing else the host can reach:
 
 ```json
-{
-  "Effect": "Allow",
-  "Principal": { "AWS": "arn:aws:iam::<account>:role/<instance role>" },
-  "Action": "kms:Decrypt",
-  "Resource": "*",
-  "Condition": { "StringEqualsIgnoreCase": { "kms:RecipientAttestation:PCR8": "<hash>" } }
-}
+[
+  {
+    "Effect": "Allow",
+    "Principal": { "AWS": "arn:aws:iam::<account>:role/<instance role>" },
+    "Action": "kms:Decrypt",
+    "Resource": "*",
+    "Condition": { "StringEqualsIgnoreCase": { "kms:RecipientAttestation:PCR8": "<hash>" } }
+  },
+  {
+    "Effect": "Deny",
+    "Principal": { "AWS": "arn:aws:iam::<account>:role/<instance role>" },
+    "Action": ["kms:Encrypt", "kms:ReEncrypt*", "kms:GenerateDataKey*"],
+    "Resource": "*"
+  }
+]
 ```
+
+The host has the instance role's credentials, and hands them in at boot. Anything they can
+do, the host can do without the enclave:
+
+- Encrypt under this key, and the host could encrypt a sealing key of its own, seal a
+  config of its choosing under it, and boot your image on it with your real updater keys.
+  So no principal the host can reach may encrypt under the key: encrypt the secrets
+  elsewhere, with credentials that never touch the host.
+- Decrypt without the attestation condition, and the host decrypts the secrets itself. No
+  other statement, and no IAM policy through the key policy's account statement, may
+  grant `kms:Decrypt` to the role.
+- Decrypt with any key (`kms:Decrypt` on `*` in the role's IAM policy). The enclave
+  names `key_id` on every decrypt, so a ciphertext under the host's own key is refused,
+  but keep the role's permissions to this key anyway.
 
 PCR8 is the hash of the certificate the image is signed with (`nitro-cli build-enclave
 --signing-certificate`), so every image signed with it gets the keys and a release needs no
@@ -200,14 +252,27 @@ On the host, one `vsock-proxy` per destination, each allowed in
 ```
 vsock-proxy 8001 kms.eu-west-1.amazonaws.com 443
 vsock-proxy 8002 stream.binance.com 9443
+vsock-proxy 8003 eth-mainnet.g.alchemy.com 443
+vsock-proxy 8004 eu.rpc.titanbuilder.xyz 443
+vsock-proxy 8005 oauth2.googleapis.com 443
+vsock-proxy 8006 www.googleapis.com 443
 ```
+
+Every tunnelled connection holds file descriptors inside the enclave; the image's
+entrypoint raises the limit to the hard one.
 
 ### The image
 
-[`deploy/aws-nitro/Dockerfile`](../deploy/aws-nitro/Dockerfile) builds `example/` with the
-`aws-nitro` feature and packages it with the enclave file and the hosts file:
+[`deploy/aws-nitro/Dockerfile`](../deploy/aws-nitro/Dockerfile) builds `example/` with its
+`aws-nitro` feature, every crate pinned by `example/Cargo.lock`, and packages it with your
+enclave file and hosts file, from `deploy/aws-nitro/local/` (gitignored) unless
+`--build-arg ENCLAVE_DIR=<dir>` names another:
 
 ```bash
+mkdir -p deploy/aws-nitro/local
+cp deploy/aws-nitro/enclave.example.toml deploy/aws-nitro/local/enclave.toml
+cp deploy/aws-nitro/hosts.example deploy/aws-nitro/local/hosts
+# edit both for your key, hosts and backoffice, then:
 docker build -f deploy/aws-nitro/Dockerfile -t quote-updater-enclave .
 nitro-cli build-enclave --docker-uri quote-updater-enclave:latest --output-file quote-updater.eif \
   --signing-certificate cert.pem --private-key key.pem
@@ -215,7 +280,9 @@ nitro-cli run-enclave --eif-path quote-updater.eif --cpu-count 2 --memory 2048 -
 ```
 
 `build-enclave` prints the measurements; PCR8 is what the key policy pins. Then the host's
-boot helper connects to `16:<port>`.
+boot helper connects to `16:<port>`. The base images and the Debian packages are not
+pinned, so two builds of one commit can measure differently: pin them by digest before
+relying on PCR0.
 
 ## Another platform
 

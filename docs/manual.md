@@ -723,8 +723,9 @@ doing the wrong thing.
 To keep the keys, the config and the backoffice out of reach of whoever gets root on the
 host, run the updater inside an enclave with `--enclave` (AWS Nitro is the platform
 shipped): the secrets arrive encrypted and only the enclave can have them decrypted, the
-host stores the config sealed, and the backoffice serves its own HTTPS behind a Google
-login. See [`enclave.md`](enclave.md).
+host stores the config sealed, and the backoffice, with a `[backoffice]` in the enclave
+file, serves its own HTTPS behind a Google login (without one, a `backoffice_addr` is
+refused there). See [`enclave.md`](enclave.md).
 
 A `.env` (or shell) still exporting `TITAN_WS` or `TITAN_API_KEY` — the variables that used
 to configure the single-builder mode — is refused rather than silently ignored: startup
