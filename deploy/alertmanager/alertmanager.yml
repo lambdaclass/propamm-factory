@@ -29,8 +29,10 @@ route:
 inhibit_rules:
   - source_matchers: ['alertname="PusherHeadStalled"']
     target_matchers: ['alertname="PusherLandingUnverified"']
+  # Same withdrawal, three rules: the pair's feed_last_tick and feed_sample_current stop
+  # with feed_up, and all three hold for 5m, so only PusherFeedDown is sent.
   - source_matchers: ['alertname="PusherFeedDown"']
-    target_matchers: ['alertname="PusherFeedStale"']
+    target_matchers: ['alertname=~"PusherFeedStale|PusherFeedSampleNotCurrent"']
     equal: [pair]
   - source_matchers: ['alertname="PusherPoolSeverelyImbalanced"']
     target_matchers: ['alertname="PusherPoolImbalanced"']

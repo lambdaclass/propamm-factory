@@ -5,8 +5,9 @@
 # of fixtures as live rules.
 #
 # Scoped to PusherSignerNearlyDry and its level check PusherSignerDry, plus
-# PusherStockCalendarEnding and PusherStockCalendarEnded and PusherVenueLate (at the end),
-# which are new enough to want their labels and wording proven. The first is a `predict_linear`, which is the only
+# PusherStockCalendarEnding and PusherStockCalendarEnded and PusherVenueLate, which are new
+# enough to want their labels and wording proven, and PusherFeedDown and PusherFeedStale (at
+# the end), whose shared hold is what keeps a short dip out of the channel. The first is a `predict_linear`, which is the only
 # expression in the file whose *silence* is a designed behaviour rather than a side effect of
 # a comparison coming out false: one NaN sample anywhere in the range suppresses it entirely,
 # and that is what stops a failed eth_getBalance paging an operator about a key that is fine.
@@ -228,3 +229,45 @@ tests:
             exp_annotations:
               summary: "ETH/USDT: okx has been delivering prices late for 5 minutes"
               description: "This venue's prices have been arriving later behind the exchange's own timestamps than max_source_lag_ms allows for five minutes, so it is out of the pair's average. quote_updater_venue_source_lag_ms says how far behind; a steady quote_updater_venue_future_stamps_total, or every stamped venue late by about the same amount, points at this host's clock instead."
+
+  # PusherFeedDown and PusherFeedStale: a feed down for four minutes and back raises neither,
+  # which under the 2m and 1m holds they had it raised both; one that stays down raises both
+  # past the five-minute mark (alertmanager.yml then sends only PusherFeedDown). time() in a
+  # promtool test is seconds since the fixture's start, so a fresh feed_last_tick is the
+  # evaluation's own second, and a frozen one stops counting with it.
+  - interval: 1m
+    name: a feed down for four minutes is not ticketed, one that stays down is
+    input_series:
+      - series: 'quote_updater_feed_up{pair="ETH/USDT"}'
+        values: "1 0x3 1x8"
+      - series: 'quote_updater_feed_up{pair="BTC/USDT"}'
+        values: "1 0x12"
+      - series: 'quote_updater_feed_last_tick_timestamp_seconds{pair="ETH/USDT"}'
+        values: "0x4 300+60x8"
+      - series: 'quote_updater_feed_last_tick_timestamp_seconds{pair="BTC/USDT"}'
+        values: "0x12"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: PusherFeedDown
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: PusherFeedStale
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: PusherFeedDown
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              pair: BTC/USDT
+            exp_annotations:
+              summary: "BTC/USDT: fewer than min_sources venues have a fresh price"
+              description: "The pair's composite has too few fresh venue prices to publish, so the lane is withdrawn. With one venue this is that venue's stream being down; with several, enough of them are down or stale at once. The per-venue series say which: quote_updater_venue_feed_up and quote_updater_venue_feed_last_tick_timestamp_seconds."
+      - eval_time: 7m
+        alertname: PusherFeedStale
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              pair: BTC/USDT
+            exp_annotations:
+              summary: "BTC/USDT: no accepted sample for over 30s"
+              description: "Past MAX_PRICE_AGE, so the updater is refusing to publish and the lane is withdrawn."
