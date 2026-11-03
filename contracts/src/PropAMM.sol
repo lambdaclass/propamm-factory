@@ -25,6 +25,9 @@ error InsufficientVaultBalance(address token, uint256 needed, uint256 available)
 /// A zero vault passed to `addPair` or `setPairVault`: a pair always names the account it fills
 /// from, because that account is also what registers it (see `pairVaults`).
 error NoVault(address token0, address token1);
+/// The same token passed as both sides of a pair to `addPair` or `initialize`: `getPairs` lists
+/// every pair with `token0 < token1`, which a pair of one token cannot satisfy.
+error IdenticalTokens(address token);
 
 /// @dev `ERC165Upgradeable` holds no state, so adding it moved no storage slot.
 contract PropAMM is
@@ -418,6 +421,7 @@ contract PropAMM is
     /// a pair listed at creation is stored exactly like one added later.
     function _addPair(address tokenX, address tokenY, address vault) internal {
         (address token0, address token1) = _sortTokens(tokenX, tokenY);
+        require(token0 != token1, IdenticalTokens(token0));
         require(vault != address(0), NoVault(token0, token1));
 
         uint256 pairKey = _keyOf(token0, token1);

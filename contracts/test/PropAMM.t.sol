@@ -3,7 +3,7 @@ pragma solidity ^0.8.35;
 
 import {Test} from "forge-std/Test.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
-import {PropAMM, NoVault, PairAlreadyExists, UnsupportedPair} from "../src/PropAMM.sol";
+import {PropAMM, IdenticalTokens, NoVault, PairAlreadyExists, UnsupportedPair} from "../src/PropAMM.sol";
 import {IPropAMM} from "../src/interfaces/IPropAMM.sol";
 import {MockPUR} from "./mocks/MockPUR.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
@@ -71,6 +71,12 @@ contract PropAMMTest is Test {
         _proxy(implementation, new address[](0), _one(USDC, USDT, address(0)));
     }
 
+    function test_initialize_refusesAPairOfOneToken() public {
+        address implementation = address(new PropAMM());
+        vm.expectRevert(abi.encodeWithSelector(IdenticalTokens.selector, USDC));
+        _proxy(implementation, new address[](0), _one(USDC, USDC, vault));
+    }
+
     /// The registry is no longer baked into the implementation, so `initialize` has to record
     /// the one it was handed: everything else on the contract reads prices through it.
     function test_initialize_storesTheOracleItIsGiven() public view {
@@ -110,6 +116,14 @@ contract PropAMMTest is Test {
         vm.prank(owner);
         vm.expectRevert(abi.encodeWithSelector(NoVault.selector, USDC, USDT));
         propAmm.addPair(USDC, USDT, address(0));
+    }
+
+    /// `getPairs` promises `token0 < token1`; a pair of one token would be listed as
+    /// `token0 == token1` (audit F-11).
+    function test_addPair_refusesTheSameTokenTwice() public {
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(IdenticalTokens.selector, USDC));
+        propAmm.addPair(USDC, USDC, vault);
     }
 
     function test_addPair_refusesADuplicateInEitherOrder() public {
