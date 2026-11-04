@@ -524,9 +524,9 @@ contract PropAMMPricingTest is Test {
         assertTrue(propAmm.isActive(WETH, USDT));
     }
 
-    /// `isActive` is a `bool` probe: whatever sits at the oracle address, it answers `false`
-    /// rather than reverting, or a batch probe over several venues fails whole. Audit F-14.
-    /// Each test swaps the code at `ORACLE`; a plain call is the check, since a revert fails it.
+    /// `isActive` is a `bool` probe: whatever sits at the oracle address, it answers rather than
+    /// reverting, or a batch probe over several venues fails whole. Audit F-14. Each test swaps
+    /// the code at `ORACLE`.
     function _etchOracle(address shape) internal {
         vm.etch(ORACLE, shape.code);
     }
@@ -541,38 +541,40 @@ contract PropAMMPricingTest is Test {
         assertFalse(propAmm.isActive(WETH, USDT));
     }
 
-    function test_isActive_falseForAOneWordOracle() public {
-        _etchOracle(address(new OneWordOracle()));
-        assertFalse(propAmm.isActive(WETH, USDT));
-    }
-
     function test_isActive_falseForARevertingOracle() public {
         _etchOracle(address(new RevertingOracle()));
         assertFalse(propAmm.isActive(WETH, USDT));
     }
 
-    function test_isActive_falseForAnUndecodableTimestamp() public {
-        _etchOracle(address(new HighBitsOracle()));
-        assertFalse(propAmm.isActive(WETH, USDT));
+    /// An answer that is not a `(uint32, uint256[])` used to revert `isActive` from inside its own
+    /// decoder. It decodes nothing now: the call succeeded, and rejecting the answer is `quote`'s.
+    function test_isActive_leavesAMalformedAnswerToQuote() public {
+        address[3] memory shapes =
+            [address(new OneWordOracle()), address(new HighBitsOracle()), address(new TruncatedArrayOracle())];
+        string[3] memory names = ["one word", "timestamp above uint32", "truncated array"];
+        for (uint256 i = 0; i < shapes.length; i++) {
+            _etchOracle(shapes[i]);
+            assertTrue(propAmm.isActive(WETH, USDT), names[i]);
+            vm.expectRevert();
+            propAmm.quote(WETH, USDT, 1e18);
+        }
     }
 
-    function test_isActive_falseForATruncatedArray() public {
-        _etchOracle(address(new TruncatedArrayOracle()));
-        assertFalse(propAmm.isActive(WETH, USDT));
-    }
+    /// What the slots hold is up to whoever posts them, so `isActive` reports a fresh lane as
+    /// active whatever it carries. Slots no quote can price with are rejected by `quote`.
+    function test_isActive_doesNotReadTheSlots() public {
+        uint256 pairKey = uint256(keccak256(abi.encodePacked(WETH, USDT)));
 
-    /// Each of these makes every quote revert (InvalidMid, SpreadTooWide, InsufficientOracleData),
-    /// so a probe documented as "a swap would succeed" must not say true.
-    function test_isActive_falseForSlotsNoQuoteCouldUse() public {
         MockPUR(ORACLE).setState(5e14, 0);
-        assertFalse(propAmm.isActive(WETH, USDT), "mid == 0");
-        MockPUR(ORACLE).setState(1e18, 1e18);
-        assertFalse(propAmm.isActive(WETH, USDT), "delta == SPREAD_SCALE");
+        assertTrue(propAmm.isActive(WETH, USDT), "mid == 0");
+        vm.expectRevert(abi.encodeWithSelector(InvalidMid.selector, pairKey));
+        propAmm.quote(WETH, USDT, 1e18);
+
         MockPUR(ORACLE).setState(5e14, 1e18);
         MockPUR(ORACLE).setSlotCount(1);
-        assertFalse(propAmm.isActive(WETH, USDT), "one slot");
-        MockPUR(ORACLE).setSlotCount(2);
-        assertTrue(propAmm.isActive(WETH, USDT), "well-formed and quotable");
+        assertTrue(propAmm.isActive(WETH, USDT), "one slot");
+        vm.expectRevert(abi.encodeWithSelector(InsufficientOracleData.selector, pairKey, uint256(1)));
+        propAmm.quote(WETH, USDT, 1e18);
     }
 
     function test_pause_onlyOwnerCanFlipIt() public {

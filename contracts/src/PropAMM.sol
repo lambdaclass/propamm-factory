@@ -142,66 +142,27 @@ contract PropAMM is
     }
 
     /// @inheritdoc IPropAMM
-    /// @dev Never reverts: an oracle without code, a failed call, or an answer that is not a
-    /// well-formed `(uint32, uint256[])` all read as inactive. A `try` cannot cover the last case,
-    /// because the decoder runs in this frame, after the call itself has succeeded. So do slots no
-    /// quote could use (fewer than two, `mid == 0`, `delta >= SPREAD_SCALE`), on which `_pricing`
-    /// and `_amountOut` revert. It still sees nothing of the vault: balance, allowance and token
-    /// transfer restrictions only show in `quote` and `swap`.
+    /// @dev Reports whether the registry holds an update for the pair's lane stamped with this
+    /// block's timestamp, which is what `getState` checks before it answers. It does not read the
+    /// answer: what the slots hold is up to whoever posts them, and `quote` is what interprets
+    /// them. So a fresh lane whose slots no quote can use still reads as active, and `quote`
+    /// reverts on it. Nor does it see the vault: balance, allowance and token transfer
+    /// restrictions only show in `quote` and `swap`.
+    ///
+    /// Never reverts (audit F-14). The call is low-level because a `try` on `oracle.getState`
+    /// still decodes the answer in this frame, after the call itself has succeeded, and reverts
+    /// there on one that is not a `(uint32, uint256[])`.
     function isActive(address tokenIn, address tokenOut) external view override returns (bool active) {
         if (paused()) return false;
 
-        address registry = address(oracle);
-        // A call to an address without code succeeds with empty data, so the success flag alone
-        // would not tell a registry from an EOA.
-        if (registry.code.length == 0) return false;
-        (bool ok, bytes memory ret) = registry.staticcall(
-            abi.encodeCall(
-                IPrioUpdateRegistry.getState,
-                (_pairKey(tokenIn, tokenOut), uint32(block.timestamp), uint32(block.timestamp))
-            )
+        bytes memory getState = abi.encodeCall(
+            IPrioUpdateRegistry.getState,
+            (_pairKey(tokenIn, tokenOut), uint32(block.timestamp), uint32(block.timestamp))
         );
-        if (!ok) return false;
-        (bool wellFormed, uint256 n, uint256 delta, uint256 mid) = _readState(ret);
-        return wellFormed && n >= 2 && mid != 0 && delta < SPREAD_SCALE;
-    }
-
-    /// @notice Reads a `getState` answer without trusting its shape.
-    /// @dev Accepts exactly the canonical encoding of `(uint32, uint256[])`: the timestamp word,
-    /// the offset 0x40, the length `n`, then `n` words; anything else is `wellFormed == false`.
-    /// Checked by hand rather than with `abi.decode`, which reverts on a malformed answer, and it
-    /// never reads past `ret`. The assembly only loads from `ret`, hence memory-safe; without that
-    /// annotation the optimizer treats memory conservatively across the whole contract, which
-    /// costs the quote and swap paths several hundred gas.
-    /// @return wellFormed Whether `ret` is a canonical encoding.
-    /// @return n How many slots it carries.
-    /// @return delta Slot 0, or zero when there is none.
-    /// @return mid Slot 1, or zero when there is none.
-    function _readState(bytes memory ret)
-        internal
-        pure
-        returns (bool wellFormed, uint256 n, uint256 delta, uint256 mid)
-    {
-        if (ret.length < 96) return (false, 0, 0, 0);
-        uint256 ts;
-        uint256 offset;
-        assembly ("memory-safe") {
-            ts := mload(add(ret, 0x20))
-            offset := mload(add(ret, 0x40))
-            n := mload(add(ret, 0x60))
-        }
-        if (ts > type(uint32).max || offset != 0x40 || n > (ret.length - 96) / 32) return (false, 0, 0, 0);
-        if (n >= 1) {
-            assembly ("memory-safe") {
-                delta := mload(add(ret, 0x80))
-            }
-        }
-        if (n >= 2) {
-            assembly ("memory-safe") {
-                mid := mload(add(ret, 0xa0))
-            }
-        }
-        return (true, n, delta, mid);
+        (bool ok, bytes memory ret) = address(oracle).staticcall(getState);
+        // A call to an address without code succeeds with no data, where a registry always
+        // answers with some.
+        return ok && ret.length != 0;
     }
 
     /// @inheritdoc IPropAMM
