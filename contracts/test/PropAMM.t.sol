@@ -277,9 +277,12 @@ contract PropAMMTest is Test {
 
     function test_nonOwnerCannotManageOracleUpdatersOrFunds() public {
         address rando = makeAddr("rando");
+        // A real oracle, so the only reason `setOracle` can revert below is the caller. Deployed
+        // up front: a CREATE between expectRevert and the call it guards would consume the expectation.
+        address newOracle = address(new MockPUR());
         vm.startPrank(rando);
         vm.expectRevert();
-        propAmm.setOracle(rando);
+        propAmm.setOracle(newOracle);
         vm.expectRevert();
         propAmm.addUpdater(rando);
         vm.expectRevert();

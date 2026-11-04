@@ -339,7 +339,9 @@ contract PropAMMFactoryTest is Test {
     function test_nobodyCanReinitializeAFactoryInstance() public {
         PropAMM propAmm = PropAMM(factory.createPropAMM(owner, PUR_ADDR, updaters, pairs));
         address rando = makeAddr("rando");
-        address evilOracle = makeAddr("evil-oracle");
+        // A real contract: `initialize` refuses an oracle without code, which would make the call
+        // below revert whether or not the instance can be initialized again.
+        address evilOracle = address(new RegistryStub());
 
         vm.startPrank(rando);
         vm.expectRevert();
