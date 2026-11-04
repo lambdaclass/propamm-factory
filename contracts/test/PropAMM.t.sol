@@ -266,11 +266,15 @@ contract PropAMMTest is Test {
     function test_nonOwnerCannotManageVaults() public {
         vm.prank(owner);
         propAmm.addPair(USDC, USDT, vault);
+        // Real tokens, so the only reason `addPair` can revert below is the caller. Deployed up
+        // front: a CREATE between expectRevert and the call it guards would consume the expectation.
+        address tokenA = address(new MockERC20());
+        address tokenB = address(new MockERC20());
 
         address rando = makeAddr("rando");
         vm.startPrank(rando);
         vm.expectRevert();
-        propAmm.addPair(makeAddr("token-a"), makeAddr("token-b"), vault);
+        propAmm.addPair(tokenA, tokenB, vault);
         vm.expectRevert();
         propAmm.setPairVault(USDC, USDT, rando);
         vm.expectRevert();
