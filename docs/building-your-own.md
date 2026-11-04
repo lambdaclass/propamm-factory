@@ -111,9 +111,9 @@ What to know:
   deviation guard (`max_deviation`, which keeps its own keys and cannot be named in a
   stanza), and answers `Pass` or `Trip`, whose reason the alarm line prefixes with
   ``guard `<kind>` tripped: `` (so a reason says only what was seen). A pair that streams
-  no price (a fixed `mid`, or a pricing kind with no `symbol` or `sources`) has no
-  composite, so a market guard stanza on it is refused at startup, on reload and under
-  `--check`, as `max_deviation` on a fixed mid is. A `QuoteGuard` judges our quote in the
+  no price (an `unguarded` fixed `mid`, or a pricing kind with no `symbol` or `sources`)
+  has no composite, so a market guard stanza on it is refused at startup, on reload and
+  under `--check`, as `max_deviation` on a pair with no stream is. A `QuoteGuard` judges our quote in the
   loop, after the pricer, the core's bounds and the band, on every tick: on the pricer's
   output *or a refusal*, the pricer's or the core's. That includes a feed with no sample yet
   or a stale one, which the core refuses before the pricer runs: on that tick the candidate

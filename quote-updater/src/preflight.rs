@@ -903,24 +903,16 @@ pub async fn build_report(
     })
 }
 
-/// What a pair's on-chain symbols say about it, as `(failures, warnings)`: the fixed
-/// stable-pair check, the band warning, and every source's stream/token cross-check.
-/// Separated from `build_report`, like `check_symbol`, so every branch is testable without a
-/// chain.
+/// What a pair's on-chain symbols say about it, as `(failures, warnings)`: the band warning,
+/// and every source's stream/token cross-check. Separated from `build_report`, like
+/// `check_symbol`, so every branch is testable without a chain.
 pub(crate) fn symbol_verdicts(
     spec: &crate::config::PairSpec,
     base_symbol: Option<&str>,
     quote_symbol: Option<&str>,
 ) -> (Vec<String>, Vec<String>) {
     let mut failures = Vec::new();
-    let mut warnings = Vec::new();
-
-    // A fixed price between two dollars with no band judging its market is the one shape
-    // that cannot stop through a depeg, so it fails; the band warning would only repeat it.
-    match fixed_dollar_failure(spec, base_symbol, quote_symbol) {
-        Some(failure) => failures.push(failure),
-        None => warnings.extend(band_warning(spec)),
-    }
+    let mut warnings: Vec<String> = band_warning(spec).into_iter().collect();
 
     // A venue symbol is the one hand-written field that can be catastrophically wrong:
     // publishing BTC's price on the WETH lane is arbitraged within a block. Every source is
@@ -978,14 +970,6 @@ pub(crate) fn symbol_verdicts(
                     .to_owned(),
             );
         }
-    } else if spec.pricing.kind == "fixed" && (base_symbol.is_none() || quote_symbol.is_none()) {
-        // The same rule for the fixed stable-pair check: it reads the symbols too, and a fixed
-        // pair with no stream is exactly the shape it exists to refuse (audit F-04).
-        warnings.push(
-            "could not read symbol() from both tokens, so the check that a fixed price between \
-             two dollars has a market and a band did not run for this pair"
-                .to_owned(),
-        );
     }
     (failures, warnings)
 }
@@ -1013,53 +997,19 @@ pub(crate) fn stand_in_failure(
     ))
 }
 
-/// Why a `fixed` pair between two dollars cannot run, if it cannot. A fixed price does not
-/// follow its market, so through a depeg the vault keeps filling at it; what stops the pair
-/// is its band judging the market's mid, which takes both a stream and a band (audit F-04).
-/// The other `fixed` pairs with no market get [`band_warning`]'s line instead. A dollar is
-/// USDC or USDT, the quotes [`crate::venues::dollar_stand_ins`] knows, read as the chain
-/// spells them; a symbol preflight could not read is reported by the symbol check, not here.
-pub(crate) fn fixed_dollar_failure(
-    spec: &crate::config::PairSpec,
-    base_symbol: Option<&str>,
-    quote_symbol: Option<&str>,
-) -> Option<String> {
-    let is_dollar = |symbol: &str| {
-        let name = crate::venues::unwrap_alias(&symbol.to_uppercase()).to_owned();
-        !crate::venues::dollar_stand_ins(&name).is_empty()
-    };
-    // Both bounds: either dollar can depeg, and the two move the mid in opposite directions.
-    let guarded = spec.feeds.is_some() && spec.band.min.is_some() && spec.band.max.is_some();
-    if spec.pricing.kind != "fixed"
-        || guarded
-        || !is_dollar(base_symbol?)
-        || !is_dollar(quote_symbol?)
-    {
-        return None;
-    }
-    Some(
-        "pricing `fixed` publishes the same mid whatever the market does, and nothing compares \
-         it with one, so through a depeg the vault fills at this price until the pair is \
-         halted. Give the pair a `symbol` (for example `USDCUSDT`) and a `min_mid`/`max_mid` \
-         band, which then stops it when the market leaves the band, or price it with \
-         `kind = \"feed\"`"
-            .to_owned(),
-    )
-}
-
 /// The warning a pair with no `min_mid`/`max_mid` earns, if it earns one. Carried over from
 /// the single-pair CLI's --min-mid/--max-mid note: bounds are optional, so a pair without
 /// them is the default and would otherwise be invisible. A pair with a market earns it, and
 /// so does a kind with no market, which is bounded by less: only `delta < 1` and a nonzero
 /// mid stand between its output and the chain. So does a `fixed` mid with no market, banded
-/// or not: the band can only compare the constant with itself, and nothing compares it with
-/// the market it is meant to track.
+/// or not, which only an `unguarded` stanza can run (audit F-04): nothing compares it with
+/// a market, and the band can only compare the constant with itself.
 fn band_warning(spec: &crate::config::PairSpec) -> Option<String> {
     if spec.feeds.is_none() && spec.pricing.kind == "fixed" {
         return Some(
-            "pricing `fixed` publishes the same mid whatever the market does, and this pair \
-             streams no market, so nothing compares its price with one; give it a symbol and a \
-             min_mid/max_mid band to stop it quoting through a move"
+            "pricing `fixed` is unguarded: it publishes the same mid whatever the market does, \
+             and this pair streams no market, so nothing compares its price with one. For a real \
+             pair, give it a symbol: it then stops quoting whenever the market leaves its quote"
                 .to_owned(),
         );
     }
@@ -1141,58 +1091,6 @@ mod tests {
     const STREAM: &str = "symbol = \"USDCUSDT\"\n";
     const BAND: &str = "min_mid = \"0.995\"\nmax_mid = \"1.005\"\n";
 
-    /// Audit F-04, path 1: a fixed price between two dollars publishes par through a depeg
-    /// unless a band judges its market, so preflight refuses it without a stream and a band.
-    #[test]
-    fn a_fixed_pair_between_two_dollars_needs_a_market_judged_band() {
-        let fails = |spec: &crate::config::PairSpec, base: &str, quote: &str| {
-            fixed_dollar_failure(spec, Some(base), Some(quote))
-        };
-        let bare = stable_pair("", FIXED);
-        let msg = fails(&bare, "USDC", "USDT").expect("the old deploy template's shape");
-        for needle in ["symbol", "min_mid", "max_mid", "feed"] {
-            assert!(msg.contains(needle), "{needle}: {msg}");
-        }
-        assert!(
-            fails(&stable_pair(STREAM, FIXED), "USDC", "USDT").is_some(),
-            "a stream and no band"
-        );
-        assert!(
-            fails(&stable_pair(BAND, FIXED), "USDC", "USDT").is_some(),
-            "a band around a constant"
-        );
-        // Either dollar can depeg, moving the mid in opposite directions, so a band with one
-        // bound leaves the pair unguarded one way.
-        let max_only = format!("{STREAM}max_mid = \"1.005\"\n");
-        assert!(
-            fails(&stable_pair(&max_only, FIXED), "USDC", "USDT").is_some(),
-            "a USDC slide lowers the mid past no bound"
-        );
-        let min_only = format!("{STREAM}min_mid = \"0.995\"\n");
-        assert!(
-            fails(&stable_pair(&min_only, FIXED), "USDC", "USDT").is_some(),
-            "a USDT slide raises the mid past no bound"
-        );
-        let guarded = format!("{STREAM}{BAND}");
-        assert_eq!(fails(&stable_pair(&guarded, FIXED), "USDC", "USDT"), None);
-        assert!(
-            fails(&bare, "usdt", "usdc").is_some(),
-            "case and token order do not matter"
-        );
-        let feed = stable_pair(STREAM, r#"{ kind = "feed" }"#);
-        assert_eq!(
-            fails(&feed, "USDC", "USDT"),
-            None,
-            "feed follows its market"
-        );
-        assert_eq!(fails(&bare, "WETH", "USDC"), None, "not two dollars");
-        assert_eq!(
-            fixed_dollar_failure(&bare, None, Some("USDT")),
-            None,
-            "an unread symbol is reported elsewhere"
-        );
-    }
-
     /// A WETH/USDC pair streaming Coinbase's ETH-USD, a market in another dollar, with
     /// `extra` added to its stanza.
     fn weth_usdc_from_usd(extra: &str) -> crate::config::PairSpec {
@@ -1228,20 +1126,10 @@ mod tests {
         );
     }
 
-    /// A check that did not run is not a check that passed: a fixed pair whose symbols could
-    /// not be read says the stable-pair check did not run, the way a pair with a stream says
-    /// its cross-check did not. Audit F-04 (review).
+    /// A check that did not run is not a check that passed: a pair whose symbols could not be
+    /// read says its stream/token cross-check did not run.
     #[test]
-    fn a_fixed_pair_whose_symbols_could_not_be_read_says_its_check_did_not_run() {
-        let (failures, warnings) = symbol_verdicts(&stable_pair("", FIXED), None, Some("USDT"));
-        assert!(failures.is_empty(), "{failures:?}");
-        assert!(
-            warnings
-                .iter()
-                .any(|w| w.contains("could not read symbol()") && w.contains("fixed")),
-            "{warnings:?}"
-        );
-
+    fn an_unread_symbol_says_the_cross_check_did_not_run() {
         let streamed = stable_pair(STREAM, r#"{ kind = "feed" }"#);
         let (_, warnings) = symbol_verdicts(&streamed, None, Some("USDT"));
         assert!(
@@ -1252,8 +1140,8 @@ mod tests {
         );
     }
 
-    /// The template every compose deployment starts from passes the check above: its stable
-    /// pair streams USDCUSDT inside a [0.995, 1.005] band. Audit F-04.
+    /// The template every compose deployment starts from passes preflight's pair verdicts:
+    /// its stable pair streams USDCUSDT inside a [0.995, 1.005] band. Audit F-04.
     #[test]
     fn the_deploy_example_passes_preflights_pair_verdicts() {
         let template = include_str!("../../deploy/config.example.toml").replace(
@@ -1268,11 +1156,11 @@ mod tests {
             other => panic!("unexpected token {other}"),
         };
         for spec in &config.pairs {
+            // `tokens` is address-sorted; the cross-check reads them as declared, base first.
             let (a, b) = spec.tokens;
-            assert_eq!(
-                fixed_dollar_failure(spec, Some(symbol(a)), Some(symbol(b))),
-                None
-            );
+            let (base, quote) = if spec.invert { (b, a) } else { (a, b) };
+            let (failures, _) = symbol_verdicts(spec, Some(symbol(base)), Some(symbol(quote)));
+            assert!(failures.is_empty(), "{failures:?}");
         }
         let stable = config
             .pairs

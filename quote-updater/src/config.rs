@@ -503,8 +503,13 @@ impl PricingSpec {
         }
     }
 
+    /// A `fixed` stanza for a test pair that streams nothing, so `unguarded` (audit F-04: a
+    /// fixed price otherwise needs a market to compare its price with).
     pub(crate) fn fixed_for_tests(mid: &str, delta: &str) -> Self {
-        Self::for_tests("fixed", &[("mid", mid), ("delta", delta)])
+        Self::for_tests(
+            "fixed",
+            &[("mid", mid), ("delta", delta), ("unguarded", "true")],
+        )
     }
 
     pub(crate) fn feed_for_tests(delta: Option<&str>) -> Self {

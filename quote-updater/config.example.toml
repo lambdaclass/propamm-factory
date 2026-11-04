@@ -350,9 +350,11 @@ max_deviation = "0.002"
 
 # A pair can publish a fixed price: the `fixed` kind, with `mid` and `delta` as decimal
 # strings in whole-token units. The end-to-end make targets use it so their assertions do
-# not depend on the book's spread. A fixed price does not follow the market, so a pair
-# between two dollars keeps its `symbol` and a band, which judges the market's mid and stops
-# the pair through a depeg; preflight refuses a fixed USDC/USDT pair without both:
+# not depend on the book's spread. A fixed price does not follow the market, so it keeps a
+# `symbol` and quotes only while the market's mid sits inside its own bid and ask,
+# mid · (1 − delta) to mid · (1 + delta); outside them a taker would trade the vault at a
+# stale price, the way a depeg drains a stable pair at par. With no market at all it fails
+# to start, unless the stanza says `unguarded = true` (a smoke test's, never a real pair's):
 #
 # [[pairs]]
 # tokens  = ["0xA0b8…", "0xdAC1…"]

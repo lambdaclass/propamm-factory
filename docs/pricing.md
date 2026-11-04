@@ -18,13 +18,14 @@ The backoffice edits these settings live, without a restart.
 
 ## The models that ship with the library
 
-**`fixed`**: always publishes the same mid and the same spread. Settings: `mid`, `delta`
-(half-spread as a fraction, `0.0005` is 5 bp). For a pair whose price does not move, or to
-test the wiring. It does not follow the market, so on a pair between two dollars it needs a
-`symbol` and a `min_mid`/`max_mid` band: the band judges the market's mid, and the pair stops
-when the market leaves it or its stream goes quiet. Preflight refuses a `fixed` USDC/USDT
-pair without both. `feed` with a band is the better default there: it follows the market
-inside the band instead of selling at a fixed price up to the band's edge.
+**`fixed`**: publishes the same mid and the same spread while the market agrees. Settings:
+`mid`, `delta` (half-spread as a fraction, `0.0005` is 5 bp). For a pair whose price should
+not move. It does not follow the market, so it needs one (`symbol` or `sources`) and quotes
+only while the market's mid sits inside its own bid and ask, `mid · (1 − delta)` to
+`mid · (1 + delta)`; outside them a taker would trade the vault at a stale price. It also
+stops when its stream goes quiet. A smoke test with no market sets `unguarded = true`.
+`feed` with a `min_mid`/`max_mid` band is the better default for a stable pair: it follows
+the market inside the band instead of standing still until the market leaves its spread.
 
 **`feed`**: publishes the exchange mid as it is. Settings: `delta`, optional. With it, the
 spread you set; without it, the exchange's own spread (only allowed when the pair follows a

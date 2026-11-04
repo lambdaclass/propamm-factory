@@ -673,7 +673,7 @@ impl ValueSource {
     #[cfg(test)]
     pub(crate) fn fixed_for_tests(delta: U256, mid: U256, price_decimals: u32) -> Self {
         Self::new(
-            Box::new(crate::pricing::FixedPricer { delta, mid }),
+            Box::new(crate::pricing::FixedPricer::for_tests(delta, mid)),
             "fixed",
             None,
             Arc::new(test_shape(false, price_decimals)),
@@ -704,7 +704,7 @@ impl ValueSource {
         inverted: bool,
     ) -> Self {
         Self::new(
-            Box::new(crate::pricing::FixedPricer { delta, mid }),
+            Box::new(crate::pricing::FixedPricer::for_tests(delta, mid)),
             "fixed",
             Some(rx),
             Arc::new(test_shape(inverted, price_decimals)),
@@ -1286,11 +1286,12 @@ mod tests {
         assert_eq!(delta, U256::from(50_000_000_000_000u64));
     }
 
-    /// A USDC/USDT pair priced `fixed` at 1.0001 with a 2 bp half-spread (the old deploy
-    /// template's numbers), streaming USDCUSDT, banded at [0.995, 1.005].
+    /// A USDC/USDT pair priced `fixed` at 1.0001 with a half-spread of `delta` (2 bp,
+    /// 2e14, is the old deploy template's), streaming USDCUSDT, banded at [0.995, 1.005].
     fn fixed_stable_over(
         market_mid: U256,
         at: std::time::Instant,
+        delta: U256,
     ) -> (
         tokio::sync::watch::Sender<Option<PriceSample>>,
         ValueSource,
@@ -1305,7 +1306,7 @@ mod tests {
         let (tx, rx) = tokio::sync::watch::channel(Some(sample));
         let source = ValueSource::fixed_over_market_for_tests(
             rx,
-            U256::from(200_000_000_000_000u64),
+            delta,
             U256::from(1_000_100_000_000_000_000u64),
             18,
         );
@@ -1316,30 +1317,60 @@ mod tests {
         (tx, source, band)
     }
 
-    /// Audit F-04, path 1: a fixed price's band used to judge only that price, which never
-    /// moves, so the pair kept selling at par through a depeg. The band now judges the
-    /// market too, and the pair stops once the market leaves it.
+    const TWO_BP: u64 = 200_000_000_000_000;
+    const FIVE_PERCENT: u64 = 50_000_000_000_000_000;
+
+    /// Audit F-04, path 1, the PoC's slide: USDC at 1.0000, 0.9997, 0.975, 0.915 and 0.88
+    /// USDT. A fixed 1.0001 with a 2 bp half-spread bids about 0.99990, so the first step
+    /// already puts the market under its bid and an arbitrageur sells it USDC at par; the
+    /// pair must not quote from there on. It stops on its own quote, with no band at all,
+    /// and the same the other way, on a USDT depeg past its ask.
     #[test]
-    fn a_fixed_pair_stops_quoting_when_its_market_leaves_the_band() {
+    fn a_fixed_pair_never_quotes_a_market_outside_its_own_quote() {
         let now = std::time::Instant::now();
-        let (_tx, at_par, band) = fixed_stable_over(U256::exp10(18), now);
+        let no_band = MidBand::default();
+        let at = |mid: u64| U256::from(mid) * U256::exp10(14);
+        let (_tx, at_par, _) = fixed_stable_over(at(10_000), now, U256::from(TWO_BP));
+        assert_eq!(
+            at_par.current(&no_band).unwrap(),
+            (U256::from(TWO_BP), at(10_001))
+        );
+        for market in [9_997, 9_750, 9_150, 8_800, 10_005] {
+            let (_tx, off, _) = fixed_stable_over(at(market), now, U256::from(TWO_BP));
+            let refused = off
+                .current(&no_band)
+                .expect_err("the market is outside the fixed price's quote");
+            assert!(
+                refused.to_string().contains("own quote"),
+                "{market}: {refused}"
+            );
+        }
+    }
+
+    /// The band judges the market's mid too, not only the published one: a fixed price
+    /// whose quote is wide enough to accept a market at 0.97 still stops there, because
+    /// the market has left [0.995, 1.005]. And the other way, at 1.03.
+    #[test]
+    fn the_band_judges_the_market_as_well_as_the_published_mid() {
+        let now = std::time::Instant::now();
+        let wide = U256::from(FIVE_PERCENT);
+        let (_tx, at_par, band) = fixed_stable_over(U256::exp10(18), now, wide);
         assert_eq!(
             at_par.current(&band).unwrap(),
-            (
-                U256::from(200_000_000_000_000u64),
-                U256::from(1_000_100_000_000_000_000u64)
-            )
+            (wide, U256::from(1_000_100_000_000_000_000u64))
         );
 
-        let (_tx, depegged, band) = fixed_stable_over(U256::from(970_000_000_000_000_000u64), now);
+        let (_tx, depegged, band) =
+            fixed_stable_over(U256::from(970_000_000_000_000_000u64), now, wide);
         let refused = depegged
             .current(&band)
             .expect_err("USDC at 0.97 USDT is outside the band");
         assert_eq!(refused.kind(), Some(UnusableKind::OutOfBand));
-        assert!(refused.to_string().contains("market"), "{refused}");
+        assert!(refused.to_string().contains("market's mid"), "{refused}");
 
         // And the other way: a USDT depeg raises USDC's price in USDT past max_mid.
-        let (_tx, above, band) = fixed_stable_over(U256::from(1_030_000_000_000_000_000u64), now);
+        let (_tx, above, band) =
+            fixed_stable_over(U256::from(1_030_000_000_000_000_000u64), now, wide);
         let refused = above
             .current(&band)
             .expect_err("USDC at 1.03 USDT is outside the band");
@@ -1348,7 +1379,9 @@ mod tests {
     }
 
     /// The market's mid is judged in lane orientation, the band's: on an inverted lane (WETH
-    /// per USDC, about 1/4000) a market that leaves the band is refused the same way.
+    /// per USDC, about 1/4000) a market that leaves the band is refused the same way. The
+    /// fixed price's half-spread is 50%, so its own quote accepts the market and the band
+    /// is what refuses it.
     #[test]
     fn the_market_is_judged_in_lane_orientation_on_an_inverted_lane() {
         let over = |market_mid: U256| {
@@ -1361,7 +1394,7 @@ mod tests {
             let (tx, rx) = tokio::sync::watch::channel(Some(sample));
             let source = ValueSource::fixed_over_market_for_tests_on(
                 rx,
-                U256::from(500_000_000_000_000u64),
+                U256::from(500_000_000_000_000_000u64),
                 U256::from(250_000_000_000_000u64),
                 18,
                 true,
@@ -1387,7 +1420,7 @@ mod tests {
     #[test]
     fn a_fixed_pair_withdraws_when_its_market_goes_stale() {
         let long_ago = std::time::Instant::now() - MAX_PRICE_AGE - Duration::from_secs(1);
-        let (_tx, stale, band) = fixed_stable_over(U256::exp10(18), long_ago);
+        let (_tx, stale, band) = fixed_stable_over(U256::exp10(18), long_ago, U256::from(TWO_BP));
         let refused = stale
             .current(&band)
             .expect_err("a stale market is no market");

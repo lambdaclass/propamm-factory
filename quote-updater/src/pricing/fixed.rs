@@ -1,8 +1,12 @@
-//! `fixed`: a pair whose stanza states `mid` and `delta` publishes them, whatever the
-//! market does. The simplest kind: for a smoke test, or a pair whose price does not move.
-//! Between two dollars it also needs a `symbol` and a `min_mid`/`max_mid` band, which then
-//! judges the market's mid and stops the pair through a depeg; preflight refuses a fixed
-//! USDC/USDT pair without both (audit F-04).
+//! `fixed`: a pair whose stanza states `mid` and `delta` publishes them while its market
+//! agrees. The simplest kind, for a pair whose price should not move.
+//!
+//! A fixed price does not follow its market, so it is only safe while the market sits
+//! inside its own quote, `mid · (1 − delta)` to `mid · (1 + delta)`. Outside it a taker
+//! trades the vault at a stale price: a stablecoin depeg drains the sound side at par, one
+//! small step at a time (audit F-04). So the pair needs a market (`symbol` or `sources`),
+//! and the pricer refuses every tick on which the market is outside its quote, whatever
+//! the pair's band. A smoke test with no market says so with `unguarded = true`.
 //!
 //! ```toml
 //! [pairs.pricing]
@@ -15,18 +19,45 @@ use ethrex_common::U256;
 
 use super::{
     BoxFuture, BuildCtx, Diagnostics, Factory, FormField, PairShape, Pricer, PricerOutput, Refusal,
-    TickCtx,
+    RefusalHandle, TickCtx,
 };
 use crate::feed::{parse_decimal_scaled, reciprocal_scaled};
 
-/// The `fixed` stanza: both as written, parsed exactly against the pair's scale in
+/// The `fixed` stanza: as written, parsed exactly against the pair's scale in
 /// [`Factory::validate`], so a typo fails the file rather than every tick.
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FixedConfig {
     pub mid: String,
     pub delta: String,
+    /// Publish with no market to compare the price with: a smoke test's, never a real
+    /// pair's. A TOML bool, or the text `"true"`/`"false"` the backoffice form posts.
+    #[serde(default, deserialize_with = "flag")]
+    pub unguarded: bool,
 }
+
+/// A bool written either way: `true`, or the form's `"true"`. Blank is false.
+fn flag<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Written {
+        Bool(bool),
+        Text(String),
+    }
+    match <Written as serde::Deserialize>::deserialize(deserializer)? {
+        Written::Bool(value) => Ok(value),
+        Written::Text(text) => match text.trim() {
+            "true" => Ok(true),
+            "false" | "" => Ok(false),
+            other => Err(serde::de::Error::custom(format!(
+                "unguarded is true or false, not {other:?}"
+            ))),
+        },
+    }
+}
+
+/// The reason a fixed price is withdrawn while its market is outside its own quote.
+const OUTSIDE_QUOTE: &str = "market_outside_quote";
 
 /// The `fixed` pricing kind. Register it with `Updater::builder().pricer("fixed", Fixed)`.
 pub struct Fixed;
@@ -36,6 +67,16 @@ impl Fixed {
     /// market orientation, inverted for an inverted lane (byte for byte the rule a feed
     /// follows), the delta as a fraction below one unit, both inside the pair's band.
     fn resolve(cfg: &FixedConfig, pair: &PairShape) -> eyre::Result<(U256, U256)> {
+        // With no market nothing could stop a fixed price through a depeg (audit F-04).
+        eyre::ensure!(
+            pair.sources > 0 || cfg.unguarded,
+            "pricing `fixed` publishes the same mid whatever the market does, and this pair \
+             has no market to compare it with, so through a depeg the vault would fill at this \
+             price until the pair is halted. Give the pair a `symbol` (for example \
+             `USDCUSDT`) or `sources`: it then stops quoting whenever the market leaves its own \
+             bid and ask. Or price it with `kind = \"feed\"`. For a smoke test with no market, \
+             set `unguarded = true` in this stanza"
+        );
         let decimals = pair.price_decimals;
         let declared_mid = parse_decimal_scaled(&cfg.mid, decimals)
             .map_err(|err| eyre::eyre!("invalid mid: {err:#}"))?;
@@ -92,7 +133,13 @@ const FIELDS: &[FormField] = &[
         "delta",
         "0.0005",
         "the spread, as a fraction of the mid. 0.0005 means we sell at mid + 0.05% and buy at \
-         mid − 0.05%.",
+         mid − 0.05%. We only quote while the market is inside that spread.",
+    ),
+    FormField::new(
+        "unguarded",
+        "",
+        "true only for a smoke test with no venue ticked: publish with no market to compare \
+         the price with. Leave blank for any real pair.",
     ),
 ];
 
@@ -109,12 +156,14 @@ impl Factory for Fixed {
     }
 
     fn form_help(&self) -> &'static str {
-        "<p class=explain>We send the same mid and the same spread every block. For a pair \
-         whose price does not move, or to smoke-test the wiring.</p>"
+        "<p class=explain>We send the same mid and the same spread every block, while the pair's \
+         market sits inside that spread; when it leaves, we stop quoting until it is back. For \
+         a pair whose price should not move. Tick its market below.</p>"
     }
 
     fn summary(&self, cfg: &FixedConfig) -> String {
-        format!("mid {} delta {}", cfg.mid, cfg.delta)
+        let unguarded = if cfg.unguarded { " unguarded" } else { "" };
+        format!("mid {} delta {}{unguarded}", cfg.mid, cfg.delta)
     }
 
     fn build<'a>(
@@ -122,20 +171,74 @@ impl Factory for Fixed {
         cfg: &'a FixedConfig,
         ctx: &'a mut BuildCtx,
     ) -> BoxFuture<'a, eyre::Result<FixedPricer>> {
-        Box::pin(std::future::ready(
-            Self::resolve(cfg, ctx.pair()).map(|(delta, mid)| FixedPricer { delta, mid }),
+        let built = Self::resolve(cfg, ctx.pair()).and_then(|(delta, mid)| {
+            Ok(FixedPricer {
+                delta,
+                mid,
+                outside_quote: ctx.refusal(OUTSIDE_QUOTE)?,
+            })
+        });
+        Box::pin(std::future::ready(built))
+    }
+}
+
+/// The mid and delta the stanza fixed, already in lane orientation, and the reason a tick
+/// is withdrawn while the market is outside the quote they make.
+pub struct FixedPricer {
+    pub(crate) delta: U256,
+    pub(crate) mid: U256,
+    outside_quote: RefusalHandle,
+}
+
+impl FixedPricer {
+    /// A pricer built outside a lane's build, for tests that drive one directly.
+    #[cfg(test)]
+    pub(crate) fn for_tests(delta: U256, mid: U256) -> Self {
+        let mut ctx = crate::testing::build_ctx(&crate::testing::pair());
+        FixedPricer {
+            delta,
+            mid,
+            outside_quote: ctx
+                .refusal(OUTSIDE_QUOTE)
+                .expect("a fresh build declares it"),
+        }
+    }
+
+    /// The quote this price makes, `mid · (1 − delta)` to `mid · (1 + delta)` in lane
+    /// orientation, or `None` where the product does not fit.
+    fn quote(&self, price_decimals: u32) -> Option<(U256, U256)> {
+        let unit = crate::config::spread_scale(price_decimals);
+        let reach = self.mid.checked_mul(self.delta)? / unit;
+        Some((
+            self.mid.saturating_sub(reach),
+            self.mid.saturating_add(reach),
         ))
     }
 }
 
-/// The mid and delta the stanza fixed, already in lane orientation.
-pub struct FixedPricer {
-    pub(crate) delta: U256,
-    pub(crate) mid: U256,
-}
-
 impl Pricer for FixedPricer {
-    fn price(&mut self, _tick: &TickCtx, _out: &mut Diagnostics) -> Result<PricerOutput, Refusal> {
+    fn price(&mut self, tick: &TickCtx, _out: &mut Diagnostics) -> Result<PricerOutput, Refusal> {
+        // A pair with a market quotes only while the market sits inside this price's own bid
+        // and ask; outside them a taker trades the vault at a stale price (audit F-04). The
+        // core has already refused a stale market, so a tick with none is an unguarded pair.
+        if let Ok(market) = tick.market() {
+            let quote = self.quote(tick.pair().price_decimals);
+            let inside = quote.is_some_and(|(low, high)| low <= market.mid && market.mid <= high);
+            if !inside {
+                let range = quote.map_or_else(
+                    || "beyond what the scale can hold".to_owned(),
+                    |(low, high)| format!("{low} to {high}"),
+                );
+                return Err(Refusal::new(
+                    &self.outside_quote,
+                    format!(
+                        "the market's mid {} is outside this fixed price's own quote, {range}: a \
+                         taker would trade the vault at a stale price; refusing to publish",
+                        market.mid
+                    ),
+                ));
+            }
+        }
         Ok(PricerOutput::new(self.delta, self.mid))
     }
 }
@@ -224,10 +327,88 @@ mod tests {
     }
 
     #[test]
-    fn the_form_fields_and_the_summary_name_the_two_keys() {
+    fn the_form_fields_and_the_summary_name_the_keys() {
         let names: Vec<&str> = Fixed.fields().iter().map(|f| f.name).collect();
-        assert_eq!(names, ["mid", "delta"]);
+        assert_eq!(names, ["mid", "delta", "unguarded"]);
         let cfg: FixedConfig = toml::from_str(STANZA).unwrap();
         assert_eq!(Fixed.summary(&cfg), "mid 1.0001 delta 0.0002");
+        let unguarded: FixedConfig =
+            toml::from_str(&format!("{STANZA}\nunguarded = true")).unwrap();
+        assert_eq!(
+            Fixed.summary(&unguarded),
+            "mid 1.0001 delta 0.0002 unguarded"
+        );
+    }
+
+    /// Audit F-04: a fixed price does not follow its market, so it is only safe while the
+    /// market sits inside its own quote. Outside it a taker trades the vault at a stale
+    /// price: at the PoC's 0.9997 USDT per USDC the vault's bid, 1.0001 · (1 − 0.0002) ≈
+    /// 0.99990, is already above the market, and a USDT depeg (1.0005) is past its ask. The
+    /// pricer refuses there, whatever the pair's band says.
+    #[test]
+    fn a_fixed_price_refuses_while_its_market_is_outside_its_own_quote() {
+        let pair = testing::pair();
+        let (mut pricer, ctx) = testing::build(&Fixed, STANZA, &pair).unwrap();
+        let mut out = testing::diagnostics(&ctx);
+        for inside in [1.0001, 1.0, 1.0002] {
+            let market = testing::market(&pair, inside, 0.0);
+            let priced = pricer.price(&testing::tick(&pair, Some(&market)), &mut out);
+            assert!(priced.is_ok(), "{inside} is inside the quote: {priced:?}");
+        }
+        for outside in [0.9997, 0.975, 0.915, 0.88, 1.0005] {
+            let market = testing::market(&pair, outside, 0.0);
+            let refusal = pricer
+                .price(&testing::tick(&pair, Some(&market)), &mut out)
+                .expect_err("outside the quote");
+            assert_eq!(refusal.reason(), "market_outside_quote", "{outside}");
+            assert!(refusal.message().contains("own quote"), "{refusal}");
+        }
+    }
+
+    /// The quote is judged in lane orientation, where the market and the published mid both
+    /// are: on an inverted lane a fixed 4000 USDC per WETH publishes 0.00025.
+    #[test]
+    fn the_quote_is_judged_in_lane_orientation_on_an_inverted_lane() {
+        let pair = testing::pair_with(true, 18);
+        let (mut pricer, ctx) =
+            testing::build(&Fixed, "mid = \"4000\"\ndelta = \"0.0005\"", &pair).unwrap();
+        let mut out = testing::diagnostics(&ctx);
+        let inside = testing::market(&pair, 4001.0, 0.0); // 2.5 bp off, inside 5 bp
+        assert!(
+            pricer
+                .price(&testing::tick(&pair, Some(&inside)), &mut out)
+                .is_ok()
+        );
+        let outside = testing::market(&pair, 3990.0, 0.0); // 25 bp off
+        let refusal = pricer
+            .price(&testing::tick(&pair, Some(&outside)), &mut out)
+            .expect_err("outside the quote");
+        assert_eq!(refusal.reason(), "market_outside_quote");
+    }
+
+    /// With no market, nothing could stop a fixed price through a depeg, so the stanza
+    /// needs a market (`symbol` or `sources`) or says it is a smoke test with `unguarded`.
+    /// The form posts `"true"` as a string, so that reads as the flag too. Audit F-04.
+    #[test]
+    fn a_fixed_price_needs_a_market_unless_it_says_it_is_unguarded() {
+        let mut pair = testing::pair();
+        pair.sources = 0;
+        let err = format!(
+            "{:#}",
+            testing::build(&Fixed, STANZA, &pair)
+                .err()
+                .expect("no market")
+        );
+        for needle in ["symbol", "unguarded", "feed"] {
+            assert!(err.contains(needle), "{needle}: {err}");
+        }
+        for flag in ["unguarded = true", "unguarded = \"true\""] {
+            let (mut pricer, ctx) = testing::build(&Fixed, &format!("{STANZA}\n{flag}"), &pair)
+                .unwrap_or_else(|err| panic!("{flag}: {err:#}"));
+            let out = pricer.price(&testing::tick(&pair, None), &mut testing::diagnostics(&ctx));
+            assert!(out.is_ok(), "{flag}");
+        }
+        let refused = testing::build(&Fixed, &format!("{STANZA}\nunguarded = \"yes\""), &pair);
+        assert!(refused.is_err(), "only true or false");
     }
 }

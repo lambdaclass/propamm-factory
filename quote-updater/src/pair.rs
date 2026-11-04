@@ -1508,11 +1508,13 @@ mod tests {
             at: std::time::Instant::now(),
             wall: std::time::SystemTime::now(),
         };
+        // A 5% half-spread: the fixed price's own quote accepts a market at 0.97, so what
+        // refuses it below is the band.
         let (delta, mid) = (
-            U256::from(200_000_000_000_000u64),
+            U256::from(50_000_000_000_000_000u64),
             U256::from(1_000_100_000_000_000_000u64),
         );
-        let mut fixed = crate::pricing::FixedPricer { delta, mid };
+        let mut fixed = crate::pricing::FixedPricer::for_tests(delta, mid);
         let (row, _) = preview_row(&mut fixed, Some(&market(U256::exp10(18))), &shape, 0);
         assert_eq!(row, Ok((delta, mid)));
         let depegged = market(U256::from(970_000_000_000_000_000u64));
@@ -2030,7 +2032,7 @@ mod tests {
                         [[pairs]]\n\
                         tokens = [\"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48\", \
                         \"0xdAC17F958D2ee523a2206206994597C13D831ec7\"]\n\
-                        key_env = \"K\"\npricing = { kind = \"fixed\", mid = \"1.0001\", delta = \"0\" }\n\n\
+                        key_env = \"K\"\npricing = { kind = \"fixed\", mid = \"1.0001\", delta = \"0\", unguarded = true }\n\n\
                         [[pairs.guards]]\nkind = \"share_band\"\n";
             let config = crate::config::parse_config(toml, 18).unwrap();
             let metrics = metrics::Metrics::new().unwrap();
@@ -2110,7 +2112,7 @@ mod tests {
                         [[pairs]]\n\
                         tokens = [\"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48\", \
                         \"0xdAC17F958D2ee523a2206206994597C13D831ec7\"]\n\
-                        key_env = \"K\"\npricing = { kind = \"fixed\", mid = \"1.0001\", delta = \"0\" }\n\n\
+                        key_env = \"K\"\npricing = { kind = \"fixed\", mid = \"1.0001\", delta = \"0\", unguarded = true }\n\n\
                         [[pairs.guards]]\nkind = \"inverted_only\"\n";
             let config = crate::config::parse_config(toml, 18).unwrap();
             let metrics = metrics::Metrics::new().unwrap();

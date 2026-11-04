@@ -2164,11 +2164,11 @@ fn render_pair_form_with(
                     .map(|field| {
                         let value = if mine {
                             pair.and_then(|p| p.pricing.get(field.name))
-                                .and_then(|v| v.as_str())
+                                .and_then(form_text)
                         } else {
                             None
                         };
-                        Filled::kind_field(name, field, value)
+                        Filled::kind_field(name, field, value.as_deref())
                     })
                     .collect(),
                 in_file: fields.is_empty(),
@@ -2233,6 +2233,17 @@ fn render_pair_form_with(
     }
     .render()
     .unwrap_or_else(render_failed)
+}
+
+/// A stanza value as a pricing field shows it: text as written, and a bool as the
+/// `true`/`false` the field posts back, so a hand-written `unguarded = true` on a `fixed` pair
+/// is not dropped by a save from the form (audit F-04). Anything else shows blank.
+fn form_text(value: &toml::Value) -> Option<String> {
+    match value {
+        toml::Value::String(text) => Some(text.clone()),
+        toml::Value::Boolean(flag) => Some(flag.to_string()),
+        _ => None,
+    }
 }
 
 fn render_builder_form() -> String {
@@ -3743,6 +3754,26 @@ api_key = "k"
             .unwrap_err()
         );
         assert!(err.contains("`half_spread` must be a number"), "{err}");
+    }
+
+    /// A stanza value as the form shows it: text as written, and a bool as `true`/`false`,
+    /// so a hand-written `unguarded = true` on a `fixed` pair survives a save from the form
+    /// (audit F-04). Anything else shows blank, as before.
+    #[test]
+    fn the_form_shows_a_bool_as_the_text_it_posts_back() {
+        assert_eq!(
+            form_text(&toml::Value::Boolean(true)).as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            form_text(&toml::Value::Boolean(false)).as_deref(),
+            Some("false")
+        );
+        assert_eq!(
+            form_text(&toml::Value::String("1.0001".to_owned())).as_deref(),
+            Some("1.0001")
+        );
+        assert_eq!(form_text(&toml::Value::Float(0.5)), None);
     }
 
     #[test]

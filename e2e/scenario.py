@@ -29,7 +29,7 @@ HERE = pathlib.Path(__file__).parent
 BLOCK_GAP_SECS = 2.5
 START_PRICE = ("4000.00", "4000.20")
 MOVED_PRICE = ("4100.00", "4100.20")
-# USDCUSDT, the fixed USDC/USDT pair's market: at par, inside its [0.995, 1.005] band.
+# USDCUSDT, the fixed USDC/USDT pair's market: at par, inside its 1.0001 ± 2 bp quote.
 STABLE_PRICE = ("0.9999", "1.0001")
 
 # All the binary inherits from the caller's shell. Its environment is built, not extended:
@@ -88,8 +88,8 @@ binance_ws = "ws://127.0.0.1:{ports['binance']}/ws"
 [settings.endpoints]
 coingecko = "http://127.0.0.1:{ports['rpc']}"
 
-# A fixed price between two dollars needs a market and a band to pass preflight (audit F-04):
-# the band judges USDCUSDT's mid, which the Binance mock holds at par for the whole run.
+# A fixed price needs a market to compare its price with (audit F-04): it quotes only while
+# USDCUSDT's mid sits inside its own bid and ask, and the Binance mock holds it at par.
 [[pairs]]
 tokens  = ["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", "0xdAC17F958D2ee523a2206206994597C13D831ec7"]
 symbol  = "USDCUSDT"

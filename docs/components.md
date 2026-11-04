@@ -42,9 +42,9 @@ serving the backoffice. What you write is the part that decides the price.
 
 The library ships three pricing models you can use as they are:
 
-- `fixed`: always the same mid and spread. To test the wiring, or for a pair whose price does
-  not move. On a stablecoin pair it needs a market and a band to stop through a depeg (see
-  [pricing.md](pricing.md)); `feed` with a band is the better default there.
+- `fixed`: the same mid and spread, while the pair's market sits inside that spread; it stops
+  quoting when the market leaves it (see [pricing.md](pricing.md)). For a pair whose price
+  should not move. On a stablecoin pair, `feed` with a band is the better default.
 - `feed`: the exchange mid as it is, with the exchange's spread or one you set.
 - `volatile`: a spread that widens when the price is moving and a mid that tilts to rebalance
   your vault. This is what you want for something like WETH/USDC.

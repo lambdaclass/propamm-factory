@@ -692,7 +692,8 @@ the band a published mid, and on a pair with a market the market's mid too, must
 That band is the only thing standing between a corrupt book and an arbitrary price on chain
 that the next fill is priced against: a mid outside it is refused, so the RPC service skips
 the push and builder mode withdraws the live quote at every builder. Startup warns for any
-feed-priced pair that sets neither, and for a `fixed` pair with no market. It is per
+feed-priced pair that sets neither. A `fixed` pair needs a market at all, unless its stanza
+says `unguarded = true`, and is warned about then. It is per
 pair rather than per process because the magnitudes are not comparable — one band covering
 both ETHUSDC (~4000) and USDCUSDT (~1) would have to be so wide it bounds nothing.
 
@@ -782,12 +783,18 @@ it may end up. On trip, an empty-tx cancel goes out to every builder holding tha
 the lane stops quoting.
 
 The band judges two numbers on a pair with a market: the mid the pair publishes, and the
-market's own mid. So a pair whose price does not follow its market, a `fixed` one, still
-stops when the market leaves the band. That makes the band the depeg guard for a pair
-between two dollars: a depeg is usually a slide in small steps, which neither breaker check
-sees. Give such a pair a `symbol` and a tight band with both bounds, for example
-`[0.995, 1.005]` for USDC/USDT. Preflight refuses a `fixed` pair between USDC and USDT
-without both.
+market's own mid, so a pair whose market leaves the band stops even when its own mid does
+not. That makes the band the depeg guard for a `feed` pair between two dollars: a depeg is
+usually a slide in small steps, which neither breaker check sees. Give such a pair a tight
+band with both bounds, for example `[0.995, 1.005]` for USDC/USDT.
+
+A `fixed` pair does not wait for the band. Its price does not follow the market, so it is
+only safe while the market sits inside its own bid and ask, `mid · (1 − delta)` to
+`mid · (1 + delta)`: outside them a taker trades the vault at a stale price, and a depeg
+drains the sound side at par long before the market reaches a band's edge. So a `fixed`
+pair needs a market (`symbol` or `sources`), and it stops quoting on every tick its market
+is outside its quote, counted as `market_outside_quote`. A smoke test with no market says
+`unguarded = true` in its stanza.
 
 One consequence worth knowing before it happens: the reference is the last print the feed
 *delivered*, however long ago. While the feed itself is away — a Binance reconnect, a
@@ -1146,7 +1153,7 @@ target = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
 [[pairs]]
 tokens  = ["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", "0xdAC17F958D2ee523a2206206994597C13D831ec7"]
 key_env = "UPDATER_KEY_USDC_USDT"
-pricing = { kind = "fixed", mid = "5", delta = "0" }
+pricing = { kind = "fixed", mid = "5", delta = "0", unguarded = true }
 
 [[builder]]
 name = "mock-a"

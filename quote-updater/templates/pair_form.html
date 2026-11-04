@@ -21,10 +21,9 @@
   <hr>
   <div class=sources>
     <span class=key>mid sources</span>
-    <p class=explain>A venue that goes quiet drops out of the average until it is back. Leave every venue
-    unticked for a fixed mid, except between two dollars: there, tick the pair's market and set
-    <code>min_mid</code>/<code>max_mid</code>, so the pair stops when the market leaves the band (the
-    check refuses a fixed USDC/USDT pair without both).</p>
+    <p class=explain>A venue that goes quiet drops out of the average until it is back. A fixed mid
+    needs its market ticked too: it quotes only while the market sits inside its spread. Leave every
+    venue unticked only for a fixed smoke test, with <code>unguarded</code> set to <code>true</code>.</p>
     <table class=venues>
       <thead><tr><th>venue<th>symbol<th>weight<th></tr></thead>
       <tbody>
