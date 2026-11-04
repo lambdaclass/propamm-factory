@@ -37,7 +37,8 @@ cast send $FACTORY "createPropAMM(address,address,address[],(address,address,add
 - `PAIRS`: one entry per pair, `"[(TOKEN0,TOKEN1,VAULT)]"`, where `TOKEN0` and `TOKEN1` are
   the two token addresses and `VAULT` is the wallet holding the inventory for that pair.
   Two pairs look like `"[(TOKEN0,TOKEN1,VAULT),(TOKEN0,TOKEN1,VAULT)]"`. Both token addresses
-  must be deployed contracts on this chain, or creation reverts with `NotAToken`.
+  must be deployed contracts on this chain with at most 36 decimals: creation reverts with
+  `NotAToken` for an address without code, and with `UnsupportedDecimals` above 36.
 
 The vault must hold the tokens and have approved the PropAMM to spend both of them. The
 PropAMM address does not exist until the call, so either approve it right after creating,

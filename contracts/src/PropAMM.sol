@@ -419,7 +419,9 @@ contract PropAMM is
     }
 
     /// @notice Adds a token pair, filled from `vault`.
-    /// @dev Reverts `NotAToken` if either token has no code. The vault may be an EOA.
+    /// @dev Reverts `NotAToken` if either token has no code, and `UnsupportedDecimals` if either
+    /// reports more than `MAX_TOKEN_DECIMALS`; a token whose `decimals()` reverts is refused too.
+    /// The vault may be an EOA.
     /// @param tokenX The first token in the pair.
     /// @param tokenY The second token in the pair.
     /// @param vault The account that holds this pair's inventory and has approved this instance.
@@ -432,12 +434,8 @@ contract PropAMM is
     function _addPair(address tokenX, address tokenY, address vault) internal {
         (address token0, address token1) = _sortTokens(tokenX, tokenY);
         require(vault != address(0), NoVault(token0, token1));
-        // The first call a token address otherwise gets is `decimals()` on the quote path, where
-        // a codeless one fails only at decoding: listed, reported active, never quotable.
         require(token0.code.length > 0, NotAToken(token0));
         require(token1.code.length > 0, NotAToken(token1));
-        // Read once here so a token `_pricing` cannot price is refused now, not at every quote. A
-        // token whose `decimals()` reverts reverts here too: it could never be quoted.
         uint8 decimals0 = IERC20Metadata(token0).decimals();
         require(decimals0 <= MAX_TOKEN_DECIMALS, UnsupportedDecimals(token0, decimals0));
         uint8 decimals1 = IERC20Metadata(token1).decimals();
