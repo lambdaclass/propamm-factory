@@ -348,13 +348,18 @@ max_deviation = "0.002"
 # kind       = "dispersion"
 # max_spread = "0.003"
 
-# Instead of `symbol`, a pair can publish a fixed price: the `fixed` kind, with `mid` and
-# `delta` as decimal strings in whole-token units. Used by the end-to-end make targets so
-# their assertions do not depend on a live Binance book:
+# A pair can publish a fixed price: the `fixed` kind, with `mid` and `delta` as decimal
+# strings in whole-token units. The end-to-end make targets use it so their assertions do
+# not depend on the book's spread. A fixed price does not follow the market, so a pair
+# between two dollars keeps its `symbol` and a band, which judges the market's mid and stops
+# the pair through a depeg; preflight refuses a fixed USDC/USDT pair without both:
 #
 # [[pairs]]
 # tokens  = ["0xA0b8…", "0xdAC1…"]
+# symbol  = "USDCUSDT"
 # key_env = "UPDATER_KEY_USDC_USDT"
+# min_mid = "0.995"
+# max_mid = "1.005"
 # pricing = { kind = "fixed", mid = "0.9998", delta = "0.0005" }
 #
 # `mid` is in the SAME market orientation as `tokens` — the price of one whole `tokens[0]`

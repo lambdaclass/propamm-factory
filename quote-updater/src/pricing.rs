@@ -371,8 +371,8 @@ pub struct PairShape {
     /// market, which a kind that reads one refuses in its `validate`.
     pub sources: usize,
     /// The pair's `min_mid`, in lane orientation, which the core holds every published mid
-    /// to; a kind whose mid is a setting checks it here, so a mistake fails the file instead
-    /// of every tick.
+    /// to, and on a pair with a market the market's mid as well; a kind whose mid is a
+    /// setting checks it here, so a mistake fails the file instead of every tick.
     pub min_mid: Option<U256>,
     /// The pair's `max_mid`, likewise.
     pub max_mid: Option<U256>,

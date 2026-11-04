@@ -37,7 +37,8 @@
     row.share = row.tr.querySelector("td.share");
     row.live = row.tr.querySelector("td.live");
     row.volumeCell = row.tr.querySelector("td.volume");
-    // The static note column is the no-script fallback; the script's columns replace it.
+    // The static note column is the no-script fallback; the script's columns replace it, and
+    // a lookup writes there only why a market in another dollar is left unticked.
     row.note.textContent = "";
     row.listed = row.tick.checked;
   }
@@ -135,6 +136,9 @@
       if (!row) continue;
       row.listed = v.listed;
       row.volume = v.volume_usd;
+      // Why a market in another dollar is filled in but not ticked: averaged as if at par, it
+      // fails the startup check unless the pair opts in (audit F-04).
+      row.note.textContent = v.stand_in ? v.note : "";
       // A new pair starts the ticks over: what the previous lookup filled in is not an
       // operator's choice, so an unlisted venue loses its auto-filled symbol and its tick.
       row.tick.dataset.touched = "";
@@ -158,9 +162,13 @@
       row.volumeCell.textContent = v.volume_usd ? money(v.volume_usd) : v.listed ? "" : v.unreachable ? "couldn't reach it" : "not listed";
     }
     const listedCount = data.venues.filter((v) => v.listed).length;
+    const selectedCount = data.venues.filter((v) => v.selected).length;
     status.textContent = `${data.base}/${data.quote}` +
       (swapped ? ` (swapped: venues price ${data.base} in ${data.quote}, not the other way round)` : "") +
-      (listedCount === 0 ? " (no venue lists this pair; fill the table by hand)" : "");
+      (listedCount === 0 ? " (no venue lists this pair; fill the table by hand)" : "") +
+      (listedCount > 0 && selectedCount === 0
+        ? ` (venues list ${data.base} only against another dollar, so none is ticked; see each venue's note)`
+        : "");
     visibility();
     shares();
     preview();

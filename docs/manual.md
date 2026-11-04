@@ -166,8 +166,8 @@ fallback: a pair quoted in USDC or USDT that an exchange does not list exactly i
 whichever of that exchange's USDC, USDT and USD markets trades the most, with a note, but it
 is not ticked: averaged as if at par, it fails the startup cross-check unless the pair sets
 `allow_symbol_mismatch`. Any other quote matches exactly or the row stays empty.
-Weights are suggested from each market's 24h volume (largest 10), and the three busiest are
-ticked. The ticked venues are then dialled live, with the
+Weights are suggested from each market's 24h volume (largest 10), and the three busiest in
+the pair's own quote are ticked. The ticked venues are then dialled live, with the
 same feed code the updater runs, and each one's mid plus the weighted composite stream into
 the table, so what would be published is on screen before Save. Nothing is saved until
 Save. A row the lookup could not fill is filled by hand, and its live price shows whether
@@ -688,10 +688,11 @@ variable exists so a flag-driven run stays possible, and setting one overrides t
 anvil-only (node mode).
 
 What each pair *publishes* is not here — it is in the config, including `min_mid`/`max_mid`,
-the band a published mid must fall inside. That band is the only thing standing between a
-corrupt book and an arbitrary price on chain that the next fill is priced against: a mid
-outside it is refused, so the RPC service skips the push and builder mode withdraws the live
-quote at every builder. Startup warns for any feed-priced pair that sets neither. It is per
+the band a published mid, and on a pair with a market the market's mid too, must fall inside.
+That band is the only thing standing between a corrupt book and an arbitrary price on chain
+that the next fill is priced against: a mid outside it is refused, so the RPC service skips
+the push and builder mode withdraws the live quote at every builder. Startup warns for any
+feed-priced pair that sets neither, and for a `fixed` pair with no market. It is per
 pair rather than per process because the magnitudes are not comparable — one band covering
 both ETHUSDC (~4000) and USDCUSDT (~1) would have to be so wide it bounds nothing.
 
@@ -754,13 +755,6 @@ was `max_deviation_window_blocks` ago. The anchor slides, so `0.20` over `1000` 
 that no single span sees 20% never trips it. That is what a speed limit is; `min_mid`/
 `max_mid` is the setting that bounds where the price may end up.
 
-The band judges two numbers on a pair with a market: the mid the pair publishes, and the
-market's own mid. So a pair whose price does not follow its market, a `fixed` one, still
-stops when the market leaves the band. That makes the band the depeg guard for a pair
-between two dollars: a depeg is usually a slide in small steps, which neither breaker check
-sees. Give such a pair a `symbol` and a tight band, for example `[0.995, 1.005]` for
-USDC/USDT. Preflight refuses a `fixed` pair between USDC and USDT without both.
-
 Two things it deliberately does not catch. A crash that fully recovers inside the window
 leaves the net move small, so it does not trip — the tick-to-tick check is what catches that,
 whenever the crash arrives as a jump rather than a walk. And for one window's length after a
@@ -786,6 +780,14 @@ The trade is explicit: a move that arrives in sub-threshold steps never trips, h
 eventually travels. That is a real market move, and `min_mid`/`max_mid` is what bounds where
 it may end up. On trip, an empty-tx cancel goes out to every builder holding that pair's quote and
 the lane stops quoting.
+
+The band judges two numbers on a pair with a market: the mid the pair publishes, and the
+market's own mid. So a pair whose price does not follow its market, a `fixed` one, still
+stops when the market leaves the band. That makes the band the depeg guard for a pair
+between two dollars: a depeg is usually a slide in small steps, which neither breaker check
+sees. Give such a pair a `symbol` and a tight band with both bounds, for example
+`[0.995, 1.005]` for USDC/USDT. Preflight refuses a `fixed` pair between USDC and USDT
+without both.
 
 One consequence worth knowing before it happens: the reference is the last print the feed
 *delivered*, however long ago. While the feed itself is away — a Binance reconnect, a

@@ -690,11 +690,24 @@ impl ValueSource {
         mid: U256,
         price_decimals: u32,
     ) -> Self {
+        Self::fixed_over_market_for_tests_on(rx, delta, mid, price_decimals, false)
+    }
+
+    /// [`Self::fixed_over_market_for_tests`] on a lane of the given orientation; `mid` and
+    /// the market's samples are in lane orientation, as the feed delivers them.
+    #[cfg(test)]
+    pub(crate) fn fixed_over_market_for_tests_on(
+        rx: tokio::sync::watch::Receiver<Option<PriceSample>>,
+        delta: U256,
+        mid: U256,
+        price_decimals: u32,
+        inverted: bool,
+    ) -> Self {
         Self::new(
             Box::new(crate::pricing::FixedPricer { delta, mid }),
             "fixed",
             Some(rx),
-            Arc::new(test_shape(false, price_decimals)),
+            Arc::new(test_shape(inverted, price_decimals)),
             Bound::none(),
         )
     }
@@ -1324,6 +1337,49 @@ mod tests {
             .expect_err("USDC at 0.97 USDT is outside the band");
         assert_eq!(refused.kind(), Some(UnusableKind::OutOfBand));
         assert!(refused.to_string().contains("market"), "{refused}");
+
+        // And the other way: a USDT depeg raises USDC's price in USDT past max_mid.
+        let (_tx, above, band) = fixed_stable_over(U256::from(1_030_000_000_000_000_000u64), now);
+        let refused = above
+            .current(&band)
+            .expect_err("USDC at 1.03 USDT is outside the band");
+        assert_eq!(refused.kind(), Some(UnusableKind::OutOfBand));
+        assert!(refused.to_string().contains("above"), "{refused}");
+    }
+
+    /// The market's mid is judged in lane orientation, the band's: on an inverted lane (WETH
+    /// per USDC, about 1/4000) a market that leaves the band is refused the same way.
+    #[test]
+    fn the_market_is_judged_in_lane_orientation_on_an_inverted_lane() {
+        let over = |market_mid: U256| {
+            let sample = PriceSample {
+                delta: U256::zero(),
+                mid: market_mid,
+                at: std::time::Instant::now(),
+                wall: SystemTime::now(),
+            };
+            let (tx, rx) = tokio::sync::watch::channel(Some(sample));
+            let source = ValueSource::fixed_over_market_for_tests_on(
+                rx,
+                U256::from(500_000_000_000_000u64),
+                U256::from(250_000_000_000_000u64),
+                18,
+                true,
+            );
+            (tx, source)
+        };
+        let band = MidBand {
+            min: Some(U256::from(200_000_000_000_000u64)),
+            max: Some(U256::from(300_000_000_000_000u64)),
+        };
+        let (_tx, inside) = over(U256::from(250_000_000_000_000u64));
+        assert!(inside.current(&band).is_ok());
+        // WETH at about 2857 USDC: 0.00035 WETH per USDC, past max_mid on the lane.
+        let (_tx, outside) = over(U256::from(350_000_000_000_000u64));
+        let refused = outside
+            .current(&band)
+            .expect_err("the market left the band");
+        assert_eq!(refused.kind(), Some(UnusableKind::OutOfBand));
     }
 
     /// A fixed pair that streams depends on its stream: when the stream goes quiet it stops

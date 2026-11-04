@@ -59,8 +59,10 @@ What to know:
 - **The core still decides.** A pricer can refuse (`Refusal::new`, counted under the reason
   it declared), and the core withdraws anything unpublishable whatever a pricer returns: a
   spread of a whole unit or more, a zero mid, or a mid the contract cannot store (over 216
-  bits), each counted under its own `reason`. How far a mid may sit from the market is the
-  pair's `min_mid`/`max_mid` band, which applies to every kind alike; a kind with a bound
+  bits), each counted under its own `reason`. Where a mid may be is the pair's
+  `min_mid`/`max_mid` band, an absolute range in lane orientation that applies to every
+  kind alike. On a pair with a market it judges the market's mid as well as yours, so the
+  pair stops when the market leaves the band even if your mid does not; a kind with a bound
   of its own checks it in `validate` or refuses the tick.
 - **Builds do not block.** A `pricer_fn` closure runs synchronously inside the lane's build,
   so a fetch there stalls startup or the reload, and the 30s build limit cannot interrupt

@@ -694,8 +694,9 @@ pub(crate) fn all_or_none<T>(results: Vec<(String, Result<T>)>) -> Result<Vec<T>
 /// `diagnostics` is how many its build declared, so the buffer has the slots the run's has
 /// and a pricer reading back what it set sees the same here.
 ///
-/// The preview goes through the core's backstop with the same market and shape the run's
-/// every tick does, so a row cannot pass what the run would withdraw.
+/// The preview goes through the core's backstop and then the pair's band, on the published
+/// mid and on the market's, with the same market and shape the run's every tick does, so a
+/// row cannot pass what the run would withdraw.
 pub(crate) fn preview_row(
     pricer: &mut dyn Pricer,
     sample: Option<&feed::PriceSample>,
@@ -705,6 +706,10 @@ pub(crate) fn preview_row(
     let market = sample.map(|sample| Market::from_sample(sample, shape));
     let tick = TickCtx::new(std::time::Instant::now(), market.as_ref(), shape);
     let mut out = Diagnostics::new(diagnostics);
+    let band = crate::config::MidBand {
+        min: shape.min_mid,
+        max: shape.max_mid,
+    };
     // A preview is the binary's code too: its panic is this row's error, and the check
     // goes on to the next pair. There is no lane to trip under `--check`.
     let row = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -714,6 +719,8 @@ pub(crate) fn preview_row(
             .map_err(|refusal| refusal.to_string())
             .and_then(|priced| {
                 crate::pricing::backstop(priced, market.as_ref(), shape)
+                    .and_then(|()| band.check(priced.mid))
+                    .and_then(|()| market.as_ref().map_or(Ok(()), |m| band.check_market(m.mid)))
                     .map(|()| (priced.delta, priced.mid))
                     .map_err(|unusable| unusable.to_string())
             }),
@@ -1477,6 +1484,41 @@ mod tests {
         let (row, _) = preview_row(&mut WholeUnit, Some(&sample), &shape, 0);
         let refused = row.unwrap_err();
         assert!(refused.contains("not below one whole unit"), "{refused}");
+    }
+
+    /// `--check` applies the band, on the published mid and on the market's, as the run does:
+    /// a fixed USDC/USDT price whose market has left its band is refused here too, rather than
+    /// shown as what the pair would publish. Audit F-04 (review).
+    #[test]
+    fn a_preview_row_is_held_to_the_band_the_run_applies() {
+        let shape = PairShape {
+            label: "USDC/USDT".to_owned(),
+            tokens: (Address::repeat_byte(1), Address::repeat_byte(2)),
+            lane: U256::one(),
+            inverted: false,
+            price_decimals: 18,
+            target: Address::zero(),
+            sources: 1,
+            min_mid: Some(U256::from(995_000_000_000_000_000u64)),
+            max_mid: Some(U256::from(1_005_000_000_000_000_000u64)),
+        };
+        let market = |mid: U256| feed::PriceSample {
+            mid,
+            delta: U256::zero(),
+            at: std::time::Instant::now(),
+            wall: std::time::SystemTime::now(),
+        };
+        let (delta, mid) = (
+            U256::from(200_000_000_000_000u64),
+            U256::from(1_000_100_000_000_000_000u64),
+        );
+        let mut fixed = crate::pricing::FixedPricer { delta, mid };
+        let (row, _) = preview_row(&mut fixed, Some(&market(U256::exp10(18))), &shape, 0);
+        assert_eq!(row, Ok((delta, mid)));
+        let depegged = market(U256::from(970_000_000_000_000_000u64));
+        let (row, _) = preview_row(&mut fixed, Some(&depegged), &shape, 0);
+        let refused = row.expect_err("the market has left the band");
+        assert!(refused.contains("market"), "{refused}");
     }
 
     /// A pricer's background task that panics is reported with its panic, so the lane's

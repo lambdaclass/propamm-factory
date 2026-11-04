@@ -1,5 +1,8 @@
 //! `fixed`: a pair whose stanza states `mid` and `delta` publishes them, whatever the
-//! market does. The simplest kind, and the one a stablecoin pair or a smoke test wants.
+//! market does. The simplest kind: for a smoke test, or a pair whose price does not move.
+//! Between two dollars it also needs a `symbol` and a `min_mid`/`max_mid` band, which then
+//! judges the market's mid and stops the pair through a depeg; preflight refuses a fixed
+//! USDC/USDT pair without both (audit F-04).
 //!
 //! ```toml
 //! [pairs.pricing]
