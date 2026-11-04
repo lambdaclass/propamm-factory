@@ -255,6 +255,10 @@ tokens  = ["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
            "0xdAC17F958D2ee523a2206206994597C13D831ec7"]
 symbol  = "USDCUSDT"
 key_env = "UPDATER_KEY_USDC_USDT"
+# The depeg guard: the band judges the market's mid as well as the published one, so the
+# pair stops quoting once USDC trades outside [0.995, 1.005] USDT.
+min_mid = "0.995"
+max_mid = "1.005"
 pricing = { kind = "feed" }
 # Why the threshold is per pair and not one setting for the run: on a stablecoin, the 2%
 # above is a depeg the breaker exists to catch, while on ETHUSDC it is an ordinary hour.

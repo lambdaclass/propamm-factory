@@ -98,9 +98,9 @@ key_env = "UPDATER_KEY_WETH_USDC"
 pricing = { kind = "feed", delta = "0.0005" }
 min_sources = "2"
 sources = [
-  { venue = "binance",  symbol = "ETHUSDC", weight = "2" },
-  { venue = "coinbase", symbol = "ETH-USD", weight = "1" },
-  { venue = "kraken",   symbol = "ETH/USD" },                 # weight blank is 1
+  { venue = "binance", symbol = "ETHUSDC", weight = "2" },
+  { venue = "okx",     symbol = "ETH-USDC", weight = "1" },
+  { venue = "kraken",  symbol = "ETH/USDC" },                 # weight blank is 1
 ]
 ```
 
@@ -124,10 +124,11 @@ Three consequences of averaging worth choosing deliberately:
 
 - **Every source must price in the same quote currency.** The average does not convert:
   mixing Coinbase's `ETH-USD` with Binance's `ETHUSDC` averages dollars with USDC, which
-  is fine only while the two trade at par. The startup cross-check accepts a USDC or USDT
-  pair read from the base's USDC, USDT or USD market, with a warning; any other
-  difference (a different asset, or another quote) fails it unless the pair sets
-  `allow_symbol_mismatch`.
+  is right only while the two trade at par, and through a depeg of either publishes the
+  wrong price. So the startup cross-check fails a USDC or USDT pair read from the base's
+  market in another of USDC, USDT or USD, and fails any other difference (a different
+  asset, or another quote), unless the pair sets `allow_symbol_mismatch`. With it, a market
+  in another dollar runs, still with a warning that it is averaged at par.
 - **A venue dropping out steps the mid by the disagreement between venues.** The fresh set
   changes, so the average moves by however far the departing venue sat from the rest. The
   breaker judges that step like any other, so `max_deviation` has to be larger than the
@@ -161,9 +162,10 @@ once both token addresses are in, the venue table fills itself: the updater read
 token's `symbol()` on chain (a wrapped token is read as its underlying, `WETH` as `ETH`),
 asks every exchange for its own list of markets, and takes the tradable market whose base
 and quote are exactly those two names, with the name the exchange gives it. The one
-fallback: a pair quoted in USDC or USDT that an exchange does not list exactly takes
-whichever of that exchange's USDC, USDT and USD markets trades the most, with a note. Any
-other quote matches exactly or the row stays empty.
+fallback: a pair quoted in USDC or USDT that an exchange does not list exactly is shown
+whichever of that exchange's USDC, USDT and USD markets trades the most, with a note, but it
+is not ticked: averaged as if at par, it fails the startup cross-check unless the pair sets
+`allow_symbol_mismatch`. Any other quote matches exactly or the row stays empty.
 Weights are suggested from each market's 24h volume (largest 10), and the three busiest are
 ticked. The ticked venues are then dialled live, with the
 same feed code the updater runs, and each one's mid plus the weighted composite stream into
@@ -751,6 +753,13 @@ was `max_deviation_window_blocks` ago. The anchor slides, so `0.20` over `1000` 
 "20% within any 1000-block span", not "20% from wherever we started" — a move slow enough
 that no single span sees 20% never trips it. That is what a speed limit is; `min_mid`/
 `max_mid` is the setting that bounds where the price may end up.
+
+The band judges two numbers on a pair with a market: the mid the pair publishes, and the
+market's own mid. So a pair whose price does not follow its market, a `fixed` one, still
+stops when the market leaves the band. That makes the band the depeg guard for a pair
+between two dollars: a depeg is usually a slide in small steps, which neither breaker check
+sees. Give such a pair a `symbol` and a tight band, for example `[0.995, 1.005]` for
+USDC/USDT. Preflight refuses a `fixed` pair between USDC and USDT without both.
 
 Two things it deliberately does not catch. A crash that fully recovers inside the window
 leaves the net move small, so it does not trip — the tick-to-tick check is what catches that,

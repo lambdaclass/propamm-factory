@@ -627,11 +627,14 @@ impl ValueSource {
         // is still worth seeing, as the volatile model's gauges always were.
         self.bound.publish(&out);
         // The core's own judgement of what the pricer published (the backstop, then the
-        // band), folded in with the pricer's refusal into the one answer the quote guards
-        // see: an `Ok` here is a quote the core would publish.
+        // band, on the published mid and then on the market's), folded in with the pricer's
+        // refusal into the one answer the quote guards see: an `Ok` here is a quote the core
+        // would publish. The market's turn is what stops a kind whose mid does not follow
+        // the market, a `fixed` price, once the market leaves the band (audit F-04).
         let judged = match priced {
             Ok(priced) => match crate::pricing::backstop(priced, market.as_ref(), &self.pair)
                 .and_then(|()| band.check(priced.mid))
+                .and_then(|()| market.as_ref().map_or(Ok(()), |m| band.check_market(m.mid)))
             {
                 Ok(()) => Ok(priced),
                 Err(unusable) => Err(unusable.as_refusal()),
@@ -673,6 +676,24 @@ impl ValueSource {
             Box::new(crate::pricing::FixedPricer { delta, mid }),
             "fixed",
             None,
+            Arc::new(test_shape(false, price_decimals)),
+            Bound::none(),
+        )
+    }
+
+    /// [`Self::fixed_for_tests`] over a market: a `fixed` pair that also streams, as one with a
+    /// `symbol` does. The pricer still publishes its constant; the core judges the market.
+    #[cfg(test)]
+    pub(crate) fn fixed_over_market_for_tests(
+        rx: tokio::sync::watch::Receiver<Option<PriceSample>>,
+        delta: U256,
+        mid: U256,
+        price_decimals: u32,
+    ) -> Self {
+        Self::new(
+            Box::new(crate::pricing::FixedPricer { delta, mid }),
+            "fixed",
+            Some(rx),
             Arc::new(test_shape(false, price_decimals)),
             Bound::none(),
         )
@@ -1250,6 +1271,71 @@ mod tests {
         let (delta, mid) = inverted.current(&weth_per_usdc_band).unwrap();
         assert_eq!(mid, U256::from(250_000_000_000_000u64));
         assert_eq!(delta, U256::from(50_000_000_000_000u64));
+    }
+
+    /// A USDC/USDT pair priced `fixed` at 1.0001 with a 2 bp half-spread (the old deploy
+    /// template's numbers), streaming USDCUSDT, banded at [0.995, 1.005].
+    fn fixed_stable_over(
+        market_mid: U256,
+        at: std::time::Instant,
+    ) -> (
+        tokio::sync::watch::Sender<Option<PriceSample>>,
+        ValueSource,
+        MidBand,
+    ) {
+        let sample = PriceSample {
+            delta: U256::zero(),
+            mid: market_mid,
+            at,
+            wall: SystemTime::now(),
+        };
+        let (tx, rx) = tokio::sync::watch::channel(Some(sample));
+        let source = ValueSource::fixed_over_market_for_tests(
+            rx,
+            U256::from(200_000_000_000_000u64),
+            U256::from(1_000_100_000_000_000_000u64),
+            18,
+        );
+        let band = MidBand {
+            min: Some(U256::from(995_000_000_000_000_000u64)),
+            max: Some(U256::from(1_005_000_000_000_000_000u64)),
+        };
+        (tx, source, band)
+    }
+
+    /// Audit F-04, path 1: a fixed price's band used to judge only that price, which never
+    /// moves, so the pair kept selling at par through a depeg. The band now judges the
+    /// market too, and the pair stops once the market leaves it.
+    #[test]
+    fn a_fixed_pair_stops_quoting_when_its_market_leaves_the_band() {
+        let now = std::time::Instant::now();
+        let (_tx, at_par, band) = fixed_stable_over(U256::exp10(18), now);
+        assert_eq!(
+            at_par.current(&band).unwrap(),
+            (
+                U256::from(200_000_000_000_000u64),
+                U256::from(1_000_100_000_000_000_000u64)
+            )
+        );
+
+        let (_tx, depegged, band) = fixed_stable_over(U256::from(970_000_000_000_000_000u64), now);
+        let refused = depegged
+            .current(&band)
+            .expect_err("USDC at 0.97 USDT is outside the band");
+        assert_eq!(refused.kind(), Some(UnusableKind::OutOfBand));
+        assert!(refused.to_string().contains("market"), "{refused}");
+    }
+
+    /// A fixed pair that streams depends on its stream: when the stream goes quiet it stops
+    /// quoting, rather than going back to publishing its constant unwatched.
+    #[test]
+    fn a_fixed_pair_withdraws_when_its_market_goes_stale() {
+        let long_ago = std::time::Instant::now() - MAX_PRICE_AGE - Duration::from_secs(1);
+        let (_tx, stale, band) = fixed_stable_over(U256::exp10(18), long_ago);
+        let refused = stale
+            .current(&band)
+            .expect_err("a stale market is no market");
+        assert_eq!(refused.kind(), Some(UnusableKind::Stale));
     }
 
     #[tokio::test]

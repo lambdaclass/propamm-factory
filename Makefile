@@ -120,7 +120,10 @@ PUSHER_KEY_ENV := UPDATER_KEY_USDC_USDT
 INTERVAL ?= 12
 
 # $(1) = target address, $(2) = output path: a config for the local pair, fixed price or a
-# Binance symbol (SYMBOL=USDCUSDT streams the live mid and spread instead).
+# Binance symbol (SYMBOL=USDCUSDT streams the live mid and spread instead). The fixed price
+# streams Binance's USDCUSDT too, with a [0.995, 1.005] band: a fixed price between two
+# dollars needs a market and a band to pass preflight (audit F-04), so PRICE must sit inside
+# the band and the updater must reach Binance.
 define write_updater_config
 mkdir -p .local; \
 { \
@@ -134,6 +137,9 @@ mkdir -p .local; \
     echo 'symbol  = "$(SYMBOL)"'; \
     echo 'pricing = { kind = "feed" }'; \
   else \
+    echo 'symbol  = "USDCUSDT"'; \
+    echo 'min_mid = "0.995"'; \
+    echo 'max_mid = "1.005"'; \
     echo 'pricing = { kind = "fixed", mid = "$(PRICE)", delta = "$(DELTA)" }'; \
   fi; \
 } > $(2)
@@ -286,7 +292,8 @@ local-down:
 
 # Keep the local pair's price fresh with the library's built-in models (no code of yours):
 # one updateState transaction per INTERVAL seconds, mining a block each (`--mine`).
-#   make price-service                  push PRICE (default 1) for USDC/USDT every 12s
+#   make price-service                  push PRICE (default 1) for USDC/USDT every 12s, while
+#                                       Binance's USDCUSDT stays inside [0.995, 1.005]
 #   make price-service SYMBOL=USDCUSDT  stream Binance's live mid and spread instead
 price-service:
 	@test -n "$$(cast code $(LOCAL_FACTORY) --rpc-url $(RPC_URL) 2>/dev/null | grep -v '^0x$$')" || { \

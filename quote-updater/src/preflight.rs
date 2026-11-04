@@ -829,7 +829,13 @@ pub async fn build_report(
             }
         }
 
-        row.warnings.extend(band_warning(spec));
+        // A fixed price between two dollars with no band judging its market is the one
+        // shape that cannot stop through a depeg, so it fails; the band warning would only
+        // repeat it.
+        match fixed_dollar_failure(spec, base_symbol.as_deref(), quote_symbol.as_deref()) {
+            Some(failure) => row.failures.push(failure),
+            None => row.warnings.extend(band_warning(spec)),
+        }
 
         // A venue symbol is the one hand-written field that can be catastrophically wrong:
         // publishing BTC's price on the WETH lane is arbitraged within a block. Every source
@@ -846,13 +852,23 @@ pub async fn build_report(
                     spec.allow_symbol_mismatch,
                 ) {
                     SymbolCheck::Match | SymbolCheck::MismatchAllowed { .. } => {}
-                    SymbolCheck::StandIn { quoted_in } => row.warnings.push(format!(
-                        "{} stream {:?} is quoted in {quoted_in}, not {}; averaged as if \
-                         they were at par",
+                    // Refused unless the pair opted in, and then still said (audit F-04).
+                    SymbolCheck::StandIn { quoted_in } => match stand_in_failure(
                         source.venue,
-                        source.symbol,
-                        quote_symbol.as_deref().unwrap_or("the quote token")
-                    )),
+                        &source.symbol,
+                        &quoted_in,
+                        quote_symbol.as_deref(),
+                        spec.allow_symbol_mismatch,
+                    ) {
+                        Some(failure) => row.failures.push(failure),
+                        None => row.warnings.push(format!(
+                            "{} stream {:?} is quoted in {quoted_in}, not {}; averaged as if \
+                             they were at par",
+                            source.venue,
+                            source.symbol,
+                            quote_symbol.as_deref().unwrap_or("the quote token")
+                        )),
+                    },
                     SymbolCheck::Mismatch { expected } => {
                         // `check_symbol` only returns `Mismatch` when both symbols were read.
                         let b = base_symbol
@@ -951,19 +967,84 @@ pub async fn build_report(
         rows,
     })
 }
+
+/// Why a source quoted in another dollar cannot run, if it cannot. The composite averages
+/// sources without converting them, so a USD or USDT market on a USDC pair is averaged as if
+/// the two were at par, and through a depeg of either the pair publishes the wrong price
+/// (audit F-04). `allow_symbol_mismatch` is the pair's way to say it averages them at par
+/// knowingly; `build_report` then keeps the at-par warning.
+pub(crate) fn stand_in_failure(
+    venue: crate::venue::VenueId,
+    stream: &str,
+    quoted_in: &str,
+    quote_symbol: Option<&str>,
+    allow_mismatch: bool,
+) -> Option<String> {
+    if allow_mismatch {
+        return None;
+    }
+    let quote = quote_symbol.unwrap_or("the quote token");
+    Some(format!(
+        "{venue} stream {stream:?} is quoted in {quoted_in}, not {quote}, and the average does \
+         not convert it: through a depeg of either it publishes the wrong price. Use a {quote} \
+         market, or set allow_symbol_mismatch = true to average it at par knowingly"
+    ))
+}
+
+/// Why a `fixed` pair between two dollars cannot run, if it cannot. A fixed price does not
+/// follow its market, so through a depeg the vault keeps filling at it; what stops the pair
+/// is its band judging the market's mid, which takes both a stream and a band (audit F-04).
+/// The other `fixed` pairs with no market get [`band_warning`]'s line instead. A dollar is
+/// USDC or USDT, the quotes [`crate::venues::dollar_stand_ins`] knows, read as the chain
+/// spells them; a symbol preflight could not read is reported by the symbol check, not here.
+pub(crate) fn fixed_dollar_failure(
+    spec: &crate::config::PairSpec,
+    base_symbol: Option<&str>,
+    quote_symbol: Option<&str>,
+) -> Option<String> {
+    let is_dollar = |symbol: &str| {
+        let name = crate::venues::unwrap_alias(&symbol.to_uppercase()).to_owned();
+        !crate::venues::dollar_stand_ins(&name).is_empty()
+    };
+    // Both bounds: either dollar can depeg, and the two move the mid in opposite directions.
+    let guarded = spec.feeds.is_some() && spec.band.min.is_some() && spec.band.max.is_some();
+    if spec.pricing.kind != "fixed"
+        || guarded
+        || !is_dollar(base_symbol?)
+        || !is_dollar(quote_symbol?)
+    {
+        return None;
+    }
+    Some(
+        "pricing `fixed` publishes the same mid whatever the market does, and nothing compares \
+         it with one, so through a depeg the vault fills at this price until the pair is \
+         halted. Give the pair a `symbol` (for example `USDCUSDT`) and a `min_mid`/`max_mid` \
+         band, which then stops it when the market leaves the band, or price it with \
+         `kind = \"feed\"`"
+            .to_owned(),
+    )
+}
+
 /// The warning a pair with no `min_mid`/`max_mid` earns, if it earns one. Carried over from
 /// the single-pair CLI's --min-mid/--max-mid note: bounds are optional, so a pair without
-/// them is the default and would otherwise be invisible. A fixed mid gets none: it cannot
-/// drift, and its kind already proved it sits inside whatever band was declared. A pair
-/// with a market does, and so does a kind with no market, which is bounded by less: only
-/// `delta < 1` and a nonzero mid stand between its output and the chain.
+/// them is the default and would otherwise be invisible. A pair with a market earns it, and
+/// so does a kind with no market, which is bounded by less: only `delta < 1` and a nonzero
+/// mid stand between its output and the chain. So does a `fixed` mid with no market, banded
+/// or not: the band can only compare the constant with itself, and nothing compares it with
+/// the market it is meant to track.
 fn band_warning(spec: &crate::config::PairSpec) -> Option<String> {
+    if spec.feeds.is_none() && spec.pricing.kind == "fixed" {
+        return Some(
+            "pricing `fixed` publishes the same mid whatever the market does, and this pair \
+             streams no market, so nothing compares its price with one; give it a symbol and a \
+             min_mid/max_mid band to stop it quoting through a move"
+                .to_owned(),
+        );
+    }
     if !spec.band.is_unset() {
         return None;
     }
     match (&spec.feeds, spec.pricing.kind.as_str()) {
-        // A fixed mid cannot drift, and its kind checked it against the band at parse time.
-        (None, "fixed") => None,
         (None, kind) => Some(format!(
             "no min_mid/max_mid set, and pricing `{kind}` has no market to be checked against, \
              so nothing bounds this pair's published mid but a nonzero value; whatever the \
@@ -983,8 +1064,9 @@ mod tests {
 
     /// A pair with no `min_mid`/`max_mid` says so when something could push its mid
     /// anywhere: a feed, or a custom pricer with no market, which nothing but `delta < 1`
-    /// and a nonzero mid bounds (the core's mid-shift check needs a market to compare
-    /// against). A static mid, or any pair with a band, does not.
+    /// and a nonzero mid bounds. A pair with a band does not, unless its mid is `fixed` and
+    /// it streams nothing: a band around a constant bounds nothing, and nothing compares
+    /// that constant with a market (audit F-04).
     #[test]
     fn a_pair_nothing_bounds_is_warned_about() {
         let spec = |text: &str| {
@@ -1006,6 +1088,121 @@ mod tests {
             "{alone}"
         );
         assert_eq!(band_warning(&spec(&banded)), None);
+
+        let fixed = band_warning(&stable_pair(BAND, FIXED))
+            .expect("a fixed mid with no market, banded or not");
+        assert!(fixed.contains("no market"), "{fixed}");
+        let streamed = format!("{STREAM}{BAND}");
+        assert_eq!(band_warning(&stable_pair(&streamed, FIXED)), None);
+    }
+
+    /// One USDC/USDT pair priced by `pricing`, with `lines` added to its stanza.
+    fn stable_pair(lines: &str, pricing: &str) -> crate::config::PairSpec {
+        let text = format!(
+            "target = \"0x70997970C51812dc3A010C7d01b50e0d17dc79C8\"\n\
+             [[pairs]]\n\
+             tokens  = [\"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48\", \
+             \"0xdAC17F958D2ee523a2206206994597C13D831ec7\"]\n\
+             key_env = \"UPDATER_KEY_USDC_USDT\"\n\
+             {lines}\
+             pricing = {pricing}\n\
+             [[builder]]\nname = \"b\"\nendpoint = \"wss://b.example/ws\"\napi_key = \"k\"\n"
+        );
+        crate::config::parse_config(&text, 18)
+            .unwrap()
+            .pairs
+            .remove(0)
+    }
+
+    /// The old deploy template's stable pair: 1.0001, 2 bp.
+    const FIXED: &str = r#"{ kind = "fixed", mid = "1.0001", delta = "0.0002" }"#;
+    const STREAM: &str = "symbol = \"USDCUSDT\"\n";
+    const BAND: &str = "min_mid = \"0.995\"\nmax_mid = \"1.005\"\n";
+
+    /// Audit F-04, path 1: a fixed price between two dollars publishes par through a depeg
+    /// unless a band judges its market, so preflight refuses it without a stream and a band.
+    #[test]
+    fn a_fixed_pair_between_two_dollars_needs_a_market_judged_band() {
+        let fails = |spec: &crate::config::PairSpec, base: &str, quote: &str| {
+            fixed_dollar_failure(spec, Some(base), Some(quote))
+        };
+        let bare = stable_pair("", FIXED);
+        let msg = fails(&bare, "USDC", "USDT").expect("the old deploy template's shape");
+        for needle in ["symbol", "min_mid", "max_mid", "feed"] {
+            assert!(msg.contains(needle), "{needle}: {msg}");
+        }
+        assert!(
+            fails(&stable_pair(STREAM, FIXED), "USDC", "USDT").is_some(),
+            "a stream and no band"
+        );
+        assert!(
+            fails(&stable_pair(BAND, FIXED), "USDC", "USDT").is_some(),
+            "a band around a constant"
+        );
+        // Either dollar can depeg, moving the mid in opposite directions, so a band with one
+        // bound leaves the pair unguarded one way.
+        let max_only = format!("{STREAM}max_mid = \"1.005\"\n");
+        assert!(
+            fails(&stable_pair(&max_only, FIXED), "USDC", "USDT").is_some(),
+            "a USDC slide lowers the mid past no bound"
+        );
+        let min_only = format!("{STREAM}min_mid = \"0.995\"\n");
+        assert!(
+            fails(&stable_pair(&min_only, FIXED), "USDC", "USDT").is_some(),
+            "a USDT slide raises the mid past no bound"
+        );
+        let guarded = format!("{STREAM}{BAND}");
+        assert_eq!(fails(&stable_pair(&guarded, FIXED), "USDC", "USDT"), None);
+        assert!(
+            fails(&bare, "usdt", "usdc").is_some(),
+            "case and token order do not matter"
+        );
+        let feed = stable_pair(STREAM, r#"{ kind = "feed" }"#);
+        assert_eq!(
+            fails(&feed, "USDC", "USDT"),
+            None,
+            "feed follows its market"
+        );
+        assert_eq!(fails(&bare, "WETH", "USDC"), None, "not two dollars");
+        assert_eq!(
+            fixed_dollar_failure(&bare, None, Some("USDT")),
+            None,
+            "an unread symbol is reported elsewhere"
+        );
+    }
+
+    /// The template every compose deployment starts from passes the check above: its stable
+    /// pair streams USDCUSDT inside a [0.995, 1.005] band. Audit F-04.
+    #[test]
+    fn the_deploy_example_passes_preflights_pair_verdicts() {
+        let template = include_str!("../../deploy/config.example.toml").replace(
+            "target = \"0x0000000000000000000000000000000000000000\"",
+            "target = \"0x70997970C51812dc3A010C7d01b50e0d17dc79C8\"",
+        );
+        let config = crate::config::parse_config(&template, 18).expect("the template parses");
+        let symbol = |token: Address| match format!("{token:#x}").as_str() {
+            "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2" => "WETH",
+            "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48" => "USDC",
+            "0xdac17f958d2ee523a2206206994597c13d831ec7" => "USDT",
+            other => panic!("unexpected token {other}"),
+        };
+        for spec in &config.pairs {
+            let (a, b) = spec.tokens;
+            assert_eq!(
+                fixed_dollar_failure(spec, Some(symbol(a)), Some(symbol(b))),
+                None
+            );
+        }
+        let stable = config
+            .pairs
+            .iter()
+            .find(|spec| symbol(spec.tokens.1) == "USDT")
+            .expect("the template keeps a USDC/USDT pair");
+        let feeds = stable.feeds.as_ref().expect("it streams");
+        assert_eq!(feeds.sources[0].symbol, "USDCUSDT");
+        let at = |text: &str| crate::feed::parse_decimal_scaled(text, 18).unwrap();
+        assert_eq!(stable.band.min, Some(at("0.995")));
+        assert_eq!(stable.band.max, Some(at("1.005")));
     }
 
     /// Builds the cell the way `rows` does, from a threshold and a block count. Named
@@ -1237,9 +1434,37 @@ mod tests {
         );
     }
 
-    /// A USDC or USDT pair read from the base's USDC, USDT or USD market passes without the
-    /// opt-out, as a stand-in; a different base never does, nor a stand-in for any other
-    /// quote.
+    /// Audit F-04, path 2: a market in another dollar is averaged as if at par, so through a
+    /// depeg of either the pair publishes the wrong price. It fails preflight unless the pair
+    /// opts in with `allow_symbol_mismatch`; then `build_report` keeps the at-par warning.
+    #[test]
+    fn an_unconverted_dollar_stand_in_fails_unless_the_pair_opts_in() {
+        use crate::venue::VenueId;
+        let usd = stand_in_failure(VenueId::Coinbase, "ETH-USD", "USD", Some("USDC"), false)
+            .expect("USD averaged as USDC");
+        for needle in [
+            "coinbase",
+            "\"ETH-USD\"",
+            "USD,",
+            "USDC",
+            "allow_symbol_mismatch",
+        ] {
+            assert!(usd.contains(needle), "{needle}: {usd}");
+        }
+        assert!(
+            stand_in_failure(VenueId::Binance, "ETHUSDT", "USDT", Some("USDC"), false).is_some(),
+            "USDT averaged as USDC"
+        );
+        assert_eq!(
+            stand_in_failure(VenueId::Coinbase, "ETH-USD", "USD", Some("USDC"), true),
+            None,
+            "the pair opted in"
+        );
+    }
+
+    /// A USDC or USDT pair read from the base's USDC, USDT or USD market is classified as a
+    /// stand-in, not a mismatch; a different base never is, nor a stand-in for any other
+    /// quote. Whether a stand-in may run is `stand_in_failure`'s call.
     #[test]
     fn a_dollar_stand_in_passes_and_a_wrong_asset_does_not() {
         use crate::venue::VenueId;

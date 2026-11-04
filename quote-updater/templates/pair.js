@@ -121,9 +121,11 @@
       token1.value = a;
     }
     const keepSaved = firstLookup && saved.size > 0;
+    // Only markets in the pair's own quote are ticked: one in another dollar is filled in but
+    // left for the operator, since averaged at par it fails preflight unless the pair opts in.
     const top = new Set(
       data.venues
-        .filter((v) => v.listed)
+        .filter((v) => v.selected)
         .sort((a, b) => (b.volume_usd || 0) - (a.volume_usd || 0))
         .slice(0, TICK_TOP)
         .map((v) => v.venue)

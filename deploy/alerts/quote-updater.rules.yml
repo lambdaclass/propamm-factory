@@ -480,10 +480,13 @@ groups:
         for: 5m
         labels: { severity: ticket }
         annotations:
-          summary: "{{ $labels.pair }}: mids are falling outside min_mid/max_mid"
+          summary: "{{ $labels.pair }}: the mid, or the market's mid, is outside min_mid/max_mid"
           description: >-
             The band is the only thing between a corrupt book and an arbitrary on-chain
-            price the next fill is priced against. Either the book is wrong or the band is.
+            price the next fill is priced against. It judges the published mid and, on a
+            pair with a market, the market's own mid, so this also fires through a depeg:
+            on a stable pair, check the peg first. Otherwise either the book is wrong or
+            the band is.
 
       # The vault drifting away from the share it is configured to hold. Nothing else in
       # this file reads the inventory series at all: they arrived with volatile pricing and

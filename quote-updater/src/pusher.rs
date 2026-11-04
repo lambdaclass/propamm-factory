@@ -882,8 +882,10 @@ mod tests {
 
     const ANVIL_KEY_0: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
-    /// What every in-process run test starts from: a mock RPC serving one USDC/USDT pair
-    /// with a vault, an acking mock builder, and a config file naming both.
+    /// What every in-process run test starts from: a mock RPC serving one `fixed` pair with a
+    /// vault, an acking mock builder, and a config file naming both. The second token answers
+    /// `TKN`, not `USDT`: a `fixed` pair between two dollars needs a market and a band to pass
+    /// preflight (audit F-04), and these runs stream nothing.
     struct Fixture {
         rpc: crate::rpc_mock::MockRpc,
         /// Shared, so a `shutdown_on` future can wait on it.
@@ -910,7 +912,7 @@ mod tests {
                 .unwrap();
             let rpc = crate::rpc_mock::MockRpc::spawn(100).await;
             rpc.set_symbol(usdc, "USDC");
-            rpc.set_symbol(usdt, "USDT");
+            rpc.set_symbol(usdt, "TKN");
             rpc.set_vault(Address::repeat_byte(0xaa));
             rpc.set_balance(Address::repeat_byte(0xaa), U256::exp10(24));
             let builder = crate::builder::mock::spawn(crate::builder::mock::Behaviour::Ack).await;
@@ -1520,7 +1522,7 @@ api_key = "k"
             // Read at once: what the run did not deliver before it returned, it never will.
             let seen = seen.lock().unwrap().clone();
             assert!(
-                matches!(seen.last(), Some(Event::LaneStopped { pair }) if pair == "USDC/USDT"),
+                matches!(seen.last(), Some(Event::LaneStopped { pair }) if pair == "USDC/TKN"),
                 "once = {once}: {seen:?}"
             );
         }
@@ -1906,7 +1908,7 @@ api_key = "k"
         assert!(fx.builder.wait_for(1, ten).await, "the lane quotes first");
         let series = |text: &str, name: &str| -> Option<String> {
             text.lines()
-                .find(|line| line.starts_with(name) && line.contains(r#"pair="USDC/USDT""#))
+                .find(|line| line.starts_with(name) && line.contains(r#"pair="USDC/TKN""#))
                 .map(str::to_owned)
         };
         let scrape = || async {

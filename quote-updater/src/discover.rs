@@ -231,7 +231,12 @@ pub async fn discover(
                 note: if exact {
                     String::new()
                 } else {
-                    format!("quoted in {}, not {quote_name}", market.quote)
+                    // The backoffice reads a stand-in by this prefix, `quoted in`.
+                    format!(
+                        "quoted in {}, not {quote_name}: not selected, since it would be \
+                         averaged as if at par",
+                        market.quote
+                    )
                 },
                 symbol: market.symbol,
             }
