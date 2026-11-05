@@ -70,33 +70,6 @@ contract TruncatedArrayOracle {
     }
 }
 
-// Tokens that are not ERC-20s, for the `balanceOf`/`allowance` reads `isActive` makes on
-// `tokenOut` (audit F-09). Each is etched over a pair's token.
-
-/// Code, and every call reverts.
-contract RevertingToken {
-    fallback() external {
-        revert();
-    }
-}
-
-/// Code, and every call succeeds with empty return data: decoding it as a `uint256` reverts, in
-/// the caller's frame.
-contract EmptyReturnToken {
-    fallback() external {}
-}
-
-/// Code, and every call returns 1: every account, address(0) included, holds and has approved
-/// a non-zero amount.
-contract AnswersOneToken {
-    fallback() external {
-        assembly {
-            mstore(0, 1)
-            return(0, 32)
-        }
-    }
-}
-
 /// Exercises `quote`/`swap` across pairs that differ in decimals, price and which token sorts
 /// first. Tokens sit at their mainnet addresses so the token0/token1 ordering the lane key and
 /// the quote direction depend on is the real one:
@@ -577,7 +550,6 @@ contract PropAMMPricingTest is Test {
     /// A malformed answer used to revert `isActive` in its decoder. Now the pair reads as active
     /// and `quote` rejects it.
     function test_isActive_leavesAMalformedAnswerToQuote() public {
-        _fundVault(USDT, 1_600_000e6);
         address[3] memory shapes =
             [address(new OneWordOracle()), address(new HighBitsOracle()), address(new TruncatedArrayOracle())];
         string[3] memory names = ["one word", "timestamp above uint32", "truncated array"];
@@ -592,7 +564,6 @@ contract PropAMMPricingTest is Test {
     /// A fresh lane reads as active whatever its slots hold; `quote` rejects the unusable ones.
     function test_isActive_doesNotReadTheSlots() public {
         uint256 pairKey = uint256(keccak256(abi.encodePacked(WETH, USDT)));
-        _fundVault(USDT, 1_600_000e6);
 
         MockPUR(ORACLE).setState(5e14, 0);
         assertTrue(propAmm.isActive(WETH, USDT), "mid == 0");
@@ -603,6 +574,26 @@ contract PropAMMPricingTest is Test {
         MockPUR(ORACLE).setSlotCount(1);
         assertTrue(propAmm.isActive(WETH, USDT), "one slot");
         vm.expectRevert(abi.encodeWithSelector(InsufficientOracleData.selector, pairKey, uint256(1)));
+        propAmm.quote(WETH, USDT, 1e18);
+    }
+
+    /// Removing a pair leaves its lane in the registry, still holding a fresh update: only the
+    /// listing check turns `isActive` false. Audit F-09.
+    function test_isActive_falseForARemovedPair() public {
+        _setPrice(1600e18, 5e14);
+        assertTrue(propAmm.isActive(WETH, USDT));
+        vm.prank(owner);
+        propAmm.removePair(WETH, USDT);
+        assertFalse(propAmm.isActive(WETH, USDT), "the lane still has a fresh price");
+    }
+
+    /// `isActive` is not told the swap's size, so a vault read could only tell an empty vault from
+    /// one holding a wei. It reads none: a vault that holds nothing and has approved nothing still
+    /// reads as active, and `quote` is what rejects it. Audit F-09 (review).
+    function test_isActive_doesNotReadTheVault() public {
+        _setPrice(1600e18, 5e14);
+        assertTrue(propAmm.isActive(WETH, USDT));
+        vm.expectRevert(abi.encodeWithSelector(EmptyVault.selector, USDT));
         propAmm.quote(WETH, USDT, 1e18);
     }
 
@@ -632,63 +623,6 @@ contract PropAMMPricingTest is Test {
 
     function _setPrice(uint256 mid, uint256 delta) internal {
         MockPUR(ORACLE).setState(delta, mid);
-    }
-
-    /// isActive is documented as "True if a swap for the pair would succeed right now". Each of
-    /// these makes every swap revert while the oracle is fine. Audit F-09.
-    function test_isActive_falseWhenTheVaultHasNotApproved() public {
-        _setPrice(1600e18, 5e14);
-        MockToken(USDT).mint(vault, 1_600_000e6);
-        assertFalse(propAmm.isActive(WETH, USDT));
-    }
-
-    function test_isActive_falseWhenTheVaultIsEmpty() public {
-        _setPrice(1600e18, 5e14);
-        vm.prank(vault);
-        MockToken(USDT).approve(address(propAmm), type(uint256).max);
-        assertFalse(propAmm.isActive(WETH, USDT));
-    }
-
-    function test_isActive_falseForARemovedPair() public {
-        _setPrice(1600e18, 5e14);
-        _fundVault(USDT, 1_600_000e6);
-        assertTrue(propAmm.isActive(WETH, USDT));
-        vm.prank(owner);
-        propAmm.removePair(WETH, USDT);
-        assertFalse(propAmm.isActive(WETH, USDT), "the lane still has a fresh price");
-    }
-
-    /// The vault reads do not stand in for the listing check: on a pair that is not listed they
-    /// ask about address(0), and a token can answer non-zero for it. Audit F-09 (review).
-    function test_isActive_falseForARemovedPairWhateverTokenOutAnswers() public {
-        _setPrice(1600e18, 5e14);
-        vm.prank(owner);
-        propAmm.removePair(WETH, USDT);
-        vm.etch(USDT, address(new AnswersOneToken()).code);
-        assertFalse(propAmm.isActive(WETH, USDT));
-    }
-
-    function test_isActive_checksTheOutputSideOnly() public {
-        _setPrice(1600e18, 5e14);
-        _fundVault(USDT, 1_600_000e6);
-        assertTrue(propAmm.isActive(WETH, USDT));
-        assertFalse(propAmm.isActive(USDT, WETH));
-    }
-
-    function test_isActive_falseNotRevertWhenTokenOutCannotAnswer() public {
-        _setPrice(1600e18, 5e14);
-        _fundVault(USDT, 1_600_000e6);
-        vm.etch(USDT, address(new RevertingToken()).code);
-        assertFalse(propAmm.isActive(WETH, USDT));
-    }
-
-    /// The empty answer is the one a `try` would not catch: the call succeeds and the decode
-    /// reverts in `isActive`'s own frame. Audit F-09 (review).
-    function test_isActive_falseNotRevertWhenTokenOutAnswersEmpty() public {
-        _setPrice(1600e18, 5e14);
-        _fundVault(USDT, 1_600_000e6);
-        vm.etch(USDT, address(new EmptyReturnToken()).code);
-        assertFalse(propAmm.isActive(WETH, USDT));
     }
 
     /// A fee-on-transfer tokenOut (USDT with its fee switch on): the recipient gets less than
@@ -798,8 +732,8 @@ contract PropAMMPricingTest is Test {
         MockToken(WETH).mint(address(amm), amount);
     }
 
-    /// Funds the vault and approves this instance from it, as a live vault would: `isActive`
-    /// reports a pair whose vault has not approved the instance as inactive (audit F-09).
+    /// Funds the vault and approves this instance from it, as a live vault would, so a test can
+    /// `swap` against it.
     function _fundVault(address token, uint256 amount) internal {
         MockToken(token).mint(vault, amount);
         vm.prank(vault);

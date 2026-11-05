@@ -161,33 +161,20 @@ contract PropAMM is
     }
 
     /// @inheritdoc IPropAMM
-    /// @dev True when the pair is listed, the registry holds an update for its lane stamped with
-    /// this block's timestamp, and the vault holds and has approved a non-zero amount of
-    /// `tokenOut`. It does not read the registry's answer; `quote` does. Never reverts (audit
-    /// F-14, F-09), but a registry or `tokenOut` answering megabytes can exhaust the gas.
+    /// @dev True when the pair is listed and the registry holds an update for its lane stamped
+    /// with this block's timestamp. It does not read the answer; `quote` does. Never reverts
+    /// (audit F-14), but a registry answering megabytes can exhaust the gas.
     function isActive(address tokenIn, address tokenOut) external view override returns (bool active) {
         if (paused()) return false;
         uint256 pairKey = _pairKey(tokenIn, tokenOut);
-        address vault = pairVaults[pairKey];
-        if (vault == address(0)) return false;
+        // A removed pair's lane can still hold a fresh update (audit F-09).
+        if (pairVaults[pairKey] == address(0)) return false;
 
         bytes memory getState =
             abi.encodeCall(IPrioUpdateRegistry.getState, (pairKey, uint32(block.timestamp), uint32(block.timestamp)));
         (bool ok, bytes memory ret) = address(oracle).staticcall(getState);
         // An address without code answers with no data; a registry always answers with some.
-        if (!ok || ret.length == 0) return false;
-        return _readsNonZero(tokenOut, abi.encodeCall(IERC20.balanceOf, (vault)))
-            && _readsNonZero(tokenOut, abi.encodeCall(IERC20.allowance, (vault, address(this))));
-    }
-
-    /// @notice Whether a `view` call on `token` answers a non-zero word, for `isActive`.
-    /// @dev A low-level call, so a token that reverts or answers fewer than 32 bytes reads as zero
-    /// and `isActive` keeps its promise never to revert. Decoding one `uint256` from 32 or more
-    /// bytes cannot revert.
-    function _readsNonZero(address token, bytes memory data) internal view returns (bool) {
-        (bool ok, bytes memory ret) = token.staticcall(data);
-        if (!ok || ret.length < 32) return false;
-        return abi.decode(ret, (uint256)) != 0;
+        return ok && ret.length != 0;
     }
 
     /// @inheritdoc IPropAMM
