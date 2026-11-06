@@ -41,11 +41,7 @@ error UpdaterNotAuthorized(address oracle, address updater);
 
 /// @notice Push payment (see `IPropAMM`) is atomic only inside the caller's transaction: tokens
 /// left on an instance between transactions can be swapped by anyone, and `withdrawERC20`
-/// recovers them only if the owner gets there first. Fee-on-transfer tokens are not supported
-/// as input: the swap reverts, unless the instance already holds the shortfall (a stray balance,
-/// or a caller that sends more than `amountIn`), in which case it fills and the vault receives
-/// `amountIn` less the token's fee. As output they are measured: the swap reverts below
-/// `minAmountOut`.
+/// recovers them only if the owner gets there first.
 /// @dev `ERC165Upgradeable` holds no state, so adding it moved no storage slot.
 contract PropAMM is
     IPropAMM,
