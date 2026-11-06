@@ -19,6 +19,54 @@ import {IPropAMM} from "../src/interfaces/IPropAMM.sol";
 import {MockPUR} from "./mocks/MockPUR.sol";
 import {MockToken} from "./mocks/MockToken.sol";
 
+// Oracle shapes etched over `ORACLE` by the `isActive` tests (audit F-14).
+
+/// Every call returns no data.
+contract EmptyReturnOracle {
+    fallback() external payable {}
+}
+
+/// Every call returns one word.
+contract OneWordOracle {
+    fallback() external payable {
+        assembly {
+            mstore(0, 1)
+            return(0, 32)
+        }
+    }
+}
+
+/// Every call reverts.
+contract RevertingOracle {
+    fallback() external payable {
+        revert("nope");
+    }
+}
+
+/// First word does not fit a uint32, so `abi.decode` reverts on it.
+contract HighBitsOracle {
+    fallback() external payable {
+        assembly {
+            mstore(0, not(0))
+            mstore(0x20, 0x40)
+            mstore(0x40, 0)
+            return(0, 0x60)
+        }
+    }
+}
+
+/// Claims two slots but returns only the head.
+contract TruncatedArrayOracle {
+    fallback() external payable {
+        assembly {
+            mstore(0, 1)
+            mstore(0x20, 0x40)
+            mstore(0x40, 2)
+            return(0, 0x60)
+        }
+    }
+}
+
 /// Exercises `quote`/`swap` across pairs that differ in decimals, price and which token sorts
 /// first. Tokens sit at their mainnet addresses so the token0/token1 ordering the lane key and
 /// the quote direction depend on is the real one:
@@ -473,6 +521,57 @@ contract PropAMMPricingTest is Test {
         vm.prank(owner);
         propAmm.unpause();
         assertTrue(propAmm.isActive(WETH, USDT));
+    }
+
+    /// Replaces the code at `ORACLE`: whatever sits there, `isActive` answers instead of
+    /// reverting (audit F-14).
+    function _etchOracle(address shape) internal {
+        vm.etch(ORACLE, shape.code);
+    }
+
+    function test_isActive_falseForAnOracleWithoutCode() public {
+        vm.etch(ORACLE, "");
+        assertFalse(propAmm.isActive(WETH, USDT));
+    }
+
+    function test_isActive_falseForAnEmptyReturnOracle() public {
+        _etchOracle(address(new EmptyReturnOracle()));
+        assertFalse(propAmm.isActive(WETH, USDT));
+    }
+
+    function test_isActive_falseForARevertingOracle() public {
+        _etchOracle(address(new RevertingOracle()));
+        assertFalse(propAmm.isActive(WETH, USDT));
+    }
+
+    /// A malformed answer used to revert `isActive` in its decoder. Now the pair reads as active
+    /// and `quote` rejects it.
+    function test_isActive_leavesAMalformedAnswerToQuote() public {
+        address[3] memory shapes =
+            [address(new OneWordOracle()), address(new HighBitsOracle()), address(new TruncatedArrayOracle())];
+        string[3] memory names = ["one word", "timestamp above uint32", "truncated array"];
+        for (uint256 i = 0; i < shapes.length; i++) {
+            _etchOracle(shapes[i]);
+            assertTrue(propAmm.isActive(WETH, USDT), names[i]);
+            vm.expectRevert();
+            propAmm.quote(WETH, USDT, 1e18);
+        }
+    }
+
+    /// A fresh lane reads as active whatever its slots hold; `quote` rejects the unusable ones.
+    function test_isActive_doesNotReadTheSlots() public {
+        uint256 pairKey = uint256(keccak256(abi.encodePacked(WETH, USDT)));
+
+        MockPUR(ORACLE).setState(5e14, 0);
+        assertTrue(propAmm.isActive(WETH, USDT), "mid == 0");
+        vm.expectRevert(abi.encodeWithSelector(InvalidMid.selector, pairKey));
+        propAmm.quote(WETH, USDT, 1e18);
+
+        MockPUR(ORACLE).setState(5e14, 1e18);
+        MockPUR(ORACLE).setSlotCount(1);
+        assertTrue(propAmm.isActive(WETH, USDT), "one slot");
+        vm.expectRevert(abi.encodeWithSelector(InsufficientOracleData.selector, pairKey, uint256(1)));
+        propAmm.quote(WETH, USDT, 1e18);
     }
 
     function test_pause_onlyOwnerCanFlipIt() public {

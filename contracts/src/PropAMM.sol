@@ -25,6 +25,12 @@ error InsufficientVaultBalance(address token, uint256 needed, uint256 available)
 /// A zero vault passed to `addPair` or `setPairVault`: a pair always names the account it fills
 /// from, because that account is also what registers it (see `pairVaults`).
 error NoVault(address token0, address token1);
+/// An oracle address with no code, given to `initialize` or `setOracle`.
+error InvalidOracle(address oracle);
+/// A pair token with no code, given to `addPair` or `initialize`.
+error NotAToken(address token);
+/// A pair token whose `decimals()` is above `MAX_TOKEN_DECIMALS`.
+error UnsupportedDecimals(address token, uint8 decimals);
 
 /// @dev `ERC165Upgradeable` holds no state, so adding it moved no storage slot.
 contract PropAMM is
@@ -79,6 +85,10 @@ contract PropAMM is
     /// @dev Price impact charged on a fill that would consume the vault's whole `tokenOut`
     /// balance, as a fraction at SPREAD_SCALE. Impact is linear in the share the fill consumes.
     uint256 constant IMPACT_FACTOR = 1e14; // 1bps
+    /// @dev The most decimals a pair token may have. `_pricing` multiplies `PRICE_SCALE` and `mid`
+    /// by `10**decimals`; 36 keeps both products well inside a word for any realistic `mid`,
+    /// where 60 already overflows `PRICE_SCALE * 10**decimals` on every quote.
+    uint256 constant MAX_TOKEN_DECIMALS = 36;
 
     /// @dev Retired: nothing reads or writes it. Kept so this layout matches instances created
     /// while it was in use, which can upgrade onto this implementation; removing it would move
@@ -110,7 +120,9 @@ contract PropAMM is
     /// proxy is the proxy itself, so the updaters registered here are the instance's own.
     /// @param owner The account that will own the instance.
     /// @param updaters The addresses allowed to push price updates for the instance's lanes.
-    /// @param oracle_ The oracle registry the instance will use for price updates.
+    /// @param oracle_ The oracle registry the instance will use for price updates. Reverts with
+    /// `InvalidOracle` for an address with no code: with no updaters nothing here would call it,
+    /// and the mistake would only show later, as an instance that never quotes.
     /// @param pairs The token pairs the instance starts out supporting, each with its vault.
     function initialize(address owner, address[] calldata updaters, address oracle_, PairConfig[] calldata pairs)
         external
@@ -119,6 +131,7 @@ contract PropAMM is
         __Ownable2Step_init();
         __Ownable_init(owner);
         __Pausable_init();
+        require(oracle_.code.length > 0, InvalidOracle(oracle_));
         oracle = IPrioUpdateRegistry(oracle_);
         for (uint256 i = 0; i < updaters.length; i++) {
             oracle.addUpdater(updaters[i]);
@@ -129,14 +142,18 @@ contract PropAMM is
     }
 
     /// @inheritdoc IPropAMM
+    /// @dev True when the registry holds an update for the pair's lane stamped with this block's
+    /// timestamp. It does not read the answer; `quote` does. Never reverts (audit F-14).
     function isActive(address tokenIn, address tokenOut) external view override returns (bool active) {
         if (paused()) return false;
 
-        try oracle.getState(_pairKey(tokenIn, tokenOut), uint32(block.timestamp), uint32(block.timestamp)) {
-            return true;
-        } catch {
-            return false;
-        }
+        bytes memory getState = abi.encodeCall(
+            IPrioUpdateRegistry.getState,
+            (_pairKey(tokenIn, tokenOut), uint32(block.timestamp), uint32(block.timestamp))
+        );
+        (bool ok, bytes memory ret) = address(oracle).staticcall(getState);
+        // An address without code answers with no data; a registry always answers with some.
+        return ok && ret.length != 0;
     }
 
     /// @inheritdoc IPropAMM
@@ -406,6 +423,9 @@ contract PropAMM is
     }
 
     /// @notice Adds a token pair, filled from `vault`.
+    /// @dev Reverts `NotAToken` if either token has no code, and `UnsupportedDecimals` if either
+    /// reports more than `MAX_TOKEN_DECIMALS`; a token whose `decimals()` reverts is refused too.
+    /// The vault may be an EOA.
     /// @param tokenX The first token in the pair.
     /// @param tokenY The second token in the pair.
     /// @param vault The account that holds this pair's inventory and has approved this instance.
@@ -418,6 +438,12 @@ contract PropAMM is
     function _addPair(address tokenX, address tokenY, address vault) internal {
         (address token0, address token1) = _sortTokens(tokenX, tokenY);
         require(vault != address(0), NoVault(token0, token1));
+        require(token0.code.length > 0, NotAToken(token0));
+        require(token1.code.length > 0, NotAToken(token1));
+        uint8 decimals0 = IERC20Metadata(token0).decimals();
+        require(decimals0 <= MAX_TOKEN_DECIMALS, UnsupportedDecimals(token0, decimals0));
+        uint8 decimals1 = IERC20Metadata(token1).decimals();
+        require(decimals1 <= MAX_TOKEN_DECIMALS, UnsupportedDecimals(token1, decimals1));
 
         uint256 pairKey = _keyOf(token0, token1);
         require(pairVaults[pairKey] == address(0), PairAlreadyExists(token0, token1));
@@ -457,8 +483,10 @@ contract PropAMM is
 
     /// @notice Updates the oracle address used for price updates.
     /// @dev Note that this does not transfer any updaters from the old oracle to the new one; the new oracle must be set up separately.
-    /// @param newOracle The new oracle address.
+    /// @param newOracle The new oracle address. Reverts with `InvalidOracle` for an address with
+    /// no code.
     function setOracle(address newOracle) external onlyOwner {
+        require(newOracle.code.length > 0, InvalidOracle(newOracle));
         oracle = IPrioUpdateRegistry(newOracle);
         emit OracleChanged(newOracle);
     }
