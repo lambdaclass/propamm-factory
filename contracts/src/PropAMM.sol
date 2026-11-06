@@ -31,7 +31,17 @@ error InvalidOracle(address oracle);
 error NotAToken(address token);
 /// A pair token whose `decimals()` is above `MAX_TOKEN_DECIMALS`.
 error UnsupportedDecimals(address token, uint8 decimals);
+/// `addUpdater` (or `initialize`) for a key `oracle` already authorizes for this instance: the
+/// registry would ignore it, and the event would record a change that did not happen.
+error UpdaterAlreadyAuthorized(address oracle, address updater);
+/// `removeUpdater` (or `removeUpdaterFrom`) for a key `oracle` does not authorize for this
+/// instance: the registry would ignore it, and the event would record a revocation that did not
+/// happen.
+error UpdaterNotAuthorized(address oracle, address updater);
 
+/// @notice Push payment (see `IPropAMM`) is atomic only inside the caller's transaction: tokens
+/// left on an instance between transactions can be swapped by anyone, and `withdrawERC20`
+/// recovers them only if the owner gets there first.
 /// @dev `ERC165Upgradeable` holds no state, so adding it moved no storage slot.
 contract PropAMM is
     IPropAMM,
@@ -70,8 +80,13 @@ contract PropAMM is
     event PairRemoved(address indexed token0, address indexed token1);
     event PairVaultChanged(address indexed token0, address indexed token1, address indexed vault);
     event OracleChanged(address indexed newOracle);
-    event UpdaterAdded(address indexed updater);
-    event UpdaterRemoved(address indexed updater);
+    /// @dev Both name the registry the change was made on: authorizations live per registry, and
+    /// a key revoked on one stays live on any other this instance has used. Not `UpdaterAdded` /
+    /// `UpdaterRemoved`: with two addresses those would share topic0 with the registry's own
+    /// `UpdaterAdded(target, updater)` / `UpdaterRemoved(target, updater)`, logged in the same
+    /// transaction with the fields in other positions.
+    event UpdaterAuthorized(address indexed updater, address indexed oracle);
+    event UpdaterRevoked(address indexed updater, address indexed oracle);
     event ERC20Withdrawn(address indexed token, address indexed to, uint256 amount);
 
     /// @dev Fixed-point scale the oracle publishes `mid` in. A `mid` of 1e18 means one whole
@@ -134,7 +149,7 @@ contract PropAMM is
         require(oracle_.code.length > 0, InvalidOracle(oracle_));
         oracle = IPrioUpdateRegistry(oracle_);
         for (uint256 i = 0; i < updaters.length; i++) {
-            oracle.addUpdater(updaters[i]);
+            _addUpdater(updaters[i]);
         }
         for (uint256 i = 0; i < pairs.length; i++) {
             _addPair(pairs[i].token0, pairs[i].token1, pairs[i].vault);
@@ -142,15 +157,16 @@ contract PropAMM is
     }
 
     /// @inheritdoc IPropAMM
-    /// @dev True when the registry holds an update for the pair's lane stamped with this block's
-    /// timestamp. It does not read the answer; `quote` does. Never reverts (audit F-14).
+    /// @dev True when the pair is listed and the registry holds an update for its lane stamped
+    /// with this block's timestamp. It does not read the answer; `quote` does.
     function isActive(address tokenIn, address tokenOut) external view override returns (bool active) {
         if (paused()) return false;
+        uint256 pairKey = _pairKey(tokenIn, tokenOut);
+        // A removed pair's lane can still hold a fresh update (audit F-09).
+        if (pairVaults[pairKey] == address(0)) return false;
 
-        bytes memory getState = abi.encodeCall(
-            IPrioUpdateRegistry.getState,
-            (_pairKey(tokenIn, tokenOut), uint32(block.timestamp), uint32(block.timestamp))
-        );
+        bytes memory getState =
+            abi.encodeCall(IPrioUpdateRegistry.getState, (pairKey, uint32(block.timestamp), uint32(block.timestamp)));
         (bool ok, bytes memory ret) = address(oracle).staticcall(getState);
         // An address without code answers with no data; a registry always answers with some.
         return ok && ret.length != 0;
@@ -175,6 +191,12 @@ contract PropAMM is
     }
 
     /// @inheritdoc IPropAMM
+    /// @dev `amountOut` is what `recipient` received, measured as a balance delta, and it is what
+    /// `minAmountOut` is checked against: a fee-on-transfer `tokenOut` delivers less than `quote`
+    /// and can revert here. A fee-on-transfer `tokenIn` is not supported: the instance receives
+    /// less than `amountIn`, so the swap reverts unless the instance already holds the shortfall,
+    /// and then the vault is paid `amountIn` less the token's fee (see the contract-level note on
+    /// push payment).
     function swap(
         address tokenIn,
         address tokenOut,
@@ -193,12 +215,17 @@ contract PropAMM is
         // warm, and cheaper than threading the address out of the pricing function.
         address vault = pairVaults[_pairKey(tokenIn, tokenOut)];
 
+        // What `recipient` holds before, so the output is measured, not assumed: a token that
+        // charges a fee on transfer delivers less than `realAmountOut`.
+        uint256 before = IERC20(tokenOut).balanceOf(recipient);
         IERC20(tokenIn).safeTransfer(vault, amountIn);
         IERC20(tokenOut).safeTransferFrom(vault, recipient, realAmountOut);
+        uint256 delivered = IERC20(tokenOut).balanceOf(recipient) - before;
+        require(delivered >= minAmountOut, InsufficientOutput(minAmountOut, delivered));
 
-        emit Swapped(msg.sender, tokenIn, tokenOut, amountIn, realAmountOut, recipient);
+        emit Swapped(msg.sender, tokenIn, tokenOut, amountIn, delivered, recipient);
 
-        return realAmountOut;
+        return delivered;
     }
 
     /// @inheritdoc IPropAMMFillable
@@ -482,7 +509,12 @@ contract PropAMM is
     }
 
     /// @notice Updates the oracle address used for price updates.
-    /// @dev Note that this does not transfer any updaters from the old oracle to the new one; the new oracle must be set up separately.
+    /// @dev Moves pricing and updater management to `newOracle`. Authorizations on the old
+    /// registry are not copied and not revoked: they stay live there for this instance, so
+    /// pointing back at it re-enables them. Revoke each old key with
+    /// `removeUpdaterFrom(oldRegistry, key)`; the old registry's own `UpdaterAdded(target,
+    /// updater)` log lists them. Authorize the keys the new registry needs with `addUpdater`
+    /// after this call.
     /// @param newOracle The new oracle address. Reverts with `InvalidOracle` for an address with
     /// no code.
     function setOracle(address newOracle) external onlyOwner {
@@ -492,17 +524,55 @@ contract PropAMM is
     }
 
     /// @notice Adds a new updater to the oracle registry.
+    /// @dev Reverts if the change would be a no-op on the current registry, so every event
+    /// records a real change. The event names the registry.
     /// @param updater The address of the new updater.
     function addUpdater(address updater) external onlyOwner {
-        oracle.addUpdater(updater);
-        emit UpdaterAdded(updater);
+        _addUpdater(updater);
     }
 
     /// @notice Removes an updater from the oracle registry.
+    /// @dev Reverts if the change would be a no-op on the current registry, so every event
+    /// records a real change. The event names the registry.
     /// @param updater The address of the updater to remove.
     function removeUpdater(address updater) external onlyOwner {
-        oracle.removeUpdater(updater);
-        emit UpdaterRemoved(updater);
+        _removeUpdater(oracle, updater);
+    }
+
+    /// @notice Revokes `updater` on `registry`, which need not be the current oracle.
+    /// @dev The registry scopes authorizations to this instance's address, so keys stay live on a
+    /// registry the instance has moved away from until revoked here, and would price it again if
+    /// it ever pointed back. Reverts like `removeUpdater` for a key `registry` does not hold.
+    /// @param registry The registry to revoke on.
+    /// @param updater The address of the updater to remove.
+    function removeUpdaterFrom(address registry, address updater) external onlyOwner {
+        _removeUpdater(IPrioUpdateRegistry(registry), updater);
+    }
+
+    /// @notice Authorizes `updater` on the current registry. Shared by `addUpdater` and
+    /// `initialize`, so a key listed at creation is checked and logged like one added later.
+    /// @dev The registry is silent about a duplicate add, so its own `isUpdater` is asked first.
+    function _addUpdater(address updater) internal {
+        IPrioUpdateRegistry registry = oracle;
+        require(!registry.isUpdater(address(this), updater), UpdaterAlreadyAuthorized(address(registry), updater));
+        registry.addUpdater(updater);
+        emit UpdaterAuthorized(updater, address(registry));
+    }
+
+    /// @notice Revokes `updater` on `registry`, which need not be the current oracle.
+    /// @dev The registry is silent about removing a key it does not have, so its own `isUpdater`
+    /// is asked first, and a key it says it does not hold is refused. Revoking must stay possible
+    /// on a registry that cannot answer (an older build without `isUpdater`): when the question
+    /// itself reverts, the removal is forwarded unchecked, since a key that cannot be revoked is
+    /// worse than one event that may record a no-op.
+    function _removeUpdater(IPrioUpdateRegistry registry, address updater) internal {
+        // Without code the `isUpdater` call below would fail in decoding, with no reason given.
+        require(address(registry).code.length > 0, InvalidOracle(address(registry)));
+        try registry.isUpdater(address(this), updater) returns (bool authorized) {
+            require(authorized, UpdaterNotAuthorized(address(registry), updater));
+        } catch {}
+        registry.removeUpdater(updater);
+        emit UpdaterRevoked(updater, address(registry));
     }
 
     /// @notice Withdraws ERC20 tokens from the contract to a specified address.

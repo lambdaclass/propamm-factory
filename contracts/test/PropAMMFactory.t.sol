@@ -3,7 +3,7 @@ pragma solidity ^0.8.35;
 
 import {Test} from "forge-std/Test.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-import {PropAMM, InvalidOracle, NotAToken} from "../src/PropAMM.sol";
+import {PropAMM, InvalidOracle, NotAToken, UpdaterAlreadyAuthorized} from "../src/PropAMM.sol";
 import {CreationIsDisabled, PropAMMFactory} from "../src/PropAMMFactory.sol";
 import {IPropAMM} from "../src/interfaces/IPropAMM.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
@@ -154,10 +154,21 @@ contract PropAMMFactoryTest is Test {
         factory.createPropAMM(owner, PUR_ADDR, updaters, p);
     }
 
-    /// Two events per creation, in this order: the instance's own PairAdded (emitted inside
-    /// initialize, so from the predicted address, before the proxy constructor returns), then the
-    /// factory's PropAMMCreated. The creation event names neither pairs nor vaults; PairAdded is
-    /// where indexers read them.
+    /// `initialize` adds updaters the way `addUpdater` does, so a key listed twice is refused
+    /// rather than logged twice. Audit F-16.
+    function test_createPropAMM_refusesADuplicateUpdater() public {
+        address[] memory twice = new address[](2);
+        twice[0] = updater;
+        twice[1] = updater;
+        vm.expectRevert(abi.encodeWithSelector(UpdaterAlreadyAuthorized.selector, PUR_ADDR, updater));
+        factory.createPropAMM(owner, PUR_ADDR, twice, pairs);
+    }
+
+    /// The instance's own events come first, from the predicted address, before the proxy
+    /// constructor returns: one UpdaterAuthorized per updater, then one PairAdded per pair. The
+    /// factory's PropAMMCreated comes last. The creation event names neither pairs nor vaults;
+    /// PairAdded is where indexers read them. (This test pins the PairAdded → PropAMMCreated order;
+    /// the UpdaterAuthorized events are pinned in PropAMM.t.sol.)
     function test_createPropAMM_emitsPairAddedThenCreated() public {
         address predicted = factory.computeAddress(address(this), owner, PUR_ADDR, updaters, pairs);
         vm.expectEmit(true, true, true, true, predicted);
@@ -329,6 +340,8 @@ contract PropAMMFactoryTest is Test {
         propAmm.addUpdater(rando);
         vm.expectRevert();
         propAmm.removeUpdater(updater);
+        vm.expectRevert();
+        propAmm.removeUpdaterFrom(PUR_ADDR, updater);
         vm.expectRevert();
         propAmm.addPair(_token("token-a"), _token("token-b"), vault);
         vm.expectRevert();

@@ -4,12 +4,14 @@ pragma solidity ^0.8.35;
 import "forge-std/console.sol";
 import {Test} from "forge-std/Test.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import {
     PropAMM,
     EmptyVault,
     InsufficientOracleData,
+    InsufficientOutput,
     InsufficientVaultBalance,
     InvalidMid,
     SpreadTooWide,
@@ -18,6 +20,7 @@ import {
 import {IPropAMM} from "../src/interfaces/IPropAMM.sol";
 import {MockPUR} from "./mocks/MockPUR.sol";
 import {MockToken} from "./mocks/MockToken.sol";
+import {FeeOnTransferToken} from "./mocks/FeeOnTransferToken.sol";
 
 // Oracle shapes etched over `ORACLE` by the `isActive` tests (audit F-14).
 
@@ -574,6 +577,26 @@ contract PropAMMPricingTest is Test {
         propAmm.quote(WETH, USDT, 1e18);
     }
 
+    /// Removing a pair leaves its lane in the registry, still holding a fresh update: only the
+    /// listing check turns `isActive` false. Audit F-09.
+    function test_isActive_falseForARemovedPair() public {
+        _setPrice(1600e18, 5e14);
+        assertTrue(propAmm.isActive(WETH, USDT));
+        vm.prank(owner);
+        propAmm.removePair(WETH, USDT);
+        assertFalse(propAmm.isActive(WETH, USDT), "the lane still has a fresh price");
+    }
+
+    /// `isActive` is not told the swap's size, so a vault read could only tell an empty vault from
+    /// one holding a wei. It reads none: a vault that holds nothing and has approved nothing still
+    /// reads as active, and `quote` is what rejects it. Audit F-09 (review).
+    function test_isActive_doesNotReadTheVault() public {
+        _setPrice(1600e18, 5e14);
+        assertTrue(propAmm.isActive(WETH, USDT));
+        vm.expectRevert(abi.encodeWithSelector(EmptyVault.selector, USDT));
+        propAmm.quote(WETH, USDT, 1e18);
+    }
+
     function test_pause_onlyOwnerCanFlipIt() public {
         vm.prank(trader);
         vm.expectRevert(abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, trader));
@@ -602,8 +625,119 @@ contract PropAMMPricingTest is Test {
         MockPUR(ORACLE).setState(delta, mid);
     }
 
+    /// A fee-on-transfer tokenOut (USDT with its fee switch on): the recipient gets less than
+    /// computed, so `minAmountOut` must be checked against what it received. Audit F-09.
+    function test_swap_revertsWhenTheRecipientWouldReceiveLessThanMinAmountOut() public {
+        (PropAMM amm, FeeOnTransferToken fot) = _feeOnTransferOutputPair();
+        uint256 quoted = amm.quote(WETH, address(fot), 1_000e18);
+        _pushIn(amm, 1_000e18);
+        uint256 delivered = quoted - quoted / 100;
+        vm.expectRevert(abi.encodeWithSelector(InsufficientOutput.selector, quoted, delivered));
+        amm.swap(WETH, address(fot), 1_000e18, quoted, trader, block.timestamp);
+    }
+
+    /// `Swapped.amountOut` is documented as a balance delta, and the router-facing return value
+    /// should agree with it. Audit F-09.
+    function test_swap_returnsAndEmitsWhatTheRecipientReceived() public {
+        (PropAMM amm, FeeOnTransferToken fot) = _feeOnTransferOutputPair();
+        uint256 quoted = amm.quote(WETH, address(fot), 1_000e18);
+        _pushIn(amm, 1_000e18);
+        uint256 delivered = quoted - quoted / 100;
+        vm.expectEmit(true, true, true, true, address(amm));
+        emit IPropAMM.Swapped(address(this), WETH, address(fot), 1_000e18, delivered, trader);
+        uint256 out = amm.swap(WETH, address(fot), 1_000e18, 0, trader, block.timestamp);
+        assertEq(out, delivered);
+        assertEq(fot.balanceOf(trader), delivered);
+    }
+
+    /// Push payment cannot tell a payment from a stray transfer: tokens left on the instance can be
+    /// swapped by anyone. The vault is still paid in full; the loss is the sender's. Audit F-09.
+    function test_swap_aStrayBalanceIsSwappableByAnyone() public {
+        _setPrice(1600e18, 5e14);
+        _fundVault(USDT, 1_600_000e6);
+        MockToken(WETH).mint(address(propAmm), 1e18); // left behind, not paid for this swap
+        address stranger = makeAddr("stranger");
+        vm.prank(stranger);
+        uint256 out = propAmm.swap(WETH, USDT, 1e18, 0, stranger, block.timestamp);
+        assertGt(out, 0);
+        assertEq(MockToken(USDT).balanceOf(stranger), out, "the stranger was paid");
+        assertEq(MockToken(WETH).balanceOf(vault), 1e18, "the vault received the stray");
+    }
+
+    /// A fee-on-transfer tokenIn (USDT with its fee switch on) is not supported: with nothing else on
+    /// the instance, it holds less than amountIn and the swap reverts. Audit F-09.
+    function test_swap_feeOnTransferTokenInReverts() public {
+        (PropAMM amm, FeeOnTransferToken fot) = _feeOnTransferInputPair();
+        fot.mint(address(this), 100e18);
+        fot.transfer(address(amm), 100e18); // arrives as 99e18
+        // Paying the vault 100e18 burns the 1e18 fee first, leaving 98e18 for the 99e18 transfer.
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC20Errors.ERC20InsufficientBalance.selector, address(amm), 98e18, 99e18)
+        );
+        amm.swap(address(fot), WETH, 100e18, 0, trader, block.timestamp);
+    }
+
+    /// ...but it does not fail closed: when the instance already holds the shortfall (a caller that
+    /// sends more than amountIn, or a stray), the swap fills, and the vault receives amountIn less
+    /// the token's fee, selling below its price. Documented, not prevented. Audit F-09 (review).
+    function test_swap_feeOnTransferTokenInFillsWhenTheShortfallIsHeld() public {
+        (PropAMM amm, FeeOnTransferToken fot) = _feeOnTransferInputPair();
+        fot.mint(address(this), 102e18);
+        fot.transfer(address(amm), 102e18); // arrives as 100.98e18, more than amountIn
+        uint256 out = amm.swap(address(fot), WETH, 100e18, 0, trader, block.timestamp);
+        assertGt(out, 99e18, "the vault sold about 100 WETH at par");
+        assertEq(fot.balanceOf(vault), 99e18, "and received amountIn less the 1% fee");
+    }
+
+    /// An instance of its own listing a token that charges 1% per transfer against WETH, its vault
+    /// funded and approved in WETH, priced at par with no spread.
+    function _feeOnTransferInputPair() internal returns (PropAMM amm, FeeOnTransferToken fot) {
+        fot = new FeeOnTransferToken(18);
+        PropAMM.PairConfig[] memory pairs = new PropAMM.PairConfig[](1);
+        pairs[0] = PropAMM.PairConfig({token0: address(fot), token1: WETH, vault: vault});
+        amm = PropAMM(
+            address(
+                new ERC1967Proxy(
+                    address(new PropAMM()), abi.encodeCall(PropAMM.initialize, (owner, new address[](0), ORACLE, pairs))
+                )
+            )
+        );
+        MockToken(WETH).mint(vault, 1_000e18);
+        vm.prank(vault);
+        MockToken(WETH).approve(address(amm), type(uint256).max);
+        MockPUR(ORACLE).setState(0, 1e18);
+    }
+
+    /// An instance of its own listing WETH against a token that charges 1% per transfer, its vault
+    /// funded and approved in that token, priced at par with no spread.
+    function _feeOnTransferOutputPair() internal returns (PropAMM amm, FeeOnTransferToken fot) {
+        fot = new FeeOnTransferToken(18);
+        PropAMM.PairConfig[] memory pairs = new PropAMM.PairConfig[](1);
+        pairs[0] = PropAMM.PairConfig({token0: WETH, token1: address(fot), vault: vault});
+        amm = PropAMM(
+            address(
+                new ERC1967Proxy(
+                    address(new PropAMM()), abi.encodeCall(PropAMM.initialize, (owner, new address[](0), ORACLE, pairs))
+                )
+            )
+        );
+        fot.mint(vault, 1_000_000e18);
+        vm.prank(vault);
+        fot.approve(address(amm), type(uint256).max);
+        MockPUR(ORACLE).setState(0, 1e18);
+    }
+
+    /// Pays `amount` of WETH to the instance, as the router's push does before calling `swap`.
+    function _pushIn(PropAMM amm, uint256 amount) internal {
+        MockToken(WETH).mint(address(amm), amount);
+    }
+
+    /// Funds the vault and approves this instance from it, as a live vault would, so a test can
+    /// `swap` against it.
     function _fundVault(address token, uint256 amount) internal {
         MockToken(token).mint(vault, amount);
+        vm.prank(vault);
+        MockToken(token).approve(address(propAmm), type(uint256).max);
     }
 
     /// Asserts `amountOut` is `midAmountOut` less `delta`, allowing for the impact term on top.
