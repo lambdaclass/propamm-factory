@@ -149,7 +149,12 @@ fn attestation(public_key: Vec<u8>) -> Result<Vec<u8>> {
 
 /// Opens the CMS `EnvelopedData` KMS returns for a recipient: the content key is unwrapped
 /// with RSA-OAEP (SHA-256) under `key`, and the content is AES-256-CBC under it.
-pub fn unwrap_envelope(der_bytes: &[u8], key: &RsaPrivateKey) -> Result<Vec<u8>> {
+///
+/// KMS encodes the envelope in BER, not DER: indefinite lengths, and the content split into
+/// pieces (seen on a live `Decrypt`, which `der` refuses with "indefinite length
+/// disallowed"). It is rewritten as DER first ([`ber_to_der`]); a DER envelope passes
+/// through unchanged.
+pub fn unwrap_envelope(ber_bytes: &[u8], key: &RsaPrivateKey) -> Result<Vec<u8>> {
     use aes::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
     use cms::{
         content_info::ContentInfo,
@@ -157,8 +162,9 @@ pub fn unwrap_envelope(der_bytes: &[u8], key: &RsaPrivateKey) -> Result<Vec<u8>>
     };
     use der::{Decode, asn1::OctetString};
 
+    let der_bytes = ber_to_der(ber_bytes).wrap_err("not a CMS envelope")?;
     let info =
-        ContentInfo::from_der(der_bytes).map_err(|err| eyre!("not a CMS envelope: {err}"))?;
+        ContentInfo::from_der(&der_bytes).map_err(|err| eyre!("not a CMS envelope: {err}"))?;
     let enveloped: EnvelopedData = info
         .content
         .decode_as()
@@ -192,6 +198,157 @@ pub fn unwrap_envelope(der_bytes: &[u8], key: &RsaPrivateKey) -> Result<Vec<u8>>
     decryptor
         .decrypt_padded_vec_mut::<Pkcs7>(content.as_bytes())
         .map_err(|err| eyre!("decrypting the content: {err}"))
+}
+
+/// How deep [`ber_to_der`] follows nested elements. A CMS envelope is under ten levels; the
+/// bound only stops a hostile input from exhausting the stack.
+const MAX_BER_DEPTH: usize = 32;
+
+/// `ber` (one BER element, as KMS encodes its envelope) rewritten as DER, which `der` and
+/// `cms` read: every length definite and minimal, and every string sent in pieces (a
+/// constructed OCTET STRING, universal or under an implicit context tag) joined into one
+/// primitive string. DER input comes back unchanged.
+///
+/// A context-specific constructed element is taken for a string in pieces when its encoding
+/// was indefinite or had more than one part, and every part is an OCTET STRING. An explicit
+/// tag around a single OCTET STRING, encoded with a definite length, is left alone. CMS
+/// `EnvelopedData` has no explicit tag around an OCTET STRING, so the rule is exact for it.
+pub fn ber_to_der(ber: &[u8]) -> Result<Vec<u8>> {
+    let (der, rest) = ber_element(ber, 0)?;
+    ensure!(rest.is_empty(), "{} bytes after the element", rest.len());
+    Ok(der)
+}
+
+/// A BER header: the tag bytes, whether the element is constructed, and its length (`None`
+/// for an indefinite length).
+struct BerHeader {
+    tag: Vec<u8>,
+    constructed: bool,
+    len: Option<usize>,
+}
+
+fn ber_header(input: &[u8]) -> Result<(BerHeader, &[u8])> {
+    let (&first, mut rest) = input
+        .split_first()
+        .ok_or_else(|| eyre!("truncated: no tag"))?;
+    let mut tag = vec![first];
+    if first & 0x1f == 0x1f {
+        // High tag number: base-128 bytes, the last one with its top bit clear.
+        loop {
+            let (&byte, after) = rest.split_first().ok_or_else(|| eyre!("truncated tag"))?;
+            tag.push(byte);
+            rest = after;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            ensure!(tag.len() <= 6, "tag too long");
+        }
+    }
+    let (&first_len, after) = rest
+        .split_first()
+        .ok_or_else(|| eyre!("truncated: no length"))?;
+    rest = after;
+    let len = match first_len {
+        0x00..=0x7f => Some(usize::from(first_len)),
+        0x80 => None,
+        _ => {
+            let count = usize::from(first_len & 0x7f);
+            ensure!(count <= 4, "length of {count} bytes");
+            ensure!(rest.len() >= count, "truncated length");
+            let (bytes, after) = rest.split_at(count);
+            rest = after;
+            Some(
+                bytes
+                    .iter()
+                    .fold(0usize, |len, &byte| (len << 8) | usize::from(byte)),
+            )
+        }
+    };
+    Ok((
+        BerHeader {
+            tag,
+            constructed: first & 0x20 != 0,
+            len,
+        },
+        rest,
+    ))
+}
+
+/// One element of `input` as DER, and what follows it.
+fn ber_element(input: &[u8], depth: usize) -> Result<(Vec<u8>, &[u8])> {
+    ensure!(
+        depth <= MAX_BER_DEPTH,
+        "nested more than {MAX_BER_DEPTH} deep"
+    );
+    let (header, rest) = ber_header(input)?;
+    if !header.constructed {
+        let len = header
+            .len
+            .ok_or_else(|| eyre!("a primitive element with an indefinite length"))?;
+        ensure!(rest.len() >= len, "truncated content");
+        let (content, after) = rest.split_at(len);
+        return Ok((der_encode(&header.tag, content), after));
+    }
+
+    let mut parts = Vec::new();
+    let after = match header.len {
+        Some(len) => {
+            ensure!(rest.len() >= len, "truncated content");
+            let (mut body, after) = rest.split_at(len);
+            while !body.is_empty() {
+                let (part, next) = ber_element(body, depth + 1)?;
+                parts.push(part);
+                body = next;
+            }
+            after
+        }
+        None => {
+            let mut body = rest;
+            loop {
+                ensure!(body.len() >= 2, "truncated: no end-of-contents");
+                if body[..2] == [0, 0] {
+                    break &body[2..];
+                }
+                let (part, next) = ber_element(body, depth + 1)?;
+                parts.push(part);
+                body = next;
+            }
+        }
+    };
+
+    let tag = header.tag[0];
+    let all_octet_strings = !parts.is_empty() && parts.iter().all(|part| part[0] == 0x04);
+    let in_pieces = header.tag.len() == 1
+        && all_octet_strings
+        && (tag == 0x24 || (tag & 0xc0 == 0x80 && (header.len.is_none() || parts.len() > 1)));
+    if in_pieces {
+        let mut content = Vec::new();
+        for part in &parts {
+            // Already DER: a definite length.
+            let (part_header, part_rest) = ber_header(part)?;
+            let len = part_header.len.unwrap_or_default();
+            content.extend_from_slice(&part_rest[..len]);
+        }
+        return Ok((der_encode(&[tag & !0x20], &content), after));
+    }
+    Ok((der_encode(&header.tag, &parts.concat()), after))
+}
+
+/// `tag`, the minimal definite length of `content`, then `content`.
+fn der_encode(tag: &[u8], content: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(tag.len() + 5 + content.len());
+    out.extend_from_slice(tag);
+    let len = content.len();
+    if len < 0x80 {
+        out.push(len as u8);
+    } else {
+        let bytes = len.to_be_bytes();
+        let skip = bytes.iter().take_while(|&&byte| byte == 0).count();
+        out.push(0x80 | (bytes.len() - skip) as u8);
+        out.extend_from_slice(&bytes[skip..]);
+    }
+    out.extend_from_slice(content);
+    out
 }
 
 #[cfg(test)]
@@ -276,6 +433,77 @@ mod tests {
         assert_eq!(unwrap_envelope(&der, &recipient).unwrap(), b"a secret");
         assert!(unwrap_envelope(&der, &other).is_err());
         assert!(unwrap_envelope(b"not der", &recipient).is_err());
+    }
+
+    /// `der` re-encoded the way KMS answers: every constructed element with an indefinite
+    /// length, and every OCTET STRING longer than 8 bytes (universal, or under an implicit
+    /// context tag such as the encrypted content's `[0]`) sent in 8-byte pieces.
+    fn as_kms_ber(der: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut rest = der;
+        while !rest.is_empty() {
+            let (header, after) = ber_header(rest).unwrap();
+            let (content, after) = after.split_at(header.len.unwrap());
+            let tag = header.tag[0];
+            if header.constructed {
+                out.extend_from_slice(&header.tag);
+                out.push(0x80);
+                out.extend(as_kms_ber(content));
+                out.extend([0, 0]);
+            } else if (tag == 0x04 || tag == 0x80) && content.len() > 8 {
+                out.extend([tag | 0x20, 0x80]);
+                for piece in content.chunks(8) {
+                    out.extend(der_encode(&[0x04], piece));
+                }
+                out.extend([0, 0]);
+            } else {
+                out.extend(der_encode(&header.tag, content));
+            }
+            rest = after;
+        }
+        out
+    }
+
+    #[test]
+    fn a_kms_ber_envelope_opens_like_its_der() {
+        let recipient = RsaPrivateKey::new(&mut rand::thread_rng(), 1024).unwrap();
+        let der = envelope(b"a secret held by KMS", &recipient.to_public_key());
+        let ber = as_kms_ber(&der);
+        assert_ne!(ber, der, "the test envelope must exercise BER");
+        // What PR #36 did, and what failed on a live Decrypt.
+        assert!(<ContentInfo as der::Decode>::from_der(&ber).is_err());
+        assert_eq!(ber_to_der(&ber).unwrap(), der);
+        assert_eq!(
+            unwrap_envelope(&ber, &recipient).unwrap(),
+            b"a secret held by KMS"
+        );
+    }
+
+    #[test]
+    fn der_passes_through_ber_to_der_unchanged() {
+        let recipient = RsaPrivateKey::new(&mut rand::thread_rng(), 1024).unwrap();
+        let der = envelope(b"x", &recipient.to_public_key());
+        assert_eq!(ber_to_der(&der).unwrap(), der);
+    }
+
+    #[test]
+    fn broken_ber_is_refused_not_misread() {
+        let recipient = RsaPrivateKey::new(&mut rand::thread_rng(), 1024).unwrap();
+        let ber = as_kms_ber(&envelope(b"x", &recipient.to_public_key()));
+        // Without its last end-of-contents, cut in a length, with bytes after it.
+        assert!(ber_to_der(&ber[..ber.len() - 2]).is_err());
+        assert!(ber_to_der(&ber[..3]).is_err());
+        let mut trailing = ber.clone();
+        trailing.push(0);
+        assert!(ber_to_der(&trailing).is_err());
+        // A primitive element cannot have an indefinite length.
+        assert!(ber_to_der(&[0x04, 0x80, 0x00, 0x00]).is_err());
+        // Nesting past the bound.
+        let mut deep = Vec::new();
+        for _ in 0..=MAX_BER_DEPTH + 1 {
+            deep.extend([0x30, 0x80]);
+        }
+        assert!(ber_to_der(&deep).is_err());
     }
 
     #[test]
