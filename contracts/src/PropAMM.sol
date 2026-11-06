@@ -162,8 +162,7 @@ contract PropAMM is
 
     /// @inheritdoc IPropAMM
     /// @dev True when the pair is listed and the registry holds an update for its lane stamped
-    /// with this block's timestamp. It does not read the answer; `quote` does. Never reverts
-    /// (audit F-14), but a registry answering megabytes can exhaust the gas.
+    /// with this block's timestamp. It does not read the answer; `quote` does.
     function isActive(address tokenIn, address tokenOut) external view override returns (bool active) {
         if (paused()) return false;
         uint256 pairKey = _pairKey(tokenIn, tokenOut);
