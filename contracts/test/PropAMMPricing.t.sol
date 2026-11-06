@@ -19,15 +19,14 @@ import {IPropAMM} from "../src/interfaces/IPropAMM.sol";
 import {MockPUR} from "./mocks/MockPUR.sol";
 import {MockToken} from "./mocks/MockToken.sol";
 
-// Oracles that are not registries, for `isActive` (audit F-14). The ones that *return* something
-// that is not a `(uint32, uint256[])` used to escape its `try`: the decoder runs in the caller.
+// Oracle shapes etched over `ORACLE` by the `isActive` tests (audit F-14).
 
-/// Code, and every call succeeds with empty return data.
+/// Every call returns no data.
 contract EmptyReturnOracle {
     fallback() external payable {}
 }
 
-/// Code, and every call returns one word.
+/// Every call returns one word.
 contract OneWordOracle {
     fallback() external payable {
         assembly {
@@ -37,14 +36,14 @@ contract OneWordOracle {
     }
 }
 
-/// Code, and every call reverts: the case `try` always caught.
+/// Every call reverts.
 contract RevertingOracle {
     fallback() external payable {
         revert("nope");
     }
 }
 
-/// 96 bytes whose first word does not fit a uint32: `abi.decode` would revert on it.
+/// First word does not fit a uint32, so `abi.decode` reverts on it.
 contract HighBitsOracle {
     fallback() external payable {
         assembly {
@@ -56,7 +55,7 @@ contract HighBitsOracle {
     }
 }
 
-/// Claims two slots but returns only the head: reading them would run past the data.
+/// Claims two slots but returns only the head.
 contract TruncatedArrayOracle {
     fallback() external payable {
         assembly {
@@ -524,9 +523,8 @@ contract PropAMMPricingTest is Test {
         assertTrue(propAmm.isActive(WETH, USDT));
     }
 
-    /// `isActive` is a `bool` probe: whatever sits at the oracle address, it answers rather than
-    /// reverting, or a batch probe over several venues fails whole. Audit F-14. Each test swaps
-    /// the code at `ORACLE`.
+    /// Replaces the code at `ORACLE`: whatever sits there, `isActive` answers instead of
+    /// reverting (audit F-14).
     function _etchOracle(address shape) internal {
         vm.etch(ORACLE, shape.code);
     }
@@ -546,8 +544,8 @@ contract PropAMMPricingTest is Test {
         assertFalse(propAmm.isActive(WETH, USDT));
     }
 
-    /// An answer that is not a `(uint32, uint256[])` used to revert `isActive` from inside its own
-    /// decoder. It decodes nothing now: the call succeeded, and rejecting the answer is `quote`'s.
+    /// A malformed answer used to revert `isActive` in its decoder. Now the pair reads as active
+    /// and `quote` rejects it.
     function test_isActive_leavesAMalformedAnswerToQuote() public {
         address[3] memory shapes =
             [address(new OneWordOracle()), address(new HighBitsOracle()), address(new TruncatedArrayOracle())];
@@ -560,8 +558,7 @@ contract PropAMMPricingTest is Test {
         }
     }
 
-    /// What the slots hold is up to whoever posts them, so `isActive` reports a fresh lane as
-    /// active whatever it carries. Slots no quote can price with are rejected by `quote`.
+    /// A fresh lane reads as active whatever its slots hold; `quote` rejects the unusable ones.
     function test_isActive_doesNotReadTheSlots() public {
         uint256 pairKey = uint256(keccak256(abi.encodePacked(WETH, USDT)));
 

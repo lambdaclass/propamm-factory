@@ -142,16 +142,8 @@ contract PropAMM is
     }
 
     /// @inheritdoc IPropAMM
-    /// @dev Reports whether the registry holds an update for the pair's lane stamped with this
-    /// block's timestamp, which is what `getState` checks before it answers. It does not read the
-    /// answer: what the slots hold is up to whoever posts them, and `quote` is what interprets
-    /// them. So a fresh lane whose slots no quote can use still reads as active, and `quote`
-    /// reverts on it. Nor does it see the vault: balance, allowance and token transfer
-    /// restrictions only show in `quote` and `swap`.
-    ///
-    /// Never reverts (audit F-14). The call is low-level because a `try` on `oracle.getState`
-    /// still decodes the answer in this frame, after the call itself has succeeded, and reverts
-    /// there on one that is not a `(uint32, uint256[])`.
+    /// @dev True when the registry holds an update for the pair's lane stamped with this block's
+    /// timestamp. It does not read the answer; `quote` does. Never reverts (audit F-14).
     function isActive(address tokenIn, address tokenOut) external view override returns (bool active) {
         if (paused()) return false;
 
@@ -160,8 +152,7 @@ contract PropAMM is
             (_pairKey(tokenIn, tokenOut), uint32(block.timestamp), uint32(block.timestamp))
         );
         (bool ok, bytes memory ret) = address(oracle).staticcall(getState);
-        // A call to an address without code succeeds with no data, where a registry always
-        // answers with some.
+        // An address without code answers with no data; a registry always answers with some.
         return ok && ret.length != 0;
     }
 
