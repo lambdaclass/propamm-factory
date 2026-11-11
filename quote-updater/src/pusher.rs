@@ -3,7 +3,7 @@
 //! or the node-mode ticker. This is the composition root today and becomes the `Pusher`
 //! builder when the extension API lands.
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use ethrex_rpc::{
     clients::eth::EthClient,
@@ -217,7 +217,23 @@ async fn run_inner(
         args.flags.no_pin,
         args.flags.builders.is_some(),
     )?;
-    refuse_backoffice_in_node_mode(args.flags.mode, file_settings.backoffice_addr.as_deref())?;
+    // Where the backoffice is served, if anywhere: `--backoffice-ip` and `--backoffice-port`
+    // over `[settings] backoffice_addr` (see `apply_file_settings`). Resolved once, and
+    // refused here rather than at the bind, which comes after the RPC and preflight.
+    let backoffice_addr = args.flags.backoffice_addr();
+    refuse_backoffice_in_node_mode(args.flags.mode, backoffice_addr)?;
+    let backoffice_addr = backoffice_addr.filter(|_| !args.flags.once);
+    if let Some(addr) = backoffice_addr {
+        backoffice::refuse_unspecified_bind(addr)?;
+    }
+    let cors_origins = backoffice::parse_origins(&args.flags.backoffice_cors_origins)
+        .wrap_err("--backoffice-cors-origin")?;
+    if !cors_origins.is_empty() && backoffice_addr.is_none() {
+        tracing::warn!(
+            "--backoffice-cors-origin is set, but this run serves no backoffice for it to \
+             answer for; it is ignored"
+        );
+    }
 
     // Loaded before anything connects, though nothing here needs the chain: the file is
     // local, cheap and deterministic, while the RPC calls below are slow and can fail
@@ -226,7 +242,7 @@ async fn run_inner(
     // the registry deployed and the updaters authorized to be told so.
     // With a backoffice an empty config is a fresh server about to be configured through
     // its API. Without one it is the mistake it has always been.
-    let backoffice_bound = file_settings.backoffice_addr.is_some() && !args.flags.once;
+    let backoffice_bound = backoffice_addr.is_some();
     let config = config::config_from_raw(
         crate::config::RawConfig::clone(&shared.snapshot()),
         args.flags.price_decimals,
@@ -575,12 +591,8 @@ async fn run_inner(
         {
             let health = health.clone();
             // Named in the notice, so it says where to go and fix it. The configured
-            // string, not the bound one, since the listener is opened further down.
-            let backoffice_addr = if backoffice_bound {
-                file_settings.backoffice_addr.clone()
-            } else {
-                None
-            };
+            // address, not the bound one, since the listener is opened further down.
+            let backoffice_addr = backoffice_addr.map(|addr| addr.to_string());
             let reload_hint = reload_hint(backoffice_addr.as_deref(), settled.is_some());
             tasks.spawn(async move {
                 let mut last_notice: Option<tokio::time::Instant> = None;
@@ -666,24 +678,28 @@ async fn run_inner(
 
         // Not under `--once`: there is nothing to converge, and binding a port from a batch
         // run is a surprise.
-        let _backoffice = match file_settings.backoffice_addr.as_deref() {
-            Some(addr) if !args.flags.once => {
-                let addr: SocketAddr = addr.parse().wrap_err_with(|| {
-                    format!("[settings] backoffice_addr {addr:?} is not host:port")
-                })?;
+        let _backoffice = match backoffice_addr {
+            Some(addr) => {
                 let (local, task) = backoffice::bind(
                     addr,
                     Arc::clone(&shared),
                     client.clone(),
                     pair_states.clone(),
                     Arc::clone(&kinds),
+                    &cors_origins,
                 )
                 .await?;
-                tracing::info!("backoffice API listening on http://{local}/api/");
+                match cors_origins.as_slice() {
+                    [] => tracing::info!("backoffice API listening on http://{local}/api/"),
+                    origins => tracing::info!(
+                        "backoffice API listening on http://{local}/api/, answering CORS for {}",
+                        origins.join(", ")
+                    ),
+                }
                 tasks.adopt(&task);
                 Some(task)
             }
-            _ => None,
+            None => None,
         };
 
         loop {
@@ -1638,27 +1654,50 @@ api_key = "k"
         assert_eq!(outcome, Outcome::Success);
     }
 
-    /// The backoffice API a real run binds reaches the real service through the shared
-    /// config: a halt sent to it withdraws the lane's quote at the builder and lands in the
-    /// file, a resume brings the lane back, and the API says what the pusher is doing.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_backoffice_api_halts_and_resumes_a_running_pair() {
-        use std::time::Duration;
-        let fx = Fixture::spawn("api-halt").await;
+    /// A free port for a backoffice a test turns on by flag, and the flags that bind it.
+    fn backoffice_flags() -> (u16, [String; 4]) {
         let port = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
             .unwrap()
             .port();
-        let text = std::fs::read_to_string(&fx.config).unwrap().replacen(
-            "[settings]\n",
-            &format!("[settings]\nbackoffice_addr = \"127.0.0.1:{port}\"\n"),
-            1,
-        );
-        std::fs::write(&fx.config, text).unwrap();
-        let handle = fx.updater().start(fx.args(&[]));
+        let flags = [
+            "--backoffice-ip".to_owned(),
+            "127.0.0.1".to_owned(),
+            "--backoffice-port".to_owned(),
+            port.to_string(),
+        ];
+        (port, flags)
+    }
+
+    /// Waits until the backoffice answers: it is bound after the pairs start.
+    async fn until_backoffice(port: u16) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while reqwest::get(format!("http://127.0.0.1:{port}/api/pairs"))
+                .await
+                .is_err()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the backoffice is up within 10s");
+    }
+
+    /// The backoffice API a real run binds, by flag alone, reaches the real service through
+    /// the shared config: a halt sent to it withdraws the lane's quote at the builder and
+    /// lands in the file, a resume brings the lane back, and the API says what the pusher
+    /// is doing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_backoffice_api_halts_and_resumes_a_running_pair() {
+        use std::time::Duration;
+        let fx = Fixture::spawn("api-halt").await;
+        let (port, flags) = backoffice_flags();
+        let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+        let handle = fx.updater().start(fx.args(&flags));
         let ten = Duration::from_secs(10);
         assert!(fx.builder.wait_for(1, ten).await, "the lane quotes first");
+        until_backoffice(port).await;
 
         let api = format!("http://127.0.0.1:{port}/api");
         let client = reqwest::Client::new();
@@ -1701,6 +1740,75 @@ api_key = "k"
             fx.builder.wait_for(quotes + 1, ten).await,
             "the lane quotes again"
         );
+
+        handle.shutdown();
+        tokio::time::timeout(Duration::from_secs(20), handle.wait())
+            .await
+            .expect("stops within 20s")
+            .expect("runs and stops cleanly");
+    }
+
+    /// A fresh host: no pairs in the file, and the backoffice turned on by flag alone. The
+    /// run starts with nothing to quote, which only a backoffice makes allowed, and a pair
+    /// added through the API is started and quotes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pair_added_through_the_api_to_an_empty_config_quotes() {
+        use std::time::Duration;
+        let fx = Fixture::spawn("api-empty").await;
+        let text = std::fs::read_to_string(&fx.config).unwrap();
+        let (pairs, builder) = (
+            text.find("[[pairs]]").unwrap(),
+            text.find("[[builder]]").unwrap(),
+        );
+        let empty = format!("{}{}", &text[..pairs], &text[builder..]).replacen(
+            "\n\n[settings]",
+            "\npairs = []\n\n[settings]",
+            1,
+        );
+        std::fs::write(&fx.config, empty).unwrap();
+        let (port, flags) = backoffice_flags();
+        let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+        let handle = fx.updater().start(fx.args(&flags));
+        until_backoffice(port).await;
+
+        let client = reqwest::Client::new();
+        let pairs: serde_json::Value = serde_json::from_slice(
+            &client
+                .get(format!("http://127.0.0.1:{port}/api/pairs"))
+                .send()
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pairs, serde_json::json!([]));
+        assert_eq!(fx.builder.count(), 0, "nothing quotes yet");
+
+        let added = client
+            .post(format!("http://127.0.0.1:{port}/api/pairs"))
+            .header("content-type", "application/json")
+            .body(
+                serde_json::json!({
+                    "tokens": [format!("{:#x}", fx.tokens.0), format!("{:#x}", fx.tokens.1)],
+                    "key_env": "QU_TEST_KEY",
+                    "pricing": {"kind": "fixed", "mid": "1.0001", "delta": "0.0002"},
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        let status = added.status().as_u16();
+        let body = String::from_utf8_lossy(&added.bytes().await.unwrap()).into_owned();
+        assert_eq!(status, 201, "{body}");
+        assert!(body.contains("\"applied\""), "{body}");
+        assert!(
+            fx.builder.wait_for(1, Duration::from_secs(10)).await,
+            "the added pair quotes"
+        );
+        assert_eq!(fx.raw_pair().key_env, "QU_TEST_KEY", "and is in the file");
 
         handle.shutdown();
         tokio::time::timeout(Duration::from_secs(20), handle.wait())

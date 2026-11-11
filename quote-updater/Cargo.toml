@@ -45,6 +45,10 @@ prometheus = "0.14.0"
 # The /metrics listener. Same measured cost: axum is already pulled in (with default
 # features) by ethrex-rpc via axum-extra, so this adds no package and no feature.
 axum = { version = "0.8.9", features = ["ws"] }
+# The backoffice API's CORS answers, for a front end served from another origin
+# (`--backoffice-cors-origin`). Zero new package entries in Cargo.lock: ethrex-rpc already
+# pulls tower-http 0.6 in with the `cors` feature on. Pinned to the version that tree locks.
+tower-http = { version = "0.6.11", features = ["cors"] }
 
 # ethrex has no standalone lightweight client crate yet, so the client (EthClient, calldata
 # encoding, signer) comes from the node's workspace crates. Pinned to one rev so the five

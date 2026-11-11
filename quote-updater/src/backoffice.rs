@@ -7,14 +7,17 @@
 //! only if the service accepts: so the config in memory and the file on disk both describe
 //! what is running. `[settings]` are read once, at start, and the API only shows them.
 //!
-//! No login: `backoffice_addr` is the host's tailnet address, so reaching this API means
-//! being past the tailnet ACL. Binding a routable address is refused, because unlike
-//! `/metrics` this API writes. Every change logs the peer that made it.
+//! No login: the address it binds (`--backoffice-ip` and `--backoffice-port`, or `[settings]
+//! backoffice_addr`) is the host's tailnet address, so reaching this API means being past
+//! the tailnet ACL. Binding every interface is refused, because unlike `/metrics` this API
+//! writes. Every change logs the peer that made it.
 //!
 //! Being past the ACL is not the same as meaning to be here: a browser on the tailnet sends
 //! whatever another site's page tells it to. So [`guard`] takes a change only as JSON,
-//! which a page on another site cannot send here without the CORS approval this API never
-//! gives, and refuses one whose `Origin` names another site.
+//! which a page on another site cannot send here without CORS approval, and refuses one
+//! whose `Origin` names another site. The approval goes to the origins
+//! `--backoffice-cors-origin` lists, and only to those: a front end served from one of
+//! them can call the API, and every other site still cannot.
 //!
 //! | Route                             | What it does                                     |
 //! |-----------------------------------|--------------------------------------------------|
@@ -47,6 +50,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use axum::{
@@ -88,6 +92,9 @@ struct Backoffice {
     /// Open previews, capped at PREVIEW_PAGES. Each connects to each venue at most once,
     /// so this bounds the venue connections previews can hold at once.
     preview_pages: Arc<tokio::sync::Semaphore>,
+    /// The origins besides its own whose pages may change things here, as
+    /// [`parse_origins`] writes them: the same list the CORS layer answers to.
+    origins: Arc<[String]>,
 }
 
 /// `0.0.0.0:8088` binds every interface, including whatever the host has facing the
@@ -96,15 +103,89 @@ pub(crate) fn is_unspecified_bind(addr: SocketAddr) -> bool {
     addr.ip().is_unspecified()
 }
 
-/// Binds `addr` and serves the API. Fatal on failure: an operator who believes this is up
-/// and whose changes are going nowhere is worse off than one whose service refused to
-/// start.
+/// Refuses [`is_unspecified_bind`]. Startup asks before it connects to anything, and
+/// [`bind`] again.
+pub(crate) fn refuse_unspecified_bind(addr: SocketAddr) -> Result<()> {
+    eyre::ensure!(
+        !is_unspecified_bind(addr),
+        "the backoffice address is {addr}, which binds every interface on this host. This \
+         API rewrites the pusher's config and has no authentication of its own; bind it to \
+         the host's tailnet address instead (--backoffice-ip, or [settings] \
+         backoffice_addr), where the tailnet ACL is the access control."
+    );
+    Ok(())
+}
+
+/// `--backoffice-cors-origin`, checked, and each written as a browser writes `Origin`
+/// (lowercase, no default port, no trailing slash), which is what both the CORS layer and
+/// [`guard`] compare a request's against, byte for byte. `*` and `null` are refused: the API
+/// has no login, so an origin that answers for any page would let any site an operator's
+/// browser visits drive it.
+pub(crate) fn parse_origins(origins: &[String]) -> Result<Vec<String>> {
+    origins
+        .iter()
+        .map(|origin| origin.trim())
+        .filter(|origin| !origin.is_empty())
+        .map(|origin| {
+            eyre::ensure!(
+                origin != "*",
+                "\"*\" would let a page on any site an operator's browser visits drive this \
+                 API, which has no login; list the front end's own origin, such as \
+                 http://100.64.1.2:3000"
+            );
+            let written = || {
+                eyre!(
+                    "{origin:?} is not an origin; write the scheme, host and port alone, such \
+                     as http://100.64.1.2:3000, with no path"
+                )
+            };
+            let url = url::Url::parse(origin).map_err(|_| written())?;
+            eyre::ensure!(
+                matches!(url.scheme(), "http" | "https")
+                    && url.has_host()
+                    && url.path() == "/"
+                    && url.query().is_none()
+                    && url.fragment().is_none()
+                    && url.username().is_empty()
+                    && url.password().is_none(),
+                written()
+            );
+            Ok(url.origin().ascii_serialization())
+        })
+        .collect()
+}
+
+/// The CORS answers for `origins`, `None` when there are none to give: a preflight from
+/// one of them is answered for the methods and the one header this API takes, and every
+/// answer to one carries `Access-Control-Allow-Origin`. No credentials: the API has no
+/// cookie or login to send.
+fn cors(origins: &[String]) -> Option<tower_http::cors::CorsLayer> {
+    if origins.is_empty() {
+        return None;
+    }
+    let origins: Vec<axum::http::HeaderValue> = origins
+        .iter()
+        .map(|origin| origin.parse().expect("parse_origins writes ASCII"))
+        .collect();
+    Some(
+        tower_http::cors::CorsLayer::new()
+            .allow_origin(tower_http::cors::AllowOrigin::list(origins))
+            .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+            .allow_headers([header::CONTENT_TYPE])
+            .max_age(Duration::from_secs(600)),
+    )
+}
+
+/// Binds `addr` and serves the API, with CORS answers for `origins` (see
+/// [`parse_origins`]). Fatal on failure: an operator who believes this is up and whose
+/// changes are going nowhere is worse off than one whose service refused to start.
 pub async fn bind(
     addr: SocketAddr,
     config: Arc<SharedConfig>,
     client: ethrex_rpc::clients::eth::EthClient,
     states: PairStates,
     kinds: Arc<crate::kinds::Kinds>,
+    origins: &[String],
 ) -> Result<(SocketAddr, JoinHandle<()>)> {
     bind_with(
         addr,
@@ -112,6 +193,7 @@ pub async fn bind(
         client,
         states,
         kinds,
+        origins,
         crate::discover::Rest::default(),
     )
     .await
@@ -124,14 +206,13 @@ async fn bind_with(
     client: ethrex_rpc::clients::eth::EthClient,
     states: PairStates,
     kinds: Arc<crate::kinds::Kinds>,
+    origins: &[String],
     rest: crate::discover::Rest,
 ) -> Result<(SocketAddr, JoinHandle<()>)> {
-    eyre::ensure!(
-        !is_unspecified_bind(addr),
-        "backoffice_addr is {addr}, which binds every interface on this host. This API \
-         rewrites the pusher's config and has no authentication of its own; bind it to the \
-         host's tailnet address instead, where the tailnet ACL is the access control."
-    );
+    refuse_unspecified_bind(addr)?;
+    // Written as `Origin` is, whatever the caller did, so the guard and the CORS layer
+    // compare against the same strings.
+    let origins = parse_origins(origins).wrap_err("--backoffice-cors-origin")?;
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -154,6 +235,7 @@ async fn bind_with(
             .wrap_err("http client")?,
         lookups: Arc::new(crate::discover::Cache::default()),
         preview_pages: Arc::new(tokio::sync::Semaphore::new(PREVIEW_PAGES)),
+        origins: origins.clone().into(),
     };
 
     let app = Router::new()
@@ -180,8 +262,15 @@ async fn bind_with(
             )
         })
         // Around every route above, so one added later is guarded without saying so.
-        .layer(axum::middleware::from_fn(guard))
-        .with_state(state);
+        .layer(axum::middleware::from_fn_with_state(state.clone(), guard));
+    // Around the guard, so a preflight (an `OPTIONS` with no JSON and no route) is answered
+    // before it, and every answer to a listed origin, a refusal included, carries the
+    // header that lets its page read it.
+    let app = match cors(&origins) {
+        Some(cors) => app.layer(cors),
+        None => app,
+    }
+    .with_state(state);
 
     let task = tokio::spawn(async move {
         // With connect info, so every change can be logged against its peer.
@@ -206,14 +295,16 @@ async fn bind_with(
 /// request that an operator's browser sent without the operator meaning it. A page on
 /// another site can make a browser send a plain form post anywhere, without asking and
 /// without the server's say; a `PUT`, a `DELETE`, or a post of JSON it cannot send without
-/// first asking this server, which never says yes (it sends no CORS headers). So:
+/// first asking this server, which says yes only to the origins `--backoffice-cors-origin`
+/// lists. So:
 ///
 /// - a `POST` or `PUT` is taken only as `Content-Type: application/json`, a bodiless one
 ///   (a halt, a reload) included;
-/// - a change whose `Origin` (which a browser sets and a page cannot) is not this API's own
-///   address is refused, whatever its method. A request with no `Origin` is not from a
-///   browser page, and goes on.
+/// - a change whose `Origin` (which a browser sets and a page cannot) is neither this API's
+///   own address nor a listed origin is refused, whatever its method. A request with no
+///   `Origin` is not from a browser page, and goes on.
 async fn guard(
+    State(state): State<Backoffice>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
@@ -222,11 +313,11 @@ async fn guard(
     let headers = request.headers();
     let refusal = if method.is_safe() {
         None
-    } else if !origin_allowed(headers) {
+    } else if !origin_allowed(headers, &state.origins) {
         Some((
             StatusCode::FORBIDDEN,
-            "the backoffice only takes a change from a page served under its own address, \
-             or from a client that is not a browser",
+            "the backoffice only takes a change from a page served under its own address or \
+             an origin --backoffice-cors-origin lists, or from a client that is not a browser",
         ))
     } else if (method == Method::POST || method == Method::PUT) && !is_json(headers) {
         Some((
@@ -261,9 +352,18 @@ fn is_json(headers: &axum::http::HeaderMap) -> bool {
         .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
 }
 
-/// No `Origin` (not a browser page), or this API's own address ([`same_origin`]).
-fn origin_allowed(headers: &axum::http::HeaderMap) -> bool {
-    !headers.contains_key(header::ORIGIN) || same_origin(headers)
+/// No `Origin` (not a browser page), this API's own address ([`same_origin`]), or one of
+/// `origins`, matched as the CORS layer matches it.
+fn origin_allowed(headers: &axum::http::HeaderMap, origins: &[String]) -> bool {
+    match headers.get(header::ORIGIN) {
+        None => true,
+        Some(origin) => {
+            same_origin(headers)
+                || origin
+                    .to_str()
+                    .is_ok_and(|origin| origins.iter().any(|listed| listed == origin))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -922,10 +1022,11 @@ async fn preview_socket(
     let bad = |status: StatusCode, msg: &str| {
         (status, Json(serde_json::json!({"error": msg}))).into_response()
     };
-    if !origin_allowed(&headers) {
+    if !origin_allowed(&headers, &state.origins) {
         return bad(
             StatusCode::FORBIDDEN,
-            "the preview only opens from a page served under the backoffice's own address",
+            "the preview only opens from a page served under the backoffice's own address \
+             or an origin --backoffice-cors-origin lists",
         );
     }
     let config = state.config.snapshot();
@@ -1267,6 +1368,8 @@ mod tests {
     use serde_json::{Value, json};
 
     const WETH_USDC: &str = "UPDATER_KEY_WETH_USDC";
+    /// A front end's origin, listed with `--backoffice-cors-origin` where a test says so.
+    const UI: &str = "http://ui.example:3000";
     const USDC: &str = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
     const USDT: &str = "0xdAC17F958D2ee523a2206206994597C13D831ec7";
 
@@ -1351,6 +1454,16 @@ mod tests {
         edit: impl FnOnce(&mut RawConfig),
         verdict: std::result::Result<String, ReloadFailure>,
     ) -> (SocketAddr, Arc<SharedConfig>) {
+        serve_for(name, edit, verdict, &[]).await
+    }
+
+    /// [`serve`], answering CORS for `origins`.
+    async fn serve_for(
+        name: &str,
+        edit: impl FnOnce(&mut RawConfig),
+        verdict: std::result::Result<String, ReloadFailure>,
+        origins: &[String],
+    ) -> (SocketAddr, Arc<SharedConfig>) {
         let (config, requests) = shared(name, edit);
         service(requests, verdict);
         let (local, _task) = bind(
@@ -1359,6 +1472,7 @@ mod tests {
             test_client(),
             PairStates::default(),
             test_kinds(),
+            origins,
         )
         .await
         .unwrap();
@@ -1473,6 +1587,7 @@ mod tests {
             test_client(),
             states,
             test_kinds(),
+            &[],
         )
         .await
         .unwrap();
@@ -1504,6 +1619,7 @@ mod tests {
             test_client(),
             PairStates::default(),
             test_kinds(),
+            &[],
         )
         .await
         .expect_err("an unspecified bind must be refused");
@@ -1700,6 +1816,125 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(config.snapshot().pairs[0].halted);
+    }
+
+    /// `--backoffice-cors-origin` is written as a browser writes `Origin`, so a listed one
+    /// matches byte for byte; anything that would answer for every page is refused.
+    #[test]
+    fn cors_origins_are_written_as_a_browser_sends_them() {
+        let parsed = parse_origins(&[
+            "HTTP://UI.Example:3000/".to_owned(),
+            " https://ui.example:443 ".to_owned(),
+            "http://[::1]:5173".to_owned(),
+            String::new(),
+        ])
+        .unwrap();
+        assert_eq!(
+            parsed,
+            [
+                "http://ui.example:3000",
+                "https://ui.example",
+                "http://[::1]:5173"
+            ]
+        );
+        for refused in [
+            "*",
+            "null",
+            "ui.example:3000",
+            "http://ui.example/app",
+            "http://ui.example?x=1",
+            "ftp://ui.example",
+            "http://user@ui.example",
+        ] {
+            let err = parse_origins(&[refused.to_owned()]).expect_err(refused);
+            let err = format!("{err:#}");
+            assert!(err.contains("origin"), "{refused}: {err}");
+        }
+    }
+
+    /// The CORS answers: a listed origin's preflight is approved for what the API takes,
+    /// its change is applied and its page may read the answer. Any other origin gets no
+    /// approval, and its change is still refused by the guard.
+    #[tokio::test]
+    async fn a_listed_origin_is_answered_with_cors_and_its_change_is_taken() {
+        let (local, config) = serve_for("cors", |_| {}, accepted(), &[UI.to_owned()]).await;
+        let halt = format!("http://{local}/api/pairs/{WETH_USDC}/halt");
+        let client = reqwest::Client::new();
+        let allow_origin = |response: &reqwest::Response| {
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .map(|value| value.to_str().unwrap().to_owned())
+        };
+        let preflight = |origin: &'static str| {
+            client
+                .request(reqwest::Method::OPTIONS, &halt)
+                .header("origin", origin)
+                .header("access-control-request-method", "POST")
+                .header("access-control-request-headers", "content-type")
+                .send()
+        };
+
+        let approved = preflight(UI).await.unwrap();
+        assert!(approved.status().is_success(), "{}", approved.status());
+        assert_eq!(allow_origin(&approved).as_deref(), Some(UI));
+        let methods = approved
+            .headers()
+            .get("access-control-allow-methods")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        for method in ["GET", "POST", "PUT", "DELETE"] {
+            assert!(methods.contains(method), "{methods}");
+        }
+        let not_listed = preflight("https://evil.example").await.unwrap();
+        assert_eq!(allow_origin(&not_listed), None);
+
+        let evil = client
+            .post(&halt)
+            .header("origin", "https://evil.example")
+            .header("content-type", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(evil.status().as_u16(), 403);
+        assert_eq!(allow_origin(&evil), None);
+        assert!(!config.snapshot().pairs[0].halted);
+
+        let taken = client
+            .post(&halt)
+            .header("origin", UI)
+            .header("content-type", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(taken.status().as_u16(), 200);
+        assert_eq!(allow_origin(&taken).as_deref(), Some(UI));
+        assert!(config.snapshot().pairs[0].halted);
+        // Still JSON only: a listed origin's form post is no more welcome than anyone's.
+        let form = client
+            .post(format!("http://{local}/api/pairs/{WETH_USDC}/resume"))
+            .header("origin", UI)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(form.status().as_u16(), 415);
+
+        // With no origin listed there is no CORS at all.
+        let (plain, _) = serve("no-cors", |_| {}, accepted()).await;
+        let unanswered = client
+            .request(
+                reqwest::Method::OPTIONS,
+                format!("http://{plain}/api/pairs"),
+            )
+            .header("origin", UI)
+            .header("access-control-request-method", "POST")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(allow_origin(&unanswered), None);
     }
 
     /// An edit replaces the stanza and nothing that makes the pair what it is: not its key,
@@ -2041,6 +2276,7 @@ mod tests {
             ethrex_rpc::clients::eth::EthClient::new(url::Url::parse(&rpc.url).unwrap()).unwrap(),
             PairStates::default(),
             test_kinds(),
+            &[],
             crate::discover::Rest::all_at(&format!("http://{exchanges}")),
         )
         .await
@@ -2198,7 +2434,8 @@ mod tests {
     const BINANCE_ETH: &str = "/ethusdc@bookTicker";
     const BYBIT: &str = "/bybit";
 
-    /// A backoffice whose Binance and Bybit endpoints are the mocks.
+    /// A backoffice whose Binance and Bybit endpoints are the mocks, answering CORS for
+    /// [`UI`].
     async fn preview_backoffice(name: &str, venues: SocketAddr) -> SocketAddr {
         let (config, _requests) = shared(name, |config| {
             config
@@ -2216,6 +2453,7 @@ mod tests {
             test_client(),
             PairStates::default(),
             test_kinds(),
+            &[UI.to_owned()],
         )
         .await
         .unwrap();
@@ -2444,17 +2682,24 @@ mod tests {
         open_preview(local)
             .await
             .expect("a page under its own address opens it");
+        open_preview_from(local, UI)
+            .await
+            .expect("so does a page from an origin --backoffice-cors-origin lists");
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("host", "backoffice.example.com".parse().unwrap());
         headers.insert("origin", "https://backoffice.example.com".parse().unwrap());
         assert!(same_origin(&headers));
         headers.insert("origin", "https://grafana.example.com".parse().unwrap());
         assert!(!same_origin(&headers));
-        assert!(!origin_allowed(&headers));
+        assert!(!origin_allowed(&headers, &[]));
+        assert!(origin_allowed(
+            &headers,
+            &["https://grafana.example.com".to_owned()]
+        ));
         headers.remove("origin");
         assert!(!same_origin(&headers));
         assert!(
-            origin_allowed(&headers),
+            origin_allowed(&headers, &[]),
             "no origin is not a browser page, so no other site's"
         );
     }
@@ -2495,6 +2740,7 @@ mod tests {
             test_client(),
             PairStates::default(),
             test_kinds(),
+            &[],
         )
         .await
         .unwrap();

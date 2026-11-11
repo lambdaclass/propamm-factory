@@ -558,7 +558,8 @@ Some things need a restart, because nothing changes them while the updater runs:
 
 ### The backoffice
 
-Set `[settings] backoffice_addr` and the updater serves the backoffice: a JSON API, under
+Set `[settings] backoffice_addr`, or `--backoffice-ip` and `--backoffice-port`, and the
+updater serves the backoffice: a JSON API, under
 `/api`, for the changes an operator actually makes: add or remove a pair, choose which venues
 its mid is averaged over and with what weights, edit a band or a `delta`, add or remove a
 builder, halt a pair (or all of them), resume a halted pair, and reload. It serves no pages
@@ -570,6 +571,17 @@ builder, halt a pair (or all of them), resume a halted pair, and reload. It serv
 [settings]
 backoffice_addr = "100.64.1.2:8088"   # this host's tailnet address
 ```
+
+or, on the command line (or as `BACKOFFICE_IP` and `BACKOFFICE_PORT`):
+
+```bash
+quote-updater --config config.toml --backoffice-ip 100.64.1.2 --backoffice-port 8088
+```
+
+Each flag overrides its half of `backoffice_addr`, as every flag overrides its `[settings]`
+key: `--backoffice-port 9000` against the file above serves `100.64.1.2:9000`. Either flag
+on its own turns the backoffice on; the half nothing gives is `127.0.0.1` for the address
+and `8088` for the port.
 
 | Route | What it does |
 |---|---|
@@ -639,18 +651,38 @@ a pair already halted), 422 for a change that is invalid (a misspelt key include
 reload rejected, 400 for a body that does not parse as JSON, 415 for a `POST` or `PUT` not
 sent as `Content-Type: application/json`, 403 for a foreign `Origin`.
 
-**Only JSON, and only from its own address.** With no login, what the API must not do is act
-on a request an operator's browser sent without the operator meaning it. So every `POST` and
-`PUT` must carry `Content-Type: application/json`, even one with no body (halt, resume,
-reload), and any request but a `GET` whose `Origin` header is not the API's own address is
-refused with 403. No CORS headers are sent, so a page on another site cannot get a browser
-to send one either. A front end in a browser therefore has to be served under the same
-address as the API, for instance by a reverse proxy that serves the UI and proxies `/api`.
-`curl` and scripts send no `Origin` and are unaffected:
+**Only JSON, and only from origins it knows.** With no login, what the API must not do is
+act on a request an operator's browser sent without the operator meaning it. So every `POST`
+and `PUT` must carry `Content-Type: application/json`, even one with no body (halt, resume,
+reload), and any request but a `GET` whose `Origin` header is neither the API's own address
+nor an origin listed with `--backoffice-cors-origin` is refused with 403. `curl` and scripts
+send no `Origin` and are unaffected:
 
 ```bash
 curl -X POST -H 'Content-Type: application/json' http://100.64.1.2:8088/api/reload
 ```
+
+**CORS, for a front end on another origin.** A browser lets a page send JSON to another
+origin only after asking that origin, and the API says yes only to the origins listed with
+`--backoffice-cors-origin` (repeat it for more than one, or comma-separate them in
+`BACKOFFICE_CORS_ORIGINS`):
+
+```bash
+quote-updater --config config.toml --backoffice-ip 100.64.1.2 \
+  --backoffice-cors-origin http://100.64.1.2:3000
+```
+
+A page from a listed origin gets its preflight approved for `GET`, `POST`, `PUT` and `DELETE`
+with a `Content-Type` header, can read every answer, and can open the preview; no credentials
+are involved, since there is no login. Every other origin gets no CORS headers, and its
+changes are still refused. An origin is written as the browser sends it, scheme, host and
+port alone (`http://100.64.1.2:3000`, no path), and `*` is refused: it would let a page on any
+site an operator's browser visits drive the API. With none listed there is no CORS at all,
+and a browser front end has to be served under the API's own address, for instance by a
+reverse proxy that serves the UI and proxies `/api`. The API itself is plain HTTP, so a
+front end served over HTTPS cannot call it from a browser whatever CORS says (the browser
+blocks mixed content); serve that front end over HTTP too, or put the API behind the same
+TLS proxy.
 
 **The lookup and the preview.** `GET /api/lookup` is the venue lookup described under the
 price sources above. The live prices run over one websocket per open preview. The client
@@ -661,7 +693,8 @@ never touches the other venues. The preview connects to the venues from this hos
 address the live feeds use, and a venue can block an address that opens too many
 connections, so it is kept small: at most 4 previews open at once, and each venue connected
 at most once every 2 seconds per preview however fast the client changes it. The socket also
-refuses a foreign `Origin`, so another site cannot open it from an operator's browser.
+refuses an `Origin` that is neither its own address nor a listed one, so another site cannot
+open it from an operator's browser.
 
 **Halting keeps the pair.** Halt sets `halted = true` on the pair in `config.toml`, and the
 updater treats a halted pair as absent: its quote is withdrawn at every builder, as a removal
@@ -687,12 +720,13 @@ retries the pair that failed.
 
 **Builder mode only.** The reload it drives belongs to the per-lane service that builder
 mode runs; node mode pushes `updateState` on a timer and has no convergence to trigger. A
-`backoffice_addr` under `--mode node` is refused at startup rather than bound and left
-inert, so trying it locally means the mock-builder recipe below, not the anvil `make`
+backoffice (`backoffice_addr`, `--backoffice-ip` or `--backoffice-port`) under `--mode node`
+is refused at startup rather than bound and left inert, so trying it locally means the mock-builder recipe below, not the anvil `make`
 targets.
 
 **Access control is the tailnet.** There is no login. Binding an unspecified address
-(`0.0.0.0`) is refused at startup rather than warned about: unlike `/metrics`, which only
+(`0.0.0.0` or `::`, from the file or `--backoffice-ip`) is refused at startup rather than
+warned about: unlike `/metrics`, which only
 leaks, this API writes, and anything that can reach it can repoint a pair's price source
 at a market of its choosing. Every change is logged with the peer that made it.
 

@@ -3294,6 +3294,7 @@ dependencies = [
  "tokio-postgres",
  "tokio-tungstenite",
  "toml",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
  "url",

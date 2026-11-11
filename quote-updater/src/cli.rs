@@ -3,7 +3,10 @@
 //! startup refusals that depend only on what was asked for (`--mode` against the flags and
 //! the config that only make sense in the other mode).
 
-use std::{net::SocketAddr, path::PathBuf};
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::PathBuf,
+};
 
 use clap::{CommandFactory, FromArgMatches, Parser, builder::FalseyValueParser};
 use ethrex_common::Address;
@@ -17,6 +20,14 @@ use crate::{MAX_PRICE_DECIMALS, config, venue};
 /// the default again: a config with no `registry` line falls back to this constant, so a
 /// wrong value here is a pusher that pushes to the wrong contract without saying so.
 const MAINNET_REGISTRY: &str = "0xDa7AfEeD021EAFC1c1Af9C362dE477DaD0396B81";
+
+/// The backoffice's address when a flag or `[settings] backoffice_addr` names only its port:
+/// this host alone, which is never the wrong place to have bound an API with no login.
+const DEFAULT_BACKOFFICE_IP: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+/// The backoffice's port when a flag names only its address: the one every doc and the
+/// compose file use.
+const DEFAULT_BACKOFFICE_PORT: u16 = 8088;
 
 /// Variables that used to configure the single-builder mode. Kept only to refuse them.
 const REMOVED_VARS: [&str; 2] = ["TITAN_WS", "TITAN_API_KEY"];
@@ -170,6 +181,32 @@ pub(crate) struct Flags {
     #[arg(long, env = "METRICS_ADDR")]
     pub(crate) metrics_addr: Option<SocketAddr>,
 
+    /// Serve the backoffice API on this address: this host's tailnet address, say
+    /// (100.64.1.2). The address half of [settings] backoffice_addr, which this overrides;
+    /// with only --backoffice-port given, 127.0.0.1. Either flag alone turns the backoffice
+    /// on. An unspecified address (0.0.0.0, ::) is refused: the API has no login, and that
+    /// would bind every interface. Builder mode only
+    #[arg(long, env = "BACKOFFICE_IP")]
+    pub(crate) backoffice_ip: Option<IpAddr>,
+
+    /// Serve the backoffice API on this port. The port half of [settings] backoffice_addr,
+    /// which this overrides; with only --backoffice-ip given, 8088
+    #[arg(long, env = "BACKOFFICE_PORT")]
+    pub(crate) backoffice_port: Option<u16>,
+
+    /// Let a browser page served from this origin (scheme://host[:port], e.g.
+    /// http://100.64.1.2:3000) call the backoffice API: it is answered with CORS headers
+    /// and its changes are taken. Repeat the flag, or comma-separate the variable, for more
+    /// than one. `*` is refused: the API has no login, so any site an operator's browser
+    /// visits could then drive it. Without this only a page served under the API's own
+    /// address, or a client that is not a browser, can make a change
+    #[arg(
+        long = "backoffice-cors-origin",
+        env = "BACKOFFICE_CORS_ORIGINS",
+        value_delimiter = ','
+    )]
+    pub(crate) backoffice_cors_origins: Vec<String>,
+
     /// Keep builder quote updates in the region they were submitted to
     #[arg(long, env = "DISABLE_CROSS_REGION", value_parser = FalseyValueParser::new())]
     pub(crate) disable_cross_region: bool,
@@ -182,6 +219,21 @@ pub(crate) struct Flags {
     /// it, so it belongs in `.env` beside the updater keys. See record.rs.
     #[arg(long, env = "RECORD_DB_URL")]
     pub(crate) record_db_url: Option<String>,
+}
+
+impl Flags {
+    /// Where the backoffice is served, once [`apply_file_settings`] has filled in what the
+    /// command line left to `[settings] backoffice_addr`: `None` when nothing asks for one,
+    /// and a missing half defaulted when only the other was given.
+    pub(crate) fn backoffice_addr(&self) -> Option<SocketAddr> {
+        match (self.backoffice_ip, self.backoffice_port) {
+            (None, None) => None,
+            (ip, port) => Some(SocketAddr::new(
+                ip.unwrap_or(DEFAULT_BACKOFFICE_IP),
+                port.unwrap_or(DEFAULT_BACKOFFICE_PORT),
+            )),
+        }
+    }
 }
 
 /// The argument ids a parse took from the command line or the environment.
@@ -423,6 +475,19 @@ pub(crate) fn apply_file_settings(
     {
         args.flags.disable_cross_region = disable;
     }
+    // Each half on its own, so `--backoffice-port` moves the port of an address the file
+    // gives and keeps its IP.
+    if let Some(addr) = &settings.backoffice_addr {
+        let addr: SocketAddr = addr
+            .parse()
+            .wrap_err_with(|| format!("[settings] backoffice_addr {addr:?} is not host:port"))?;
+        if !given("backoffice_ip") {
+            args.flags.backoffice_ip = Some(addr.ip());
+        }
+        if !given("backoffice_port") {
+            args.flags.backoffice_port = Some(addr.port());
+        }
+    }
     Ok(())
 }
 
@@ -458,14 +523,15 @@ pub(crate) fn removed_vars_error(present: &[&str]) -> String {
 /// every change failed, so it is refused at startup rather than bound and left inert.
 pub(crate) fn refuse_backoffice_in_node_mode(
     mode: Mode,
-    backoffice_addr: Option<&str>,
+    backoffice_addr: Option<SocketAddr>,
 ) -> Result<()> {
     ensure!(
         mode != Mode::Node || backoffice_addr.is_none(),
-        "[settings] backoffice_addr is set, but --mode node has no config reload for it to \
-         drive: the convergence it would trigger belongs to builder mode, which node mode \
-         does not run. Drop the setting, or use --mode builder (see the mock-builder recipe \
-         in the README for a local run)."
+        "a backoffice is configured (--backoffice-ip, --backoffice-port or [settings] \
+         backoffice_addr), but --mode node has no config reload for it to drive: the \
+         convergence it would trigger belongs to builder mode, which node mode does not run. \
+         Drop it, or use --mode builder (see the mock-builder recipe in the README for a \
+         local run)."
     );
     Ok(())
 }
@@ -663,6 +729,14 @@ mod tests {
                 },
                 "price_decimals",
             ),
+            (
+                "backoffice_addr",
+                config::FileSettings {
+                    backoffice_addr: Some("tailnet:8088".to_owned()),
+                    ..Default::default()
+                },
+                "backoffice_addr",
+            ),
         ];
         for (case, settings, expected) in cases {
             let mut args = defaulted_args();
@@ -674,17 +748,85 @@ mod tests {
         }
     }
 
+    /// The backoffice's address, a half at a time: the file's `backoffice_addr` fills in
+    /// whichever of `--backoffice-ip` and `--backoffice-port` the command line left alone,
+    /// and a half nothing gives is defaulted when the other is given.
+    #[test]
+    fn the_backoffice_address_is_resolved_a_half_at_a_time() {
+        let addr = |argv: &[&str], file: Option<&str>| {
+            let mut full = vec!["quote-updater", "--config", "config.toml"];
+            full.extend_from_slice(argv);
+            let mut args = Args::try_parse_from(full).unwrap();
+            let settings = config::FileSettings {
+                backoffice_addr: file.map(str::to_owned),
+                ..Default::default()
+            };
+            let given = args.given.clone();
+            apply_file_settings(&mut args, &|id| given.contains(id), &settings).unwrap();
+            args.flags.backoffice_addr().map(|addr| addr.to_string())
+        };
+        assert_eq!(addr(&[], None), None, "nothing asks for one");
+        assert_eq!(
+            addr(&[], Some("100.64.1.2:8088")).as_deref(),
+            Some("100.64.1.2:8088")
+        );
+        assert_eq!(
+            addr(&["--backoffice-port", "9000"], Some("100.64.1.2:8088")).as_deref(),
+            Some("100.64.1.2:9000"),
+            "the flag moves the port and keeps the file's address"
+        );
+        assert_eq!(
+            addr(&["--backoffice-ip", "100.64.9.9"], Some("100.64.1.2:8088")).as_deref(),
+            Some("100.64.9.9:8088")
+        );
+        assert_eq!(
+            addr(&["--backoffice-port", "9000"], None).as_deref(),
+            Some("127.0.0.1:9000"),
+            "a port alone is this host alone"
+        );
+        assert_eq!(
+            addr(&["--backoffice-ip", "100.64.9.9"], None).as_deref(),
+            Some("100.64.9.9:8088")
+        );
+        assert_eq!(
+            addr(&["--backoffice-ip", "::1", "--backoffice-port", "0"], None).as_deref(),
+            Some("[::1]:0")
+        );
+    }
+
+    /// The CORS origins: the flag repeated, or one value split on commas, which is how the
+    /// variable lists more than one.
+    #[test]
+    fn cors_origins_are_repeated_or_comma_separated() {
+        let args = Args::try_parse_from([
+            "quote-updater",
+            "--config",
+            "config.toml",
+            "--backoffice-cors-origin",
+            "http://a.example,http://b.example",
+            "--backoffice-cors-origin",
+            "http://c.example",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.flags.backoffice_cors_origins,
+            ["http://a.example", "http://b.example", "http://c.example"]
+        );
+        assert!(defaulted_args().flags.backoffice_cors_origins.is_empty());
+    }
+
     /// A backoffice bound in a mode with no reload would serve an API whose every change
     /// failed. Refused at startup rather than discovered at the moment it was needed.
     #[test]
     fn a_backoffice_in_node_mode_is_refused() {
+        let addr: SocketAddr = "100.64.1.2:8088".parse().unwrap();
         refuse_backoffice_in_node_mode(Mode::Node, None).expect("node mode without one is fine");
-        refuse_backoffice_in_node_mode(Mode::Builder, Some("100.64.1.2:8088"))
+        refuse_backoffice_in_node_mode(Mode::Builder, Some(addr))
             .expect("builder mode is what it is for");
 
         let err = format!(
             "{:#}",
-            refuse_backoffice_in_node_mode(Mode::Node, Some("100.64.1.2:8088")).unwrap_err()
+            refuse_backoffice_in_node_mode(Mode::Node, Some(addr)).unwrap_err()
         );
         assert!(err.contains("backoffice_addr"), "{err}");
         assert!(err.contains("--mode builder"), "{err}");
