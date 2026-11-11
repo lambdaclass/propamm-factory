@@ -1582,9 +1582,8 @@ async fn drive(
         // "block N passed" for a block that has not, and book a spurious miss.
         if halted {
             tracing::warn!(
-                "[{label}] halted; this pair will not quote again until you reload ({}) once \
-                 the feed is trusted",
-                crate::hints::reload()
+                "[{label}] halted; this pair will not quote again until a reload re-arms it \
+                 once the feed is trusted (the halt notice says how this run reloads)"
             );
             return Ok(Ended::Halted);
         }

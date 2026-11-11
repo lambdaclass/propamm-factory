@@ -46,10 +46,11 @@ use crate::{
 /// guard reading a [`super::guard::SourceSample`]'s own `mid` and `delta`.
 pub use crate::feed::scaled_to_f64;
 
-/// One input of a pricing kind on the backoffice's pair form: the stanza key it writes, the
-/// placeholder the empty input shows, and the hint under it. A kind that declares its fields
-/// ([`Factory::fields`]) is editable from the page; one that declares none is edited in the
-/// config file, and the page says so.
+/// One input of a pricing kind on a pair form: the stanza key it writes, the placeholder the
+/// empty input shows, and the hint under it. The backoffice API lists every registered
+/// kind's fields (`GET /api/kinds`) for whatever front end draws that form. A kind that
+/// declares its fields ([`Factory::fields`]) can be edited from such a form; one that
+/// declares none has a stanza only written whole, as the config file holds it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FormField {
     /// The stanza key the input writes, e.g. `half_spread`.
@@ -59,7 +60,7 @@ pub struct FormField {
     /// One or two sentences under the input: what the key means and what blank means.
     pub hint: &'static str,
     /// Written into the stanza as a TOML number rather than a string, for a config type
-    /// with `f64`/`u64` fields; the page refuses a value that is not one.
+    /// with `f64`/`u64` fields: a form sends it as a JSON number.
     pub number: bool,
 }
 
@@ -159,21 +160,22 @@ pub trait Factory: Send + Sync + 'static {
         Ok(())
     }
 
-    /// The stanza's keys as inputs on the backoffice's pair form, in the order shown. The
-    /// page posts each as text and writes it into the stanza as a string, so a kind that
-    /// declares fields reads its config as strings (the kinds this crate ships do). Empty, the default,
-    /// means the stanza is edited in the file and the page says so.
+    /// The stanza's keys as inputs on a pair form, in the order shown, as the backoffice API
+    /// lists them (`GET /api/kinds`). A field is written into the stanza as a string unless
+    /// it is a [`FormField::number`], so a kind that declares fields reads its config as
+    /// strings (the kinds this crate ships do). Empty, the default, means the stanza is
+    /// only written whole.
     fn fields(&self) -> &'static [FormField] {
         &[]
     }
 
-    /// HTML the pair form shows above this kind's fields: what the model does and how to
-    /// tune it. Empty by default.
+    /// HTML a pair form shows above this kind's fields: what the model does and how to tune
+    /// it. Listed by `GET /api/kinds` as `help_html`. Empty by default.
     fn form_help(&self) -> &'static str {
         ""
     }
 
-    /// One line describing a stanza for the `--check` report and the backoffice's pair
+    /// One line describing a stanza for the `--check` report and the backoffice API's pair
     /// list, e.g. `mid 1.0001 delta 0.0002`. Empty by default, which shows the kind alone.
     fn summary(&self, _cfg: &Self::Config) -> String {
         String::new()

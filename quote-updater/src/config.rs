@@ -30,9 +30,10 @@ const MAX_INVERTED_PRICE_DECIMALS: u32 = 38;
 /// otherwise arm a guard measuring over days and looking like it measured over hours.
 pub const MAX_BREAKER_WINDOW_BLOCKS: u64 = 7200;
 
-/// The config file as written on disk. `Serialize` too, because the backoffice edits it by
-/// reading it into this and writing it back: one type for both directions, so a field the
-/// writer forgot fails to compile rather than vanishing from someone's config.
+/// The config file as written on disk, and the pusher's configuration while it runs (see
+/// `state.rs`). `Serialize` too, because every change is written back to the file from
+/// this: one type for both directions, so a field the writer forgot fails to compile
+/// rather than vanishing from someone's config.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawConfig {
@@ -92,66 +93,31 @@ impl FileSettings {
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
     }
-
-    /// The keys that differ, so a refused reload can name the one that changed.
-    pub fn changed_keys(&self, other: &Self) -> Vec<&'static str> {
-        let mut changed = Vec::new();
-        let mut check = |name, differs| {
-            if differs {
-                changed.push(name);
-            }
-        };
-        check("mode", self.mode != other.mode);
-        check("rpc_url", self.rpc_url != other.rpc_url);
-        check("rpc_ws_url", self.rpc_ws_url != other.rpc_ws_url);
-        check("registry", self.registry != other.registry);
-        check(
-            "price_decimals",
-            self.price_decimals != other.price_decimals,
-        );
-        check("binance_ws", self.binance_ws != other.binance_ws);
-        check("endpoints", self.endpoints != other.endpoints);
-        check("interval", self.interval != other.interval);
-        check("requote_ms", self.requote_ms != other.requote_ms);
-        check("metrics_addr", self.metrics_addr != other.metrics_addr);
-        check(
-            "disable_cross_region",
-            self.disable_cross_region != other.disable_cross_region,
-        );
-        check(
-            "backoffice_addr",
-            self.backoffice_addr != other.backoffice_addr,
-        );
-        changed
-    }
 }
 
 /// A serde round-trip cannot keep comments, so a rewritten file says where they went.
-fn written_header() -> String {
-    format!(
-        "\
-# The pusher's configuration. Rewritten in full whenever the backoffice changes it, which
-# is why it carries no comments: see quote-updater/config.example.toml for what every key
-# means. Editing it by hand is fine ({} applies the
-# [[pairs]]), but the next backoffice write reformats whatever you leave here.
+const WRITTEN_HEADER: &str = "\
+# The pusher's configuration. Read once, when the pusher starts; after that its pairs and
+# builders are changed through the backoffice API, which rewrites this file in full on every
+# change. That is why it carries no comments: see quote-updater/config.example.toml for what
+# every key means. A hand edit here takes effect at the next start. Until then, a change made
+# through the API keeps `target` and the settings table as you left them, but rewrites the
+# pairs and builders from what is running.
 #
 # It holds the builder API keys, so it stays mode 0600.
-",
-        crate::hints::reload_in_prose()
-    )
-}
+";
 
 /// Reads the file exactly as written, for a caller that is about to change one entry.
 pub fn load_raw(path: &Path) -> Result<RawConfig> {
     let text = std::fs::read_to_string(path)
         .wrap_err_with(|| format!("failed to read config {}", path.display()))?;
-    toml::from_str(&text).wrap_err_with(|| format!("invalid config {}", path.display()))
+    parse_raw(&text).wrap_err_with(|| format!("invalid config {}", path.display()))
 }
 
 /// Renders a config back to TOML, header and all.
 pub fn render_raw(config: &RawConfig) -> Result<String> {
     let body = toml::to_string_pretty(config).wrap_err("failed to render the config as TOML")?;
-    Ok(format!("{}\n{body}", written_header()))
+    Ok(format!("{WRITTEN_HEADER}\n{body}"))
 }
 
 /// Write-then-rename into the same directory, so a reload racing this sees the whole old
@@ -217,14 +183,6 @@ pub fn parse_file_settings(toml_text: &str) -> Result<FileSettings> {
     Ok(probe.settings)
 }
 
-/// Same, from a path, so a caller reading the file for its settings reports a missing or
-/// unreadable file the way `load_config` does.
-pub fn load_file_settings(path: &Path) -> Result<FileSettings> {
-    let text = std::fs::read_to_string(path)
-        .wrap_err_with(|| format!("failed to read config {}", path.display()))?;
-    parse_file_settings(&text).wrap_err_with(|| format!("invalid config {}", path.display()))
-}
-
 /// One `[[pairs]]` stanza, as written. See `RawConfig` for why this is serializable.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -264,11 +222,11 @@ pub struct RawPair {
     /// cleared. Parsed and validated like any other pair, so resuming one cannot surprise.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub halted: bool,
-    /// Why, when a binary's `UpdaterHandle::halt` set the flag: the backoffice shows it and
-    /// the reload logs it when it stops the lane. Cleared with the flag by a resume. The
-    /// quoting never acts on it; the backoffice does, once: its "Restart halted pairs"
-    /// leaves a halt with a reason for that pair's own Resume, so a kill switch outlives
-    /// the button. One written by hand beside `halted = true` makes that halt as sticky.
+    /// Why, when a binary's `UpdaterHandle::halt` set the flag: the backoffice API shows it
+    /// and the reload logs it when it stops the lane. Cleared with the flag by a resume. The
+    /// quoting never acts on it; the backoffice does, once: its `POST /api/reload` leaves a
+    /// halt with a reason for that pair's own resume, so a kill switch outlives the bulk
+    /// restart. One written by hand beside `halted = true` makes that halt as sticky.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub halt_reason: Option<String>,
     /// The pair's pricing stanza: `kind` names a pricing kind the binary registered
@@ -938,15 +896,9 @@ pub fn parse_address(s: &str) -> Result<Address> {
     s.parse().map_err(|e| eyre!("invalid address {s:?}: {e:?}"))
 }
 
-pub fn load_config(path: &Path, price_decimals: u32, allow_no_pairs: bool) -> Result<Config> {
-    let text = std::fs::read_to_string(path)
-        .wrap_err_with(|| format!("failed to read config {}", path.display()))?;
-    parse_config_with(&text, price_decimals, allow_no_pairs)
-        .wrap_err_with(|| format!("invalid config {}", path.display()))
-}
-
 /// The strict parse: a config with no pairs is a mistake. Used by the tests, which are
-/// where every parse rule is pinned down; the binary goes through `load_config`.
+/// where every parse rule is pinned down; the binary reads the file once with `load_raw`
+/// and goes through `config_from_raw`.
 #[cfg(test)]
 pub fn parse_config(toml_text: &str, price_decimals: u32) -> Result<Config> {
     parse_config_with(toml_text, price_decimals, false)
@@ -974,15 +926,11 @@ fn parse_pricing(stanza: &toml::Table, at: &str) -> Result<PricingSpec> {
     })
 }
 
-/// `allow_no_pairs` is for a server whose pairs are going to arrive through the
-/// backoffice. Otherwise an empty `[[pairs]]` is a config that failed to say what it
-/// meant, and is refused.
-pub fn parse_config_with(
-    toml_text: &str,
-    price_decimals: u32,
-    allow_no_pairs: bool,
-) -> Result<Config> {
-    let raw: RawConfig = toml::from_str(toml_text).map_err(|err| {
+/// The TOML text as a [`RawConfig`], every key checked for spelling but no value for
+/// sense. Says where a pricing key that moved into `[pairs.pricing]` went, since serde's
+/// "unknown field" names the key and nothing else.
+pub fn parse_raw(toml_text: &str) -> Result<RawConfig> {
+    toml::from_str(toml_text).map_err(|err| {
         // The pricing keys that used to sit on the pair itself now live in its
         // `[pairs.pricing]` stanza; say so, since serde's "unknown field" names the key
         // and nothing else.
@@ -1015,7 +963,30 @@ pub fn parse_config_with(
             ""
         };
         eyre!("could not parse TOML: {text}{hint}")
-    })?;
+    })
+}
+
+/// [`parse_raw`] and then [`config_from_raw`], for the tests.
+#[cfg(test)]
+pub fn parse_config_with(
+    toml_text: &str,
+    price_decimals: u32,
+    allow_no_pairs: bool,
+) -> Result<Config> {
+    config_from_raw(parse_raw(toml_text)?, price_decimals, allow_no_pairs)
+}
+
+/// Every rule a config is held to, applied to one already read: the file at boot, and each
+/// change the backoffice API or an `UpdaterHandle` makes to the shared config after that.
+///
+/// `allow_no_pairs` is for a server whose pairs are going to arrive through the
+/// backoffice. Otherwise an empty `[[pairs]]` is a config that failed to say what it
+/// meant, and is refused.
+pub fn config_from_raw(
+    raw: RawConfig,
+    price_decimals: u32,
+    allow_no_pairs: bool,
+) -> Result<Config> {
     ensure!(
         allow_no_pairs || !raw.pairs.is_empty(),
         "no pairs configured; at least one is required"
@@ -1905,17 +1876,11 @@ sources = [{ venue = "binance", symbol = "ETHUSDC" }]"#,
     }
 
     #[test]
-    fn the_endpoints_table_is_a_setting_a_reload_refuses_to_change() {
+    fn the_endpoints_table_round_trips_as_a_sub_table() {
         let a = FileSettings {
             endpoints: [("binance".to_owned(), "wss://a".to_owned())].into(),
             ..FileSettings::default()
         };
-        let b = FileSettings {
-            endpoints: [("binance".to_owned(), "wss://b".to_owned())].into(),
-            ..FileSettings::default()
-        };
-        assert_eq!(a.changed_keys(&b), ["endpoints"]);
-        assert!(a.changed_keys(&a.clone()).is_empty());
         // Round trip through TOML as a sub-table.
         let text = toml::to_string(&a).unwrap();
         assert!(text.contains("[endpoints]"), "{text}");
@@ -2234,29 +2199,6 @@ disable_cross_region = false
     fn a_config_with_no_builders_parses() {
         let config = parse_config(&three_pair_toml(), 18).unwrap();
         assert!(config.builders.is_empty());
-    }
-
-    /// The reload path refuses a changed setting by naming the key. That message is only
-    /// as good as this diff.
-    #[test]
-    fn changed_keys_names_every_setting_that_moved() {
-        let running = FileSettings {
-            requote_ms: Some(50),
-            rpc_url: Some("https://a.example".to_owned()),
-            ..Default::default()
-        };
-        assert!(running.changed_keys(&running).is_empty());
-
-        let desired = FileSettings {
-            requote_ms: Some(25),
-            rpc_url: Some("https://b.example".to_owned()),
-            metrics_addr: Some("127.0.0.1:9464".to_owned()),
-            ..Default::default()
-        };
-        assert_eq!(
-            running.changed_keys(&desired),
-            vec!["rpc_url", "requote_ms", "metrics_addr"]
-        );
     }
 
     /// Each rejection is a config mistake that would otherwise publish wrong prices or
@@ -2781,7 +2723,7 @@ disable_cross_region = false
     }
 
     /// The backoffice's serde round-trip keeps a stanza it cannot interpret, so an operator
-    /// editing an unrelated field through the page does not lose a guard.
+    /// editing an unrelated field through the API does not lose a guard.
     #[test]
     fn the_backoffice_round_trip_keeps_a_guards_stanza() {
         let text = with_guards("[[pairs.guards]]\nkind = \"dispersion\"\nmax_spread = \"0.003\"\n");

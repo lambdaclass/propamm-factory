@@ -1,6 +1,7 @@
-//! Startup: read the config, build the client and the metrics, run preflight, then either
-//! the builder-mode `Service` with its reload loop or the node-mode ticker. This is the
-//! composition root today and becomes the `Pusher` builder when the extension API lands.
+//! Startup: read the config file into the shared config (`state.rs`), build the client and
+//! the metrics, run preflight, then either the builder-mode `Service` with its reload loop
+//! or the node-mode ticker. This is the composition root today and becomes the `Pusher`
+//! builder when the extension API lands.
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
@@ -22,7 +23,8 @@ use crate::{
     node::push_update,
     pair::{Live, SendOpts, all_or_none, build_live, collect_prices, colliding_label},
     preflight, record,
-    service::{Service, finish_recording, install_hangup, record_config},
+    service::{Service, finish_recording, record_config},
+    state::SharedConfig,
     supervisor,
     tasks::Tasks,
     updater::{Outcome, Parts},
@@ -44,6 +46,43 @@ fn refuse_panic_abort(aborts: bool) -> Result<()> {
          panic = \"unwind\" (see the release profile in this repository's Cargo.toml)"
     );
     Ok(())
+}
+
+/// SIGHUP used to re-read the config file. Nothing does now: the config is read once, at
+/// start, and changed through the shared config (`state.rs`). The signal's default
+/// disposition is still to terminate, though, so one sent out of habit, or by a unit that
+/// still declares `ExecReload`, would end the pusher without withdrawing a single quote.
+/// So it is held for the whole run and answered with a line saying where changes go.
+fn ignore_hangup(tasks: &mut Tasks, config: &std::path::Path) {
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+        Ok(mut stream) => {
+            let config = config.display().to_string();
+            tasks.spawn(async move {
+                while stream.recv().await.is_some() {
+                    tracing::warn!(
+                        "SIGHUP ignored: {config} is read once, at start; change the pairs and \
+                         builders through the backoffice API, and reload with POST /api/reload"
+                    );
+                }
+            });
+        }
+        Err(err) => tracing::warn!(
+            "could not listen for SIGHUP ({err}); one sent to this process will terminate it \
+             without withdrawing its quotes"
+        ),
+    }
+}
+
+/// How the halt notice tells an operator to reload: the one thing that re-arms a lane its
+/// breaker halted without restarting the others.
+fn reload_hint(backoffice: Option<&str>, handle: bool) -> String {
+    match (backoffice, handle) {
+        (Some(addr), _) => format!("POST http://{addr}/api/reload"),
+        (None, true) => "UpdaterHandle::reload".to_owned(),
+        (None, false) => "this run has no backoffice to reload through; set [settings] \
+                          backoffice_addr, which takes a restart"
+            .to_owned(),
+    }
 }
 
 /// `--check`'s verdict: it passes only when the chain report, every pair's price preview
@@ -116,12 +155,7 @@ async fn run_inner(
         // Consumed by `run_from_env` before the run; a run inside a binary's own runtime
         // has that binary's subscriber.
         log_targets: _,
-        unit,
     } = parts;
-    // Before anything prints a hint: the unit is a fact about the process (see hints.rs).
-    if let Some(unit) = unit {
-        crate::hints::set_unit(unit);
-    }
     let kinds = Arc::new(kinds);
     let key_lookup = key_lookup.unwrap_or_else(|| Arc::new(config::env_lookup));
     // Every long-lived task below is spawned through this, so none outlives `run`, on any
@@ -132,13 +166,39 @@ async fn run_inner(
     let removed = removed_vars_present();
     ensure!(removed.is_empty(), "{}", removed_vars_error(&removed));
 
-    // Before every check below: each reads a setting the file may supply.
-    let file_settings = config::load_file_settings(&args.flags.config)?;
+    // The one time the config is read from the file. From here on the run's configuration is
+    // the shared config built from it, which the backoffice API and an `UpdaterHandle`
+    // change and the service converges onto; a change writes the file, keeping only its
+    // `target` and `[settings]`, and never reads its pairs back (see state.rs). Before every
+    // check below: each reads a setting the file may supply.
+    let raw = config::load_raw(&args.flags.config)?;
+    let file_settings = raw.settings.clone();
     let given = args.given.clone();
     apply_file_settings(&mut args, &|id| given.contains(id), &file_settings)?;
+
+    // The reloads that wait for a verdict: the backoffice's, and an `UpdaterHandle`'s when
+    // the run was `start`ed, which then supplies the channel so both share one. Bounded at
+    // one in flight: the asker waits for its answer, so a second click is better made to
+    // wait than buffered into a convergence nobody asked for. Read by every mode: a request
+    // nobody answers would hang its sender.
+    let (reloads, mut reload_requests, settled) = match control {
+        Some(crate::updater::Control {
+            reloads,
+            requests,
+            settled,
+        }) => (reloads, requests, Some(settled)),
+        None => {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            (tx, rx, None)
+        }
+    };
+    let shared = Arc::new(SharedConfig::new(args.flags.config.clone(), raw, reloads));
     // The handle's halt and resume are refused in node mode, which only now is known.
-    if let Some(control) = &control {
-        control.mode.send_replace(Some(args.flags.mode));
+    if let Some(settled) = &settled {
+        settled.send_replace(Some(crate::updater::Settled {
+            mode: args.flags.mode,
+            config: Arc::clone(&shared),
+        }));
     }
 
     ensure!(
@@ -165,13 +225,14 @@ async fn run_inner(
     // written for — whoever has no builders configured would first have to get an RPC up,
     // the registry deployed and the updaters authorized to be told so.
     // With a backoffice an empty config is a fresh server about to be configured through
-    // the page. Without one it is the mistake it has always been.
+    // its API. Without one it is the mistake it has always been.
     let backoffice_bound = file_settings.backoffice_addr.is_some() && !args.flags.once;
-    let config = config::load_config(
-        &args.flags.config,
+    let config = config::config_from_raw(
+        crate::config::RawConfig::clone(&shared.snapshot()),
         args.flags.price_decimals,
         backoffice_bound,
-    )?;
+    )
+    .wrap_err_with(|| format!("invalid config {}", args.flags.config.display()))?;
     // Every stanza names a registered kind and fits its config: checked with the file, before
     // anything connects.
     kinds.check(&config)?;
@@ -388,7 +449,7 @@ async fn run_inner(
         .as_ref()
         .filter(|_| !args.flags.once)
         .map(|_| record::Recorder::new());
-    record_config(recorder.as_ref(), &args.flags.config, "startup");
+    record_config(recorder.as_ref(), &shared.snapshot(), "startup");
 
     let opts = SendOpts {
         registry: args.flags.registry,
@@ -494,27 +555,8 @@ async fn run_inner(
         _ => None,
     };
 
-    // Installed here, above the mode branch, and held for the whole run. See
-    // `install_hangup`: not installing it is not the same as ignoring the signal.
-    let mut reloads = install_hangup(&args.flags.config);
-
-    // The reloads that wait for a verdict: the backoffice's, and an `UpdaterHandle`'s when
-    // the run was `start`ed, which then supplies the channel so both share one. Bounded at
-    // one in flight: the page (or the caller) waits for its answer, so a second click is
-    // better made to wait than buffered into a convergence nobody asked for. Above the mode
-    // branch so every mode reads it: a request nobody answers would hang its sender.
-    let (backoffice_tx, mut backoffice_reloads, edits) = match control {
-        Some(crate::updater::Control {
-            reloads,
-            requests,
-            edits,
-            mode: _,
-        }) => (reloads, requests, edits),
-        None => {
-            let (tx, rx) = tokio::sync::mpsc::channel(1);
-            (tx, rx, Arc::new(tokio::sync::Mutex::new(())))
-        }
-    };
+    // Above the mode branch, and held for the whole run. See `ignore_hangup`.
+    ignore_hangup(&mut tasks, &args.flags.config);
 
     // Builder mode: one supervised task per pair, each fanning its signed update out to
     // every configured builder (see quoting.rs).
@@ -539,6 +581,7 @@ async fn run_inner(
             } else {
                 None
             };
+            let reload_hint = reload_hint(backoffice_addr.as_deref(), settled.is_some());
             tasks.spawn(async move {
                 let mut last_notice: Option<tokio::time::Instant> = None;
                 loop {
@@ -554,7 +597,7 @@ async fn run_inner(
                                     health.census(),
                                     backoffice_addr.as_deref(),
                                     &health.trips(),
-                                    &crate::hints::reload()
+                                    &reload_hint
                                 )
                             );
                         }
@@ -595,14 +638,12 @@ async fn run_inner(
             builders_path,
             builders_from_config: args.flags.builders.is_none(),
             backoffice_bound,
-            file_settings: file_settings.clone(),
             head,
             metrics: metrics.clone(),
             health: health.clone(),
             reload_metrics: metrics.register_reload()?,
             endpoints: endpoints.clone(),
             price_decimals: args.flags.price_decimals,
-            config_path: args.flags.config.clone(),
             registry: args.flags.registry,
             histories,
             readers,
@@ -623,22 +664,6 @@ async fn run_inner(
             service.spawn(built, spec, done.clone());
         }
 
-        // SIGHUP, the signal whose meaning is "re-read your config file" — which since
-        // `pairs.toml` is the desired state is the whole of this service's control surface.
-        // No socket, no port, nothing to authenticate: `systemctl --user reload` and
-        // `kill -HUP` both reach it, and the file's own permissions are the only access
-        // control there is, exactly as for the keys beside it.
-        //
-        // This is the only mode with a supervised pair set to converge, so it is the only
-        // one that reads the stream `install_hangup` opened above.
-        if reloads.is_some() && !args.flags.once {
-            tracing::info!(
-                "reload {} with {}; check it first with --check",
-                args.flags.config.display(),
-                crate::hints::reload_command()
-            );
-        }
-
         // Not under `--once`: there is nothing to converge, and binding a port from a batch
         // run is a surprise.
         let _backoffice = match file_settings.backoffice_addr.as_deref() {
@@ -648,15 +673,13 @@ async fn run_inner(
                 })?;
                 let (local, task) = backoffice::bind(
                     addr,
-                    args.flags.config.clone(),
-                    backoffice_tx.clone(),
+                    Arc::clone(&shared),
                     client.clone(),
                     pair_states.clone(),
-                    edits.clone(),
                     Arc::clone(&kinds),
                 )
                 .await?;
-                tracing::info!("backoffice listening on http://{local}/");
+                tracing::info!("backoffice API listening on http://{local}/api/");
                 tasks.adopt(&task);
                 Some(task)
             }
@@ -682,34 +705,17 @@ async fn run_inner(
                         break;
                     }
                 }
-                Some(_) = async { match reloads.as_mut() {
-                    Some(stream) => stream.recv().await,
-                    // Never fires. `select!` still polls this arm, so it must be a future
-                    // that does not resolve rather than one that resolves to None, which
-                    // would spin the loop.
-                    None => std::future::pending().await,
-                } } => {
-                    if args.flags.once {
-                        // `--once` is a batch invocation: the pairs publish once and the run
-                        // ends. There is no desired state to converge onto and nothing that
-                        // would still be running to converge, so the signal is acknowledged
-                        // and dropped rather than silently ignored — see the handler above
-                        // for why it is installed at all.
-                        tracing::warn!("SIGHUP ignored: --once has no running pair set to reload");
-                        continue;
-                    }
-                    let _ = service.reload_and_report(&done, &args.flags.config).await;
-                }
-                // The backoffice or the handle, which unlike SIGHUP wait for the verdict:
-                // a rejection means putting the operator's file back.
-                Some(request) = backoffice_reloads.recv() => {
+                // The backoffice or the handle, through the shared config, which waits for
+                // the verdict to keep or drop the change it carries.
+                Some(request) = reload_requests.recv() => {
                     let outcome = if args.flags.once {
-                        // As for SIGHUP above: a batch run has no pair set to converge.
+                        // `--once` is a batch invocation: the pairs publish once and the run
+                        // ends, so there is nothing still running to converge.
                         Err(crate::service::ReloadFailure::Rejected(
                             "--once has no running pair set to reload".to_owned(),
                         ))
                     } else {
-                        service.reload_and_report(&done, &args.flags.config).await
+                        service.reload_and_report(&done, &request.config).await
                     };
                     let _ = request.reply.send(outcome);
                 }
@@ -802,27 +808,14 @@ async fn run_inner(
                 finish_recording(recording).await;
                 return Ok(Outcome::Success);
             }
-            // Node mode runs no supervised pair set, so there is nothing for a reload to
-            // converge — but the signal must still be handled rather than left to its
-            // default disposition, which is to kill this process. See `install_hangup`.
-            Some(_) = async { match reloads.as_mut() {
-                Some(stream) => stream.recv().await,
-                None => std::future::pending().await,
-            } } => {
-                tracing::warn!(
-                    "SIGHUP ignored: --mode node has no supervised pair set to reload, so \
-                     changing {} needs a restart",
-                    args.flags.config.display()
-                );
-            }
             // The handle's reload, answered rather than left waiting: the backoffice is
             // refused in this mode, so only a `start`ed run can ask.
-            Some(request) = backoffice_reloads.recv() => {
-                let _ = request.reply.send(Err(crate::service::ReloadFailure::Rejected(format!(
-                    "--mode node has no supervised pair set to reload, so changing {} needs \
-                     a restart",
-                    args.flags.config.display()
-                ))));
+            Some(request) = reload_requests.recv() => {
+                let _ = request.reply.send(Err(crate::service::ReloadFailure::Rejected(
+                    "--mode node has no supervised pair set to reload; it runs the config \
+                     it started with"
+                        .to_owned(),
+                )));
             }
             _ = ticker.tick() => {
                 // 0 is a multiple of everything, so the first tick prices the runway, just
@@ -1421,18 +1414,19 @@ api_key = "k"
         let ten = std::time::Duration::from_secs(10);
         assert!(fx.builder.wait_for(1, ten).await, "the lane quotes first");
 
-        let text = std::fs::read_to_string(&fx.config).unwrap().replacen(
-            "\n[[builder]]",
-            "\n[[pairs.guards]]\nkind = \"tripwire\"\nfail = true\n\n[[builder]]",
-            1,
-        );
-        std::fs::write(&fx.config, text).unwrap();
-        // Partial: the rest of the file applied and stays, so the handle answers `Ok` with
-        // the line that says which pair kept its previous config.
-        let line = tokio::time::timeout(ten, handle.reload())
-            .await
-            .expect("answered")
-            .expect("the rebuild fails, so the reload is partial, and the file stays");
+        // Partial: the rest of the change applied and stays, so the handle answers `Ok`
+        // with the line that says which pair kept its previous config.
+        let line = tokio::time::timeout(
+            ten,
+            handle.change(|config| {
+                config.pairs[0]
+                    .guards
+                    .push(toml::from_str("kind = \"tripwire\"\nfail = true").unwrap());
+            }),
+        )
+        .await
+        .expect("answered")
+        .expect("the rebuild fails, so the reload is partial, and the change stays");
         assert!(line.contains("1 failed"), "{line}");
         let quotes = fx.builder.count();
         fx.rpc.set_head(101);
@@ -1644,6 +1638,77 @@ api_key = "k"
         assert_eq!(outcome, Outcome::Success);
     }
 
+    /// The backoffice API a real run binds reaches the real service through the shared
+    /// config: a halt sent to it withdraws the lane's quote at the builder and lands in the
+    /// file, a resume brings the lane back, and the API says what the pusher is doing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_backoffice_api_halts_and_resumes_a_running_pair() {
+        use std::time::Duration;
+        let fx = Fixture::spawn("api-halt").await;
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let text = std::fs::read_to_string(&fx.config).unwrap().replacen(
+            "[settings]\n",
+            &format!("[settings]\nbackoffice_addr = \"127.0.0.1:{port}\"\n"),
+            1,
+        );
+        std::fs::write(&fx.config, text).unwrap();
+        let handle = fx.updater().start(fx.args(&[]));
+        let ten = Duration::from_secs(10);
+        assert!(fx.builder.wait_for(1, ten).await, "the lane quotes first");
+
+        let api = format!("http://127.0.0.1:{port}/api");
+        let client = reqwest::Client::new();
+        let get = |path: &str| {
+            let request = client.get(format!("{api}{path}"));
+            async move {
+                let body = request.send().await.unwrap().bytes().await.unwrap();
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+            }
+        };
+        let post = |path: &str| {
+            let request = client
+                .post(format!("{api}{path}"))
+                .header("content-type", "application/json");
+            async move {
+                let response = request.send().await.unwrap();
+                let status = response.status().as_u16();
+                let body = response.bytes().await.unwrap();
+                (
+                    status,
+                    serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                )
+            }
+        };
+        assert_eq!(get("/pairs").await[0]["status"], "live");
+
+        let (status, body) = post("/pairs/QU_TEST_KEY/halt").await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["status"], "applied", "{body}");
+        assert!(fx.wait_for_withdraw(ten).await, "the quote is withdrawn");
+        assert!(fx.raw_pair().halted, "the file carries the halt");
+        assert_eq!(get("/pairs/QU_TEST_KEY").await["status"], "halted");
+
+        let quotes = fx.builder.count();
+        let (status, body) = post("/pairs/QU_TEST_KEY/resume").await;
+        assert_eq!(status, 200, "{body}");
+        assert!(!fx.raw_pair().halted);
+        fx.rpc.set_head(101);
+        assert!(
+            fx.builder.wait_for(quotes + 1, ten).await,
+            "the lane quotes again"
+        );
+
+        handle.shutdown();
+        tokio::time::timeout(Duration::from_secs(20), handle.wait())
+            .await
+            .expect("stops within 20s")
+            .expect("runs and stops cleanly");
+    }
+
     /// A halt whose reload applies only in part, because another lane added beside it would
     /// not build, is still a halt: the reload stopped the pair, so the file keeps saying
     /// so, the answer says the change applied rather than "nothing changed", and the next
@@ -1675,26 +1740,29 @@ api_key = "k"
             .start(fx.args(&[]));
         assert!(fx.builder.wait_for(1, ten).await, "the lane quotes first");
 
-        // A lane added by hand on that kind, so its build fails at once and the reload the
-        // halt asks for applies everywhere but there.
+        // A lane added on that kind, so its build fails at once (this change applies in
+        // part) and the reload the halt asks for applies everywhere but there.
         let weth: Address = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
             .parse()
             .unwrap();
         fx.rpc.set_symbol(weth, "WETH");
-        let text = std::fs::read_to_string(&fx.config).unwrap();
         let usdc = format!("{:#x}", fx.tokens.0);
-        std::fs::write(
-            &fx.config,
-            text.replacen(
-                "[[builder]]",
-                &format!(
-                    "[[pairs]]\ntokens = [\"{weth:#x}\", \"{usdc}\"]\n\
-                     key_env = \"QU_TEST_KEY_B\"\npricing = {{ kind = \"unbuildable\" }}\n\n[[builder]]"
-                ),
-                1,
-            ),
+        let added = tokio::time::timeout(
+            ten,
+            handle.change(|config| {
+                config.pairs.push(
+                    toml::from_str(&format!(
+                        "tokens = [\"{weth:#x}\", \"{usdc}\"]\n\
+                         key_env = \"QU_TEST_KEY_B\"\npricing = {{ kind = \"unbuildable\" }}"
+                    ))
+                    .unwrap(),
+                );
+            }),
         )
-        .unwrap();
+        .await
+        .expect("answered")
+        .expect("kept, though the new lane would not build");
+        assert!(added.contains("1 failed"), "{added}");
 
         let line = tokio::time::timeout(ten, handle.halt(fx.tokens, "desk"))
             .await
@@ -1708,7 +1776,8 @@ api_key = "k"
         assert!(fx.raw_pair().halted, "the file keeps the halt");
         assert!(fx.wait_for_withdraw(ten).await, "the lane was stopped");
 
-        // And stays stopped: the next reload reads `halted = true`, not a put-back file.
+        // And stays stopped: the next reload converges onto `halted = true`, the change
+        // kept rather than dropped.
         let quoted = fx.builder.received().len();
         let _ = tokio::time::timeout(ten, handle.reload())
             .await

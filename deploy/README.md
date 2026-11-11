@@ -47,7 +47,7 @@ once per distinct error while polling carries the head.
 
 | Service | Where to reach it | What it holds |
 | --- | --- | --- |
-| updater | backoffice at `BACKOFFICE_BIND:8088` | quotes; rewrites `config/config.toml` from the backoffice |
+| updater | backoffice API at `BACKOFFICE_BIND:8088/api/` | quotes; rewrites `config/config.toml` on every change made through the backoffice |
 | grafana | `GRAFANA_BIND:3000`, user `admin` | the "Quote updater" dashboard; Prometheus and the recorder as datasources |
 | prometheus | `127.0.0.1:9090` | 90 days of `quote_updater_*` metrics; the rules from [`alerts/`](alerts/) |
 | alertmanager | `127.0.0.1:9093` | routes pages and tickets to `#propamm-alerts` |
@@ -63,17 +63,22 @@ reachable from the host only, or through an ssh tunnel.
 ```bash
 docker compose logs -f updater                 # the run
 docker compose run --rm updater --check        # after editing config/config.toml by hand
-docker compose kill -s HUP updater             # reload the config without a restart
+docker compose restart updater                 # then this: the file is read only at start
+curl -X POST -H 'Content-Type: application/json' http://<BACKOFFICE_BIND>:8088/api/reload   # re-arm pairs halted by their breaker
 docker compose up -d updater                   # after editing .env (keys, RPC_WS_URL); restart would not
 docker compose pull && docker compose up -d    # newer Prometheus, Alertmanager, Grafana, Postgres
 docker compose build updater && docker compose up -d updater   # a new build of the updater
 ```
 
-A reload (`SIGHUP`, or any save in the backoffice) re-reads `config.toml` and changes only
-the pairs and builders that changed; `target` and `[settings]` are read once at startup,
-and `.env` only when the container is created (`docker compose up -d`, not `restart`).
-[docs/manual.md](../docs/manual.md) covers the config file, the reload, the backoffice, the
-breaker, the metrics and the recorder.
+The updater reads `config.toml` once, at start. A change made through the backoffice API is
+written to it and touches only the pairs and builders that changed, so change those through
+the API: a hand edit of them waits for the next start, and the next change made through the
+API overwrites it. `target` and `[settings]` are not changed through the API, so they are a
+hand edit and a restart; changes made through the API in the meantime keep that edit. `.env`
+is read only when the container is created (`docker compose up -d`, not `restart`).
+The updater ignores `SIGHUP`, so `docker compose kill -s HUP` no longer reloads anything.
+[docs/manual.md](../docs/manual.md) covers the config file, the backoffice API and its
+reload, the breaker, the metrics and the recorder.
 
 ## Your own pricing models
 

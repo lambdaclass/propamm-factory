@@ -5,7 +5,7 @@
 //! process: it parses the command line, builds the runtime and turns the result into an
 //! exit code, so a binary's `main` is one line.
 
-use std::{path::PathBuf, process::ExitCode, sync::Arc};
+use std::{process::ExitCode, sync::Arc};
 
 use tokio::{
     sync::{mpsc, oneshot},
@@ -13,7 +13,11 @@ use tokio::{
 };
 
 use crate::{
-    Address, backoffice::ReloadRequest, cli::Args, config::RawPair, service::ReloadFailure,
+    Address,
+    cli::Args,
+    config::RawPair,
+    service::ReloadFailure,
+    state::{Refused, ReloadRequest, SharedConfig},
 };
 
 /// A quote updater, assembled with [`Updater::builder`].
@@ -52,8 +56,6 @@ pub(crate) struct Parts {
     /// The binary's own `tracing` targets, rendered by the operator layer `run_from_env`
     /// installs; see [`UpdaterBuilder::log_target`].
     pub(crate) log_targets: Vec<&'static str>,
-    /// The systemd unit the operator hints name; see [`UpdaterBuilder::systemd_unit`].
-    pub(crate) unit: Option<&'static str>,
 }
 
 impl Parts {
@@ -66,17 +68,24 @@ impl Parts {
     }
 }
 
-/// The reload channel a `start`ed run reads beside the backoffice's: the requests are
-/// the backoffice's own type, so the loop that answers a page's click answers the handle
-/// with the same verdict, and the backoffice, if bound, sends on `reloads` too.
+/// The reload channel a `start`ed run reads: the shared config's own, so the loop that
+/// answers the backoffice's requests answers the handle's with the same verdict.
 pub(crate) struct Control {
     pub(crate) reloads: mpsc::Sender<ReloadRequest>,
     pub(crate) requests: mpsc::Receiver<ReloadRequest>,
-    /// Serializes the handle's edits of the config file with the backoffice's.
-    pub(crate) edits: Arc<tokio::sync::Mutex<()>>,
-    /// The mode the run settled on, published once `[settings]` has been applied: the flag
-    /// alone does not say, since `[settings] mode` decides when no flag or variable did.
-    pub(crate) mode: tokio::sync::watch::Sender<Option<crate::cli::Mode>>,
+    /// What the run settled on, published once the config file is read and `[settings]`
+    /// applied. See [`Settled`].
+    pub(crate) settled: tokio::sync::watch::Sender<Option<Settled>>,
+}
+
+/// What a `start`ed run tells its handle once the config file is read.
+#[derive(Clone)]
+pub(crate) struct Settled {
+    /// The mode: the flag alone does not say, since `[settings] mode` decides when no flag
+    /// or variable did.
+    pub(crate) mode: crate::cli::Mode,
+    /// The shared config the handle's halt and resume change, the backoffice's too.
+    pub(crate) config: Arc<SharedConfig>,
 }
 
 /// How a run ended, for the caller to turn into an exit status.
@@ -109,16 +118,6 @@ impl UpdaterBuilder {
     /// this; `run_from_env` then leaves that subscriber alone.
     pub fn log_target(mut self, target: &'static str) -> Self {
         self.parts.log_targets.push(target);
-        self
-    }
-
-    /// Names the systemd user unit this binary runs as, so the operator hints the library
-    /// prints (how to reload after a halt, how to restart after a settings change) say
-    /// `systemctl --user reload <unit>` rather than `SIGHUP`. Process-wide, once: the
-    /// first run (`run`, `start` or `run_from_env`) in a process decides for any other,
-    /// and a different unit named by a later one is refused with a warning.
-    pub fn systemd_unit(mut self, unit: &'static str) -> Self {
-        self.parts.unit = Some(unit);
         self
     }
 
@@ -317,23 +316,17 @@ impl UpdaterBuilder {
         }));
         // Bounded at one in flight, as the backoffice's is: the caller awaits its answer.
         let (reloads, requests) = mpsc::channel(1);
-        let edits = Arc::new(tokio::sync::Mutex::new(()));
-        let (mode, settled) = tokio::sync::watch::channel(None);
+        let (settled, settled_rx) = tokio::sync::watch::channel(None);
         self.parts.control = Some(Control {
-            reloads: reloads.clone(),
+            reloads,
             requests,
-            edits: Arc::clone(&edits),
-            mode,
+            settled,
         });
-        let config_path = args.config_path().to_owned();
         let task = tokio::spawn(crate::pusher::run(args, self.parts));
         UpdaterHandle {
-            reloads,
             shutdown: std::sync::Mutex::new(Some(stop)),
             task: tokio::sync::Mutex::new(Some(task)),
-            config_path,
-            mode: settled,
-            edits,
+            settled: settled_rx,
         }
     }
 
@@ -407,7 +400,6 @@ impl UpdaterBuilder {
 /// # }
 /// ```
 pub struct UpdaterHandle {
-    reloads: mpsc::Sender<ReloadRequest>,
     /// `None` once `shutdown` has been called. A std mutex: it is held for a `take` only,
     /// never across an await, so `shutdown` stays a plain call usable from any arm.
     shutdown: std::sync::Mutex<Option<oneshot::Sender<()>>>,
@@ -415,36 +407,43 @@ pub struct UpdaterHandle {
     /// because a wait holds it across the run's whole life: a second wait queues behind the
     /// first rather than polling the same `JoinHandle` from two places.
     task: tokio::sync::Mutex<Option<JoinHandle<eyre::Result<Outcome>>>>,
-    /// The file `halt` and `resume` edit: the run's `--config`.
-    config_path: PathBuf,
-    /// The run's mode once its settings are applied, `None` until then; node mode has no
-    /// service to halt a pair in. See [`Control::mode`].
-    mode: tokio::sync::watch::Receiver<Option<crate::cli::Mode>>,
-    /// The edit lock the backoffice holds for its own writes of the same file.
-    edits: Arc<tokio::sync::Mutex<()>>,
+    /// The run's mode and shared config once it has read its config file, `None` until
+    /// then. See [`Settled`].
+    settled: tokio::sync::watch::Receiver<Option<Settled>>,
 }
 
 impl UpdaterHandle {
-    /// Re-reads the config file and converges the running pairs onto it, exactly as SIGHUP
-    /// and the backoffice do, and answers with the reload's one-line summary, or with why
-    /// it was rejected, in which case nothing changed and every pair is still quoting its
-    /// previous config. A reload that applied in part (a pair whose feed would not come up
-    /// keeps its previous config, or is not started) answers `Ok`, since it did change
-    /// what runs: its line counts the pairs that failed and says to see the journal. A run
-    /// with no pair set to converge (`--once`, `--mode node`) says so; one that has already
-    /// ended (`--check` reports and returns) says it has stopped. Reloads are serialized
-    /// with the backoffice's: one in flight at a time.
+    /// Converges the running pairs onto the run's config as it is, exactly as the
+    /// backoffice's `POST /api/reload` does: a lane its circuit breaker halted is re-armed,
+    /// and one whose feed never came up is tried again. The config is the one the run read
+    /// from its file at start, with every change made since through the backoffice or this
+    /// handle; the file is not read again, so a hand edit of it waits for the next start.
+    /// Answers with the reload's one-line summary, or with why it was rejected, in which
+    /// case nothing changed and every pair is still quoting its previous config. A reload
+    /// that applied in part (a pair whose feed would not come up keeps its previous config,
+    /// or is not started) answers `Ok`, since it did change what runs: its line counts the
+    /// pairs that failed and says to see the journal. A run with no pair set to converge
+    /// (`--once`, `--mode node`) says so; one that has already ended (`--check` reports and
+    /// returns) says it has stopped. Serialized with the backoffice's reloads and changes:
+    /// one in flight at a time.
     pub async fn reload(&self) -> Result<String, String> {
-        let (reply, answer) = oneshot::channel();
-        self.reloads
-            .send(ReloadRequest { reply })
-            .await
-            .map_err(|_| "the updater has stopped".to_owned())?;
-        // A dropped reply is the run ending with the request unread, which only the paths
-        // that never read the channel do (`--check`); the loops always answer.
-        match answer.await {
-            Ok(Ok(line) | Err(ReloadFailure::Partial(line))) => Ok(line),
-            Ok(Err(ReloadFailure::Rejected(line))) => Err(line),
+        let config = self.config().await?;
+        match config.reload().await {
+            Ok(line) | Err(ReloadFailure::Partial(line)) => Ok(line),
+            Err(ReloadFailure::Rejected(line)) => Err(line),
+        }
+    }
+
+    /// The run's shared config, once it has read its config file. A run that ended before
+    /// getting there (its file would not load) has nothing to reload or edit.
+    async fn config(&self) -> Result<Arc<SharedConfig>, String> {
+        Ok(self.settled().await?.config)
+    }
+
+    async fn settled(&self) -> Result<Settled, String> {
+        let mut settled = self.settled.clone();
+        match settled.wait_for(Option::is_some).await {
+            Ok(settled) => Ok(settled.clone().expect("waited for")),
             Err(_) => Err("the updater has stopped".to_owned()),
         }
     }
@@ -467,8 +466,8 @@ impl UpdaterHandle {
         }
     }
 
-    /// Stops the pair quoting and keeps it, with every setting, in the config file:
-    /// `halted = true` with `reason` beside it as `halt_reason`, then a reload, which
+    /// Stops the pair quoting and keeps it, with every setting, in the run's config and its
+    /// file: `halted = true` with `reason` beside it as `halt_reason`, then a reload, which
     /// withdraws its quote at every builder exactly as removing it would. A halt is an
     /// intent, not a judgement: no reload clears it, only [`Self::resume`] (or that pair's
     /// own Resume in the backoffice, whose "Restart halted pairs" leaves a halt with a
@@ -476,13 +475,13 @@ impl UpdaterHandle {
     /// a [`crate::guard::Latch`] trip is not, since the next reload re-arms it.
     ///
     /// Answers with what changed and the reload's summary (`Ok` too when the reload applied
-    /// in part because another pair's feed would not come up: the halt is in the file and
-    /// in force, and the line says which pairs kept their previous config), or with why it
-    /// was refused, in which case the file is as it was: no pair has these tokens, it is
-    /// already halted, the reload was rejected, or the run is in node mode (by flag,
-    /// variable or `[settings] mode`), which has no service to halt a pair in. Serialized
-    /// with the backoffice's edits of the same file, and written as the backoffice writes
-    /// it: the file is rewritten in full, in its canonical form, so comments in it are not
+    /// in part because another pair's feed would not come up: the halt is kept and in
+    /// force, and the line says which pairs kept their previous config), or with why it was
+    /// refused, in which case the config and its file are as they were: no pair has these
+    /// tokens, it is already halted, the reload was rejected, or the run is in node mode
+    /// (by flag, variable or `[settings] mode`), which has no service to halt a pair in.
+    /// Serialized with the backoffice's changes, and written as the backoffice writes them:
+    /// the file is rewritten in full, in its canonical form, so comments in it are not
     /// kept, keys are sorted and arrays re-wrapped; `config.example.toml` documents every
     /// key.
     pub async fn halt(&self, tokens: (Address, Address), reason: &str) -> Result<String, String> {
@@ -497,10 +496,9 @@ impl UpdaterHandle {
         self.edit(tokens, "resume", resume_line).await
     }
 
-    /// Both verbs: under the edit lock, find the pair by its tokens and apply `change`,
-    /// which returns the line describing what it did; then write, reload, and revert if
-    /// the reload refuses. The description is decided before the file is changed, so the
-    /// pair is looked up twice: once for the line, once under the write.
+    /// Both verbs: find the pair by its tokens and apply `change`, which returns the line
+    /// describing what it did, through the shared config, which converges the run onto
+    /// the change and keeps it only if the run accepts.
     async fn edit(
         &self,
         tokens: (Address, Address),
@@ -509,42 +507,47 @@ impl UpdaterHandle {
     ) -> Result<String, String> {
         // Asked of the run rather than of `args`: the mode is only known once the file's
         // `[settings]` are applied, which the run does before it connects to anything, so
-        // this waits a moment at most. A run that ended before getting there (its config
-        // would not load) has nothing left to edit for.
-        let node = {
-            let mut mode = self.mode.clone();
-            match mode.wait_for(Option::is_some).await {
-                Ok(mode) => matches!(*mode, Some(crate::cli::Mode::Node)),
-                Err(_) => return Err("the updater has stopped".to_owned()),
-            }
-        };
-        if node {
+        // this waits a moment at most.
+        let settled = self.settled().await?;
+        if settled.mode == crate::cli::Mode::Node {
             return Err(format!("node mode has no service to {verb}"));
         }
-        let _serialized = self.edits.lock().await;
-        let mut preview =
-            crate::config::load_raw(&self.config_path).map_err(|err| format!("{err:#}"))?;
-        let at = pair_index(&preview.pairs, tokens).map_err(|err| format!("{err:#}"))?;
-        let what = change(&mut preview.pairs[at]).map_err(|err| format!("{err:#}"))?;
-        let edited = preview.pairs.swap_remove(at);
-        let changed = crate::service::change_config(
-            &self.config_path,
-            &self.reloads,
-            "handle:",
-            &what,
-            |raw| {
+        let changed = settled
+            .config
+            .change("handle:", |raw| {
                 let at = pair_index(&raw.pairs, tokens)?;
-                raw.pairs[at] = edited;
-                Ok(())
-            },
-        )
-        .await;
-        // `Err` means the file is as it was, so a partial apply, which keeps the edit, is
-        // not one: a caller retrying a halt it was told failed would be told it is already
-        // halted.
+                change(&mut raw.pairs[at])
+            })
+            .await;
+        // `Err` means the config is as it was, so a partial apply, which keeps the change,
+        // is not one: a caller retrying a halt it was told failed would be told it is
+        // already halted.
         match changed {
-            Ok(line) | Err(ReloadFailure::Partial(line)) => Ok(line),
-            Err(ReloadFailure::Rejected(line)) => Err(line),
+            Ok(line) | Err(Refused::Reload(ReloadFailure::Partial(line))) => Ok(line),
+            Err(Refused::Reload(ReloadFailure::Rejected(line))) => Err(line),
+            Err(Refused::Change(err)) => Err(format!("{err:#}")),
+        }
+    }
+
+    /// Makes `change` to the run's config as the backoffice would, for a test that needs a
+    /// config the handle's own verbs cannot write.
+    #[cfg(test)]
+    pub(crate) async fn change(
+        &self,
+        change: impl FnOnce(&mut crate::config::RawConfig),
+    ) -> Result<String, String> {
+        let changed = self
+            .config()
+            .await?
+            .change("test:", |raw| {
+                change(raw);
+                Ok::<_, std::convert::Infallible>("changed the config".to_owned())
+            })
+            .await;
+        match changed {
+            Ok(line) | Err(Refused::Reload(ReloadFailure::Partial(line))) => Ok(line),
+            Err(Refused::Reload(ReloadFailure::Rejected(line))) => Err(line),
+            Err(Refused::Change(never)) => match never {},
         }
     }
 
@@ -589,7 +592,7 @@ fn pair_index(pairs: &[RawPair], tokens: (Address, Address)) -> eyre::Result<usi
         })
         .ok_or_else(|| {
             eyre::eyre!(
-                "no pair with tokens {:#x} and {:#x} in the config file",
+                "no pair with tokens {:#x} and {:#x} in the config",
                 tokens.0,
                 tokens.1
             )
@@ -755,15 +758,5 @@ mod tests {
         let err = format!("{err:#}");
         assert!(err.contains("observer `slack` registered twice"), "{err}");
         assert!(!err.contains("risk"), "{err}");
-    }
-
-    /// The unit a binary names is what the operator hints print; none names the signal.
-    #[test]
-    fn the_unit_is_kept_for_the_hints() {
-        assert_eq!(Updater::builder().parts.unit, None);
-        assert_eq!(
-            Updater::builder().systemd_unit("my-updater").parts.unit,
-            Some("my-updater")
-        );
     }
 }

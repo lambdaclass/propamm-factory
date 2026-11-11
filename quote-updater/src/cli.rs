@@ -178,8 +178,8 @@ pub(crate) struct Flags {
     /// Postgres (e.g. postgresql://ponder:pass@127.0.0.1:5432/ponder), the indexer's
     /// database, for the P&L dashboard. Unset disables recording. Ignored under --check and
     /// --once. Flag or environment only, deliberately not a `[settings]` key: the URL
-    /// carries a password, and the backoffice rewrites `[settings]` from its form, so it
-    /// belongs in `.env` beside the updater keys. See record.rs.
+    /// carries a password, and the backoffice API shows `[settings]` to anyone who reaches
+    /// it, so it belongs in `.env` beside the updater keys. See record.rs.
     #[arg(long, env = "RECORD_DB_URL")]
     pub(crate) record_db_url: Option<String>,
 }
@@ -453,9 +453,9 @@ pub(crate) fn removed_vars_error(present: &[&str]) -> String {
     )
 }
 
-/// The backoffice's only verb is reload, and the reload path belongs to the `Service`,
-/// which node mode never builds. A backoffice there would serve a page whose every button
-/// failed, so it is refused at startup rather than bound and left inert.
+/// Every change the backoffice API makes is a reload, and the reload path belongs to the
+/// `Service`, which node mode never builds. A backoffice there would serve an API whose
+/// every change failed, so it is refused at startup rather than bound and left inert.
 pub(crate) fn refuse_backoffice_in_node_mode(
     mode: Mode,
     backoffice_addr: Option<&str>,
@@ -674,7 +674,7 @@ mod tests {
         }
     }
 
-    /// A backoffice bound in a mode with no reload would serve a page whose every button
+    /// A backoffice bound in a mode with no reload would serve an API whose every change
     /// failed. Refused at startup rather than discovered at the moment it was needed.
     #[test]
     fn a_backoffice_in_node_mode_is_refused() {

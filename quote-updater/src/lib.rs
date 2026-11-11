@@ -73,7 +73,6 @@ mod exporter;
 mod feed;
 pub mod guard;
 mod head;
-mod hints;
 mod kinds;
 mod landing;
 mod metrics;
@@ -98,6 +97,7 @@ mod rpc;
 #[cfg(test)]
 mod rpc_mock;
 mod service;
+mod state;
 mod supervisor;
 mod tasks;
 pub mod testing;

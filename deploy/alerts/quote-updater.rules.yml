@@ -22,8 +22,8 @@ groups:
             guard, the feed moved further in one tick than this pair's max_deviation allows;
             quote_updater_trip_source{pair,source,cause} says what tripped it and how (a
             registered guard, a panic, an external trip). It does NOT come back on its own.
-            Verify the feed, then reload the config (SIGHUP) — which brings this
-            lane back without disturbing the others or clearing their breakers.
+            Verify the feed, then reload (POST /api/reload on the backoffice) — which brings
+            this lane back without disturbing the others or clearing their breakers.
             This alert resolves when someone reloads or restarts, which means someone acted
             — not that the feed is fixed.
 
@@ -260,13 +260,13 @@ groups:
 
   - name: quote-updater-ticket
     rules:
-      # The failure mode a file-authoritative config introduces. `pairs.toml` is the desired
-      # state and a reload converges the running pairs onto it — but a reload that fails to
-      # validate applies nothing at all, deliberately, so the pairs carry on quoting the
-      # previous config perfectly well. Nothing else in the process says otherwise: every
-      # other series stays exactly as healthy as it was. The gap is only in what the operator
-      # believes, having just edited the file, and this counter is the one thing that can see
-      # it.
+      # The failure mode that changing a running updater's config introduces. Each change made
+      # through the backoffice API (or a binary's UpdaterHandle) converges the running pairs
+      # onto the new config — but one that fails to validate applies nothing at all,
+      # deliberately, and config.toml is put back, so the pairs carry on quoting the previous
+      # config perfectly well. Nothing else in the process says otherwise: every other series
+      # stays exactly as healthy as it was. The gap is only in what the operator believes,
+      # having just made the change, and this counter is how an alert can see it.
       #
       # `increase(...) > 0` over an hour rather than a `for:` on a level: a rejection is an
       # instant, not a state, so there is no condition to sit in for five minutes.
@@ -278,12 +278,13 @@ groups:
         for: 0m
         labels: { severity: ticket }
         annotations:
-          summary: "A config reload was rejected; the running pairs are not what pairs.toml says"
+          summary: "A config change or reload was rejected; it did not take effect"
           description: >-
-            The updater re-read its config, refused it, and changed nothing — so every pair is
-            still running the previous config while the file on disk says something else.
-            The journal names the reason. Fix the file, check it with
-            `quote-updater --check`, and reload again.
+            A change made through the backoffice API (or an UpdaterHandle), or a reload, was
+            refused and changed nothing — every pair is still running the previous config, and
+            config.toml was put back to match it, so whoever made the change may believe it
+            took. The journal names the reason, as did the answer to the change. Fix the
+            change and send it again.
 
       # The other half of the same gap, and the worse half. A reload validates whole but
       # cannot know whether a feed will come up without dialling it, so a lane whose symbol
@@ -298,19 +299,20 @@ groups:
         annotations:
           summary: "A config reload only partly applied; some pairs are on the old config"
           description: >-
-            The updater accepted pairs.toml but at least one pair's feed would not come up, so
-            that pair is still quoting its previous config (or was never started) while the
-            rest moved onto the new one. Nothing is mispriced and no quote is wrong — the
+            The updater kept a config change but at least one pair's feed would not come up,
+            so that pair is still quoting its previous config (or was never started) while
+            the rest moved onto the new one. Nothing is mispriced and no quote is wrong — the
             pairs that failed are named in the journal, usually a wrong symbol or a blocked
-            endpoint. Fix them, check with `quote-updater --check`, and reload again.
+            endpoint. Fix them through the backoffice API, or retry them with
+            POST /api/reload.
 
       # Not a fault. The only rule in this file that fires on something working, and it is
       # here because a change to a live lane's pricing is otherwise invisible: the two rules
       # above catch a reload that was *refused* or that half-applied, and a reload that
-      # succeeds cleanly says nothing at all. `config.toml` is edited by hand over ssh and by
-      # the backoffice, which does the edit-and-reload on an operator's behalf and has no
-      # login, only a tailnet address (deploy/README.md). So delta, max_deviation
-      # or a band can change on a quoting lane with no trace outside the journal.
+      # succeeds cleanly says nothing at all. A running updater's config is changed through
+      # the backoffice API, which writes config.toml and converges onto it on an operator's
+      # behalf and has no login, only a tailnet address (deploy/README.md). So delta,
+      # max_deviation or a band can change on a quoting lane with no trace outside the journal.
       #
       # What it buys is adjacency. When a page arrives twenty minutes after someone widened a
       # band, the two land in the same channel in the right order, and nobody has to go and

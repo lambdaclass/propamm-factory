@@ -1,5 +1,5 @@
-//! Finding where a pair trades, so the backoffice can fill the venue table instead of an
-//! operator looking up how each venue spells the market.
+//! Finding where a pair trades, so the backoffice API can fill a pair's venue table
+//! instead of an operator looking up how each venue spells the market.
 //!
 //! The token names come from the chain (`symbol()` on each contract, read by the caller).
 //! Then every exchange is asked for its own list of markets, and a market is the pair's

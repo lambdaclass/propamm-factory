@@ -55,8 +55,6 @@ ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex", rev = "73318b686fd
 ethrex-l2-rpc = { git = "https://github.com/lambdaclass/ethrex", rev = "73318b686fdc2c3951a67cea9721eb5378855ada" }
 ethrex-rpc = { git = "https://github.com/lambdaclass/ethrex", rev = "73318b686fdc2c3951a67cea9721eb5378855ada" }
 ethrex-sdk = { git = "https://github.com/lambdaclass/ethrex", rev = "73318b686fdc2c3951a67cea9721eb5378855ada" }
-# The backoffice's HTML templates. Four new entries in Cargo.lock, all askama's own.
-askama = { version = "0.16.0", default-features = false, features = ["derive", "std", "urlencode"] }
 # The feed recorder's database client (record.rs): the Binance mid and the vault balances
 # into the indexer's Postgres, off the quoting path through one writer task. Measured cost
 # in Cargo.lock: 19 new package entries (tokio-postgres, postgres-protocol, postgres-types,

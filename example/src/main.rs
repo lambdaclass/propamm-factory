@@ -11,8 +11,9 @@
 //! - An observer, `block_log`: logs lifecycle events (a lane starting, stopping, tripping,
 //!   a reload) and withdrawn blocks with the pricer's diagnostics. Watches, never decides.
 //!
-//! Everything else is the library's: config file and reload, the price feeds, the builders,
-//! `--check`, metrics, the backoffice, the deviation breaker and the core's bounds.
+//! Everything else is the library's: the config file and reload, the price feeds, the
+//! builders, `--check`, metrics, the backoffice API, the deviation breaker and the core's
+//! bounds.
 //!
 //! Run: `cargo run -- --config config.toml` (see README.md).
 
@@ -322,8 +323,6 @@ fn main() -> std::process::ExitCode {
     Updater::builder()
         // So the observer's tracing lines are rendered beside the library's.
         .log_target(env!("CARGO_CRATE_NAME"))
-        // Named in the operator hints ("systemctl --user reload my-propamm"). Optional.
-        .systemd_unit("my-propamm")
         // The three kinds the library ships, registered exactly like our own below.
         .pricer("fixed", quote_updater::pricers::Fixed)
         .pricer("feed", quote_updater::pricers::Feed)

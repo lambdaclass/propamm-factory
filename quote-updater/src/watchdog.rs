@@ -96,7 +96,7 @@ pub(crate) fn halt_notice(
             Some(addr) => format!(
                 "nothing is quoting: all {total} pair(s) are failing to start and none has \
                  halted, so this is the config rather than a feed. NOT exiting, so the \
-                 backoffice stays reachable: fix it at http://{addr}/"
+                 backoffice stays reachable: fix it through http://{addr}/api/"
             ),
             None => format!(
                 "nothing is quoting: all {total} pair(s) are failing to start and none has \
@@ -174,7 +174,7 @@ mod tests {
     use super::*;
     use crate::guard::Cause;
 
-    /// A binary run as a unit, so the expected lines read as they always have.
+    /// A run with a backoffice, which is told the call that reloads it.
     fn notice(
         counts: (usize, usize, usize),
         backoffice: Option<&str>,
@@ -184,7 +184,7 @@ mod tests {
             counts,
             backoffice,
             sources,
-            "systemctl --user reload example-quoter",
+            "POST http://100.64.1.2:8088/api/reload",
         )
     }
 
@@ -196,11 +196,17 @@ mod tests {
         assert_eq!(
             old,
             "1/2 pair(s) halted on their circuit breaker, 1 still quoting. Check that feed \
-             and reload once you trust it (systemctl --user reload example-quoter)"
+             and reload once you trust it (POST http://100.64.1.2:8088/api/reload)"
         );
-        // A binary that names no unit is told the signal, in the same place.
-        let signal = halt_notice((1, 0, 2), None, &[("deviation", Cause::Guard)], "SIGHUP");
-        assert!(signal.ends_with("(SIGHUP)"), "{signal}");
+        // A run with no backoffice is told whatever its caller can reload it with, in the
+        // same place.
+        let handle = halt_notice(
+            (1, 0, 2),
+            None,
+            &[("deviation", Cause::Guard)],
+            "UpdaterHandle::reload",
+        );
+        assert!(handle.ends_with("(UpdaterHandle::reload)"), "{handle}");
         let new = notice(
             (2, 0, 3),
             None,
@@ -209,15 +215,15 @@ mod tests {
         assert_eq!(
             new,
             "2/3 pair(s) halted: 1 on `deviation`, 1 on a panic in `funding`; 1 still \
-             quoting. Check those lanes and reload once you trust them (systemctl --user \
-             reload example-quoter)"
+             quoting. Check those lanes and reload once you trust them (POST \
+             http://100.64.1.2:8088/api/reload)"
         );
         let external = notice((1, 0, 1), None, &[("kill", Cause::External)]);
         assert_eq!(
             external,
             "nothing is quoting: 1/1 pair(s) halted: 1 on `kill` (external), 0 waiting to \
              restart. NOT exiting, because a restart would clear the latches; check those \
-             lanes and reload once you trust them (systemctl --user reload example-quoter)"
+             lanes and reload once you trust them (POST http://100.64.1.2:8088/api/reload)"
         );
     }
 
@@ -329,7 +335,10 @@ mod tests {
             with_page.contains("this is the config rather than a feed"),
             "{with_page}"
         );
-        assert!(with_page.contains("http://100.64.1.2:8088/"), "{with_page}");
+        assert!(
+            with_page.contains("http://100.64.1.2:8088/api/"),
+            "{with_page}"
+        );
         assert!(!with_page.contains("breaker"), "{with_page}");
 
         let without = notice((0, 2, 2), None, &[]);

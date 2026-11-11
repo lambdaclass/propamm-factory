@@ -14,7 +14,7 @@ kind  = "feed"
 delta = "0.0005"
 ```
 
-The backoffice edits these settings live, without a restart.
+The backoffice API changes these settings live, without a restart.
 
 ## The models that ship with the library
 
@@ -89,7 +89,7 @@ fn main() -> std::process::ExitCode {
 ```
 
 From then on a pair can say `kind = "skewed"` with `half_spread` and `skew` in its `pricing`
-table, and the backoffice shows those fields. That whole program is
+table, and the backoffice API lists the kind (`GET /api/kinds`). That whole program is
 [`quote-updater/examples/custom_pricer.rs`](../quote-updater/examples/custom_pricer.rs).
 
 ## What the library gives you to work with
