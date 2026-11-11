@@ -361,6 +361,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_closed_market_with_offhours_open_reaches_the_guard_as_offhours() {
+        let api = MockApi::serve(vec![
+            (
+                "/v1/status/market",
+                MockApi::json(
+                    r#"{"isOpen":false,"marketStatus":"closed",
+                        "offhours":{"isOpen":true,"nextOpen":null,"nextClose":"2026-11-09T09:00:00Z"}}"#,
+                ),
+            ),
+            ("/v1/status/assets", MockApi::json("[]")),
+        ]);
+        let status = Status::shared(&api.url, "offhours", Duration::from_secs(60))
+            .await
+            .unwrap();
+        let names = ["AAPLon".to_owned()];
+        let session = |sessions: &[&str]| {
+            let sessions = sessions.iter().map(|s| (*s).to_owned()).collect();
+            OndoStatus::new(Arc::clone(&status), sessions)
+                .read(&names)
+                .session
+                .unwrap()
+                .value
+        };
+        assert_eq!(session(&["regular", "offhours"]), Ok(()));
+        let refused = session(&["regular"]).unwrap_err();
+        assert!(refused.contains("offhours"), "{refused}");
+    }
+
+    #[tokio::test]
     async fn a_wrong_key_or_an_answer_that_does_not_parse_fails_the_build_that_asked() {
         let api = MockApi::serve(vec![
             ("/v1/status/market", MockApi::json(r#"{"isOpen":true}"#)),

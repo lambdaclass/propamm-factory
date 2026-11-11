@@ -133,14 +133,31 @@ fn positive(what: &str, written: &str) -> Result<f64, String> {
 #[serde(rename_all = "camelCase")]
 struct MarketStatus {
     market_status: String,
+    /// Off-hours trading, `{isOpen, nextOpen, nextClose}`, which `marketStatus` may not
+    /// cover. Read as any value, so an object missing or in a shape this updater does not
+    /// expect leaves the session as `marketStatus` states it.
+    #[serde(default)]
+    offhours: Option<serde_json::Value>,
 }
 
-/// The `marketStatus` of `GET /v1/status/market`: `regular`, `premarket`, `postmarket`,
-/// `overnight`, `offhours`, `paused` or `closed`.
+/// The session `GET /v1/status/market` reports: its `marketStatus` (`regular`, `premarket`,
+/// `postmarket`, `overnight`, `offhours`, `paused` or `closed`), except that a `closed` market
+/// with `offhours.isOpen` true is `offhours`. Ondo's docs say a weekend or holiday reads as
+/// `closed` in `marketStatus` and that off-hours trading is reported by `offhours.isOpen`
+/// alone.
 pub fn parse_market_session(body: &str) -> Result<String, String> {
-    serde_json::from_str::<MarketStatus>(body)
-        .map(|status| status.market_status)
-        .map_err(|err| format!("the market-status answer does not parse: {err}"))
+    let status = serde_json::from_str::<MarketStatus>(body)
+        .map_err(|err| format!("the market-status answer does not parse: {err}"))?;
+    let offhours_open = status
+        .offhours
+        .as_ref()
+        .and_then(|offhours| offhours.get("isOpen"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    if offhours_open && status.market_status.trim().eq_ignore_ascii_case("closed") {
+        return Ok("offhours".to_owned());
+    }
+    Ok(status.market_status)
 }
 
 #[derive(Deserialize)]
@@ -565,6 +582,67 @@ mod tests {
             "nextOpenSession":"postmarket","nextOpen":"2026-10-08T20:01:00Z","nextClose":"2026-10-08T19:59:00Z"}"#;
         assert_eq!(parse_market_session(body), Ok("regular".to_owned()));
         assert!(parse_market_session(r#"{"isOpen":true}"#).is_err());
+    }
+
+    /// A market-status answer in the documented shape, with `offhours.isOpen` set to
+    /// `offhours_open` (or no `offhours` object when `None`).
+    fn market_status(status: &str, offhours_open: Option<bool>) -> String {
+        let offhours = offhours_open.map_or_else(String::new, |open| {
+            format!(
+                r#","offhours":{{"isOpen":{open},"nextOpen":"2026-11-09T01:00:00Z","nextClose":"2026-11-09T09:00:00Z"}}"#
+            )
+        });
+        format!(
+            r#"{{"timestamp":"2026-11-08T18:00:00Z","isOpen":false,"marketStatus":"{status}","nextOpenSession":"overnight","nextOpen":"2026-11-09T01:00:00Z","nextClose":"2026-11-07T00:59:00Z"{offhours}}}"#
+        )
+    }
+
+    #[test]
+    fn a_closed_market_with_offhours_open_is_in_the_offhours_session() {
+        assert_eq!(
+            parse_market_session(&market_status("closed", Some(true))),
+            Ok("offhours".to_owned())
+        );
+        // `closed` is matched trimmed and in any case.
+        assert_eq!(
+            parse_market_session(&market_status(" Closed ", Some(true))),
+            Ok("offhours".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_closed_market_without_offhours_open_stays_closed() {
+        for offhours_open in [Some(false), None] {
+            assert_eq!(
+                parse_market_session(&market_status("closed", offhours_open)),
+                Ok("closed".to_owned()),
+                "offhours.isOpen {offhours_open:?}"
+            );
+        }
+        // An `offhours` object in a shape this updater does not expect changes nothing.
+        for offhours in [r#"null"#, r#"{}"#, r#"{"isOpen":"true"}"#, r#"true"#] {
+            let body = format!(r#"{{"marketStatus":"closed","offhours":{offhours}}}"#);
+            assert_eq!(
+                parse_market_session(&body),
+                Ok("closed".to_owned()),
+                "{offhours}"
+            );
+        }
+    }
+
+    #[test]
+    fn offhours_open_leaves_any_other_session_as_ondo_states_it() {
+        for session in ["regular", "premarket", "postmarket", "overnight"] {
+            assert_eq!(
+                parse_market_session(&market_status(session, Some(true))),
+                Ok(session.to_owned())
+            );
+        }
+        // Nothing trades while paused, whatever off-hours trading says.
+        assert_eq!(
+            parse_market_session(&market_status("paused", Some(true))),
+            Ok("paused".to_owned())
+        );
     }
 
     #[test]
