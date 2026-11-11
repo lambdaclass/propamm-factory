@@ -67,10 +67,11 @@ pub struct OndoCfg {
     pub ticker: Option<String>,
     /// The Ondo GM API key, as `{ env = "ONDO_API_KEY" }`.
     pub api_key: EnvSecret,
-    /// The sessions Ondo reports (`/v1/status/market`'s `marketStatus`) in which the pair
-    /// quotes: any of `regular`, `premarket`, `postmarket`, `overnight` and `offhours`, in
-    /// any case. Default `regular` only, and an empty list means the default. Ondo's
-    /// `paused` and `closed` are never quoted in: nothing trades then.
+    /// The sessions Ondo reports (`/v1/status/market`'s `marketStatus`, or `offhours` when it
+    /// reads `closed` with `offhours.isOpen` true) in which the pair quotes: any of `regular`,
+    /// `premarket`, `postmarket`, `overnight` and `offhours`, in any case. Default `regular`
+    /// only, and an empty list means the default. Ondo's `paused` and `closed` are never quoted
+    /// in: nothing trades then.
     #[serde(default = "default_sessions")]
     pub sessions: Vec<String>,
     /// Ondo's GM API.
