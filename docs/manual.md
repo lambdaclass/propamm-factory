@@ -966,6 +966,29 @@ Seven series are worth watching ahead of everything else the registry exposes:
   was more than 2 seconds ahead of their arrival, left out of the venue's usual lag; a
   steady count means this host's clock is behind.
 
+**Alerts on the vault losing money.** Most of the shipped rules in `deploy/alerts/` say
+whether a pair is quoting. These say whether a pair that is quoting is losing:
+
+- `PusherVaultLosingValue` (ticket) and `PusherVaultDraining` (page) compare what a vault
+  holds now with what it held an hour ago, both priced at today's prices, as a share of the
+  vault's value. A market move does not show (no balance changed); a vault paying out more
+  than it takes in does. They fire at 0.5% and 2% in an hour. Two things read the same as a
+  loss: a withdrawal by the operator, and an ordinary market-making loss, so tune the
+  thresholds to what a pair does on a normal day. A deposit hides a loss of its size for
+  the hour.
+- `PusherVaultUnpriced` (ticket) names a vault holding a token with no USD price, for
+  which the two rules above and the next one are silent: they need every token valued.
+- `PusherVaultOneSided` (ticket): over 90% of a vault's value in one token, read from the
+  balances, so it works for a pair priced by any kind. The `PusherPoolImbalanced` rules
+  read the `volatile` kind's own diagnostics and say nothing for the others.
+- `PusherQuoteThroughMarket` (ticket): the market's mid is outside what a quoting pair last
+  published by more than its half-spread, so one of its two prices is on the wrong side of
+  the market. Builder mode only.
+
+All of them read `quote_updater_vault_balance`, `quote_updater_token_price_usd`,
+`quote_updater_vault_value_usd` and the feed and published gauges; the USD prices come from
+CoinGecko, so they are as good as its price for the token.
+
 `--mode node` records a smaller registry than builder mode — no builders, no head watcher, no
 landing tracker — but it now records the two series that matter for safety rather than for
 performance: `price_unusable_total`, which is what `PusherMidOutOfBand` fires on, and the
