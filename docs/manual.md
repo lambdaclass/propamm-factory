@@ -247,6 +247,76 @@ clears it, and a form loaded before the field existed keeps whatever the file se
 Rolling back to a version without this key: the config parser refuses keys it does not
 know, so remove `max_source_lag_ms` from every pair before downgrading.
 
+### Venues that disagree
+
+A pair with two or more venues stops quoting while they disagree by more than a limit, and
+starts again on the first tick they agree. This is on for every such pair, with nothing to
+set.
+
+Why. The average of a pair's venues looks like a price whether or not the venues agree,
+and three things make them disagree without anything else noticing:
+
+- A venue's price stops while its connection stays up. A venue is fresh while frames keep
+  arriving, and a ping answered counts as a frame, so the last price is re-stamped as
+  current for as long as the socket is alive. If the venue's price stream stalls behind a
+  live socket, that price is averaged at full weight indefinitely.
+- A venue delivers a backlog: frames arrive on time, each carrying a price from seconds
+  ago. `max_source_lag_ms` sees that on a venue that stamps its frames; Binance's does not.
+- A venue with a thin book is pushed. A few trades move its mid, and the average moves by
+  that venue's share of the weight.
+
+In each case the venues stop agreeing, and that is the only sign there is. So the composite
+measures it on every sample: the gap between the **primary** venue (the fresh one with the
+most weight, the first of them on a tie) and each other fresh venue, as a fraction of the
+other's mid, taking the largest. A venue listed with a tiny weight, as a backup, moves the
+average by nothing and still counts in full here: it is a second reading of where the
+market is.
+
+The limit, when the pair sets none, follows the spread the pair is publishing on that tick:
+**20 times the half-spread, and no less than 0.05% (5 bp)**. A pair publishing a 0.5 bp
+half-spread withdraws when its venues are more than 0.1% apart; one publishing 5 bp, at 1%.
+The spread is the right yardstick because it is what a disagreement costs: a quote is safe
+while the market is inside it. It is 20 spreads and not one because two books on one market
+are routinely a few spreads apart for a moment on every move, and a limit that withdrew on
+each of those would stop a healthy pair many times an hour. The default is meant to catch a
+venue that froze, fell behind or was pushed far off, and to leave ordinary noise alone.
+
+To set a pair's own limit, tighter or looser:
+
+```toml
+[[pairs]]
+# ...
+sources = [
+  { venue = "binance", symbol = "ETHUSDC" },
+  { venue = "okx",     symbol = "ETH-USDC", weight = "0.001" },
+]
+max_source_divergence = "0.0005"   # a fraction of the mid: 0.05%
+```
+
+Choose it from what the pair's venues actually do:
+`quote_updater_feed_divergence{pair}` is the gap at every sample, whether or not anything
+was withdrawn. A limit just above its ordinary peaks is the tightest that will not withdraw
+a healthy pair. There is no "off"; a pair that must quote through any disagreement sets a
+limit it cannot reach, such as `"0.5"`.
+
+What it does not do:
+
+- It needs two fresh venues. A pair with one venue, or one whose other venues have all
+  gone stale, has nothing to compare and quotes as before. A single-venue pair whose venue
+  freezes behind a live socket is not caught by this.
+- It cannot say which venue is wrong, so it withdraws the pair rather than dropping a
+  venue. The primary and a backup disagreeing may be the backup's fault; quoting on a
+  number the venues do not agree on is the risk either way.
+- A frozen venue is only seen once the market has moved the limit away from it.
+
+A withdrawn tick is counted under
+`quote_updater_price_unusable_total{reason="source_divergence"}`, and
+`PusherSourcesDisagree` raises a ticket when that goes on for five minutes. Nothing
+latches, so there is nothing to re-arm. `--check` applies the same limit to the row it
+prints. The backoffice's pair form has the field; blank is the default limit. Rolling back
+to a version without this key: remove `max_source_divergence` from every pair first, as
+for `max_source_lag_ms`.
+
 ### What the updater charges a taker
 
 Every pair names how it is priced in its `pricing` table: a kind, and the keys that kind
@@ -962,6 +1032,10 @@ Seven series are worth watching ahead of everything else the registry exposes:
 - `quote_updater_venue_late{pair, venue}` — 1 while the venue is left out of the pair's
   average for arriving later than `max_source_lag_ms` (`PusherVenueLate` raises a ticket
   after five minutes).
+- `quote_updater_feed_divergence{pair}` — how far the pair's venues disagree at the last
+  composite sample: the largest gap between the primary venue and any other fresh one, as
+  a fraction (0.001 = 0.1%); 0 with one fresh venue. Past the pair's limit its quote is
+  withdrawn under `reason="source_divergence"` (see "Venues that disagree" above).
 - `quote_updater_venue_future_stamps_total{pair, venue}` — frames whose exchange timestamp
   was more than 2 seconds ahead of their arrival, left out of the venue's usual lag; a
   steady count means this host's clock is behind.

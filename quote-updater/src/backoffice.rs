@@ -430,6 +430,9 @@ struct AddPair {
     /// keeps whatever the file sets; a blank field clears the key.
     #[serde(default)]
     max_source_lag_ms: Option<String>,
+    /// The venues-disagree limit, with the same two meanings of absent and blank.
+    #[serde(default)]
+    max_source_divergence: Option<String>,
     #[serde(default)]
     allow_symbol_mismatch: Option<String>,
     /// The pricing kind the operator chose. Every kind's section is posted whichever is
@@ -551,6 +554,7 @@ fn pair_from_form(form: &AddPair, kinds: &crate::kinds::Kinds) -> Result<RawPair
         sources: Vec::new(),
         min_sources: None,
         max_source_lag_ms: form.max_source_lag_ms.as_deref().and_then(optional),
+        max_source_divergence: form.max_source_divergence.as_deref().and_then(optional),
         min_mid: optional(&form.min_mid),
         max_mid: optional(&form.max_mid),
         max_deviation: optional(&form.max_deviation),
@@ -971,6 +975,7 @@ fn preview_snapshot(
             mid,
             at: now,
             wall,
+            divergence: ethrex_common::U256::zero(),
         });
     serde_json::json!({
         "composite": market(composite),
@@ -1226,6 +1231,9 @@ struct EditPair {
     /// keeps whatever the file sets; a blank field clears the key.
     #[serde(default)]
     max_source_lag_ms: Option<String>,
+    /// The venues-disagree limit, with the same two meanings of absent and blank.
+    #[serde(default)]
+    max_source_divergence: Option<String>,
     #[serde(default)]
     allow_symbol_mismatch: Option<String>,
     /// The pricing kind the operator chose. Every kind's section is posted whichever is
@@ -1320,6 +1328,10 @@ fn edit_from_form(pair: &mut RawPair, form: &EditPair, kinds: &crate::kinds::Kin
     set_if_posted(
         &mut pair.max_source_lag_ms,
         form.max_source_lag_ms.as_deref(),
+    );
+    set_if_posted(
+        &mut pair.max_source_divergence,
+        form.max_source_divergence.as_deref(),
     );
     pair.allow_symbol_mismatch = form.allow_symbol_mismatch.is_some();
     Ok(())
@@ -1784,6 +1796,13 @@ const SOURCE_FIELDS: &[Field] = &[
          milliseconds behind the exchange's own timestamp; needs a venue that sends one \
          (not binance, not mexc). Blank is off",
     ),
+    Field::new(
+        "max_source_divergence",
+        "0.001",
+        "stop quoting while the main venue and any other differ by more than this fraction \
+         of the price (0.001 = 0.1%); needs two or more venues. Blank is the default: 20 \
+         times the spread the pair quotes, and at least 0.05%",
+    ),
 ];
 
 /// How many venues must have a fresh price before the pair publishes.
@@ -2127,6 +2146,7 @@ fn render_pair_form_with(
             pair.max_deviation_window.as_deref(),
             pair.max_deviation_window_blocks.as_deref(),
             pair.max_source_lag_ms.as_deref(),
+            pair.max_source_divergence.as_deref(),
         ],
         None => vec![None; SOURCE_FIELDS.len()],
     };
@@ -2489,6 +2509,7 @@ api_key = "k"
                     sources: Vec::new(),
                     min_sources: None,
                     max_source_lag_ms: None,
+                    max_source_divergence: None,
                     min_mid: None,
                     max_mid: None,
                     max_deviation: None,
@@ -3038,6 +3059,31 @@ api_key = "k"
             Some("1500"),
             "the file keeps the change"
         );
+    }
+
+    /// The venues-disagree limit is on both forms, the edit form showing the file's value,
+    /// and an edit sets it, keeps it when the field is absent, and clears it when blank.
+    #[test]
+    fn the_divergence_limit_is_shown_and_edited_from_the_form() {
+        assert!(
+            render_pair_form(None, &test_kinds()).contains(r#"name="max_source_divergence""#),
+            "max_source_divergence is missing from the new-pair form"
+        );
+        let mut config = a_config();
+        config.pairs[0].max_source_divergence = Some("0.0005".to_owned());
+        let form = render_pair_form(Some(&config.pairs[0]), &test_kinds());
+        assert!(
+            form.contains("name=\"max_source_divergence\"\n         value=\"0.0005\""),
+            "{form}"
+        );
+
+        let mut pair = config.pairs[0].clone();
+        set_if_posted(&mut pair.max_source_divergence, None);
+        assert_eq!(pair.max_source_divergence.as_deref(), Some("0.0005"));
+        set_if_posted(&mut pair.max_source_divergence, Some("0.001"));
+        assert_eq!(pair.max_source_divergence.as_deref(), Some("0.001"));
+        set_if_posted(&mut pair.max_source_divergence, Some(" "));
+        assert_eq!(pair.max_source_divergence, None);
     }
 
     /// The source-check field is on both forms, the edit form showing the file's value.

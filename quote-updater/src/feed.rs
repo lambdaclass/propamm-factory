@@ -379,6 +379,11 @@ pub struct PriceSample {
     pub mid: U256,
     pub at: Instant,
     pub wall: SystemTime,
+    /// How far the pair's venues disagree, on a composite's sample: the largest gap between
+    /// the primary venue's mid and any other fresh venue's, as a fraction of the other's,
+    /// scaled by 10^decimals (see `composite::divergence`). Zero on one venue's own sample
+    /// and on a composite with a single fresh venue, where there is nothing to compare.
+    pub divergence: U256,
 }
 
 impl PriceSample {
@@ -731,6 +736,7 @@ impl Feed {
                     mid,
                     at,
                     wall,
+                    divergence: U256::zero(),
                 }));
             }
             Err(err) => {

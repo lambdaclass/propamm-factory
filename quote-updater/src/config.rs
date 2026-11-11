@@ -246,6 +246,11 @@ pub struct RawPair {
     /// no such check.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_source_lag_ms: Option<String>,
+    /// How far the pair's venues may disagree before its quote is withdrawn, as a fraction
+    /// of the mid (0.001 = 0.1%). See [`SourceChecks`]. Blank: the default limit, which
+    /// follows the spread the pair publishes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_source_divergence: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_mid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -324,7 +329,8 @@ pub struct Source {
 pub struct Feeds {
     pub sources: Vec<Source>,
     pub min_sources: usize,
-    /// The late-venue check; off unless the stanza sets it.
+    /// The late-venue check, off unless the stanza sets it, and the limit on how far the
+    /// venues may disagree, the default one unless the stanza sets it.
     pub checks: SourceChecks,
 }
 
@@ -346,6 +352,11 @@ pub const MAX_SOURCE_LAG_MS: u64 = 30_000;
 pub struct SourceChecks {
     /// `max_source_lag_ms`.
     pub max_lag: Option<std::time::Duration>,
+    /// `max_source_divergence`, scaled by `10^price_decimals`: the most the pair's primary
+    /// venue may sit from any other fresh one before the quote is withdrawn. On for every
+    /// pair with two or more venues, whether or not this is set: `None` is the default
+    /// limit, a multiple of the half-spread the pair publishes (`pricing::agreement`).
+    pub max_divergence: Option<U256>,
 }
 
 impl Feeds {
@@ -552,7 +563,7 @@ pub fn spread_scale(price_decimals: u32) -> U256 {
 ///
 /// `symbol` is the short form of one Binance source and the two keys are exclusive, so a
 /// stanza cannot say two different things about where its price comes from.
-fn parse_feeds(raw: &RawPair, at: &str) -> Result<Option<Feeds>> {
+fn parse_feeds(raw: &RawPair, price_decimals: u32, at: &str) -> Result<Option<Feeds>> {
     let mut sources = Vec::with_capacity(raw.sources.len() + 1);
     match (&raw.symbol, raw.sources.is_empty()) {
         (Some(_), false) => bail!(
@@ -565,7 +576,7 @@ fn parse_feeds(raw: &RawPair, at: &str) -> Result<Option<Feeds>> {
                 "{at}: min_sources needs sources to count"
             );
             let mut feeds = Feeds::single_binance(symbol);
-            feeds.checks = parse_source_checks(raw, &feeds.sources, at)?;
+            feeds.checks = parse_source_checks(raw, &feeds.sources, price_decimals, at)?;
             return Ok(Some(feeds));
         }
         (None, true) => {
@@ -576,6 +587,10 @@ fn parse_feeds(raw: &RawPair, at: &str) -> Result<Option<Feeds>> {
             ensure!(
                 raw.max_source_lag_ms.is_none(),
                 "{at}: max_source_lag_ms judges a pair's venues, and this pair has none"
+            );
+            ensure!(
+                raw.max_source_divergence.is_none(),
+                "{at}: max_source_divergence compares a pair's venues, and this pair has none"
             );
             return Ok(None);
         }
@@ -636,7 +651,7 @@ fn parse_feeds(raw: &RawPair, at: &str) -> Result<Option<Feeds>> {
             n
         }
     };
-    let checks = parse_source_checks(raw, &sources, at)?;
+    let checks = parse_source_checks(raw, &sources, price_decimals, at)?;
     Ok(Some(Feeds {
         sources,
         min_sources,
@@ -648,17 +663,25 @@ fn parse_feeds(raw: &RawPair, at: &str) -> Result<Option<Feeds>> {
 /// message: for the backoffice, which checks an edit before writing it. A pair not setting
 /// it is not looked at, so nothing else changes there.
 pub(crate) fn check_source_keys(raw: &RawPair) -> Result<()> {
-    if raw.max_source_lag_ms.is_none() {
+    if raw.max_source_lag_ms.is_none() && raw.max_source_divergence.is_none() {
         return Ok(());
     }
-    parse_feeds(raw, "this pair").map(|_| ())
+    // At the most decimals a run can have, so a fraction is refused here only for what is
+    // wrong with it at any scale. One too fine for this run's scale is refused by the
+    // reload that follows every edit, which puts the file back.
+    parse_feeds(raw, crate::MAX_PRICE_DECIMALS, "this pair").map(|_| ())
 }
 
 /// `max_source_lag_ms`: a whole number of milliseconds, above zero and at most
 /// [`MAX_SOURCE_LAG_MS`], on a pair at least one of whose `sources` stamps its frames.
 /// On one where none does there would be nothing to judge, so the key is refused rather
 /// than quietly doing nothing.
-fn parse_source_checks(raw: &RawPair, sources: &[Source], at: &str) -> Result<SourceChecks> {
+fn parse_source_checks(
+    raw: &RawPair,
+    sources: &[Source],
+    price_decimals: u32,
+    at: &str,
+) -> Result<SourceChecks> {
     let max_lag = match &raw.max_source_lag_ms {
         None => None,
         Some(text) => {
@@ -689,7 +712,28 @@ fn parse_source_checks(raw: &RawPair, sources: &[Source], at: &str) -> Result<So
             Some(std::time::Duration::from_millis(ms))
         }
     };
-    Ok(SourceChecks { max_lag })
+    // `max_source_divergence`: a fraction of the mid, held to what every threshold is (not
+    // zero at this scale, not finer than it, below 1), on a pair with something to compare.
+    let max_divergence = match &raw.max_source_divergence {
+        None => None,
+        Some(text) => {
+            ensure!(
+                sources.len() >= 2,
+                "{at}: max_source_divergence compares a pair's venues with each other, and \
+                 this pair has one; add a second venue, or leave the key unset"
+            );
+            Some(parse_threshold(
+                text.trim(),
+                price_decimals,
+                "max_source_divergence",
+                at,
+            )?)
+        }
+    };
+    Ok(SourceChecks {
+        max_lag,
+        max_divergence,
+    })
 }
 
 /// Parses one threshold fraction, applying every check that makes a threshold trustworthy.
@@ -1097,7 +1141,7 @@ pub fn parse_config_with(
         );
 
         let pricing = parse_pricing(&raw_pair.pricing, &at)?;
-        let feeds = parse_feeds(raw_pair, &at)?;
+        let feeds = parse_feeds(raw_pair, price_decimals, &at)?;
 
         // Bounds are read in lane orientation, so they need no inversion: they describe the
         // number this lane publishes, which is the one the check below has in hand.
@@ -1723,6 +1767,74 @@ sources = [{ venue = "binance", symbol = "ETHUSDT" }]
         );
         let err = parse_config(&text, 18).map(|_| ()).unwrap_err().to_string();
         assert!(err.contains("not both"), "{err}");
+    }
+
+    /// Audit F-05. The limit on how far a pair's venues may disagree is the default one
+    /// unless the stanza sets it, and then it is a fraction held to what every threshold
+    /// is, on a pair that has two venues to compare.
+    #[test]
+    fn the_divergence_limit_is_the_default_unless_set_and_needs_two_venues() {
+        let two = r#"
+pricing = { kind = "feed", delta = "0.0005" }
+sources = [
+  { venue = "binance", symbol = "ETHUSDC" },
+  { venue = "okx", symbol = "ETH-USDC", weight = "0.001" },
+]
+"#;
+        let plain = parse_config(&pair_with(two), 18).unwrap();
+        let checks = &plain.pairs[0].feeds.as_ref().unwrap().checks;
+        assert_eq!(checks.max_divergence, None, "the default limit");
+
+        let set = parse_config(
+            &pair_with(&format!("{two}max_source_divergence = \"0.001\"\n")),
+            18,
+        )
+        .unwrap();
+        assert_eq!(
+            set.pairs[0].feeds.as_ref().unwrap().checks.max_divergence,
+            Some(U256::exp10(15))
+        );
+        assert_ne!(set.pairs, plain.pairs, "a reload sees the change");
+        let raw: RawConfig = toml::from_str(&pair_with(&format!(
+            "{two}max_source_divergence = \"0.001\"\n"
+        )))
+        .unwrap();
+        assert!(
+            render_raw(&raw)
+                .unwrap()
+                .contains("max_source_divergence = \"0.001\""),
+            "the backoffice's rewrite keeps the key"
+        );
+
+        let cases = [
+            (format!("{two}max_source_divergence = \"0\""), "is zero"),
+            // 2 is 200%, not 2%.
+            (
+                format!("{two}max_source_divergence = \"2\""),
+                "not a percentage",
+            ),
+            (
+                format!("{two}max_source_divergence = \"ten\""),
+                "invalid max_source_divergence",
+            ),
+            // One venue has nothing to compare with, in either spelling.
+            (
+                "symbol = \"ETHUSDC\"\nmax_source_divergence = \"0.001\"".to_owned(),
+                "this pair has one",
+            ),
+            (
+                "sources = [{ venue = \"okx\", symbol = \"ETH-USDC\" }]\nmax_source_divergence = \"0.001\"".to_owned(),
+                "this pair has one",
+            ),
+            (
+                "pricing = { kind = \"fixed\", mid = \"4000\", delta = \"0.0005\" }\nmax_source_divergence = \"0.001\"".to_owned(),
+                "this pair has none",
+            ),
+        ];
+        for (body, expected) in cases {
+            let err = parse_config(&pair_with(&body), 18).map(|_| ()).unwrap_err();
+            assert!(format!("{err:#}").contains(expected), "{body}: {err:#}");
+        }
     }
 
     /// The late-venue key is off unless set, and read as written when it is.

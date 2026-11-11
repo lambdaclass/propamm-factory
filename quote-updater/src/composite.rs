@@ -188,6 +188,7 @@ pub fn spawn(feeds: &Feeds, params: Params<'_>) -> Spawned {
                     m.feed_sample_current.set(f64::NAN);
                     m.feed_sources_fresh.set(f64::NAN);
                     m.feed_sources_min.set(f64::NAN);
+                    m.feed_divergence.set(f64::NAN);
                 });
             }
             _ = async {
@@ -423,6 +424,9 @@ impl Composite {
             );
             return;
         };
+        // How far the venues behind this number disagree, carried on the sample for the
+        // quote loop to judge against what the pair then publishes (`pricing::agreement`).
+        let divergence = divergence(&fresh, self.decimals);
 
         // Judged before it is published to the channel, so a reader can never see a
         // sample no guard has. The verdict is not acted on here (nothing this task holds
@@ -481,6 +485,8 @@ impl Composite {
             }
         }
         self.metrics.record(|m| {
+            m.feed_divergence
+                .set(scaled_to_f64(divergence, self.decimals));
             m.feed_up.set(1.0);
             m.feed_ticks.inc();
             m.feed_mid.set(scaled_to_f64(mid, self.decimals));
@@ -497,8 +503,50 @@ impl Composite {
             mid,
             at: now,
             wall,
+            divergence,
         }));
     }
+}
+
+/// How far the fresh venues disagree: the largest gap between the primary's mid and any
+/// other's, `|primary − other| / other`, at the samples' own scale (`decimals`). Zero with
+/// fewer than two fresh venues, where there is nothing to compare.
+///
+/// The primary is the fresh venue with the most weight, the first of them on a tie: the
+/// one the average mostly is. Measuring it against each of the others, rather than each
+/// venue against the average, is what makes the gap mean the same thing whatever the
+/// weights are. A venue listed at a thousandth of the weight moves the average by nothing,
+/// and is still an independent reading of where the market is: when the venue the price
+/// comes from is frozen, late or pushed, that reading is what shows it.
+///
+/// A product that leaves a uint256 reads as the widest gap there is, so the pair withdraws
+/// rather than quote a number nothing could be checked against.
+pub(crate) fn divergence(fresh: &[(&Source, PriceSample)], decimals: u32) -> U256 {
+    let mut primary: Option<&(&Source, PriceSample)> = None;
+    for entry in fresh {
+        // Strictly greater, so the first of a tie stays.
+        if primary.is_none_or(|(source, _)| entry.0.weight > source.weight) {
+            primary = Some(entry);
+        }
+    }
+    let Some((primary, at)) = primary else {
+        return U256::zero();
+    };
+    let scale = U256::exp10(decimals as usize);
+    fresh
+        .iter()
+        .filter(|(source, _)| !std::ptr::eq(*source, *primary))
+        .map(|(_, other)| {
+            if other.mid.is_zero() {
+                return U256::MAX;
+            }
+            at.mid
+                .abs_diff(other.mid)
+                .checked_mul(scale)
+                .map_or(U256::MAX, |gap| gap / other.mid)
+        })
+        .max()
+        .unwrap_or_default()
 }
 
 /// `(Σ w·delta / Σ w, Σ w·mid / Σ w)` over `fresh`, or `None` if a product overflows. The
@@ -545,7 +593,54 @@ mod tests {
             mid: U256::from(mid),
             at: Instant::now(),
             wall: SystemTime::now(),
+            divergence: U256::zero(),
         }
+    }
+
+    /// Audit F-05: what the composite reports about its venues agreeing. The primary is
+    /// the venue the average mostly is, and the gap is its distance from the furthest of
+    /// the others, so a venue listed at a thousandth of the weight still counts in full as
+    /// a second reading of the market.
+    #[test]
+    fn the_divergence_is_the_primarys_gap_to_the_furthest_other_venue() {
+        let primary = source(VenueId::Binance, "A", "1");
+        let backup = source(VenueId::Okx, "B", "0.001");
+        let third = source(VenueId::Gate, "C", "0.5");
+        let at = |mid: u64| sample(mid, 0);
+        let gap = |fresh: &[(&Source, PriceSample)]| divergence(fresh, 4);
+
+        // One fresh venue: nothing to compare.
+        assert_eq!(gap(&[]), U256::zero());
+        assert_eq!(gap(&[(&primary, at(4000))]), U256::zero());
+        // |4000 − 3990| / 3990 = 0.2506%, at 4 decimals and truncated.
+        let two = [(&primary, at(4000)), (&backup, at(3990))];
+        assert_eq!(gap(&two), U256::from(25u64));
+        // The primary is the heaviest, wherever it is listed.
+        let reordered = [(&backup, at(3990)), (&primary, at(4000))];
+        assert_eq!(gap(&reordered), U256::from(25u64));
+        // The furthest of the others: |4000 − 4100| / 4100 = 2.439%.
+        let three = [
+            (&primary, at(4000)),
+            (&backup, at(3990)),
+            (&third, at(4100)),
+        ];
+        assert_eq!(gap(&three), U256::from(243u64));
+        // Agreeing venues read zero.
+        assert_eq!(
+            gap(&[(&primary, at(4000)), (&backup, at(4000))]),
+            U256::zero()
+        );
+
+        // On a tie the first is the primary: against 4200 that is 200/4200 = 4.76%, where
+        // the second as primary would read 200/4000 = 5%.
+        let a = source(VenueId::Kucoin, "A", "3");
+        let b = source(VenueId::Bitget, "B", "3");
+        let c = source(VenueId::Gate, "C", "2");
+        let tied = [(&a, at(4000)), (&b, at(4200)), (&c, at(4200))];
+        assert_eq!(gap(&tied), U256::from(476u64));
+
+        // A venue reporting no price at all is the widest disagreement there is.
+        assert_eq!(gap(&[(&primary, at(4000)), (&backup, at(0))]), U256::MAX);
     }
 
     #[test]
@@ -1003,7 +1098,11 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(sample.delta, U256::zero());
+        // The sample says how far the two disagree: the primary (weight 2) against the
+        // other, |3000 − 3300| / 3300 at this feed's 8 decimals.
+        assert_eq!(sample.divergence, U256::from(9_090_909u64));
         let m = metrics.for_pair("TEST");
+        assert!((m.feed_divergence.get() - 300.0 / 3300.0).abs() < 1e-7);
         assert_eq!(m.feed_sources_fresh.get(), 2.0);
         assert_eq!(m.feed_sources_min.get(), 2.0);
         assert_eq!(m.feed_up.get(), 1.0);
@@ -1130,6 +1229,7 @@ mod tests {
             ],
             min_sources: 1,
             checks: crate::config::SourceChecks {
+                max_divergence: None,
                 max_lag: Some(Duration::from_millis(1_500)),
             },
         };
@@ -1261,6 +1361,7 @@ mod tests {
             sources: vec![source(VenueId::Okx, "ETH-USDT", "1")],
             min_sources: 1,
             checks: crate::config::SourceChecks {
+                max_divergence: None,
                 max_lag: Some(Duration::from_millis(1_500)),
             },
         };

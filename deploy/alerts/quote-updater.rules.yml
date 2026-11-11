@@ -485,6 +485,24 @@ groups:
             The band is the only thing between a corrupt book and an arbitrary on-chain
             price the next fill is priced against. Either the book is wrong or the band is.
 
+      # A pair with two or more venues is withdrawn while its primary venue and any other
+      # disagree by more than its limit (max_source_divergence, or by default 20 times the
+      # half-spread it publishes and at least 5 bp). A moment of it on a fast move is the
+      # check working. Five minutes of it is a venue that froze behind a live socket, one
+      # delivering a backlog, a thin book that was pushed, or a limit set inside the
+      # venues' ordinary noise.
+      - alert: PusherSourcesDisagree
+        expr: rate(quote_updater_price_unusable_total{reason="source_divergence"}[5m]) > 0
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.pair }}: withdrawn because its venues disagree"
+          description: >-
+            The pair's venues have disagreed by more than its limit for five minutes, so it
+            is not quoting. quote_updater_feed_divergence shows the gap and the per-venue
+            mids show which venue is off. Fix or remove that venue, or raise
+            max_source_divergence if the gap is the venues' ordinary one.
+
       # The vault drifting away from the share it is configured to hold. Nothing else in
       # this file reads the inventory series at all: they arrived with volatile pricing and
       # were alerted on by nothing.
