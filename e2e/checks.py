@@ -47,11 +47,13 @@ def inverted(bid, ask):
 
 def tilted(bid, ask, half_spread, tilt):
     """What the `tilted` kind publishes for the WETH/USDC lane: the configured half-spread
-    as the delta, and the inverted mid tilted by tilt × (base share − 0.5).
+    as the delta, and the inverted mid tilted by tilt × (base share − 0.5), capped at the
+    half-spread either way so the quote never goes through the market.
 
     The mock's vault holds 1e30 raw of every token, so its base share at any sane price is
-    a few parts per billion: the tilt is (almost exactly) −tilt/2 in market terms, which
-    the inverted lane carries as a mid divided by (1 − skew). The updater does this in
+    a few parts per billion: the tilt is (almost exactly) −tilt/2 in market terms, which at
+    the scenario's settings is past the half-spread and so is the cap, −half_spread. The
+    inverted lane carries it as a mid divided by (1 − skew). The updater does this in
     fixed point off an f64 factor; the tolerance in `check` covers the last digits.
     """
     _, mid = inverted(bid, ask)
@@ -60,6 +62,7 @@ def tilted(bid, ask, half_spread, tilt):
     quote = Decimal(10**30) / Decimal(10**TOKENS[USDC][1])
     share = base * market_mid / (base * market_mid + quote)
     skew = Decimal(tilt) * (share - Decimal("0.5"))
+    skew = max(-Decimal(half_spread), min(Decimal(half_spread), skew))
     return [10**18 * Decimal(half_spread), mid / (1 - skew)]
 
 
