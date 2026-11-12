@@ -1022,6 +1022,8 @@ pub struct PublishGate {
     /// stop — but the alarm describes a transition, and re-emitting it on every feed move
     /// would flood stderr sub-second on a liquid pair.
     announced_halt: bool,
+    /// The pair's kill switch (`halts.rs`), read on every tick: set, the gate withdraws.
+    halt: crate::halts::HaltSignal,
     /// The lane's latch. The composite task's guards trip it, a panic trips it, a
     /// component's own task can trip it; this gate only reads it. Shared rather than owned
     /// so that a supervised restart, which builds a new gate, finds a trip that happened
@@ -1084,7 +1086,14 @@ impl PublishGate {
             withdrawn: None,
             announced_halt: false,
             latch,
+            halt: Default::default(),
         }
+    }
+
+    /// The gate, reading the pair's kill switch (`halts.rs`) on every tick.
+    pub(crate) fn with_halt(mut self, halt: crate::halts::HaltSignal) -> Self {
+        self.halt = halt;
+        self
     }
 
     /// Forgets the per-block state: the new block needs its own signature, and its
@@ -1117,6 +1126,13 @@ impl PublishGate {
         if let Some(trip) = self.latch.tripped() {
             let reason = trip.reason.clone();
             return self.halt(&reason);
+        }
+        // The kill switch, read before the price: a halted pair withdraws whatever the
+        // price, once per block like any withdraw, and sends nothing else. Not a `Halt`:
+        // the loop keeps running, silent, until the service shuts it down, and a resume
+        // has it quote again.
+        if self.halt.is_set() {
+            return self.withdraw(|| "halted".to_owned());
         }
         match price {
             Ok(quote) => self.publish(quote),
@@ -1239,7 +1255,9 @@ async fn drive(
     // Shared with whatever restarts this loop, so the latch is not reset by the failure it
     // is meant to see through. Still per pair, so a trip withdraws this lane's quote and
     // leaves the others quoting.
-    let mut gate = PublishGate::new(live.latch.clone());
+    let mut gate = PublishGate::new(live.latch.clone()).with_halt(live.halt.clone());
+    // The loop's own copy of the kill switch, to wake on: the gate's reads it, this one waits.
+    let mut halt = live.halt.clone();
     // The latest block, as the head watcher knows it, is the first target's parent.
     // Nothing is fetched for it: the watcher delivers the header with the number.
     let mut parent = tokio::select! {
@@ -1446,6 +1464,10 @@ async fn drive(
                 // when the latch is already tripped, so a loop that starts between a trip
                 // and its first price move halts without waiting for either.
                 _ = live.latch.notified() => {}
+                // The kill switch, likewise: a halt withdraws on this tick, not on the next
+                // price move or block, which on a quiet pair can be most of a slot away.
+                // A resume wakes it the same way, to quote again at once.
+                _ = halt.changed() => {}
                 Some(event) = events.recv() => {
                     if let Some(line) = summary.fold(&event) {
                         tracing::info!("[{label}] {line}");
@@ -2091,6 +2113,7 @@ mod tests {
             Address::from_slice(&[0xda; 20]),
         );
         let live = Live {
+            halt: Default::default(),
             pair: Pair {
                 tokens: (token0, token1),
                 lane: lane_of(token0, token1),
@@ -3704,6 +3727,7 @@ mod tests {
         let secret = secp256k1::SecretKey::from_slice(&[0x11; 32]).unwrap();
         let lane = U256::from(7);
         let live = Live {
+            halt: Default::default(),
             pair: Pair {
                 tokens: (
                     Address::from_slice(&[0xa0; 20]),
@@ -3935,6 +3959,7 @@ mod tests {
         let secret = secp256k1::SecretKey::from_slice(&[0x11; 32]).unwrap();
         let lane = U256::from(7);
         let live = Live {
+            halt: Default::default(),
             pair: Pair {
                 tokens: (
                     Address::from_slice(&[0xa0; 20]),
@@ -4080,6 +4105,7 @@ mod tests {
         let secret = secp256k1::SecretKey::from_slice(&[0x11; 32]).unwrap();
         let lane = U256::from(7);
         let live = Live {
+            halt: Default::default(),
             pair: Pair {
                 tokens: (
                     Address::from_slice(&[0xa0; 20]),
@@ -4319,6 +4345,7 @@ mod tests {
         let secret = secp256k1::SecretKey::from_slice(&[0x22; 32]).unwrap();
         let lane = U256::from(7);
         let live = Live {
+            halt: Default::default(),
             pair: Pair {
                 tokens: (
                     Address::from_slice(&[0xa0; 20]),
@@ -4444,6 +4471,7 @@ mod tests {
         let secret = secp256k1::SecretKey::from_slice(&[0x33; 32]).unwrap();
         let lane = U256::from(7);
         let live = Live {
+            halt: Default::default(),
             pair: Pair {
                 tokens: (
                     Address::from_slice(&[0xa0; 20]),
@@ -4626,6 +4654,7 @@ mod tests {
             "nothing has landed before the first block"
         );
         let live = Live {
+            halt: Default::default(),
             pair: Pair {
                 tokens: (
                     Address::from_slice(&[0xa0; 20]),
@@ -4804,6 +4833,41 @@ mod tests {
             gate.decide(Ok(scaled(103))).action,
             Action::Publish(scaled(103)),
             "the gate must not judge prices itself"
+        );
+    }
+
+    /// The kill switch at the gate (audit F-06): set, a usable price is withdrawn rather
+    /// than published, once per block like any withdraw; lifted, the price goes out again.
+    #[test]
+    fn a_halted_gate_withdraws_whatever_the_price_and_a_resume_publishes() {
+        let flags = crate::halts::HaltFlags::default();
+        let lane = U256::from(1);
+        let mut gate = breaker_gate().with_halt(flags.flag(lane));
+        assert_eq!(
+            gate.decide(Ok(scaled(100))).action,
+            Action::Publish(scaled(100))
+        );
+        gate.published(scaled(100));
+
+        flags.set(&[lane]);
+        assert_eq!(gate.decide(Ok(scaled(100))).action, Action::Withdraw);
+        assert_eq!(gate.withdrawn_reason(), Some("halted"));
+        assert_eq!(
+            gate.decide(Ok(scaled(101))).action,
+            Action::Nothing,
+            "the retraction stands for the block"
+        );
+        gate.begin_block();
+        assert_eq!(
+            gate.decide(Ok(scaled(101))).action,
+            Action::Withdraw,
+            "and is made again for the next"
+        );
+
+        flags.clear(&[lane]);
+        assert_eq!(
+            gate.decide(Ok(scaled(101))).action,
+            Action::Publish(scaled(101))
         );
     }
 

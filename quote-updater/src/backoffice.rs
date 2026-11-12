@@ -31,7 +31,7 @@
 //! | `GET /api/pairs/{key_env}`        | one pair                                         |
 //! | `PUT /api/pairs/{key_env}`        | replaces a pair's stanza                         |
 //! | `DELETE /api/pairs/{key_env}`     | removes a pair                                   |
-//! | `POST /api/pairs/{key_env}/halt`  | stops a pair quoting, keeping it                 |
+//! | `POST /api/pairs/{key_env}/halt`  | stops a pair quoting at once, keeping it         |
 //! | `POST /api/pairs/{key_env}/resume`| clears a halt                                    |
 //! | `POST /api/halt`                  | halts every pair                                 |
 //! | `POST /api/reload`                | restarts the pairs halted here, re-arms the rest |
@@ -771,18 +771,36 @@ async fn remove_pair(
     .await
 }
 
-/// Stops a pair quoting and keeps it, with every setting, in the config. The reload treats
-/// it as gone, so its quote is withdrawn at every builder exactly as a removal would.
+/// Stops a pair quoting and keeps it, with every setting, in the config: the kill switch
+/// (audit F-06, `SharedConfig::halt`). Its lane withdraws its quote at every builder on its
+/// next tick, with no reload, no RPC call and no other pair's check in the way, so it is
+/// never refused for another pair's sake and never waits on the chain; then the halt is
+/// recorded, in the config and the file.
 async fn halt_pair(
     State(state): State<Backoffice>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(key_env): Path<String>,
 ) -> Response {
-    apply(&state, peer, false, move |config| {
-        set_halted(config, Some(&key_env), true)?;
-        Ok(format!("halted pair {key_env}"))
-    })
-    .await
+    let by = format!("backoffice: {peer}");
+    let halted = state
+        .config
+        .halt(
+            &by,
+            |config| {
+                let pair = config
+                    .pairs
+                    .iter()
+                    .find(|pair| pair.key_env == key_env)
+                    .ok_or_else(|| no_pair(&key_env))?;
+                if pair.halted {
+                    return Err(ApiError::conflict("already halted"));
+                }
+                Ok((vec![key_env.clone()], format!("halted pair {key_env}")))
+            },
+            None,
+        )
+        .await;
+    respond(halted, false)
 }
 
 async fn resume_pair(
@@ -797,15 +815,35 @@ async fn resume_pair(
     .await
 }
 
+/// [`halt_pair`], for every pair not halted already.
 async fn halt_all(
     State(state): State<Backoffice>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
 ) -> Response {
-    apply(&state, peer, false, |config| {
-        set_halted(config, None, true)?;
-        Ok("halted every pair".to_owned())
-    })
-    .await
+    let by = format!("backoffice: {peer}");
+    let halted = state
+        .config
+        .halt(
+            &by,
+            |config| {
+                if config.pairs.is_empty() {
+                    return Err(ApiError::conflict("there are no pairs to halt"));
+                }
+                let keys: Vec<String> = config
+                    .pairs
+                    .iter()
+                    .filter(|pair| !pair.halted)
+                    .map(|pair| pair.key_env.clone())
+                    .collect();
+                if keys.is_empty() {
+                    return Err(ApiError::conflict("already halted"));
+                }
+                Ok((keys, "halted every pair".to_owned()))
+            },
+            None,
+        )
+        .await;
+    respond(halted, false)
 }
 
 /// A reload with no edit behind it: covers the ways the running pairs drift from the
@@ -1548,7 +1586,9 @@ mod tests {
         edit(&mut config);
         config::write_raw_atomically(&path, &config).unwrap();
         let (tx, rx) = tokio::sync::mpsc::channel(1);
-        (Arc::new(SharedConfig::new(path, config, tx)), rx)
+        // No service here to retire a halted lane: the notice goes nowhere.
+        let (halts, _) = tokio::sync::mpsc::unbounded_channel();
+        (Arc::new(SharedConfig::new(path, config, tx, halts)), rx)
     }
 
     /// The service, answering every reload it is asked for with `verdict`. It keeps
@@ -1846,15 +1886,14 @@ mod tests {
         .await;
         let before = std::fs::read_to_string(config.path()).unwrap();
 
-        let (status, body) =
-            call(local, "POST", &format!("/api/pairs/{WETH_USDC}/halt"), None).await;
+        let (status, body) = call(local, "DELETE", &format!("/api/pairs/{WETH_USDC}"), None).await;
 
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
         let error = body["error"].as_str().unwrap();
         assert!(error.contains("preflight failed"), "{error}");
         assert!(error.contains("nothing changed"), "{error}");
         assert_eq!(std::fs::read_to_string(config.path()).unwrap(), before);
-        assert!(!config.snapshot().pairs[0].halted);
+        assert_eq!(config.snapshot().pairs.len(), 1);
     }
 
     /// One the service applied in part is kept, and says `partial` rather than `applied`.
@@ -1869,8 +1908,7 @@ mod tests {
         )
         .await;
 
-        let (status, body) =
-            call(local, "POST", &format!("/api/pairs/{WETH_USDC}/halt"), None).await;
+        let (status, body) = call(local, "DELETE", &format!("/api/pairs/{WETH_USDC}"), None).await;
 
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["status"], "partial", "{body}");
@@ -1878,8 +1916,40 @@ mod tests {
             body["message"].as_str().unwrap().contains("is kept"),
             "{body}"
         );
+        assert!(config.snapshot().pairs.is_empty());
+        assert!(config::load_raw(config.path()).unwrap().pairs.is_empty());
+    }
+
+    /// A halt is the kill switch, not a converged change (audit F-06): a service that would
+    /// reject every change, as one with a pair failing its checks does, is not asked, and
+    /// the halt is recorded in the config and the file all the same.
+    #[tokio::test]
+    async fn a_halt_is_not_refused_by_a_service_that_refuses_every_change() {
+        let (local, config) = serve(
+            "halt-not-refused",
+            |_| {},
+            Err(ReloadFailure::Rejected(
+                "preflight failed: another pair is not authorized".to_owned(),
+            )),
+        )
+        .await;
+
+        let (status, body) =
+            call(local, "POST", &format!("/api/pairs/{WETH_USDC}/halt"), None).await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "applied", "{body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("withdrawn at every builder"),
+            "{body}"
+        );
         assert!(config.snapshot().pairs[0].halted);
         assert!(config::load_raw(config.path()).unwrap().pairs[0].halted);
+        let (status, _) = call(local, "POST", &format!("/api/pairs/{WETH_USDC}/halt"), None).await;
+        assert_eq!(status, StatusCode::CONFLICT, "already halted");
     }
 
     /// The guard: a change only as JSON, and never from another site's page, whatever its

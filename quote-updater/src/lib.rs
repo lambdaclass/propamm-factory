@@ -72,6 +72,7 @@ mod discover;
 mod exporter;
 mod feed;
 pub mod guard;
+mod halts;
 mod head;
 mod kinds;
 mod landing;
