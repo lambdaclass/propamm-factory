@@ -82,6 +82,8 @@ pub(crate) fn watchdog_verdict(
 /// has ("halted on their circuit breaker", "check that feed"); once a registered guard, a
 /// panic or a kill switch can halt a lane, the notice names the sources instead, so a
 /// panic in a pricer never pages as a feed problem.
+///
+/// `backoffice` is the backoffice's base URL, scheme included, when the run serves one.
 pub(crate) fn halt_notice(
     (halted, waiting, total): (usize, usize, usize),
     backoffice: Option<&str>,
@@ -93,10 +95,10 @@ pub(crate) fn halt_notice(
     // have no reason to doubt.
     if halted == 0 && waiting >= total && total > 0 {
         return match backoffice {
-            Some(addr) => format!(
+            Some(url) => format!(
                 "nothing is quoting: all {total} pair(s) are failing to start and none has \
                  halted, so this is the config rather than a feed. NOT exiting, so the \
-                 backoffice stays reachable: fix it through http://{addr}/api/"
+                 backoffice stays reachable: fix it through {url}/api/"
             ),
             None => format!(
                 "nothing is quoting: all {total} pair(s) are failing to start and none has \
@@ -330,13 +332,13 @@ mod tests {
     /// is the config: on a page-managed server, most often a pair added before any builder.
     #[test]
     fn a_config_outage_is_not_reported_as_a_halt() {
-        let with_page = notice((0, 1, 1), Some("100.64.1.2:8088"), &[]);
+        let with_page = notice((0, 1, 1), Some("https://100.64.1.2:8088"), &[]);
         assert!(
             with_page.contains("this is the config rather than a feed"),
             "{with_page}"
         );
         assert!(
-            with_page.contains("http://100.64.1.2:8088/api/"),
+            with_page.contains("fix it through https://100.64.1.2:8088/api/"),
             "{with_page}"
         );
         assert!(!with_page.contains("breaker"), "{with_page}");

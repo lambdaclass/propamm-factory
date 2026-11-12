@@ -12,6 +12,9 @@
 //! the tailnet ACL. Binding every interface is refused, because unlike `/metrics` this API
 //! writes. Every change logs the peer that made it.
 //!
+//! Plain HTTP unless `--backoffice-tls-cert` and `--backoffice-tls-key` are given; then
+//! HTTPS only, with the certificate read again whenever its files change (`tls.rs`).
+//!
 //! Being past the ACL is not the same as meaning to be here: a browser on the tailnet sends
 //! whatever another site's page tells it to. So [`guard`] takes a change only as JSON,
 //! which a page on another site cannot send here without CORS approval, and refuses one
@@ -176,16 +179,19 @@ fn cors(origins: &[String]) -> Option<tower_http::cors::CorsLayer> {
     )
 }
 
-/// Binds `addr` and serves the API, with CORS answers for `origins` (see
-/// [`parse_origins`]). Fatal on failure: an operator who believes this is up and whose
-/// changes are going nowhere is worse off than one whose service refused to start.
-pub async fn bind(
+/// Binds `addr` and serves the API, over HTTPS with `tls`'s certificate when there is one,
+/// with CORS answers for `origins` (see [`parse_origins`]). Fatal on failure: an operator
+/// who believes this is up and whose changes are going nowhere is worse off than one whose
+/// service refused to start.
+#[allow(clippy::too_many_arguments)] // one call site outside the tests, naming each
+pub(crate) async fn bind(
     addr: SocketAddr,
     config: Arc<SharedConfig>,
     client: ethrex_rpc::clients::eth::EthClient,
     states: PairStates,
     kinds: Arc<crate::kinds::Kinds>,
     origins: &[String],
+    tls: Option<crate::tls::Tls>,
 ) -> Result<(SocketAddr, JoinHandle<()>)> {
     bind_with(
         addr,
@@ -194,12 +200,14 @@ pub async fn bind(
         states,
         kinds,
         origins,
+        tls,
         crate::discover::Rest::default(),
     )
     .await
 }
 
 /// [`bind`], with the exchanges' APIs somewhere else: a test's mock.
+#[allow(clippy::too_many_arguments)] // two call sites (bind and a test), each naming them
 async fn bind_with(
     addr: SocketAddr,
     config: Arc<SharedConfig>,
@@ -207,6 +215,7 @@ async fn bind_with(
     states: PairStates,
     kinds: Arc<crate::kinds::Kinds>,
     origins: &[String],
+    tls: Option<crate::tls::Tls>,
     rest: crate::discover::Rest,
 ) -> Result<(SocketAddr, JoinHandle<()>)> {
     refuse_unspecified_bind(addr)?;
@@ -272,17 +281,34 @@ async fn bind_with(
     }
     .with_state(state);
 
-    let task = tokio::spawn(async move {
-        // With connect info, so every change can be logged against its peer.
-        if let Err(err) = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-        {
-            tracing::warn!("backoffice listener stopped: {err}");
+    // With connect info, so every change can be logged against its peer.
+    let app = app.into_make_service_with_connect_info::<SocketAddr>();
+    let task = match tls {
+        None => tokio::spawn(async move {
+            if let Err(err) = axum::serve(listener, app).await {
+                tracing::warn!("backoffice listener stopped: {err}");
+            }
+        }),
+        Some(tls) => {
+            let (listener, accepting) = crate::tls::listener(listener, tls)
+                .wrap_err("bound backoffice listener has no local address")?;
+            // The accept loop and the server in one task, so ending it ends both. `tap_io`
+            // only so axum hands the peer's address to `ConnectInfo`, which it does for a
+            // wrapped listener of any kind and for its own `TcpListener` alone otherwise.
+            use axum::serve::ListenerExt;
+            tokio::spawn(async move {
+                let serving = axum::serve(listener.tap_io(|_| {}), app);
+                tokio::select! {
+                    served = serving.into_future() => {
+                        if let Err(err) = served {
+                            tracing::warn!("backoffice listener stopped: {err}");
+                        }
+                    }
+                    () = accepting => {}
+                }
+            })
         }
-    });
+    };
 
     Ok((local, task))
 }
@@ -1473,6 +1499,7 @@ mod tests {
             PairStates::default(),
             test_kinds(),
             origins,
+            None,
         )
         .await
         .unwrap();
@@ -1588,6 +1615,7 @@ mod tests {
             states,
             test_kinds(),
             &[],
+            None,
         )
         .await
         .unwrap();
@@ -1620,6 +1648,7 @@ mod tests {
             PairStates::default(),
             test_kinds(),
             &[],
+            None,
         )
         .await
         .expect_err("an unspecified bind must be refused");
@@ -1935,6 +1964,91 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(allow_origin(&unanswered), None);
+    }
+
+    /// A client that takes any certificate, keeps the one it was given, and opens a new
+    /// connection for every request, so a renewed certificate is the one it sees next.
+    fn https_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .tls_info(true)
+            .pool_max_idle_per_host(0)
+            .build()
+            .unwrap()
+    }
+
+    /// The status of a `GET` of `url`, and the certificate the server presented for it.
+    async fn presented(client: &reqwest::Client, url: &str) -> (u16, Vec<u8>) {
+        let response = client.get(url).send().await.unwrap();
+        let certificate = response
+            .extensions()
+            .get::<reqwest::tls::TlsInfo>()
+            .and_then(|info| info.peer_certificate())
+            .expect("an HTTPS answer carries the server's certificate")
+            .to_vec();
+        (response.status().as_u16(), certificate)
+    }
+
+    /// With a certificate the API is HTTPS: it presents that certificate, takes a change
+    /// (the peer's address still reaching the guard and the log), turns plain HTTP away
+    /// without falling over, and presents a renewed certificate once its files change.
+    #[tokio::test]
+    async fn the_api_is_served_over_https_and_a_renewal_is_picked_up() {
+        use crate::tls::tests::{fixture, leaf};
+        let dir = std::env::temp_dir().join(format!(
+            "quote-updater-backoffice-certificate-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (cert, key) = (dir.join("server.crt"), dir.join("server.key"));
+        std::fs::copy(fixture("a.crt"), &cert).unwrap();
+        std::fs::copy(fixture("a.key"), &key).unwrap();
+        let (config, requests) = shared("https", |_| {});
+        service(requests, accepted());
+        let (local, _task) = bind(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::clone(&config),
+            test_client(),
+            PairStates::default(),
+            test_kinds(),
+            &[],
+            Some(crate::tls::Tls::load(&cert, &key).unwrap()),
+        )
+        .await
+        .unwrap();
+        let client = https_client();
+        let pairs = format!("https://{local}/api/pairs");
+
+        let (status, certificate) = presented(&client, &pairs).await;
+        assert_eq!(status, 200);
+        assert_eq!(certificate, leaf("a.crt"));
+
+        let halted = client
+            .post(format!("https://{local}/api/pairs/{WETH_USDC}/halt"))
+            .header("content-type", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(halted.status().as_u16(), 200);
+        assert!(config.snapshot().pairs[0].halted);
+
+        assert!(
+            reqwest::get(format!("http://{local}/api/pairs"))
+                .await
+                .is_err(),
+            "plain HTTP is not answered on the HTTPS port"
+        );
+        assert_eq!(presented(&client, &pairs).await.0, 200, "and still serves");
+
+        std::fs::copy(fixture("b.crt"), &cert).unwrap();
+        std::fs::copy(fixture("b.key"), &key).unwrap();
+        let (status, renewed) = presented(&client, &pairs).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            renewed,
+            leaf("b.crt"),
+            "the renewed certificate, with no restart"
+        );
     }
 
     /// An edit replaces the stanza and nothing that makes the pair what it is: not its key,
@@ -2277,6 +2391,7 @@ mod tests {
             PairStates::default(),
             test_kinds(),
             &[],
+            None,
             crate::discover::Rest::all_at(&format!("http://{exchanges}")),
         )
         .await
@@ -2437,6 +2552,15 @@ mod tests {
     /// A backoffice whose Binance and Bybit endpoints are the mocks, answering CORS for
     /// [`UI`].
     async fn preview_backoffice(name: &str, venues: SocketAddr) -> SocketAddr {
+        preview_backoffice_with(name, venues, None).await
+    }
+
+    /// [`preview_backoffice`], over HTTPS when given a certificate.
+    async fn preview_backoffice_with(
+        name: &str,
+        venues: SocketAddr,
+        tls: Option<crate::tls::Tls>,
+    ) -> SocketAddr {
         let (config, _requests) = shared(name, |config| {
             config
                 .settings
@@ -2454,6 +2578,7 @@ mod tests {
             PairStates::default(),
             test_kinds(),
             &[UI.to_owned()],
+            tls,
         )
         .await
         .unwrap();
@@ -2704,6 +2829,46 @@ mod tests {
         );
     }
 
+    /// Over HTTPS the preview is a `wss://` socket: the websocket upgrade runs on the TLS
+    /// connection the backoffice's own listener accepted, and the venues come through.
+    #[tokio::test]
+    async fn the_preview_opens_over_wss() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let (_mocks, venues) = MockVenues::start().await;
+        let tls = crate::tls::Tls::load(
+            &crate::tls::tests::fixture("a.crt"),
+            &crate::tls::tests::fixture("a.key"),
+        )
+        .unwrap();
+        let local = preview_backoffice_with("preview-wss", venues, Some(tls)).await;
+        let mut request = format!(
+            "wss://{local}/api/preview?token0=0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2\
+             &token1=0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+        )
+        .into_client_request()
+        .unwrap();
+        request
+            .headers_mut()
+            .insert("origin", format!("https://{local}").parse().unwrap());
+        let connector = tokio_tungstenite::Connector::NativeTls(
+            native_tls::TlsConnector::builder()
+                .danger_accept_invalid_certs(true)
+                .build()
+                .unwrap(),
+        );
+        let (mut page, _) =
+            tokio_tungstenite::connect_async_tls_with_config(request, None, false, Some(connector))
+                .await
+                .expect("the preview opens over wss://");
+        send(
+            &mut page,
+            serde_json::json!({"type": "set", "venue": "binance", "symbol": "ETHUSDC", "weight": "1"}),
+        )
+        .await;
+        let found = snapshot_where(&mut page, |v| v["fresh"] == 1).await;
+        assert!((found["venues"][0]["mid"].as_f64().unwrap() - 2000.0).abs() < 0.01);
+    }
+
     /// At most PREVIEW_PAGES pages at once; one more is refused before it opens anything,
     /// and closing a page frees its place.
     #[tokio::test]
@@ -2741,6 +2906,7 @@ mod tests {
             PairStates::default(),
             test_kinds(),
             &[],
+            None,
         )
         .await
         .unwrap();

@@ -583,6 +583,33 @@ key: `--backoffice-port 9000` against the file above serves `100.64.1.2:9000`. E
 on its own turns the backoffice on; the half nothing gives is `127.0.0.1` for the address
 and `8088` for the port.
 
+**HTTPS.** Give it a certificate and its key and the backoffice is served over HTTPS only
+(and the preview over `wss://`); without them it is plain HTTP:
+
+```bash
+tailscale cert pusher.your-tailnet.ts.net    # writes pusher.your-tailnet.ts.net.crt and .key
+quote-updater --config config.toml --backoffice-ip 100.64.1.2 \
+  --backoffice-tls-cert pusher.your-tailnet.ts.net.crt \
+  --backoffice-tls-key pusher.your-tailnet.ts.net.key
+```
+
+`--backoffice-tls-cert` (`BACKOFFICE_TLS_CERT`) is a PEM file holding the certificate and any
+intermediates, the server's own first; `--backoffice-tls-key` (`BACKOFFICE_TLS_KEY`) is its
+private key, one unencrypted PEM key in PKCS#8 (`BEGIN PRIVATE KEY`), SEC1 (`BEGIN EC PRIVATE
+KEY`, what `tailscale cert` writes) or PKCS#1 (`BEGIN RSA PRIVATE KEY`). The two go together:
+one without the other refuses the run, as do a file that does not read, a chain with no
+certificate, an encrypted key, or a key that is not the certificate's, each at startup
+(`--check` included) and naming its file. TLS 1.2 and 1.3, no client certificates. They are
+flags (and variables) only, not `[settings]` keys.
+
+A renewal needs no restart: the two files are looked at on every new connection, and when
+either has changed (its modification time or its size) they are read again. A pair that does
+not load, such as the moment between `tailscale cert` writing the certificate and writing its
+key, is warned about once and the certificate loaded before goes on being served until the
+files change again. A connection already open keeps the certificate it was made with. The
+`https://` address is the one to reach it by, and the one the halt notice names; a client
+speaking plain HTTP to it gets its connection dropped, and the journal says why.
+
 | Route | What it does |
 |---|---|
 | `GET /api/pairs` | every pair, with what the updater is doing with it |
@@ -679,10 +706,9 @@ changes are still refused. An origin is written as the browser sends it, scheme,
 port alone (`http://100.64.1.2:3000`, no path), and `*` is refused: it would let a page on any
 site an operator's browser visits drive the API. With none listed there is no CORS at all,
 and a browser front end has to be served under the API's own address, for instance by a
-reverse proxy that serves the UI and proxies `/api`. The API itself is plain HTTP, so a
-front end served over HTTPS cannot call it from a browser whatever CORS says (the browser
-blocks mixed content); serve that front end over HTTP too, or put the API behind the same
-TLS proxy.
+reverse proxy that serves the UI and proxies `/api`. A front end served over HTTPS can only
+call the API over HTTPS too, whatever CORS says (a browser blocks mixed content): serve the
+backoffice with a certificate (above), and list the front end's `https://` origin.
 
 **The lookup and the preview.** `GET /api/lookup` is the venue lookup described under the
 price sources above. The live prices run over one websocket per open preview. The client

@@ -101,6 +101,7 @@ mod state;
 mod supervisor;
 mod tasks;
 pub mod testing;
+mod tls;
 mod update;
 mod updater;
 mod vault;

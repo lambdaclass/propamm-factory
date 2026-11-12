@@ -74,10 +74,11 @@ fn ignore_hangup(tasks: &mut Tasks, config: &std::path::Path) {
 }
 
 /// How the halt notice tells an operator to reload: the one thing that re-arms a lane its
-/// breaker halted without restarting the others.
+/// breaker halted without restarting the others. `backoffice` is its base URL, scheme
+/// included.
 fn reload_hint(backoffice: Option<&str>, handle: bool) -> String {
     match (backoffice, handle) {
-        (Some(addr), _) => format!("POST http://{addr}/api/reload"),
+        (Some(url), _) => format!("POST {url}/api/reload"),
         (None, true) => "UpdaterHandle::reload".to_owned(),
         (None, false) => "this run has no backoffice to reload through; set [settings] \
                           backoffice_addr, which takes a restart"
@@ -234,6 +235,28 @@ async fn run_inner(
              answer for; it is ignored"
         );
     }
+    // The certificate is read here too, so a bad path or a key that is not the
+    // certificate's is refused, by `--check` as well, before anything connects.
+    let backoffice_tls = match (args.flags.backoffice_tls()?, backoffice_addr) {
+        (Some((cert, key)), Some(_)) => Some(crate::tls::Tls::load(cert, key)?),
+        (Some(_), None) => {
+            tracing::warn!(
+                "--backoffice-tls-cert is set, but this run serves no backoffice to serve it \
+                 on; it is ignored"
+            );
+            None
+        }
+        (None, _) => None,
+    };
+    // How the backoffice is reached, for every line that tells an operator where to go.
+    let backoffice_url = backoffice_addr.map(|addr| {
+        let scheme = if backoffice_tls.is_some() {
+            "https"
+        } else {
+            "http"
+        };
+        format!("{scheme}://{addr}")
+    });
 
     // Loaded before anything connects, though nothing here needs the chain: the file is
     // local, cheap and deterministic, while the RPC calls below are slow and can fail
@@ -592,8 +615,8 @@ async fn run_inner(
             let health = health.clone();
             // Named in the notice, so it says where to go and fix it. The configured
             // address, not the bound one, since the listener is opened further down.
-            let backoffice_addr = backoffice_addr.map(|addr| addr.to_string());
-            let reload_hint = reload_hint(backoffice_addr.as_deref(), settled.is_some());
+            let backoffice_url = backoffice_url.clone();
+            let reload_hint = reload_hint(backoffice_url.as_deref(), settled.is_some());
             tasks.spawn(async move {
                 let mut last_notice: Option<tokio::time::Instant> = None;
                 loop {
@@ -607,7 +630,7 @@ async fn run_inner(
                                 "{}",
                                 halt_notice(
                                     health.census(),
-                                    backoffice_addr.as_deref(),
+                                    backoffice_url.as_deref(),
                                     &health.trips(),
                                     &reload_hint
                                 )
@@ -680,6 +703,11 @@ async fn run_inner(
         // run is a surprise.
         let _backoffice = match backoffice_addr {
             Some(addr) => {
+                let scheme = if backoffice_tls.is_some() {
+                    "https"
+                } else {
+                    "http"
+                };
                 let (local, task) = backoffice::bind(
                     addr,
                     Arc::clone(&shared),
@@ -687,12 +715,14 @@ async fn run_inner(
                     pair_states.clone(),
                     Arc::clone(&kinds),
                     &cors_origins,
+                    backoffice_tls,
                 )
                 .await?;
                 match cors_origins.as_slice() {
-                    [] => tracing::info!("backoffice API listening on http://{local}/api/"),
+                    [] => tracing::info!("backoffice API listening on {scheme}://{local}/api/"),
                     origins => tracing::info!(
-                        "backoffice API listening on http://{local}/api/, answering CORS for {}",
+                        "backoffice API listening on {scheme}://{local}/api/, answering CORS \
+                         for {}",
                         origins.join(", ")
                     ),
                 }
@@ -1746,6 +1776,68 @@ api_key = "k"
             .await
             .expect("stops within 20s")
             .expect("runs and stops cleanly");
+    }
+
+    /// HTTPS by flag, through the real startup: the backoffice is served over https://
+    /// with the certificate given; and a certificate whose key is not its own refuses the
+    /// run before it connects to anything, naming the file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_backoffice_is_served_over_https_by_flag() {
+        use std::time::Duration;
+        let fixture = |name: &str| crate::tls::tests::fixture(name).display().to_string();
+        let fx = Fixture::spawn("api-https").await;
+        let (port, flags) = backoffice_flags();
+        let mut argv: Vec<String> = flags.to_vec();
+        argv.extend([
+            "--backoffice-tls-cert".to_owned(),
+            fixture("a.crt"),
+            "--backoffice-tls-key".to_owned(),
+            fixture("a.key"),
+        ]);
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let handle = fx.updater().start(fx.args(&argv));
+
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap();
+        let url = format!("https://127.0.0.1:{port}/api/pairs");
+        let answer = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(answer) = client.get(&url).send().await {
+                    break answer;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the backoffice answers over https:// within 10s");
+        assert_eq!(answer.status().as_u16(), 200);
+        let pairs: serde_json::Value =
+            serde_json::from_slice(&answer.bytes().await.unwrap()).unwrap();
+        assert_eq!(pairs[0]["pair"]["key_env"], "QU_TEST_KEY", "{pairs}");
+        handle.shutdown();
+        tokio::time::timeout(Duration::from_secs(20), handle.wait())
+            .await
+            .expect("stops within 20s")
+            .expect("runs and stops cleanly");
+
+        let (_, flags) = backoffice_flags();
+        let mut argv: Vec<String> = flags.to_vec();
+        argv.extend([
+            "--backoffice-tls-cert".to_owned(),
+            fixture("a.crt"),
+            "--backoffice-tls-key".to_owned(),
+            fixture("b.key"),
+        ]);
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let refused = fx.updater().start(fx.args(&argv));
+        let err = tokio::time::timeout(Duration::from_secs(10), refused.wait())
+            .await
+            .expect("refused at once")
+            .expect_err("a key that is not the certificate's refuses the run");
+        let err = format!("{err:#}");
+        assert!(err.contains("a.crt") && err.contains("b.key"), "{err}");
     }
 
     /// A fresh host: no pairs in the file, and the backoffice turned on by flag alone. The

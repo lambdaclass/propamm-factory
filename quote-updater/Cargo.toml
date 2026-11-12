@@ -30,7 +30,9 @@ tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "signal",
 # `default-tls` -> hyper-tls -> native-tls is already in the graph for EthClient's HTTP
 # calls, and Cargo features are additive, so nothing on this side can switch it off.
 # Measured cost of switching: +1.4 MB of binary for a second TLS stack and no OpenSSL
-# removed. Revisit only if ethrex takes reqwest with default-features = false.
+# removed. Revisit only if ethrex takes reqwest with default-features = false. (The
+# backoffice's HTTPS server is rustls, below: a server, for a reason this choice does not
+# cover. The clients stay on native-tls.)
 tokio-tungstenite = { version = "0.29", features = ["native-tls"] }
 # Human-editable pair and builder configs. Measured cost in Cargo.lock: three new package
 # entries (toml, toml_writer, toml_parser); serde_spanned, toml_datetime and winnow all
@@ -49,6 +51,14 @@ axum = { version = "0.8.9", features = ["ws"] }
 # (`--backoffice-cors-origin`). Zero new package entries in Cargo.lock: ethrex-rpc already
 # pulls tower-http 0.6 in with the `cors` feature on. Pinned to the version that tree locks.
 tower-http = { version = "0.6.11", features = ["cors"] }
+# The backoffice's HTTPS (tls.rs). rustls, not the native-tls the clients use: as a server
+# it must read the key `tailscale cert` writes, SEC1 (`BEGIN EC PRIVATE KEY`), and
+# native-tls takes PKCS#8 alone; rustls also serves the same way on Linux and macOS. ring
+# for its crypto, already compiled here, rather than rustls' default aws-lc-rs, a C library
+# build of its own. Zero new package entries in Cargo.lock (all were locked through ethrex),
+# but rustls, rustls-webpki and tokio-rustls are now compiled in. Measured: a release build
+# of example/ went from 10.18 MB to 11.44 MB (+1.26 MB, macOS arm64), this code included.
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 
 # ethrex has no standalone lightweight client crate yet, so the client (EthClient, calldata
 # encoding, signer) comes from the node's workspace crates. Pinned to one rev so the five
@@ -79,6 +89,9 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry", "std"] }
 
 [dev-dependencies]
+# The client side of the HTTPS tests: the websocket preview over wss://, accepting the
+# test certificate. Already compiled in through reqwest and tokio-tungstenite.
+native-tls = "0.2.18"
 # Only for tokio's paused clock (`#[tokio::test(start_paused = true)]`), which lets a
 # waited duration (a restart backoff, quoting.rs's shutdown bound) be asserted without
 # waiting it out. test-util = ["rt", "sync", "time"], all already enabled, so this adds

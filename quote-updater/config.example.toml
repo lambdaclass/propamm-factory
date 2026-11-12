@@ -134,6 +134,10 @@ disable_cross_region = false
 # that origin listed with --backoffice-cors-origin (BACKOFFICE_CORS_ORIGINS, comma-separated):
 # the API answers CORS for those origins only, and `*` is refused.
 #
+# It is plain HTTP unless --backoffice-tls-cert and --backoffice-tls-key (BACKOFFICE_TLS_CERT,
+# BACKOFFICE_TLS_KEY) name a PEM certificate and its key, `tailscale cert`'s included; then
+# it is HTTPS only, and a renewed certificate is picked up without a restart.
+#
 # Setting it also lets the updater start with no pairs and no builders, which is what makes
 # a fresh host bootable from a config file holding nothing but a target and this address:
 # everything else is then added through the API. Without a backoffice an empty [[pairs]]

@@ -207,6 +207,18 @@ pub(crate) struct Flags {
     )]
     pub(crate) backoffice_cors_origins: Vec<String>,
 
+    /// Serve the backoffice API over HTTPS with this certificate: a PEM file holding the
+    /// certificate and any intermediates, the server's own first (what `tailscale cert`
+    /// writes as <name>.crt). Needs --backoffice-tls-key. Read again whenever it changes,
+    /// so a renewal needs no restart. Without both, the backoffice is plain HTTP
+    #[arg(long, env = "BACKOFFICE_TLS_CERT")]
+    pub(crate) backoffice_tls_cert: Option<PathBuf>,
+
+    /// The private key of --backoffice-tls-cert: one unencrypted PEM key, PKCS#8, SEC1
+    /// (what `tailscale cert` writes as <name>.key) or PKCS#1
+    #[arg(long, env = "BACKOFFICE_TLS_KEY")]
+    pub(crate) backoffice_tls_key: Option<PathBuf>,
+
     /// Keep builder quote updates in the region they were submitted to
     #[arg(long, env = "DISABLE_CROSS_REGION", value_parser = FalseyValueParser::new())]
     pub(crate) disable_cross_region: bool,
@@ -232,6 +244,24 @@ impl Flags {
                 ip.unwrap_or(DEFAULT_BACKOFFICE_IP),
                 port.unwrap_or(DEFAULT_BACKOFFICE_PORT),
             )),
+        }
+    }
+
+    /// The backoffice's certificate and key files, `None` when it is plain HTTP. One
+    /// without the other is refused: half a TLS setup is a mistake, and serving plain HTTP
+    /// over it would hide that.
+    pub(crate) fn backoffice_tls(&self) -> Result<Option<(&std::path::Path, &std::path::Path)>> {
+        match (&self.backoffice_tls_cert, &self.backoffice_tls_key) {
+            (Some(cert), Some(key)) => Ok(Some((cert, key))),
+            (None, None) => Ok(None),
+            (Some(_), None) => bail!(
+                "--backoffice-tls-cert is set without --backoffice-tls-key; HTTPS needs the \
+                 certificate's private key too"
+            ),
+            (None, Some(_)) => bail!(
+                "--backoffice-tls-key is set without --backoffice-tls-cert; HTTPS needs the \
+                 certificate the key belongs to"
+            ),
         }
     }
 }
@@ -813,6 +843,34 @@ mod tests {
             ["http://a.example", "http://b.example", "http://c.example"]
         );
         assert!(defaulted_args().flags.backoffice_cors_origins.is_empty());
+    }
+
+    /// The TLS files go together: both, or neither for plain HTTP.
+    #[test]
+    fn the_tls_certificate_and_key_go_together() {
+        let tls = |argv: &[&str]| {
+            let mut full = vec!["quote-updater", "--config", "config.toml"];
+            full.extend_from_slice(argv);
+            let args = Args::try_parse_from(full).unwrap();
+            args.flags
+                .backoffice_tls()
+                .map(|files| files.map(|(c, k)| (c.to_owned(), k.to_owned())))
+                .map_err(|err| format!("{err:#}"))
+        };
+        assert_eq!(tls(&[]), Ok(None));
+        assert_eq!(
+            tls(&[
+                "--backoffice-tls-cert",
+                "s.crt",
+                "--backoffice-tls-key",
+                "s.key"
+            ]),
+            Ok(Some((PathBuf::from("s.crt"), PathBuf::from("s.key"))))
+        );
+        let err = tls(&["--backoffice-tls-cert", "s.crt"]).unwrap_err();
+        assert!(err.contains("--backoffice-tls-key"), "{err}");
+        let err = tls(&["--backoffice-tls-key", "s.key"]).unwrap_err();
+        assert!(err.contains("--backoffice-tls-cert"), "{err}");
     }
 
     /// A backoffice bound in a mode with no reload would serve an API whose every change
