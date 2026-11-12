@@ -26,6 +26,12 @@ services:
       # Read and written: the updater reads config.toml once, at start, and the backoffice
       # API rewrites it in place with every change it applies.
       - ./config:/config
+      # The backoffice's HTTPS certificate and key, when BACKOFFICE_TLS_CERT and
+      # BACKOFFICE_TLS_KEY in .env name them as /tls/...; empty, and unused, otherwise. The
+      # directory rather than the two files: a renewal that replaces a file (a new one
+      # renamed over the old) shows through a directory mount and not through a file mount,
+      # and the updater picks it up without a restart. deploy/README.md, "HTTPS".
+      - ./tls:/tls:ro
     # An RPC node or a builder running on this host is `host.docker.internal` from inside.
     extra_hosts:
       - "host.docker.internal:host-gateway"

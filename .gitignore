@@ -16,6 +16,8 @@
 /deploy/.env
 /deploy/config/*
 !/deploy/config/.gitkeep
+/deploy/tls/*
+!/deploy/tls/.gitkeep
 /deploy/alertmanager/slack-webhook
 
 # direnv's cache of the flake shell.

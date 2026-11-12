@@ -95,6 +95,8 @@ Edit the three files:
   - `BACKOFFICE_BIND` and `GRAFANA_BIND`: the IP of this server the backoffice API (port 8088)
     and Grafana (port 3000) listen on. Neither has a login, so use a private IP such as the
     server's tailnet address. `127.0.0.1` keeps them reachable only from the server itself.
+  - `BACKOFFICE_TLS_CERT` and `BACKOFFICE_TLS_KEY`: optional, to serve the backoffice over
+    HTTPS with a certificate from `tailscale cert`; see step 7.
 - `config/config.toml`: the PropAMM address, the builders with their API keys, and the
   pairs. Pairs can also be added later through the backoffice API.
 - `alertmanager/slack-webhook`: the Slack webhook URL alerts go to.
@@ -120,6 +122,15 @@ backoffice", lists its routes. For example, to list the pairs and what each is d
 ```bash
 curl http://<IP from .env>:8088/api/pairs
 ```
+
+**HTTPS.** The backoffice is plain HTTP unless it is given a certificate. To serve it over
+HTTPS (which a front end served over HTTPS needs in order to call it), turn on HTTPS
+Certificates for the tailnet, write this host's certificate into `deploy/tls` with `tailscale
+cert`, and set `BACKOFFICE_TLS_CERT=/tls/backoffice.crt` and
+`BACKOFFICE_TLS_KEY=/tls/backoffice.key` in `.env`; then `docker compose up -d updater`, and
+reach it by the host's tailnet name, `https://pusher.your-tailnet.ts.net:8088/api/`. Renewing
+the certificate needs no restart. The steps, the renewal cron line and what can go wrong are
+in [`deploy/README.md`](../deploy/README.md), "HTTPS for the backoffice".
 
 `target` and `[settings]` are read once at start and only shown by the API: to change one,
 edit `config/config.toml` by hand and `docker compose restart updater` (changes made through
