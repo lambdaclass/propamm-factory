@@ -235,6 +235,8 @@ async fn run_inner(
              answer for; it is ignored"
         );
     }
+    let backoffice_hosts = backoffice::parse_hosts(&args.flags.backoffice_hosts)
+        .wrap_err("--backoffice-host or [settings] backoffice_hosts")?;
     // The certificate is read here too, so a bad path or a key that is not the
     // certificate's is refused, by `--check` as well, before anything connects.
     let backoffice_tls = match (args.flags.backoffice_tls()?, backoffice_addr) {
@@ -248,14 +250,19 @@ async fn run_inner(
         }
         (None, _) => None,
     };
-    // How the backoffice is reached, for every line that tells an operator where to go.
+    // How the backoffice is reached, for every line that tells an operator where to go: by
+    // the first name it answers to when it has one (over HTTPS, the one its certificate
+    // names), by its address otherwise.
     let backoffice_url = backoffice_addr.map(|addr| {
         let scheme = if backoffice_tls.is_some() {
             "https"
         } else {
             "http"
         };
-        format!("{scheme}://{addr}")
+        match backoffice_hosts.first() {
+            Some(name) => format!("{scheme}://{name}:{}", addr.port()),
+            None => format!("{scheme}://{addr}"),
+        }
     });
 
     // Loaded before anything connects, though nothing here needs the chain: the file is
@@ -708,22 +715,31 @@ async fn run_inner(
                 } else {
                     "http"
                 };
+                let mut answering = Vec::new();
+                if !backoffice_hosts.is_empty() {
+                    answering.push(format!("reached as {}", backoffice_hosts.join(", ")));
+                }
+                if !cors_origins.is_empty() {
+                    answering.push(format!("CORS for {}", cors_origins.join(", ")));
+                }
                 let (local, task) = backoffice::bind(
                     addr,
                     Arc::clone(&shared),
                     client.clone(),
                     pair_states.clone(),
                     Arc::clone(&kinds),
-                    &cors_origins,
-                    backoffice_tls,
+                    backoffice::Access {
+                        hosts: backoffice_hosts,
+                        origins: cors_origins,
+                        tls: backoffice_tls,
+                    },
                 )
                 .await?;
-                match cors_origins.as_slice() {
+                match answering.as_slice() {
                     [] => tracing::info!("backoffice API listening on {scheme}://{local}/api/"),
-                    origins => tracing::info!(
-                        "backoffice API listening on {scheme}://{local}/api/, answering CORS \
-                         for {}",
-                        origins.join(", ")
+                    parts => tracing::info!(
+                        "backoffice API listening on {scheme}://{local}/api/ ({})",
+                        parts.join("; ")
                     ),
                 }
                 tasks.adopt(&task);

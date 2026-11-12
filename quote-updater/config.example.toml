@@ -144,6 +144,14 @@ disable_cross_region = false
 # stays refused, because a updater quoting nothing is normally a file that failed to say
 # what it meant.
 # backoffice_addr = "100.64.1.2:8088"
+#
+# The names it answers to besides an IP address and localhost, which it always does: the
+# name you reach it by, if not its IP (its tailnet name, which an HTTPS certificate from
+# `tailscale cert` names, or a reverse proxy's). The name alone, no scheme, port or path. A
+# request addressed to any other name is refused: that is what stops a site from pointing
+# its own domain at this host and driving the API from an operator's browser (DNS
+# rebinding). --backoffice-host / BACKOFFICE_HOSTS replaces this list.
+# backoffice_hosts = ["pusher.your-tailnet.ts.net"]
 
 # `tokens` is [base, quote] in market orientation — the order a human says the pair in.
 # The lane is keccak256 of the two address-sorted tokens, matching PropAMM._pairKey, and

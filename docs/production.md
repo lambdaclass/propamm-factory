@@ -126,9 +126,10 @@ curl http://<IP from .env>:8088/api/pairs
 **HTTPS.** The backoffice is plain HTTP unless it is given a certificate. To serve it over
 HTTPS (which a front end served over HTTPS needs in order to call it), turn on HTTPS
 Certificates for the tailnet, write this host's certificate into `deploy/tls` with `tailscale
-cert`, and set `BACKOFFICE_TLS_CERT=/tls/backoffice.crt` and
-`BACKOFFICE_TLS_KEY=/tls/backoffice.key` in `.env`; then `docker compose up -d updater`, and
-reach it by the host's tailnet name, `https://pusher.your-tailnet.ts.net:8088/api/`. Renewing
+cert`, and set `BACKOFFICE_TLS_CERT=/tls/backoffice.crt`,
+`BACKOFFICE_TLS_KEY=/tls/backoffice.key` and `BACKOFFICE_HOSTS=pusher.your-tailnet.ts.net`
+(the name the backoffice answers to besides its IP) in `.env`; then `docker compose up -d
+updater`, and reach it by that name, `https://pusher.your-tailnet.ts.net:8088/api/`. Renewing
 the certificate needs no restart. The steps, the renewal cron line and what can go wrong are
 in [`deploy/README.md`](../deploy/README.md), "HTTPS for the backoffice".
 

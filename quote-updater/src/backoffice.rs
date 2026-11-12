@@ -16,11 +16,13 @@
 //! HTTPS only, with the certificate read again whenever its files change (`tls.rs`).
 //!
 //! Being past the ACL is not the same as meaning to be here: a browser on the tailnet sends
-//! whatever another site's page tells it to. So [`guard`] takes a change only as JSON,
-//! which a page on another site cannot send here without CORS approval, and refuses one
-//! whose `Origin` names another site. The approval goes to the origins
-//! `--backoffice-cors-origin` lists, and only to those: a front end served from one of
-//! them can call the API, and every other site still cannot.
+//! whatever another site's page tells it to (audit F-02). So [`guard`] answers only requests
+//! addressed to a name the API is served under, which stops a site that points its own
+//! domain at this host (DNS rebinding); takes a change only as JSON, which a page on another
+//! site cannot send here without CORS approval; and refuses one whose `Origin` names another
+//! site. The approval goes to the origins `--backoffice-cors-origin` lists, and only to
+//! those: a front end served from one of them can call the API, and every other site still
+//! cannot.
 //!
 //! | Route                             | What it does                                     |
 //! |-----------------------------------|--------------------------------------------------|
@@ -98,6 +100,22 @@ struct Backoffice {
     /// The origins besides its own whose pages may change things here, as
     /// [`parse_origins`] writes them: the same list the CORS layer answers to.
     origins: Arc<[String]>,
+    /// The names besides an IP address and `localhost` that requests may be addressed to,
+    /// as [`parse_hosts`] writes them.
+    hosts: Arc<[String]>,
+}
+
+/// Who may reach the API, and how: the names it answers to, the browser origins besides its
+/// own it answers CORS for, and its certificate when it is HTTPS. The default is plain HTTP,
+/// answering to IP addresses and `localhost` alone, with no CORS.
+#[derive(Default)]
+pub(crate) struct Access {
+    /// `--backoffice-host` or `[settings] backoffice_hosts`; see [`parse_hosts`].
+    pub(crate) hosts: Vec<String>,
+    /// `--backoffice-cors-origin`; see [`parse_origins`].
+    pub(crate) origins: Vec<String>,
+    /// `--backoffice-tls-cert` and `--backoffice-tls-key`, read.
+    pub(crate) tls: Option<crate::tls::Tls>,
 }
 
 /// `0.0.0.0:8088` binds every interface, including whatever the host has facing the
@@ -158,6 +176,36 @@ pub(crate) fn parse_origins(origins: &[String]) -> Result<Vec<String>> {
         .collect()
 }
 
+/// `--backoffice-host` and `[settings] backoffice_hosts`, checked: each a bare hostname, as
+/// a `Host` header carries it without its port, lowercased and without a trailing dot. The
+/// names the API is reached by besides an IP address and `localhost`, which it always
+/// answers to: its tailnet name (the one its certificate names, over HTTPS), or the name a
+/// reverse proxy serves it under. Never a front end's: that is an origin, for
+/// `--backoffice-cors-origin`.
+pub(crate) fn parse_hosts(hosts: &[String]) -> Result<Vec<String>> {
+    hosts
+        .iter()
+        .map(|host| host.trim())
+        .filter(|host| !host.is_empty())
+        .map(|host| {
+            let name = host.strip_suffix('.').unwrap_or(host);
+            let labels_ok = name.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && label
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            });
+            eyre::ensure!(
+                labels_ok,
+                "{host:?} is not a hostname; write the name alone, such as \
+                 pusher.your-tailnet.ts.net, without a scheme, a port or a path"
+            );
+            Ok(name.to_ascii_lowercase())
+        })
+        .collect()
+}
+
 /// The CORS answers for `origins`, `None` when there are none to give: a preflight from
 /// one of them is answered for the methods and the one header this API takes, and every
 /// answer to one carries `Access-Control-Allow-Origin`. No credentials: the API has no
@@ -179,19 +227,17 @@ fn cors(origins: &[String]) -> Option<tower_http::cors::CorsLayer> {
     )
 }
 
-/// Binds `addr` and serves the API, over HTTPS with `tls`'s certificate when there is one,
-/// with CORS answers for `origins` (see [`parse_origins`]). Fatal on failure: an operator
-/// who believes this is up and whose changes are going nowhere is worse off than one whose
-/// service refused to start.
-#[allow(clippy::too_many_arguments)] // one call site outside the tests, naming each
+/// Binds `addr` and serves the API as `access` says: the names it answers to, its CORS
+/// answers, and HTTPS when it has a certificate. Fatal on failure: an operator who believes
+/// this is up and whose changes are going nowhere is worse off than one whose service
+/// refused to start.
 pub(crate) async fn bind(
     addr: SocketAddr,
     config: Arc<SharedConfig>,
     client: ethrex_rpc::clients::eth::EthClient,
     states: PairStates,
     kinds: Arc<crate::kinds::Kinds>,
-    origins: &[String],
-    tls: Option<crate::tls::Tls>,
+    access: Access,
 ) -> Result<(SocketAddr, JoinHandle<()>)> {
     bind_with(
         addr,
@@ -199,29 +245,28 @@ pub(crate) async fn bind(
         client,
         states,
         kinds,
-        origins,
-        tls,
+        access,
         crate::discover::Rest::default(),
     )
     .await
 }
 
 /// [`bind`], with the exchanges' APIs somewhere else: a test's mock.
-#[allow(clippy::too_many_arguments)] // two call sites (bind and a test), each naming them
 async fn bind_with(
     addr: SocketAddr,
     config: Arc<SharedConfig>,
     client: ethrex_rpc::clients::eth::EthClient,
     states: PairStates,
     kinds: Arc<crate::kinds::Kinds>,
-    origins: &[String],
-    tls: Option<crate::tls::Tls>,
+    access: Access,
     rest: crate::discover::Rest,
 ) -> Result<(SocketAddr, JoinHandle<()>)> {
     refuse_unspecified_bind(addr)?;
-    // Written as `Origin` is, whatever the caller did, so the guard and the CORS layer
+    // Written as the headers are, whatever the caller did, so the guard and the CORS layer
     // compare against the same strings.
-    let origins = parse_origins(origins).wrap_err("--backoffice-cors-origin")?;
+    let origins = parse_origins(&access.origins).wrap_err("--backoffice-cors-origin")?;
+    let hosts = parse_hosts(&access.hosts).wrap_err("--backoffice-host")?;
+    let tls = access.tls;
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -245,6 +290,7 @@ async fn bind_with(
         lookups: Arc::new(crate::discover::Cache::default()),
         preview_pages: Arc::new(tokio::sync::Semaphore::new(PREVIEW_PAGES)),
         origins: origins.clone().into(),
+        hosts: hosts.into(),
     };
 
     let app = Router::new()
@@ -318,12 +364,17 @@ async fn bind_with(
 // ---------------------------------------------------------------------------
 
 /// Runs before every route. This API has no login, so what it must not do is act on a
-/// request that an operator's browser sent without the operator meaning it. A page on
-/// another site can make a browser send a plain form post anywhere, without asking and
-/// without the server's say; a `PUT`, a `DELETE`, or a post of JSON it cannot send without
-/// first asking this server, which says yes only to the origins `--backoffice-cors-origin`
-/// lists. So:
+/// request that an operator's browser sent without the operator meaning it (audit F-02).
+/// A page on another site can make a browser send a plain form post anywhere, without
+/// asking and without the server's say; a `PUT`, a `DELETE`, or a post of JSON it cannot
+/// send without first asking this server, which says yes only to the origins
+/// `--backoffice-cors-origin` lists. And a site can point its own domain at this host's
+/// address once its page has loaded (DNS rebinding): to the browser that page and this API
+/// are then one origin, so it sends anything and reads every answer, `Origin` and `Host`
+/// both carrying the site's name. What gives it away is that name. So:
 ///
+/// - every request, reads included, must be addressed (`Host`) to an IP address,
+///   `localhost`, or a name `--backoffice-host` lists ([`host_allowed`]);
 /// - a `POST` or `PUT` is taken only as `Content-Type: application/json`, a bodiless one
 ///   (a halt, a reload) included;
 /// - a change whose `Origin` (which a browser sets and a page cannot) is neither this API's
@@ -337,7 +388,15 @@ async fn guard(
 ) -> Response {
     let method = request.method();
     let headers = request.headers();
-    let refusal = if method.is_safe() {
+    let refusal = if !host_allowed(headers, request.uri(), &state.hosts) {
+        Some((
+            StatusCode::FORBIDDEN,
+            "this request was addressed to a name the backoffice does not answer to. It \
+             answers to an IP address, to localhost, and to the names listed with \
+             --backoffice-host or [settings] backoffice_hosts; list this one there and \
+             restart if it is how you reach the backoffice",
+        ))
+    } else if method.is_safe() {
         None
     } else if !origin_allowed(headers, &state.origins) {
         Some((
@@ -356,17 +415,48 @@ async fn guard(
     };
     match refusal {
         Some((status, why)) => {
-            let origin = headers
-                .get(header::ORIGIN)
-                .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned());
+            let header = |name| {
+                headers
+                    .get(name)
+                    .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned())
+            };
             tracing::warn!(
-                "backoffice: refused {method} {} from {peer} (Origin {origin:?}): {why}",
+                "backoffice: refused {method} {} from {peer} (Host {:?}, Origin {:?}): {why}",
                 request.uri().path(),
+                header(header::HOST),
+                header(header::ORIGIN),
             );
             ApiError::new(status, why).into_response()
         }
         None => next.run(request).await,
     }
+}
+
+/// Whether the request is addressed to a name this API is served under: any IP address,
+/// `localhost`, or one of `hosts` ([`parse_hosts`]). The port is not part of the question.
+/// An IP address needs no listing because a rebound name is always a name; see [`guard`].
+/// `Host`, or the request line's own authority when a client sent one there instead.
+fn host_allowed(headers: &axum::http::HeaderMap, uri: &axum::http::Uri, hosts: &[String]) -> bool {
+    let authority = match headers.get(header::HOST) {
+        Some(host) => host
+            .to_str()
+            .ok()
+            .and_then(|host| host.parse::<axum::http::uri::Authority>().ok()),
+        None => uri.authority().cloned(),
+    };
+    let Some(authority) = authority else {
+        return false;
+    };
+    let name = authority.host();
+    let name = name.strip_suffix('.').unwrap_or(name);
+    // An IPv6 address is written in brackets in a `Host`.
+    let address = name
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(name);
+    address.parse::<std::net::IpAddr>().is_ok()
+        || name.eq_ignore_ascii_case("localhost")
+        || hosts.iter().any(|host| host.eq_ignore_ascii_case(name))
 }
 
 /// Whether the body is declared JSON, parameters such as `charset` aside.
@@ -1498,8 +1588,10 @@ mod tests {
             test_client(),
             PairStates::default(),
             test_kinds(),
-            origins,
-            None,
+            Access {
+                origins: origins.to_vec(),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -1614,8 +1706,7 @@ mod tests {
             test_client(),
             states,
             test_kinds(),
-            &[],
-            None,
+            Access::default(),
         )
         .await
         .unwrap();
@@ -1647,8 +1738,7 @@ mod tests {
             test_client(),
             PairStates::default(),
             test_kinds(),
-            &[],
-            None,
+            Access::default(),
         )
         .await
         .expect_err("an unspecified bind must be refused");
@@ -2011,8 +2101,10 @@ mod tests {
             test_client(),
             PairStates::default(),
             test_kinds(),
-            &[],
-            Some(crate::tls::Tls::load(&cert, &key).unwrap()),
+            Access {
+                tls: Some(crate::tls::Tls::load(&cert, &key).unwrap()),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -2049,6 +2141,139 @@ mod tests {
             leaf("b.crt"),
             "the renewed certificate, with no restart"
         );
+    }
+
+    /// `--backoffice-host` is a bare name, as a `Host` header carries it without its port.
+    #[test]
+    fn backoffice_hosts_are_bare_names() {
+        assert_eq!(
+            parse_hosts(&[
+                "Pusher.Example.ts.net.".to_owned(),
+                " ".to_owned(),
+                "ui_1.example".to_owned(),
+            ])
+            .unwrap(),
+            ["pusher.example.ts.net", "ui_1.example"]
+        );
+        for refused in [
+            "https://pusher.example",
+            "pusher.example:8088",
+            "pusher.example/api",
+            "*",
+            "*.example",
+            "a..b",
+            "[::1]",
+        ] {
+            let err = format!("{:#}", parse_hosts(&[refused.to_owned()]).unwrap_err());
+            assert!(err.contains("not a hostname"), "{refused}: {err}");
+        }
+    }
+
+    /// Answered: an IP address, `localhost`, a listed name, in any case, with or without its
+    /// port or a trailing dot. Not: any other name, a listed name inside a longer one, or
+    /// no name at all.
+    #[test]
+    fn only_an_ip_localhost_or_a_listed_name_is_answered() {
+        let allowed = |host: Option<&str>, uri: &str| {
+            let mut headers = axum::http::HeaderMap::new();
+            if let Some(host) = host {
+                headers.insert("host", host.parse().unwrap());
+            }
+            host_allowed(
+                &headers,
+                &uri.parse().unwrap(),
+                &["pusher.example.ts.net".to_owned()],
+            )
+        };
+        for answered in [
+            "100.64.1.2:8088",
+            "127.0.0.1",
+            "[::1]:8088",
+            "localhost:8088",
+            "LOCALHOST",
+            "pusher.example.ts.net:8088",
+            "Pusher.Example.TS.net",
+            "pusher.example.ts.net.:8088",
+        ] {
+            assert!(allowed(Some(answered), "/api/pairs"), "{answered}");
+        }
+        for refused in [
+            "evil.example:8088",
+            "pusher.example.ts.net.evil.example",
+            "localhost.evil.example",
+            "100.64.1.2.nip.io",
+            "",
+        ] {
+            assert!(!allowed(Some(refused), "/api/pairs"), "{refused}");
+        }
+        assert!(!allowed(None, "/api/pairs"), "no name at all");
+        assert!(
+            allowed(None, "http://pusher.example.ts.net:8088/api/pairs"),
+            "the request line's own authority stands in for a missing Host"
+        );
+    }
+
+    /// DNS rebinding as the backoffice sees it: its own routes, asked by a page whose name
+    /// was pointed at this host, so `Host` and `Origin` both carry that name. Refused, reads
+    /// (which would hand over the settings) and changes alike, the preview too. A listed
+    /// name, and an IP address, are answered.
+    #[tokio::test]
+    async fn a_request_addressed_to_another_name_is_refused() {
+        let (config, requests) = shared("hosts", |_| {});
+        service(requests, accepted());
+        let (local, _task) = bind(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::clone(&config),
+            test_client(),
+            PairStates::default(),
+            test_kinds(),
+            Access {
+                hosts: vec!["Pusher.Example.ts.net".to_owned()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let halt = format!("/api/pairs/{WETH_USDC}/halt");
+        let rebound = [
+            ("host", "evil.example:8088"),
+            ("origin", "http://evil.example:8088"),
+            ("content-type", "application/json"),
+        ];
+
+        let (status, body) = call_with(local, "GET", "/api/settings", None, &rebound).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("--backoffice-host"),
+            "{body}"
+        );
+        let (status, body) = call_with(local, "POST", &halt, None, &rebound).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(!config.snapshot().pairs[0].halted, "nothing changed");
+        let preview = http(
+            local,
+            "GET /api/preview?token0=0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2\
+             &token1=0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 HTTP/1.1\r\n\
+             Host: evil.example:8088\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(preview.starts_with("HTTP/1.1 403"), "{preview}");
+
+        // The listed name, as a page served under it sends it.
+        let named = [
+            ("host", "pusher.example.ts.net:8088"),
+            ("origin", "http://pusher.example.ts.net:8088"),
+            ("content-type", "application/json"),
+        ];
+        let (status, body) = call_with(local, "POST", &halt, None, &named).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(config.snapshot().pairs[0].halted);
+        // And an IP address, which needs no listing.
+        let (status, body) = call(local, "GET", "/api/pairs", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
     }
 
     /// An edit replaces the stanza and nothing that makes the pair what it is: not its key,
@@ -2390,8 +2615,7 @@ mod tests {
             ethrex_rpc::clients::eth::EthClient::new(url::Url::parse(&rpc.url).unwrap()).unwrap(),
             PairStates::default(),
             test_kinds(),
-            &[],
-            None,
+            Access::default(),
             crate::discover::Rest::all_at(&format!("http://{exchanges}")),
         )
         .await
@@ -2400,7 +2624,7 @@ mod tests {
         let page = http(
             local,
             &format!(
-                "GET /api/lookup?token0={WETH}&token1={USDC} HTTP/1.1\r\nHost: t\r\n\
+                "GET /api/lookup?token0={WETH}&token1={USDC} HTTP/1.1\r\nHost: 127.0.0.1\r\n\
                  Connection: close\r\n\r\n"
             ),
         )
@@ -2577,8 +2801,11 @@ mod tests {
             test_client(),
             PairStates::default(),
             test_kinds(),
-            &[UI.to_owned()],
-            tls,
+            Access {
+                origins: vec![UI.to_owned()],
+                tls,
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -2905,8 +3132,7 @@ mod tests {
             test_client(),
             PairStates::default(),
             test_kinds(),
-            &[],
-            None,
+            Access::default(),
         )
         .await
         .unwrap();
@@ -2919,7 +3145,7 @@ mod tests {
                 local,
                 &format!(
                     "GET /api/lookup?token0={token0}&token1=0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 \
-                     HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"
+                     HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
                 ),
             )
             .await;

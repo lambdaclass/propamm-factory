@@ -77,12 +77,13 @@ certificate, for this host's name on the tailnet.
    ```
 
 3. In `.env`, point the updater at them (paths inside the container, where `deploy/tls` is
-   mounted at `/tls`), and keep `BACKOFFICE_BIND` this host's tailnet address, the one that
-   name resolves to:
+   mounted at `/tls`), list the name it will be reached by, and keep `BACKOFFICE_BIND` this
+   host's tailnet address, the one that name resolves to:
 
    ```bash
    BACKOFFICE_TLS_CERT=/tls/backoffice.crt
    BACKOFFICE_TLS_KEY=/tls/backoffice.key
+   BACKOFFICE_HOSTS=pusher.your-tailnet.ts.net
    ```
 
 4. `docker compose up -d updater` (not `restart`: `.env` is read when the container is
@@ -94,9 +95,13 @@ certificate, for this host's name on the tailnet.
    ```
 
 Reach it by that name, not by its IP: the certificate names the host, so a client checking
-it (every browser, and `curl`) refuses `https://100.x.y.z:8088`. A front end on another
-origin still needs that origin listed with `BACKOFFICE_CORS_ORIGINS` in `.env`, as its
-`https://` address.
+it (every browser, and `curl`) refuses `https://100.x.y.z:8088`. And list it in
+`BACKOFFICE_HOSTS`: the backoffice answers only to an IP address, `localhost` and the names
+listed there, which is what keeps another site from pointing its own domain at this host and
+driving the API from your browser (DNS rebinding). A request to an unlisted name gets a 403
+saying so. A front end on another origin also needs its own address listed with
+`BACKOFFICE_CORS_ORIGINS`, as its `https://` origin: `BACKOFFICE_HOSTS` is where requests
+are sent, `BACKOFFICE_CORS_ORIGINS` where the pages sending them come from.
 
 The certificate is short-lived (Let's Encrypt's, 90 days or less). Run the same `tailscale
 cert` command from cron or a systemd timer, daily say; it gets a new certificate as the

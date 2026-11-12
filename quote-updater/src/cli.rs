@@ -194,6 +194,20 @@ pub(crate) struct Flags {
     #[arg(long, env = "BACKOFFICE_PORT")]
     pub(crate) backoffice_port: Option<u16>,
 
+    /// A name the backoffice is reached by, besides an IP address and localhost, which it
+    /// always answers to: this host's tailnet name (the one its HTTPS certificate names), or a
+    /// reverse proxy's. A request addressed to any other name is refused, which stops a site
+    /// that points its own domain at this host (DNS rebinding). The name alone, with no scheme
+    /// or port; repeat the flag, or comma-separate the variable, for more than one. Replaces
+    /// [settings] backoffice_hosts. Not a front end's address: that is
+    /// --backoffice-cors-origin
+    #[arg(
+        long = "backoffice-host",
+        env = "BACKOFFICE_HOSTS",
+        value_delimiter = ','
+    )]
+    pub(crate) backoffice_hosts: Vec<String>,
+
     /// Let a browser page served from this origin (scheme://host[:port], e.g.
     /// http://100.64.1.2:3000) call the backoffice API: it is answered with CORS headers
     /// and its changes are taken. Repeat the flag, or comma-separate the variable, for more
@@ -504,6 +518,10 @@ pub(crate) fn apply_file_settings(
         && !given("disable_cross_region")
     {
         args.flags.disable_cross_region = disable;
+    }
+    // A list given on the command line replaces the file's, as every other setting does.
+    if !settings.backoffice_hosts.is_empty() && !given("backoffice_hosts") {
+        args.flags.backoffice_hosts = settings.backoffice_hosts.clone();
     }
     // Each half on its own, so `--backoffice-port` moves the port of an address the file
     // gives and keeps its IP.
@@ -821,6 +839,29 @@ mod tests {
         assert_eq!(
             addr(&["--backoffice-ip", "::1", "--backoffice-port", "0"], None).as_deref(),
             Some("[::1]:0")
+        );
+    }
+
+    /// The backoffice's names: the file's list unless the command line gives one, which
+    /// replaces it rather than adding to it.
+    #[test]
+    fn backoffice_hosts_come_from_the_file_unless_given() {
+        let hosts = |argv: &[&str]| {
+            let mut full = vec!["quote-updater", "--config", "config.toml"];
+            full.extend_from_slice(argv);
+            let mut args = Args::try_parse_from(full).unwrap();
+            let settings = config::FileSettings {
+                backoffice_hosts: vec!["from-file.example".to_owned()],
+                ..Default::default()
+            };
+            let given = args.given.clone();
+            apply_file_settings(&mut args, &|id| given.contains(id), &settings).unwrap();
+            args.flags.backoffice_hosts
+        };
+        assert_eq!(hosts(&[]), ["from-file.example"]);
+        assert_eq!(
+            hosts(&["--backoffice-host", "a.example,b.example"]),
+            ["a.example", "b.example"]
         );
     }
 

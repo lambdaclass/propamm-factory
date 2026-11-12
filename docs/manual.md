@@ -589,9 +589,14 @@ and `8088` for the port.
 ```bash
 tailscale cert pusher.your-tailnet.ts.net    # writes pusher.your-tailnet.ts.net.crt and .key
 quote-updater --config config.toml --backoffice-ip 100.64.1.2 \
+  --backoffice-host pusher.your-tailnet.ts.net \
   --backoffice-tls-cert pusher.your-tailnet.ts.net.crt \
   --backoffice-tls-key pusher.your-tailnet.ts.net.key
 ```
+
+Over HTTPS it is reached by the name its certificate names, so that name is listed with
+`--backoffice-host` (below); reached by its IP the certificate does not match, and a browser
+or `curl` refuses it.
 
 `--backoffice-tls-cert` (`BACKOFFICE_TLS_CERT`) is a PEM file holding the certificate and any
 intermediates, the server's own first; `--backoffice-tls-key` (`BACKOFFICE_TLS_KEY`) is its
@@ -607,8 +612,9 @@ either has changed (its modification time or its size) they are read again. A pa
 not load, such as the moment between `tailscale cert` writing the certificate and writing its
 key, is warned about once and the certificate loaded before goes on being served until the
 files change again. A connection already open keeps the certificate it was made with. The
-`https://` address is the one to reach it by, and the one the halt notice names; a client
-speaking plain HTTP to it gets its connection dropped, and the journal says why.
+`https://` address is the one to reach it by, and the one the halt notice names (by the first
+`--backoffice-host`); a client speaking plain HTTP to it gets its connection dropped, and the
+journal says why.
 
 | Route | What it does |
 |---|---|
@@ -677,6 +683,27 @@ changed nothing: 404 for an unknown pair or builder, 409 for a conflict (a key a
 a pair already halted), 422 for a change that is invalid (a misspelt key included) or that the
 reload rejected, 400 for a body that does not parse as JSON, 415 for a `POST` or `PUT` not
 sent as `Content-Type: application/json`, 403 for a foreign `Origin`.
+
+**Only the names it is served under.** Being on the tailnet is enough to reach the API, and a
+browser on the tailnet sends whatever another site's page tells it to (audit F-02). One way
+in is DNS rebinding: a site points its own domain at this host's address after its page has
+loaded, and to the browser that page and the API are then one origin, so the page can send
+anything and read every answer. What gives it away is the name the request is addressed to.
+So every request, reads included, must carry a `Host` that is an IP address, `localhost`, or
+a name listed with `--backoffice-host` (`BACKOFFICE_HOSTS`, comma-separated) or `[settings]
+backoffice_hosts`; anything else is refused with 403. Reached by IP, as in the example at the
+top, there is nothing to list. Reached by name (the tailnet name its certificate names, or a
+reverse proxy's), list the name alone, without scheme or port:
+
+```toml
+[settings]
+backoffice_addr  = "100.64.1.2:8088"
+backoffice_hosts = ["pusher.your-tailnet.ts.net"]
+```
+
+These are the backoffice's own names, the address requests are sent to. A front end's
+address, where its pages are served from, is an origin, for `--backoffice-cors-origin` below.
+A reverse proxy in front has to pass `Host` and `Origin` through unchanged, as Caddy does.
 
 **Only JSON, and only from origins it knows.** With no login, what the API must not do is
 act on a request an operator's browser sent without the operator meaning it. So every `POST`

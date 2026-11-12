@@ -86,6 +86,11 @@ pub struct FileSettings {
     /// default: a service that listens on nothing is the one that cannot be reached wrong.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backoffice_addr: Option<String>,
+    /// The names the backoffice answers to besides an IP address and `localhost`, which it
+    /// always does: its tailnet name, or a reverse proxy's (`--backoffice-host`). A request
+    /// addressed to any other name is refused; see `backoffice::guard`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backoffice_hosts: Vec<String>,
 }
 
 impl FileSettings {
