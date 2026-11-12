@@ -21,8 +21,11 @@ use aws_sdk_kms::{
 };
 use eyre::{Result, WrapErr, bail, ensure, eyre};
 use futures_util::future::BoxFuture;
-use rsa::{Oaep, RsaPrivateKey, pkcs8::EncodePublicKey};
-use sha2::Sha256;
+use openssl::{
+    cms::CmsContentInfo,
+    pkey::{PKey, PKeyRef, Private},
+    rsa::Rsa,
+};
 
 use super::{SecretRelease, protocol::Credentials};
 
@@ -63,13 +66,12 @@ async fn decrypt_all(
     credentials: &Credentials,
     secrets: &[(String, Vec<u8>)],
 ) -> Result<Vec<Vec<u8>>> {
-    let rsa = RsaPrivateKey::new(&mut rand::thread_rng(), 2048)
+    let key = Rsa::generate(2048)
+        .and_then(PKey::from_rsa)
         .wrap_err("generating the recipient key")?;
-    let public_der = rsa
-        .to_public_key()
-        .to_public_key_der()
-        .wrap_err("encoding the recipient public key")?
-        .into_vec();
+    let public_der = key
+        .public_key_to_der()
+        .wrap_err("encoding the recipient public key")?;
     let document = attestation(public_der)?;
 
     let provider = aws_sdk_kms::config::Credentials::new(
@@ -108,7 +110,7 @@ async fn decrypt_all(
             .ciphertext_for_recipient()
             .ok_or_else(|| eyre!("KMS answered without a ciphertext for the recipient"))?;
         plaintexts.push(
-            unwrap_envelope(envelope.as_ref(), &rsa)
+            unwrap_envelope(envelope.as_ref(), &key)
                 .wrap_err_with(|| format!("opening the envelope of secret {name}"))?,
         );
     }
@@ -147,51 +149,23 @@ fn attestation(public_key: Vec<u8>) -> Result<Vec<u8>> {
     }
 }
 
-/// Opens the CMS `EnvelopedData` KMS returns for a recipient: the content key is unwrapped
-/// with RSA-OAEP (SHA-256) under `key`, and the content is AES-256-CBC under it.
-pub fn unwrap_envelope(der_bytes: &[u8], key: &RsaPrivateKey) -> Result<Vec<u8>> {
-    use aes::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
-    use cms::{
-        content_info::ContentInfo,
-        enveloped_data::{EnvelopedData, RecipientInfo},
-    };
-    use der::{Decode, asn1::OctetString};
-
-    let info =
-        ContentInfo::from_der(der_bytes).map_err(|err| eyre!("not a CMS envelope: {err}"))?;
-    let enveloped: EnvelopedData = info
-        .content
-        .decode_as()
-        .map_err(|err| eyre!("not EnvelopedData: {err}"))?;
-    let recipient = enveloped
-        .recip_infos
-        .0
-        .iter()
-        .find_map(|info| match info {
-            RecipientInfo::Ktri(ktri) => Some(ktri),
-            _ => None,
-        })
-        .ok_or_else(|| eyre!("no key-transport recipient in the envelope"))?;
-    let content_key = key
-        .decrypt(Oaep::new::<Sha256>(), recipient.enc_key.as_bytes())
-        .map_err(|err| eyre!("unwrapping the content key: {err}"))?;
-    ensure!(content_key.len() == 32, "the content key is not AES-256");
-
-    let encrypted = enveloped.encrypted_content;
-    let iv: OctetString = encrypted
-        .content_enc_alg
-        .parameters
-        .ok_or_else(|| eyre!("the content cipher carries no IV"))?
-        .decode_as()
-        .map_err(|err| eyre!("the content cipher's IV: {err}"))?;
-    let content = encrypted
-        .encrypted_content
-        .ok_or_else(|| eyre!("the envelope carries no content"))?;
-    let decryptor = cbc::Decryptor::<aes::Aes256>::new_from_slices(&content_key, iv.as_bytes())
-        .map_err(|err| eyre!("content cipher: {err}"))?;
-    decryptor
-        .decrypt_padded_vec_mut::<Pkcs7>(content.as_bytes())
-        .map_err(|err| eyre!("decrypting the content: {err}"))
+/// Opens the CMS `EnvelopedData` KMS returns for a recipient (RSA-OAEP-SHA256 key transport,
+/// AES-256-CBC content) with the private half of `key`.
+///
+/// KMS encodes the envelope in BER, with indefinite lengths and the content in pieces. A
+/// DER-only parser refuses that ("indefinite length disallowed" on a live `Decrypt`), and
+/// OpenSSL reads it as it is. OpenSSL takes the algorithms from the envelope itself; the
+/// envelope comes from KMS over TLS.
+///
+/// No recipient certificate is checked, because KMS encrypts to the attestation document's
+/// bare public key, which has none. Without a certificate, OpenSSL defends against a padding
+/// oracle: when `key` does not unwrap the content key, it decrypts with a random one instead.
+/// So the wrong `key` gives an error or, rarely, bytes that are not the plaintext.
+pub fn unwrap_envelope(envelope: &[u8], key: &PKeyRef<Private>) -> Result<Vec<u8>> {
+    CmsContentInfo::from_der(envelope)
+        .map_err(|err| eyre!("not a CMS envelope: {err}"))?
+        .decrypt_without_cert_check(key)
+        .map_err(|err| eyre!("opening the envelope: {err}"))
 }
 
 #[cfg(test)]
@@ -206,10 +180,11 @@ mod tests {
         },
     };
     use der::{
-        Any, Encode,
+        Any, Decode, Encode, Header, Reader, SliceReader, Tag,
         asn1::{OctetString, SetOfVec},
     };
-    use rsa::RsaPublicKey;
+    use rsa::{Oaep, RsaPublicKey, pkcs1::RsaOaepParams, pkcs8::DecodePublicKey};
+    use sha2::Sha256;
     use spki::AlgorithmIdentifierOwned;
 
     use super::*;
@@ -223,9 +198,18 @@ mod tests {
     const ID_AES_256_CBC: const_oid::ObjectIdentifier =
         const_oid::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.42");
 
-    /// An envelope in the shape KMS returns: RSA-OAEP-SHA256 key transport, AES-256-CBC
-    /// content.
-    fn envelope(plaintext: &[u8], recipient: &RsaPublicKey) -> Vec<u8> {
+    /// A throwaway recipient key; 1024 bits keeps the tests fast.
+    fn recipient_key() -> PKey<Private> {
+        PKey::from_rsa(Rsa::generate(1024).unwrap()).unwrap()
+    }
+
+    /// An envelope in the shape KMS returns: RSA-OAEP-SHA256 key transport, with its
+    /// parameters written out (OpenSSL reads the hash from them; absent, OAEP means SHA-1),
+    /// and AES-256-CBC content. It is built with RustCrypto so that OpenSSL is tested against
+    /// an encoder other than its own.
+    fn envelope(plaintext: &[u8], recipient: &PKeyRef<Private>) -> Vec<u8> {
+        let recipient =
+            RsaPublicKey::from_public_key_der(&recipient.public_key_to_der().unwrap()).unwrap();
         let content_key = [0x11u8; 32];
         let iv = [0x22u8; 16];
         let ciphertext = cbc::Encryptor::<aes::Aes256>::new(&content_key.into(), &iv.into())
@@ -240,7 +224,7 @@ mod tests {
             )),
             key_enc_alg: AlgorithmIdentifierOwned {
                 oid: ID_RSAES_OAEP,
-                parameters: None,
+                parameters: Some(Any::encode_from(&RsaOaepParams::new::<Sha256>()).unwrap()),
             },
             enc_key: OctetString::new(wrapped).unwrap(),
         };
@@ -268,14 +252,64 @@ mod tests {
         .unwrap()
     }
 
+    /// `der` re-encoded the way KMS answers: every constructed element with an indefinite
+    /// length, and every OCTET STRING longer than 8 bytes (universal, or under an implicit
+    /// context tag such as the encrypted content's `[0]`) sent in 8-byte pieces.
+    fn as_kms_ber(der: &[u8]) -> Vec<u8> {
+        let mut reader = SliceReader::new(der).unwrap();
+        let mut out = Vec::new();
+        while !reader.is_finished() {
+            let header = Header::decode(&mut reader).unwrap();
+            let content = reader.read_slice(header.length).unwrap();
+            let tag = u8::from(header.tag);
+            if header.tag.is_constructed() {
+                out.extend([tag, 0x80]);
+                out.extend(as_kms_ber(content));
+                out.extend([0, 0]);
+            } else if (tag == 0x04 || tag == 0x80) && content.len() > 8 {
+                out.extend([tag | 0x20, 0x80]);
+                for piece in content.chunks(8) {
+                    Header::new(Tag::OctetString, piece.len())
+                        .unwrap()
+                        .encode_to_vec(&mut out)
+                        .unwrap();
+                    out.extend(piece);
+                }
+                out.extend([0, 0]);
+            } else {
+                header.encode_to_vec(&mut out).unwrap();
+                out.extend(content);
+            }
+        }
+        out
+    }
+
     #[test]
     fn the_envelope_opens_for_its_recipient_only() {
-        let recipient = RsaPrivateKey::new(&mut rand::thread_rng(), 1024).unwrap();
-        let other = RsaPrivateKey::new(&mut rand::thread_rng(), 1024).unwrap();
-        let der = envelope(b"a secret", &recipient.to_public_key());
+        let recipient = recipient_key();
+        let der = envelope(b"a secret", &recipient);
         assert_eq!(unwrap_envelope(&der, &recipient).unwrap(), b"a secret");
-        assert!(unwrap_envelope(&der, &other).is_err());
+        // Usually an error, but OpenSSL's padding-oracle defence can hand back random bytes
+        // (see unwrap_envelope): what never comes back is the plaintext.
+        let other = unwrap_envelope(&der, &recipient_key());
+        assert_ne!(other.ok().as_deref(), Some(&b"a secret"[..]));
         assert!(unwrap_envelope(b"not der", &recipient).is_err());
+    }
+
+    #[test]
+    fn a_kms_ber_envelope_opens_like_its_der() {
+        let recipient = recipient_key();
+        let der = envelope(b"a secret held by KMS", &recipient);
+        let ber = as_kms_ber(&der);
+        assert_ne!(ber, der, "the test envelope must exercise BER");
+        // A DER-only parser refuses it: the failure seen on a live Decrypt.
+        assert!(ContentInfo::from_der(&ber).is_err());
+        assert_eq!(
+            unwrap_envelope(&ber, &recipient).unwrap(),
+            b"a secret held by KMS"
+        );
+        // Cut short, it is refused rather than misread.
+        assert!(unwrap_envelope(&ber[..ber.len() - 2], &recipient).is_err());
     }
 
     #[test]

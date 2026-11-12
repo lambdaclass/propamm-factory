@@ -102,11 +102,14 @@ sha2 = "0.10"
 aws-nitro-enclaves-nsm-api = { version = "0.4", optional = true }
 aws-sdk-kms = { version = "1", optional = true }
 serde_bytes = { version = "0.11", optional = true }
-rsa = { version = "0.9", optional = true, features = ["sha2"] }
-cms = { version = "0.2", optional = true }
-aes = { version = "0.8", optional = true }
-cbc = { version = "0.1", optional = true, features = ["alloc"] }
-der = { version = "0.7", optional = true, features = ["alloc"] }
+# The recipient key and the envelope. KMS answers in BER, which OpenSSL reads as it is (the
+# RustCrypto `der` 0.7 reads DER only). On Linux, native-tls already links OpenSSL (see
+# tokio-tungstenite above), so the enclave binary gains no library. On macOS, native-tls
+# uses the Security framework instead, so building this feature there needs OpenSSL
+# installed (`brew install openssl@3`, which the build finds without configuration). Not
+# `openssl/vendored`: a static OpenSSL clashes with ethrex_crypto's own SHA3_absorb and
+# SHA3_squeeze symbols.
+openssl = { version = "0.10", optional = true }
 
 [features]
 default = []
@@ -115,11 +118,7 @@ aws-nitro = [
     "dep:aws-nitro-enclaves-nsm-api",
     "dep:aws-sdk-kms",
     "dep:serde_bytes",
-    "dep:rsa",
-    "dep:cms",
-    "dep:aes",
-    "dep:cbc",
-    "dep:der",
+    "dep:openssl",
 ]
 
 # `[link] kind = "vsock"`, an AWS Nitro enclave's only channel to its host, exists on Linux
@@ -133,9 +132,15 @@ tempfile = "3"
 # A throwaway certificate made in memory for the backoffice's HTTPS test, so no key is ever
 # committed. Test-only: never in a binary.
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
-# For the `aws-nitro` tests, which build a CMS envelope the way KMS does.
+# For the `aws-nitro` tests, which build a CMS envelope the way KMS does, with a stack other
+# than the OpenSSL that opens it. Test-only: never in a binary.
 const-oid = { version = "0.9", features = ["db"] }
 spki = "0.7"
+rsa = { version = "0.9", features = ["sha2"] }
+cms = "0.2"
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+der = { version = "0.7", features = ["alloc"] }
 # Only for tokio's paused clock (`#[tokio::test(start_paused = true)]`), which lets a
 # waited duration (a restart backoff, quoting.rs's shutdown bound) be asserted without
 # waiting it out. test-util = ["rt", "sync", "time"], all already enabled, so this adds
