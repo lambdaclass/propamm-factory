@@ -123,6 +123,10 @@ backoffice", lists its routes. For example, to list the pairs and what each is d
 curl http://<IP from .env>:8088/api/pairs
 ```
 
+For pages instead of `curl`, build [`backoffice-ui/`](../backoffice-ui/README.md) with pnpm
+and serve its `dist/`, static files that call this API; its README says how, and what the
+backoffice must list to answer it.
+
 **HTTPS.** The backoffice is plain HTTP unless it is given a certificate. To serve it over
 HTTPS (which a front end served over HTTPS needs in order to call it), turn on HTTPS
 Certificates for the tailnet, write this host's certificate into `deploy/tls` with `tailscale
