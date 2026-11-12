@@ -193,9 +193,10 @@ impl TickReject {
 /// - `rejected`: the file did not validate, so **nothing** was touched. Consistent, at
 ///   least: every lane is on the previous config together.
 /// - `partial`: the file validated and was applied, but at least one lane's feed would not
-///   come up, so that lane is still on its old config (or was never started) while the rest
-///   moved. A *mixture*, which is strictly worse to reason about than `rejected` — hence
-///   its own value rather than being folded into `applied`.
+///   come up, so that lane is still on its old config (or was never started, or was stopped
+///   because the change took out a builder it quoted to: audit F-18) while the rest moved.
+///   A *mixture*, which is strictly worse to reason about than `rejected` — hence its own
+///   value rather than being folded into `applied`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reload {
     Applied,

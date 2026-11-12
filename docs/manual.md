@@ -514,6 +514,14 @@ change, touching nothing, unless at least one of them connects. A lane opens its
 after it starts, unlike its feed, so without that check a typo would take every lane down at
 once.
 
+A lane whose rebuild onto the new list fails (its feed would not come up) is normally left
+quoting on its old config, as below. When the change took a builder out of the list, or
+changed any field of its entry, that would leave the lane quoting to the builder that was
+removed, so it is stopped instead (audit F-18): its quote is withdrawn at every builder it
+had, the removed one included, the change is answered `partial` with the pair named as
+stopped, and the next reload starts it on the new list. A change that only adds builders
+leaves such a lane quoting where it was.
+
 Every change and every reload diffs the config against what is running, per lane, and
 touches only what differs:
 
@@ -530,7 +538,8 @@ Two properties make it safe to run casually. A change that fails to validate app
 leave every pair exactly as it was. And a lane that is being started or restarted has its new
 feed dialled *before* the old one is stopped, so a stanza that turns out to be wrong costs
 that lane nothing: it keeps quoting on the config it already had, and only it is reported as
-failed. Everything else is all-or-nothing; the feed dial is the one thing that cannot be
+failed (unless the change took a builder out of its list, which stops it: see above).
+Everything else is all-or-nothing; the feed dial is the one thing that cannot be
 known without doing it.
 
 A pair halted by its circuit breaker is the exception: no reload brings it back.
@@ -691,7 +700,8 @@ curl -X DELETE http://100.64.1.2:8088/api/pairs/UPDATER_KEY_WETH_USDC
 "disable_cross_region"}` (the last optional), and `GET /api/builders` never answers an
 `api_key`. Adding or removing one restarts every pair onto the new list (except one halted
 on its circuit breaker, which stays halted), and an addition is refused if none of the
-builders would connect.
+builders would connect. A pair that cannot be rebuilt onto a list that lost a builder is
+stopped rather than left quoting to it, and the answer is `partial`.
 
 **Kinds and venues.** `GET /api/kinds` lists each registered pricing kind as `{"kind",
 "help_html", "fields": [{"name", "placeholder", "hint", "number"}]}`, which is what a form for
@@ -702,7 +712,8 @@ venue as `{"venue", "example", "default_endpoint", "polled"}`.
 **Answers.** A change that was made answers 2xx (201 for a `POST` that adds a pair or a
 builder) with `{"status": "applied" | "partial", "message": ...}`. `partial` means the change
 is kept and live on the pairs the reload reached, but some pair kept its previous config
-because its feed did not come up. Anything refused answers 4xx with `{"error": ...}` and
+because its feed did not come up, or was stopped because the change took out a builder it
+quoted to (the message names a stopped pair). Anything refused answers 4xx with `{"error": ...}` and
 changed nothing: 404 for an unknown pair or builder, 409 for a conflict (a key already taken,
 a pair already halted, a re-arm of a pair that is not tripped), 422 for a change that is
 invalid (a misspelt key included) or that the reload rejected, 400 for a body that does not
@@ -804,7 +815,8 @@ back before the API answers. So after every change the pairs and builders on dis
 what is running, and a bad change costs a rejected reload and nothing else. Without the
 revert a rejected change would sit in the file until the next start applied it. A change
 that applies only in part (some pair's feed would not come up, so that pair keeps its
-previous config or is not started) is not reverted: it already stopped, started and restarted every other lane it reached, a halt
+previous config, is not started, or, when the change took a builder out of its list, is
+stopped) is not reverted: it already stopped, started and restarted every other lane it reached, a halt
 among them, and putting the config back would have the next reload undo that. The API
 answers it with `"status": "partial"`, saying the change was kept, and the next reload
 retries the pair that failed.
@@ -843,7 +855,8 @@ alerted on:
 - `result="rejected"` — the change did not validate, so nothing was touched and the file
   was put back. Every lane is on the previous config, together. `PusherConfigReloadFailed`.
 - `result="partial"` — the change was applied, but a lane's feed would not come up, so that
-  lane is still on its old stanza (or was never started) while the rest moved. A mixture,
+  lane is still on its old stanza (or was never started, or was stopped because the change
+  took out a builder it quoted to) while the rest moved. A mixture,
   which is the harder of the two to reason about. `PusherConfigReloadPartial`.
 
 `quote_updater_config_generation` advances only when a reload put **every** configured pair

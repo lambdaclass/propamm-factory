@@ -54,8 +54,8 @@ What to know:
   reload and under `--check`; under `--check` every guard is also built, as the run builds
   it before the lane quotes, so a guard that cannot be built (a quote guard reading a
   diagnostic the pair's pricer never declares) fails the check under its row instead of
-  passing it and refusing the start; a failed build keeps the old lane quoting and reports
-  the reload partial. A panic in any of them counts as that failure, not as the process's.
+  passing it and refusing the start; a failed build keeps the old lane quoting (or stops it,
+  when the change took a builder out of its list) and reports the reload partial. A panic in any of them counts as that failure, not as the process's.
 - **The core still decides.** A pricer can refuse (`Refusal::new`, counted under the reason
   it declared), and the core withdraws anything unpublishable whatever a pricer returns: a
   spread of a whole unit or more, a zero mid, or a mid the contract cannot store (over 216
