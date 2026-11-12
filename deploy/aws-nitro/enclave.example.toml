@@ -1,0 +1,77 @@
+# The enclave file for `--enclave` on AWS Nitro: baked into the image, so the host cannot
+# change it. Holds no secret. See docs/enclave.md.
+
+# How the run reaches its host. A Nitro enclave has a vsock to its host and nothing else.
+[link]
+kind = "vsock"
+port = 5000          # the boot helper connects here with the secrets and the sealed config
+
+# Outbound tunnels: a loopback address inside, piped to a vsock port on the host (cid 3),
+# where AWS's vsock-proxy dials the real host. One per host the updater connects to: KMS,
+# the RPC node, every builder, every venue a pair reads, Google (for the backoffice login),
+# CoinGecko if used. The hosts file maps each name to its `listen` address; two hosts on the
+# same port take two loopback addresses.
+[[link.forward]]
+listen = "127.0.0.2:443"     # kms.eu-west-1.amazonaws.com
+cid    = 3
+port   = 8001
+
+[[link.forward]]
+listen = "127.0.0.3:9443"    # stream.binance.com
+cid    = 3
+port   = 8002
+
+[[link.forward]]
+listen = "127.0.0.4:443"     # your RPC node, e.g. eth-mainnet.g.alchemy.com
+cid    = 3
+port   = 8003
+
+# Every builder in the config: one forward each (here Titan's EU endpoint).
+[[link.forward]]
+listen = "127.0.0.5:443"     # eu.rpc.titanbuilder.xyz
+cid    = 3
+port   = 8004
+
+# The backoffice login: the code exchange and Google's signing keys. The browser talks to
+# accounts.google.com itself, so that one needs no forward.
+[[link.forward]]
+listen = "127.0.0.6:443"     # oauth2.googleapis.com
+cid    = 3
+port   = 8005
+
+[[link.forward]]
+listen = "127.0.0.7:443"     # www.googleapis.com
+cid    = 3
+port   = 8006
+
+# Inbound tunnels: a vsock port on the enclave, piped to an address inside: the backoffice
+# (its `backoffice_addr` in the config) and the metrics scrape (`metrics_addr`).
+[[link.accept]]
+port = 8088
+to   = "127.0.0.1:8088"
+
+[[link.accept]]
+port = 9464
+to   = "127.0.0.1:9464"
+
+# How the secrets are decrypted: AWS KMS, only for this image's attestation. Needs a build
+# with the quote-updater `aws-nitro` feature. The endpoint's name is pointed at a
+# [[link.forward]] above by the image's hosts file.
+[release]
+kind     = "aws-nitro-kms"
+region   = "eu-west-1"
+# The key's full ARN: every decrypt names it, so a ciphertext under any other key is refused.
+key_id   = "arn:aws:kms:eu-west-1:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab"
+endpoint = "https://kms.eu-west-1.amazonaws.com"
+
+# The backoffice serves its own HTTPS and asks for a Google login. The certificate is
+# handed in by the host at boot; its private key is the secret named here.
+[backoffice]
+key_secret = "BACKOFFICE_TLS_KEY"
+
+[backoffice.google]
+client_id            = "0000000000-xxxxxxxx.apps.googleusercontent.com"
+client_secret_secret = "BACKOFFICE_OAUTH_SECRET"   # the secret holding the client secret
+redirect_url         = "https://backoffice.example.com/auth/callback"
+allowed_domain       = "example.com"               # a Google Workspace domain, and/or:
+# allowed_accounts   = ["someone@example.com"]

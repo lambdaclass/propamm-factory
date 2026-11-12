@@ -7,6 +7,10 @@ with a dashboard of the updater's metrics. Two files to fill, both gitignored: `
 The contracts are not part of it: deploying a PropAMM is a one-off `forge script`, see
 [`contracts/`](../contracts/).
 
+For a host whose root must not be able to take the keys or change the config, the updater
+runs inside an enclave instead; [`aws-nitro/`](aws-nitro/) has the image for AWS Nitro and
+[`../docs/enclave.md`](../docs/enclave.md) the rest.
+
 ## Setup
 
 From a clean state (the first block stops and removes a previous run, including its data

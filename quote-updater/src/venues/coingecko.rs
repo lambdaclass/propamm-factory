@@ -12,14 +12,13 @@ pub const DEFAULT_ENDPOINT: &str = "https://api.coingecko.com/api/v3";
 /// The paid API (Basic plan and up).
 pub const PRO_ENDPOINT: &str = "https://pro-api.coingecko.com/api/v3";
 
-/// The environment variable holding a paid plan's API key, if any.
+/// The name a paid plan's API key is read under, if any: an environment variable, or inside
+/// an enclave one of the secrets handed in.
 pub const API_KEY_VAR: &str = "COINGECKO_API_KEY";
 
 /// The key in `COINGECKO_API_KEY`, if any.
 fn api_key() -> Option<String> {
-    std::env::var(API_KEY_VAR)
-        .ok()
-        .filter(|key| !key.is_empty())
+    crate::secrets::lookup(API_KEY_VAR).filter(|key| !key.is_empty())
 }
 
 /// The header that carries the key, when there is one.

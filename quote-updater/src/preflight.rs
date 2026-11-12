@@ -1932,7 +1932,7 @@ mod tests {
         unset.updater = None;
         unset
             .failures
-            .push("UPDATER_KEY_USDC_USDT is not set in the environment".to_owned());
+            .push("UPDATER_KEY_USDC_USDT is not set".to_owned());
         let mut unfunded = row("WBTC/USDC", Some(true), Some(0));
         unfunded.warnings.push("updater has no ETH".to_owned());
 

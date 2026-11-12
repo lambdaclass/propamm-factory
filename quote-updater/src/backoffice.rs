@@ -6,7 +6,8 @@
 //!
 //! No login: `backoffice_addr` is the host's tailnet address, so reaching this page means
 //! being past the tailnet ACL. Binding a routable address is refused, because unlike
-//! `/metrics` this page writes. Every change logs the peer that made it.
+//! `/metrics` this page writes. Every change logs who made it: the peer, or inside an
+//! enclave the account that logged in.
 
 use std::{
     net::SocketAddr,
@@ -78,6 +79,7 @@ pub(crate) fn is_unspecified_bind(addr: SocketAddr) -> bool {
 /// Binds `addr` and serves the page. Fatal on failure: an operator who believes this is up
 /// and whose changes are going nowhere is worse off than one whose service refused to
 /// start.
+#[allow(clippy::too_many_arguments)] // one production caller, pusher::run_inner
 pub async fn bind(
     addr: SocketAddr,
     config_path: PathBuf,
@@ -86,6 +88,7 @@ pub async fn bind(
     states: PairStates,
     edits: Arc<tokio::sync::Mutex<()>>,
     kinds: Arc<crate::kinds::Kinds>,
+    secure: Option<crate::login::Secure>,
 ) -> Result<(SocketAddr, JoinHandle<()>)> {
     bind_with(
         addr,
@@ -96,6 +99,7 @@ pub async fn bind(
         edits,
         kinds,
         crate::discover::Rest::default(),
+        secure,
     )
     .await
 }
@@ -111,6 +115,7 @@ async fn bind_with(
     edits: Arc<tokio::sync::Mutex<()>>,
     kinds: Arc<crate::kinds::Kinds>,
     rest: crate::discover::Rest,
+    secure: Option<crate::login::Secure>,
 ) -> Result<(SocketAddr, JoinHandle<()>)> {
     eyre::ensure!(
         !is_unspecified_bind(addr),
@@ -168,17 +173,32 @@ async fn bind_with(
         .route("/reload", post(reload_only))
         .with_state(state);
 
-    let task = tokio::spawn(async move {
-        // With connect info, so every mutation can be logged against its peer.
-        if let Err(err) = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-        {
-            tracing::warn!("backoffice listener stopped: {err}");
+    // With connect info, so every mutation can be logged against its peer.
+    let task = match secure {
+        None => tokio::spawn(async move {
+            if let Err(err) = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            {
+                tracing::warn!("backoffice listener stopped: {err}");
+            }
+        }),
+        // HTTPS terminated here, a login on every route but the login's own, and the
+        // hardening headers on all of them; see login/mod.rs.
+        Some(secure) => {
+            let app = app
+                .layer(axum::middleware::from_fn_with_state(
+                    Arc::clone(&secure.login),
+                    crate::login::require,
+                ))
+                .merge(crate::login::routes(Arc::clone(&secure.login)))
+                .layer(axum::middleware::from_fn(crate::login::harden));
+            let listener = crate::login::TlsListener::spawn(listener, secure.tls)?;
+            tokio::spawn(crate::login::serve(listener, app))
         }
-    });
+    };
 
     Ok((local, task))
 }
@@ -187,12 +207,37 @@ async fn bind_with(
 // Applying a change
 // ---------------------------------------------------------------------------
 
+/// Who made a change, for the line that logs it: the account that logged in, where the page
+/// asks for a login (inside an enclave, where every peer is the tunnel's loopback address),
+/// else the peer address, which past the tailnet ACL is the person.
+struct Who(String);
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for Who {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        if let Some(crate::login::Account(email)) = parts.extensions.get() {
+            return Ok(Who(email.clone()));
+        }
+        Ok(Who(parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map_or_else(
+                || "an unknown peer".to_owned(),
+                |ConnectInfo(peer)| peer.to_string(),
+            )))
+    }
+}
+
 /// Reads the config, hands it to `change`, writes it back and reloads, restoring the
 /// previous file if the reload is refused. The one place that is done, so no handler can
 /// forget the revert.
 async fn apply(
     state: &Backoffice,
-    peer: SocketAddr,
+    peer: &str,
     what: &str,
     change: impl FnOnce(&mut RawConfig) -> Result<()>,
 ) -> Outcome {
@@ -204,7 +249,7 @@ async fn apply(
 /// decide what to change under the same lock the change is made under.
 async fn apply_locked(
     state: &Backoffice,
-    peer: SocketAddr,
+    peer: &str,
     what: &str,
     change: impl FnOnce(&mut RawConfig) -> Result<()>,
 ) -> Outcome {
@@ -215,7 +260,7 @@ async fn apply_locked(
 /// apply from a rejection.
 async fn change_locked(
     state: &Backoffice,
-    peer: SocketAddr,
+    peer: &str,
     what: &str,
     change: impl FnOnce(&mut RawConfig) -> Result<()>,
 ) -> std::result::Result<String, ReloadFailure> {
@@ -256,6 +301,8 @@ struct Outcome {
 impl From<std::result::Result<String, ReloadFailure>> for Outcome {
     fn from(result: std::result::Result<String, ReloadFailure>) -> Self {
         match result {
+            // Applied, but gone at the next restart: shown as the warning it is.
+            Ok(message) if message.contains(config::NOT_PERSISTED) => Outcome::failed(message),
             Ok(message) => Outcome::ok(message),
             Err(failure) => Outcome::failed(failure.line().to_owned()),
         }
@@ -726,12 +773,12 @@ pub(crate) fn field_value(
 
 async fn add_pair(
     State(state): State<Backoffice>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Who(peer): Who,
     Form(form): Form<AddPair>,
 ) -> Response {
     let what = format!("added pair {}/{}", form.token0, form.token1);
     let kinds = Arc::clone(&state.kinds);
-    apply(&state, peer, &what, move |config| {
+    apply(&state, &peer, &what, move |config| {
         let pair = pair_from_form(&form, &kinds)?;
         config::check_source_keys(&pair)?;
         if config
@@ -1276,7 +1323,7 @@ fn optional_number<T: std::str::FromStr>(name: &str, value: &str) -> Result<Opti
 /// operator does want.
 async fn save_settings(
     State(state): State<Backoffice>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Who(peer): Who,
     Form(form): Form<SaveSettings>,
 ) -> Response {
     let _guard = state.edits.lock().await;
@@ -1296,10 +1343,21 @@ async fn save_settings(
     let changed = config.settings.changed_keys(&settings).join(", ");
     config.settings = settings;
 
-    if let Err(err) = config::write_raw_atomically(&state.config_path, &config) {
-        return Outcome::failed(format!("{err:#}")).redirect();
-    }
+    let persisted = match config::write_raw_atomically(&state.config_path, &config) {
+        Ok(persisted) => persisted,
+        Err(err) => return Outcome::failed(format!("{err:#}")).redirect(),
+    };
     tracing::info!("backoffice: {peer} changed [settings] {changed}; restart pending");
+    // A setting applies only at the restart, so one the host was not handed never applies.
+    if persisted != config::Persisted::Yes {
+        return Outcome::failed(format!(
+            "saved {changed} here, but NOT persisted to the host: the link to the host is \
+             down, and these settings apply only at a restart, which would start from the \
+             host's copy without them. Restart the enclave once its boot helper is back, then \
+             save again."
+        ))
+        .redirect();
+    }
     Outcome::ok(format!(
         "saved {changed}. These are read once at startup, so {} to apply them.",
         crate::hints::restart_instruction()
@@ -1313,6 +1371,10 @@ async fn save_settings(
 /// `bind` is this file's, `run` is `pusher::run`, the rest are in `cli.rs`. A value that
 /// passes here and fails there is a bug in this function.
 fn build_settings(form: &SaveSettings) -> Result<config::FileSettings> {
+    build_settings_in(form, crate::enclave::active())
+}
+
+fn build_settings_in(form: &SaveSettings, enclave: bool) -> Result<config::FileSettings> {
     let mode = optional(&form.mode);
     if let Some(mode) = &mode {
         eyre::ensure!(
@@ -1403,6 +1465,18 @@ fn build_settings(form: &SaveSettings) -> Result<config::FileSettings> {
             );
         }
     }
+    // `run`: inside an enclave every endpoint must be https:// or wss://, the same list
+    // startup checks. A blank rpc_url is the default, which is plain http.
+    if enclave {
+        let rpc_url = optional(&form.rpc_url);
+        crate::enclave::require_tls(&crate::enclave::named_endpoints(
+            rpc_url.as_deref().unwrap_or(crate::cli::DEFAULT_RPC_URL),
+            optional(&form.rpc_ws_url).as_deref(),
+            None,
+            &endpoints,
+            &[],
+        ))?;
+    }
     Ok(config::FileSettings {
         mode,
         rpc_url: optional(&form.rpc_url),
@@ -1461,7 +1535,7 @@ struct EditPair {
 /// added a pair, and an index would then edit the wrong row.
 async fn edit_pair(
     State(state): State<Backoffice>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Who(peer): Who,
     Form(form): Form<EditPair>,
 ) -> Response {
     let what = format!("edited pair {}", form.key_env);
@@ -1470,7 +1544,7 @@ async fn edit_pair(
     let result = {
         let (form, kinds) = (Arc::clone(&form), Arc::clone(&kinds));
         let _guard = state.edits.lock().await;
-        change_locked(&state, peer, &what, move |config| {
+        change_locked(&state, &peer, &what, move |config| {
             let pair = config
                 .pairs
                 .iter_mut()
@@ -1488,7 +1562,9 @@ async fn edit_pair(
         .await
     };
     let outcome = match result {
-        Ok(message) => return Outcome::ok(message).redirect(),
+        // Through the `From` above, so an edit the host did not get is shown as the warning
+        // it is.
+        Ok(message) => return Outcome::from(Ok::<_, ReloadFailure>(message)).redirect(),
         // Written and applied to some lanes: not a rejection, and not the form again, which
         // would read as one. The list, saying it was saved and what the reload could not do.
         Err(ReloadFailure::Partial(line)) => {
@@ -1551,11 +1627,11 @@ struct RemovePair {
 
 async fn remove_pair(
     State(state): State<Backoffice>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Who(peer): Who,
     Form(form): Form<RemovePair>,
 ) -> Response {
     let what = format!("removed pair {}", form.key_env);
-    apply(&state, peer, &what, move |config| {
+    apply(&state, &peer, &what, move |config| {
         let before = config.pairs.len();
         config
             .pairs
@@ -1647,11 +1723,11 @@ fn explained_halts(config: &RawConfig) -> String {
 /// as gone, so its quote is withdrawn at every builder exactly as a removal would.
 async fn halt_pair(
     State(state): State<Backoffice>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Who(peer): Who,
     Form(form): Form<RemovePair>,
 ) -> Response {
     let what = format!("halted pair {}", form.key_env);
-    apply(&state, peer, &what, move |config| {
+    apply(&state, &peer, &what, move |config| {
         set_halted(config, Some(&form.key_env), true)
     })
     .await
@@ -1660,22 +1736,19 @@ async fn halt_pair(
 
 async fn resume_pair(
     State(state): State<Backoffice>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Who(peer): Who,
     Form(form): Form<RemovePair>,
 ) -> Response {
     let what = format!("resumed pair {}", form.key_env);
-    apply(&state, peer, &what, move |config| {
+    apply(&state, &peer, &what, move |config| {
         set_halted(config, Some(&form.key_env), false)
     })
     .await
     .redirect()
 }
 
-async fn halt_all(
-    State(state): State<Backoffice>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-) -> Response {
-    apply(&state, peer, "halted every pair", |config| {
+async fn halt_all(State(state): State<Backoffice>, Who(peer): Who) -> Response {
+    apply(&state, &peer, "halted every pair", |config| {
         set_halted(config, None, true)
     })
     .await
@@ -1693,7 +1766,7 @@ struct AddBuilder {
 
 async fn add_builder(
     State(state): State<Backoffice>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Who(peer): Who,
     Form(form): Form<AddBuilder>,
 ) -> Response {
     let builder = BuilderConfig {
@@ -1703,7 +1776,7 @@ async fn add_builder(
         disable_cross_region: form.disable_cross_region.is_some().then_some(true),
     };
     let what = format!("added builder {}", builder.name);
-    apply(&state, peer, &what, move |config| {
+    apply(&state, &peer, &what, move |config| {
         if config
             .builders
             .iter()
@@ -1731,11 +1804,11 @@ struct RemoveBuilder {
 
 async fn remove_builder(
     State(state): State<Backoffice>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Who(peer): Who,
     Form(form): Form<RemoveBuilder>,
 ) -> Response {
     let what = format!("removed builder {}", form.name);
-    apply(&state, peer, &what, move |config| {
+    apply(&state, &peer, &what, move |config| {
         let before = config.builders.len();
         config.builders.retain(|b| b.name != form.name.trim());
         if config.builders.len() == before {
@@ -1757,10 +1830,7 @@ async fn remove_builder(
 /// read under the edit lock, so two presses at once cannot both see a flag the first one
 /// is about to clear, which would have the second report an error for a restart that
 /// worked.
-async fn reload_only(
-    State(state): State<Backoffice>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-) -> Response {
+async fn reload_only(State(state): State<Backoffice>, Who(peer): Who) -> Response {
     let _guard = state.edits.lock().await;
     let (any_flagged, kept) = match config::load_raw(&state.config_path) {
         Ok(config) => (
@@ -1773,7 +1843,7 @@ async fn reload_only(
         Err(_) => (false, String::new()),
     };
     if any_flagged {
-        let result = change_locked(&state, peer, "restarted halted pairs", |config| {
+        let result = change_locked(&state, &peer, "restarted halted pairs", |config| {
             set_halted(config, None, false)
         })
         .await;
@@ -2861,32 +2931,27 @@ api_key = "k"
             )));
         });
 
-        let outcome = apply(
-            &state,
-            "100.64.0.9:1234".parse().unwrap(),
-            "added pair TEST",
-            |config| {
-                config.pairs.push(RawPair {
-                    tokens: vec!["0xaa".to_owned(), "0xbb".to_owned()],
-                    key_env: "UPDATER_KEY_TEST".to_owned(),
-                    symbol: Some("TESTUSDC".to_owned()),
-                    sources: Vec::new(),
-                    min_sources: None,
-                    max_source_lag_ms: None,
-                    min_mid: None,
-                    max_mid: None,
-                    max_deviation: None,
-                    max_deviation_window: None,
-                    max_deviation_window_blocks: None,
-                    allow_symbol_mismatch: false,
-                    halted: false,
-                    halt_reason: None,
-                    pricing: toml::from_str("kind = \"feed\"").unwrap(),
-                    guards: Vec::new(),
-                });
-                Ok(())
-            },
-        )
+        let outcome = apply(&state, "100.64.0.9:1234", "added pair TEST", |config| {
+            config.pairs.push(RawPair {
+                tokens: vec!["0xaa".to_owned(), "0xbb".to_owned()],
+                key_env: "UPDATER_KEY_TEST".to_owned(),
+                symbol: Some("TESTUSDC".to_owned()),
+                sources: Vec::new(),
+                min_sources: None,
+                max_source_lag_ms: None,
+                min_mid: None,
+                max_mid: None,
+                max_deviation: None,
+                max_deviation_window: None,
+                max_deviation_window_blocks: None,
+                allow_symbol_mismatch: false,
+                halted: false,
+                halt_reason: None,
+                pricing: toml::from_str("kind = \"feed\"").unwrap(),
+                guards: Vec::new(),
+            });
+            Ok(())
+        })
         .await;
         service.await.unwrap();
 
@@ -2916,7 +2981,7 @@ api_key = "k"
 
         let outcome = apply(
             &state,
-            "100.64.0.9:1234".parse().unwrap(),
+            "100.64.0.9:1234",
             "halted pair UPDATER_KEY_WETH_USDC",
             |config| set_halted(config, Some("UPDATER_KEY_WETH_USDC"), true),
         )
@@ -2949,7 +3014,7 @@ api_key = "k"
 
         let outcome = apply(
             &state,
-            "100.64.0.9:1234".parse().unwrap(),
+            "100.64.0.9:1234",
             "edited pair UPDATER_KEY_WETH_USDC",
             |config| {
                 config.pairs[0].max_deviation = Some("0.02".to_owned());
@@ -2989,6 +3054,7 @@ api_key = "k"
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
             test_kinds(),
+            None,
         )
         .await
         .expect_err("an unspecified bind must be refused");
@@ -3020,6 +3086,7 @@ api_key = "k"
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
             test_kinds(),
+            None,
         )
         .await
         .unwrap();
@@ -3131,6 +3198,7 @@ api_key = "k"
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
             test_kinds(),
+            None,
         )
         .await
         .unwrap();
@@ -3187,6 +3255,7 @@ api_key = "k"
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
             test_kinds(),
+            None,
         )
         .await
         .unwrap();
@@ -3285,6 +3354,7 @@ api_key = "k"
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
             test_kinds(),
+            None,
         )
         .await
         .unwrap();
@@ -3385,6 +3455,7 @@ api_key = "k"
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
             test_kinds(),
+            None,
         )
         .await
         .unwrap();
@@ -3499,6 +3570,7 @@ api_key = "k"
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
             test_kinds(),
             crate::discover::Rest::all_at(&format!("http://{exchanges}")),
+            None,
         )
         .await
         .unwrap();
@@ -3666,7 +3738,7 @@ api_key = "k"
             .settings
             .endpoints
             .insert("bybit".to_owned(), format!("ws://{venues}{BYBIT}"));
-        config::write_raw_atomically(&path, &config).unwrap();
+        let _ = config::write_raw_atomically(&path, &config).unwrap();
         let (local, _task) = bind(
             "127.0.0.1:0".parse().unwrap(),
             path.clone(),
@@ -3675,6 +3747,7 @@ api_key = "k"
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
             test_kinds(),
+            None,
         )
         .await
         .unwrap();
@@ -3948,6 +4021,7 @@ api_key = "k"
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
             test_kinds(),
+            None,
         )
         .await
         .unwrap();
@@ -3982,6 +4056,7 @@ api_key = "k"
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
             test_kinds(),
+            None,
         )
         .await
         .unwrap();
@@ -4461,6 +4536,37 @@ api_key = "k"
         node.mode = "node".to_owned();
         node.backoffice_addr = String::new();
         build_settings(&node).expect("node mode without a backoffice saves");
+
+        // Inside an enclave startup refuses any plaintext endpoint, and a blank rpc_url,
+        // which is the plain-http default: so does the save.
+        build_settings_in(&fine, true).expect("TLS endpoints save inside an enclave");
+        for (key, mutate) in [
+            (
+                "rpc_url",
+                Box::new(|f: &mut SaveSettings| f.rpc_url = "http://a".to_owned()) as Mutate,
+            ),
+            ("rpc_url", Box::new(|f| f.rpc_url = String::new())),
+            (
+                "rpc_ws_url",
+                Box::new(|f| f.rpc_ws_url = "ws://a".to_owned()),
+            ),
+            (
+                "endpoints.binance",
+                Box::new(|f| f.binance_ws = "ws://stream.binance.com:9443/ws".to_owned()),
+            ),
+        ] {
+            let mut bad = form();
+            bad.rpc_ws_url = "wss://a".to_owned();
+            bad.binance_ws = "wss://stream.binance.com:9443/ws".to_owned();
+            mutate(&mut bad);
+            let err = format!("{:#}", build_settings_in(&bad, true).unwrap_err());
+            assert!(
+                err.contains("https:// or wss://") && err.contains(key),
+                "{key}: {err}"
+            );
+            build_settings_in(&bad, false).expect("outside an enclave it saves");
+        }
+
         for (key, mutate) in cases {
             let mut bad = form();
             mutate(&mut bad);
@@ -4610,6 +4716,7 @@ api_key = "k"
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
             test_kinds(),
+            None,
         )
         .await
         .unwrap();
@@ -4735,6 +4842,7 @@ api_key = "k"
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
             test_kinds(),
+            None,
         )
         .await
         .unwrap();
@@ -4779,6 +4887,7 @@ api_key = "k"
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
             test_kinds(),
+            None,
         )
         .await
         .unwrap();
@@ -5161,6 +5270,7 @@ api_key = "k"
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
             test_kinds(),
+            None,
         )
         .await
         .unwrap();
@@ -5198,6 +5308,7 @@ api_key = "k"
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
             test_kinds(),
+            None,
         )
         .await
         .unwrap();
@@ -5264,6 +5375,7 @@ api_key = "k"
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
             Arc::new(kinds),
+            None,
         )
         .await
         .unwrap();
@@ -5387,6 +5499,7 @@ api_key = "k"
             PairStates::default(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
             test_kinds(),
+            None,
         )
         .await
         .unwrap();

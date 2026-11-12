@@ -1097,12 +1097,20 @@ pub(crate) async fn change_config(
         .map_err(|err| refused(format!("could not read {}: {err}", path.display())))?;
     let mut raw = config::load_raw(path).map_err(|err| refused(format!("{err:#}")))?;
     change(&mut raw).map_err(|err| refused(format!("{err:#}")))?;
-    config::write_raw_atomically(path, &raw).map_err(|err| refused(format!("{err:#}")))?;
+    // Past here the file holds the change. Whether the host was also handed it (inside an
+    // enclave) does not stop it: a halt has to take effect even with the host gone, so it
+    // is applied and said to be temporary instead.
+    let persisted =
+        config::write_raw_atomically(path, &raw).map_err(|err| refused(format!("{err:#}")))?;
+    let temporary = persisted
+        .warning()
+        .map(|warning| format!(" {warning}"))
+        .unwrap_or_default();
 
     match request_reload(reloads).await {
         Ok(summary) => {
             tracing::info!("{by} {what}; {summary}");
-            Ok(format!("{what}. {summary}"))
+            Ok(format!("{what}. {summary}{temporary}"))
         }
         // Not put back: the reload stopped, started and restarted what it could, so the
         // file already describes those lanes, and reverting it would have the next reload
@@ -1112,23 +1120,34 @@ pub(crate) async fn change_config(
             Err(ReloadFailure::Partial(format!(
                 "{what}, but the reload applied in part: {summary}. The config file keeps the \
                  change, which is live on every pair the reload reached; the next reload \
-                 retries the rest."
+                 retries the rest.{temporary}"
             )))
         }
         Err(ReloadFailure::Rejected(err)) => {
             // Put back before the rejection is reported, so by the time it is read the file
-            // already matches what is running again.
-            let restored = std::fs::write(path, &before);
+            // already matches what is running again. Through the same write as the change,
+            // so inside an enclave the host's copy is put back too: it was handed the
+            // rejected one, and would otherwise start the next boot from it.
+            let restored = config::write_text_atomically(path, &before);
             tracing::warn!("{by} {what} REJECTED, reverted: {err}");
             Err(ReloadFailure::Rejected(match restored {
-                Ok(()) => format!(
+                Ok(config::Persisted::Yes) => format!(
                     "{what} was rejected and nothing changed: {err}. The config file has \
                      been put back as it was."
                 ),
+                // The host was handed the rejected change before the reload, and cannot be
+                // handed the file put back: it would start the next boot from the change.
+                Ok(config::Persisted::NotToTheHost) => format!(
+                    "{what} was rejected and nothing changed here: {err}. The config file has \
+                     been put back, but NOT persisted to the host, whose copy may still hold \
+                     the rejected change: restart the enclave only after a save that \
+                     persists."
+                ),
                 Err(write_err) => format!(
                     "{what} was rejected ({err}) AND the config file could not be put back \
-                     ({write_err}). The file on disk no longer matches what is running: fix \
-                     it by hand before the next reload."
+                     ({write_err:#}). The file on disk, or inside an enclave the copy the host \
+                     keeps, no longer matches what is running: fix it before the next reload \
+                     or restart."
                 ),
             }))
         }

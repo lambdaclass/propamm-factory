@@ -53,6 +53,9 @@ jobs:
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       # builder_mock_server and metrics_fixture_server are #[ignore]d (they serve forever).
       - run: cargo test --locked --workspace
+      # The enclave's KMS release is behind a feature the line above leaves off; clippy
+      # compiles its tests, this runs them.
+      - run: cargo test --locked -p quote-updater --features aws-nitro
 
   downstream:
     name: Downstream crate (builds against the library)

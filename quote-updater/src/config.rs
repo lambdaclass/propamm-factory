@@ -159,15 +159,52 @@ pub fn render_raw(config: &RawConfig) -> Result<String> {
     Ok(format!("{}\n{body}", written_header()))
 }
 
+/// Whether a config write reached everywhere the config is kept. Outside an enclave the file
+/// is all there is, so a write that succeeded always has. Inside one the host keeps the
+/// sealed copy the next boot starts from, and a write it could not be handed (the link is
+/// down) is applied but lasts only until the restart.
+#[must_use]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Persisted {
+    /// Kept everywhere.
+    Yes,
+    /// Written and applied here, but not handed to the host.
+    NotToTheHost,
+}
+
+/// What an operator is told after a change [`Persisted::NotToTheHost`]: it stands, and will
+/// not survive a restart.
+pub const NOT_PERSISTED: &str = "Applied, but NOT persisted to the host: the link to the host \
+                                 is down, so this change will be lost at the next restart of \
+                                 the enclave.";
+
+impl Persisted {
+    /// [`NOT_PERSISTED`], when there is something to warn of.
+    pub fn warning(self) -> Option<&'static str> {
+        match self {
+            Persisted::Yes => None,
+            Persisted::NotToTheHost => Some(NOT_PERSISTED),
+        }
+    }
+}
+
 /// Write-then-rename into the same directory, so a reload racing this sees the whole old
 /// file or the whole new one. 0600 throughout: it holds the builder API keys.
-pub fn write_raw_atomically(path: &Path, config: &RawConfig) -> Result<()> {
+pub fn write_raw_atomically(path: &Path, config: &RawConfig) -> Result<Persisted> {
     let rendered = render_raw(config)?;
 
     // A round-trip failure here would leave a file the loader cannot read. Cheap to catch
     // now, expensive at the next reload.
     parse_file_settings(&rendered).wrap_err("the rendered config does not parse back")?;
+    write_text_atomically(path, &rendered)
+}
 
+/// Writes `text` to `path` the way every config write goes: through a temporary file and a
+/// rename, readable by this process only, and sealed for the host inside an enclave. Also
+/// how a rejected change is put back, so the host's copy follows the revert too. An `Err`
+/// means the file was not replaced; once it has been, the answer is whether it was also
+/// [`Persisted`], never an error.
+pub fn write_text_atomically(path: &Path, text: &str) -> Result<Persisted> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let tmp = dir.join(format!(
         ".{}.tmp",
@@ -188,11 +225,20 @@ pub fn write_raw_atomically(path: &Path, config: &RawConfig) -> Result<()> {
         let mut file = options
             .open(&tmp)
             .wrap_err_with(|| format!("failed to open {}", tmp.display()))?;
-        file.write_all(rendered.as_bytes())
+        file.write_all(text.as_bytes())
             .wrap_err_with(|| format!("failed to write {}", tmp.display()))?;
         // Before the rename: otherwise a crash could leave an empty file at the real path.
         file.sync_all()
             .wrap_err_with(|| format!("failed to flush {}", tmp.display()))?;
+    }
+    // On the temporary file, before the rename, which keeps it: a leftover one from an
+    // earlier run is reopened with its own mode, and a chmod after the rename could fail
+    // with the file already replaced, breaking the promise above.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))
+            .wrap_err_with(|| format!("failed to chmod 600 {}", tmp.display()))?;
     }
     fs::rename(&tmp, path).wrap_err_with(|| {
         format!(
@@ -201,13 +247,12 @@ pub fn write_raw_atomically(path: &Path, config: &RawConfig) -> Result<()> {
             tmp.display()
         )
     })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .wrap_err_with(|| format!("failed to chmod 600 {}", path.display()))?;
+    // Inside an enclave this file is on a filesystem that ends with the process: the host
+    // keeps it between boots, sealed so it can neither read nor change it.
+    match crate::enclave::host() {
+        Some(host) if !host.config_written(path) => Ok(Persisted::NotToTheHost),
+        _ => Ok(Persisted::Yes),
     }
-    Ok(())
 }
 
 /// Reads just the `[settings]` table. Separate from `parse_config` because
@@ -1239,11 +1284,12 @@ impl ResolvedPair {
     }
 }
 
-/// Reads the process environment. Passed as `lookup` in production; tests inject their
-/// own closure instead, since `std::env::set_var` is unsafe in edition 2024 and process
-/// env is shared across test threads.
+/// Reads a secret by name: the secrets an enclave was handed, else the process
+/// environment (`secrets.rs`). Passed as `lookup` in production; tests inject their own
+/// closure instead, since `std::env::set_var` is unsafe in edition 2024 and process env is
+/// shared across test threads.
 pub fn env_lookup(name: &str) -> Option<String> {
-    std::env::var(name).ok()
+    crate::secrets::lookup(name)
 }
 
 /// Where a run reads updater keys from: [`env_lookup`] in production, a closure in tests,
@@ -1261,7 +1307,7 @@ pub fn resolve_keys<F: Fn(&str) -> Option<String>>(
         .iter()
         .map(|pair| {
             let name = &pair.key_env;
-            let raw = lookup(name).ok_or_else(|| eyre!("{name} is not set in the environment"))?;
+            let raw = lookup(name).ok_or_else(|| eyre!("{name} is not set"))?;
             let secret: SecretKey = raw
                 .strip_prefix("0x")
                 .unwrap_or(&raw)
@@ -1407,8 +1453,14 @@ impl BuildersConfig {
 }
 
 /// Shape only, and deliberately not "there is at least one": whether an empty list is
-/// fatal depends on the mode, which the file does not know.
+/// fatal depends on the mode, which the file does not know. Inside an enclave a builder
+/// must be `wss://` as well: startup, a reload and the backoffice's add all come through
+/// here, so a plaintext builder is refused before it is connected, not at the next start.
 pub fn validate_builders(builders: &[BuilderConfig]) -> Result<()> {
+    validate_builders_in(builders, crate::enclave::active())
+}
+
+fn validate_builders_in(builders: &[BuilderConfig], enclave: bool) -> Result<()> {
     let mut seen = HashSet::new();
     for builder in builders {
         ensure!(
@@ -1431,6 +1483,12 @@ pub fn validate_builders(builders: &[BuilderConfig]) -> Result<()> {
              the scheme must be ws or wss",
             builder.name,
             url.scheme(),
+        );
+        ensure!(
+            !enclave || url.scheme() == "wss",
+            "builder {:?} has a ws:// endpoint; inside an enclave the host carries every \
+             connection, and would read its api_key and its updates: use wss://",
+            builder.name,
         );
         ensure!(
             !builder.api_key.is_empty(),
@@ -2265,6 +2323,25 @@ disable_cross_region = false
             let err = parse_err(&text, 18);
             assert!(err.contains(expected), "{case}: {err}");
         }
+    }
+
+    /// Inside an enclave the host carries the connection, so a plaintext builder would hand
+    /// it the api_key: refused wherever a list is checked, not just at startup.
+    #[test]
+    fn inside_an_enclave_a_builder_must_be_wss() {
+        let builder = |endpoint: &str| BuilderConfig {
+            name: "b".into(),
+            endpoint: endpoint.into(),
+            api_key: "k".into(),
+            disable_cross_region: None,
+        };
+        validate_builders_in(&[builder("ws://127.0.0.1:9000/ws")], false)
+            .expect("outside an enclave a local ws:// builder is fine");
+        validate_builders_in(&[builder("wss://eu.example/ws")], true).unwrap();
+        let err = validate_builders_in(&[builder("ws://eu.example:443/ws")], true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("use wss://"), "{err}");
     }
 
     /// Node mode has no builders and must not be forced to declare any: whether an empty

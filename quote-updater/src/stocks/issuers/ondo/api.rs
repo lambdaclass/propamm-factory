@@ -417,12 +417,22 @@ fn rfc3339_ms(written: &str) -> Option<i64> {
 }
 
 /// Whether the key may be sent to `api`: over https, or plain http to this machine only (the
-/// smoke test's mock). Anywhere else, plain http would hand the key to the network.
+/// smoke test's mock). Anywhere else, plain http would hand the key to the network. Inside an
+/// enclave there is no "this machine" to trust: a loopback address there is a tunnel the
+/// host carries, so only https passes.
 pub fn check_api(api: &str) -> Result<(), String> {
+    check_api_in(api, crate::enclave::active())
+}
+
+fn check_api_in(api: &str, enclave: bool) -> Result<(), String> {
     let url = reqwest::Url::parse(api).map_err(|err| format!("api {api:?} is not a URL: {err}"))?;
     let host = url.host_str().unwrap_or_default();
     match url.scheme() {
         "https" if !host.is_empty() => Ok(()),
+        "http" if enclave => Err(format!(
+            "api {api:?} is plain http: inside an enclave the host carries the connection, and \
+             would read the key"
+        )),
         "http" if ["127.0.0.1", "localhost", "[::1]"].contains(&host) => Ok(()),
         "http" => Err(format!(
             "api {api:?} is plain http: the key would cross the network in the clear (http is \
@@ -776,6 +786,9 @@ mod tests {
         ] {
             assert!(check_api(bad).is_err(), "{bad} was accepted");
         }
+        // Inside an enclave this machine's loopback is the host's tunnel.
+        assert_eq!(check_api_in("https://api.gm.ondo.finance", true), Ok(()));
+        assert!(check_api_in("http://127.0.0.1:8556", true).is_err());
     }
 
     #[test]

@@ -22,6 +22,13 @@ serde = { version = "1", features = ["derive"] }
 # For the observer's log lines. The library renders them when `log_target` names this crate.
 tracing = "0.1"
 
+[features]
+# The library's AWS Nitro enclave support (docs/enclave.md), for the enclave image
+# (deploy/aws-nitro/Dockerfile). Declared here rather than passed to the library from the
+# command line so Cargo.lock pins its dependencies too: a feature only a dependency names is
+# resolved afresh on every build, whatever --locked says.
+aws-nitro = ["quote-updater/aws-nitro"]
+
 # The same release profile as the root Cargo.toml: Cargo reads the release profile from the binary's
 # own workspace, never from a dependency's. No panic = "abort": the library refuses to start
 # with it, since one pair's panic would then kill every pair.
