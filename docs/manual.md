@@ -24,11 +24,38 @@ pairs roll to the next block sooner and fetch nothing per block, and the head is
 as a slow liveness check. Polling covers any spell the subscription is down, so a WebSocket
 endpoint that drops costs nothing but the push.
 
+Either way, a head is not taken at its word. One that does not follow the head the updater
+holds (an older block, or one more than 32 blocks past it) is kept out, so a single absurd
+answer from a node, or from one replica behind a load balancer, changes nothing. If the
+node keeps saying so for 36 seconds, with nothing in that time agreeing with the head the
+updater holds, the updater takes the node's head instead and logs that it did. Two details
+keep that from being fooled. A head far ahead has to grow as well as be repeated, so a node
+stuck on one absurd number is never believed, while a chain that really moved on is; and
+answers that agree with the head the updater holds do not cancel it, so one replica stuck
+far behind cannot keep the updater there. And the node has to be saying so the whole time:
+two stray answers with an outage between them start the count over. A pair that was quoting
+past the old head logs `the chain head moved back`, withdraws that quote and goes on from
+the new head.
+
 Every configured builder is quoted with the *same* signed transaction — signed once per
 block and sent byte-identical to each connection. That is safe by construction: the
 transaction's nonce and hash are the same everywhere it is held, so however many builders
 hold the quote, at most one of them can ever get it included. Fan-out only multiplies the
 chance of inclusion, never the chance of a double-send.
+
+**The builders you list are a trust boundary.** What a builder holds is a transaction it
+can include, not an instruction it has to follow. Every requote inside a slot is a complete
+signed `updateState` with the same nonce and the same slot timestamp, so each of them stays
+valid for that whole slot. The protocol asks a builder to keep only the latest and to drop
+a quote the updater withdraws, and nothing enforces either: a withdraw is a request. A
+builder, or any region of one the stream reaches, can include any version it was sent during
+the slot, including an earlier price or one the updater has withdrawn since (a tripped
+breaker, a stale feed). What the registry does bound is the slot: it takes an update only in
+the block carrying its timestamp, so a quote never lands later than the slot it was signed
+for. List the builders you would trust with that choice and no others.
+`disable_cross_region` keeps a quote in the region it was sent to; left off, a builder's
+other regions hold it too. Every entry, and every region it reaches, is one more party that
+can pick which of a slot's prices lands.
 
 ```bash
 UPDATER_KEY_USDC_USDT=0x... my-quote-updater \
@@ -127,7 +154,9 @@ Three consequences of averaging worth choosing deliberately:
   is fine only while the two trade at par. The startup cross-check accepts a USDC or USDT
   pair read from the base's USDC, USDT or USD market, with a warning; any other
   difference (a different asset, or another quote) fails it unless the pair sets
-  `allow_symbol_mismatch`.
+  `allow_symbol_mismatch`. So does a token whose `symbol()` cannot be read: the check has
+  nothing to compare the stream with, and the pair fails until `allow_symbol_mismatch` says
+  you compared them yourself.
 - **A venue dropping out steps the mid by the disagreement between venues.** The fresh set
   changes, so the average moves by however far the departing venue sat from the rest. The
   breaker judges that step like any other, so `max_deviation` has to be larger than the
@@ -255,11 +284,14 @@ takes. The binary registers the kinds that exist; the library ships `feed`, `fix
 section is about `feed` and `fixed`.
 
 A `feed` pair with no `delta` publishes the book's own half-spread,
-`(ask - bid) / (ask + bid)`. On a liquid market that is around 0.02bp, which is what a
-venue charges a taker it can quote away from in milliseconds. A published quote cannot be
-pulled that way: it stands for the whole block, and the maker wears every move that happens
-inside it. Quoting a book's spread on-chain therefore fills at close to mid and loses to
-adverse selection on average.
+`(ask - bid) / (ask + bid)`, and never less than its `min_delta`. On a liquid market the
+book's is around 0.02bp, which is what a venue charges a taker it can quote away from in
+milliseconds. A published quote cannot be pulled that way: it stands for the whole block,
+and the maker wears every move that happens inside it. Quoting a book's spread on-chain
+therefore fills at close to mid and loses to adverse selection on average, which is what
+the floor is for. `min_delta` is `"0.0001"` (1bp) when the stanza leaves it out; that is
+not sized for any market, so state the one the pair should have. Zero is refused, and so is
+a `min_delta` beside a `delta`, which is published as it is.
 
 Set `delta` in the pair's `pricing` table and that number is published instead, with only
 the mid coming from the stream. It is the same key, in the same units, as on a `fixed` pair:
@@ -268,8 +300,8 @@ trades at. It is not
 reoriented on an inverted lane, because `(ask - bid) / (ask + bid)` is unchanged by
 inversion and a fraction standing in for it is too.
 
-So `feed` alone tracks the book's spread, `feed` with a `delta` takes the mid live and
-charges your own spread, and `fixed` with `mid` and `delta` fixes both. A `delta` at or above one whole
+So `feed` alone tracks the book's spread down to its floor, `feed` with a `delta` takes the
+mid live and charges your own spread, and `fixed` with `mid` and `delta` fixes both. A `delta` at or above one whole
 unit is refused at parse time, and a *book* that gapes that wide is refused per sample:
 PropAMM subtracts the spread from the mid fill, so a whole unit leaves the taker nothing and
 beyond it `_quote` reverts `SpreadTooWide`. Refusing withdraws the quote rather than
@@ -548,7 +580,7 @@ Some things need a restart, because nothing changes them while the updater runs:
 
 - **`target`** — every lane's identity is derived from it.
 - **Command-line and environment settings** — `--mode`, `--rpc-url`, `--registry`,
-  `--price-decimals`, `--requote-ms`.
+  `--requote-ms`.
 - **A newly added `UPDATER_KEY_*`** — systemd reads `EnvironmentFile` once, at exec, so a key
   written into `.env` after the process started is not in its environment, and a pair naming
   it is refused. Adding a pair whose key was already there works.
@@ -902,7 +934,9 @@ variable exists so a flag-driven run stays possible, and setting one overrides t
 - `REQUOTE_MS` — the requote cadence; keep it well under the builder's ~400ms eviction
   (Titan's protocol, and its own guidance is a ~50ms cadence).
 
-`REGISTRY`, `PRICE_DECIMALS` and `BINANCE_WS` already default to the mainnet values.
+`REGISTRY` and `BINANCE_WS` already default to the mainnet values. `PRICE_DECIMALS` is 18
+and takes no other value: PropAMM reads the mid and the spread at 1e18, so at any other scale
+every price is off by a power of ten, and the updater refuses to start.
 `INTERVAL` paces node mode only and has no effect in builder mode, and `MINE`/`NO_PIN` are
 anvil-only (node mode).
 
@@ -1103,11 +1137,10 @@ the worst failure mode is an operator who believes a pair is guarded when it is 
 - a threshold of `1` or more — it is a fraction, not a percentage, so `"2"` means 200% and
   leaves the pair effectively unguarded. The error reports how the value was read
   (`this is 200.00%`) rather than only that it was rejected.
-- a threshold that rounds to zero at `--price-decimals` — every price would read as a
-  deviation, so the pair would halt on its second sample.
-- a threshold with more decimal digits than `--price-decimals` can hold — it would be
-  silently truncated to a tighter guard than the one configured. The error says how it
-  would have been read.
+- a threshold that rounds to zero at the 18 decimals a published price is scaled by —
+  every price would read as a deviation, so the pair would halt on its second sample.
+- a threshold with more decimal digits than those 18 — it would be silently truncated to a
+  tighter guard than the one configured. The error says how it would have been read.
 
 `--check` prints a `breaker` column showing each pair's threshold, or `-` for a pair with
 none, so a `max_deviation` that was mistyped or left off one row of a multi-pair config is
@@ -1158,7 +1191,7 @@ so there is no pair a sample of it could belong to; the same is true of its poll
 and error count. In `--mode node` those three are absent rather than zero — nothing there
 starts a watcher.
 
-Seven series are worth watching ahead of everything else the registry exposes:
+These series are worth watching ahead of everything else the registry exposes:
 
 - `quote_updater_breaker_tripped` — the circuit breaker latches (see "Circuit breaker"
   above): once this reads 1 for a pair it stays there until a human has looked at the feed
@@ -1169,6 +1202,18 @@ Seven series are worth watching ahead of everything else the registry exposes:
   is normal: a builder includes the update only when a swap hits the lane in that block.
   What this counts is blocks where the read-back itself failed, so the updater cannot tell;
   the `PusherLandingUnverified` alert in `deploy/alerts/` pages on it.
+- `quote_updater_landings_total{result="foreign"}` — the same read-back found a price
+  stamped for the block that this updater did not sign, in a block where the pair's own key
+  landed nothing. The registry authorizes an updater key for every lane of its PropAMM, not
+  for one pair, so another pair's key can write this lane, and a write to a lane carries
+  nothing but the block's timestamp to say whose it is. The read-back therefore compares
+  the price itself against every version the updater signed for the block, and for a price
+  that is none of them asks whether the pair's key landed a transaction in that block: if it
+  did, the update is the pair's own (signed before a restart or a reload, or by a second
+  updater running with the same key) and counts as `landed`. The lane is read back on blocks
+  the pair was not quoting for as well. Any count above zero means another key priced this
+  lane: `PusherForeignLaneWrite` pages on the first one, and the log names the block. One
+  case it cannot see: this pair's update and another key's both landing in the same block.
 - the gap between `quote_updater_feed_mid` and `quote_updater_published_mid` — that gap *is*
   withdrawn time. A stale price, an out-of-band print or a tripped breaker withdraws the
   published quote while the feed keeps moving underneath it, and watching the two series
@@ -1263,6 +1308,20 @@ functions the panels are built on, are defined once in `quote-updater/sql/feed.s
 the updater compiles in and runs on every connect; nothing else writes that schema, so
 redeploying the updater is how a change to it reaches the database. Expect about a million
 mid rows a month per pair; a few hundred balance rows.
+
+Nothing deletes those rows unless you say how long to keep them. `RECORD_RETENTION_DAYS`
+(or `--record-retention-days`) is a number of days: at startup and every hour after, the
+updater deletes the rows older than that from the three tables that grow with time
+(`feed.mids`, `feed.quotes`, `feed.vault_balances`). The config history (`feed.config_changes`,
+`feed.pairs`) and `feed.tokens` are never deleted from. Unset, every row is kept and the
+database grows for as long as the updater runs, which the startup log says in one line.
+
+The deletes run on a connection of their own, oldest rows first and 10,000 at a time, each
+batch its own transaction. Recording carries on while they work, and the first run on a
+database that grew for a long time before the setting is many small deletes rather than one.
+They seek on an index over `ts` (`mids_ts`, `quotes_ts`, `vault_balances_ts`); the first two
+are new, and the first connection after upgrading builds them, once, which on a large table
+holds recording up for as long as the build takes.
 
 What it can never do is slow quoting: the database is not on the quoting path, a refused
 connection or a failed write is a log line and a retry with backoff, and rows are kept in

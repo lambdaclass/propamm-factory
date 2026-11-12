@@ -216,4 +216,6 @@ What to know:
 - **Build settings.** Copy the `[profile.release]` from this repository's root `Cargo.toml`
   (Cargo only reads a profile from the binary's own workspace). The library refuses to start
   when built with `panic = "abort"`, which would turn one pair's panic into every pair's.
+  Keep its `overflow-checks = true`: a release build otherwise lets an integer overflow
+  wrap, and a wrapped number is carried on as if it were right.
 

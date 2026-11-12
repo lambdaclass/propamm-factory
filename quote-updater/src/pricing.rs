@@ -31,7 +31,10 @@ pub use self::inputs::{
 };
 pub use self::{feed::Feed, fixed::Fixed, volatile::Volatile};
 #[cfg(test)]
-pub(crate) use self::{feed::FeedPricer, fixed::FixedPricer};
+pub(crate) use self::{
+    feed::{FeedPricer, Spread as FeedSpread},
+    fixed::FixedPricer,
+};
 
 use crate::{
     feed::{PriceSample, parse_decimal_scaled},

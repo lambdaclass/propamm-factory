@@ -22,7 +22,8 @@ secp256k1 = "0.30.0"
 serde = { version = "1", features = ["derive"] }
 # `raw_value` keeps a JSON number as the text the venue sent (kraken.rs, coingecko.rs).
 serde_json = { version = "1", features = ["raw_value"] }
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+# 1.54.1 at least: the first release without RUSTSEC-2026-0386.
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 # Same version axum's ws feature already pulls in via ethrex-rpc, so this adds no new tree.
 #
 # native-tls and not rustls, deliberately. rustls here would not replace native-tls, it
@@ -76,7 +77,13 @@ ethrex-sdk = { git = "https://github.com/lambdaclass/ethrex", rev = "73318b686fd
 # and never compile on the server. Plain TCP (`NoTls`): the database is on the same host.
 # `with-serde_json-1` lets a `serde_json::Value` bind as a jsonb parameter (the config
 # snapshots); serde_json is already a dependency, so the feature adds no package.
-tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+#
+# 0.7.18 at least, with postgres-protocol 0.6.12: the releases before them panic on a
+# malformed row and take an unbounded SCRAM iteration count from the server
+# (RUSTSEC-2026-0178, -0179, -0180). They moved to the next RustCrypto generation, which is
+# 13 more package entries beside the ones ethrex's tree still locks (digest 0.11, sha2 0.11,
+# hmac 0.13, rand 0.10 and their leaves).
+tokio-postgres = { version = "0.7.18", features = ["with-serde_json-1"] }
 # The venues that have no stream (MEXC's is protobuf-only, CoinGecko is an HTTP API) are
 # polled, and KuCoin hands out its WebSocket URL over HTTP. Already in the tree with
 # default features through ethrex-rpc's EthClient, so this adds no package to Cargo.lock.
@@ -96,4 +103,4 @@ native-tls = "0.2.18"
 # waited duration (a restart backoff, quoting.rs's shutdown bound) be asserted without
 # waiting it out. test-util = ["rt", "sync", "time"], all already enabled, so this adds
 # no package to Cargo.lock and nothing to the binary.
-tokio = { version = "1.53.1", features = ["test-util"] }
+tokio = { version = "1.54.1", features = ["test-util"] }

@@ -24,7 +24,7 @@ test the wiring.
 
 **`feed`**: publishes the exchange mid as it is. Settings: `delta`, optional. With it, the
 spread you set; without it, the exchange's own spread (only allowed when the pair follows a
-single exchange).
+single exchange), and never less than `min_delta`, which is 1 bp unless you set it.
 
 **`volatile`**: for pairs that move, like WETH/USDC. The spread is computed every block from
 how much the price has been moving (sigma, measured over the last `volatility_window_secs`)

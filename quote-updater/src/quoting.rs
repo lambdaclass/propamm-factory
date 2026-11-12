@@ -14,7 +14,11 @@
 //! idle past ~400ms. In one shared loop a builder that is TCP-alive but slow would cost
 //! *every* builder its quote; per-task, it costs only its own.
 
-use std::{collections::VecDeque, sync::Arc, time::Duration};
+use std::{
+    collections::{HashSet, VecDeque},
+    sync::Arc,
+    time::Duration,
+};
 
 use ethrex_common::{Address, U256};
 use ethrex_rpc::{
@@ -38,6 +42,7 @@ use crate::{
     metrics::{BuilderMetrics, Metrics, PairMetrics, PublishAction, RpcCall, timed},
     runway_check,
     supervisor::Shutdown,
+    unquoted,
     update::{UpdateParams, UpdateStamp, sign_update_tx, wall_clock_secs},
     verify_landed,
 };
@@ -1323,6 +1328,11 @@ async fn drive(
         let mut summary = carried.carry_over(target_block);
         gate.begin_block();
         let mut halted = false;
+        // Every (delta, mid) signed for this block: a builder may include any of them, and
+        // the read-back after the block tells a price that is one of these from one that
+        // another key wrote (see `verify_landed`). One entry per price move, so a few
+        // hundred at the fastest a liquid pair requotes, dropped with the block.
+        let mut signed: HashSet<(U256, U256)> = HashSet::new();
         // The latest block once this target has passed — the next target's parent —
         // assigned by the one arm below that leaves the loop with a block. `None` past
         // the loop means the halt arm broke out, which returns before the rollover.
@@ -1395,6 +1405,7 @@ async fn drive(
                     {
                         Ok(raw_tx) => {
                             gate.published(quote);
+                            signed.insert(quote);
                             // Set only here, after a successful sign and send: a failed
                             // attempt retries next tick with the same quote (see
                             // `gate.published`'s own doc), and setting the gauge on a
@@ -1479,7 +1490,17 @@ async fn drive(
                 // checks the current value before waiting, so a block that landed while
                 // the loop was busy signing is seen on the very next pass. Recreated per
                 // pass without loss: the version lives in the channel, not the future.
-                passed = head.wait_for(|head| head.number >= target_block) => {
+                //
+                // A head behind this block's parent is watched for too. The watcher moves
+                // the head back in one case only: it re-anchored, having found that the
+                // head it had published was not the chain's (see head.rs). The target here
+                // follows that head, so no block may ever reach it, and waiting for one
+                // is how a pair once stopped quoting until the process was restarted. It
+                // is the next parent like any other head; what differs is handled below,
+                // where `moved_back` is read.
+                passed = head.wait_for(|head| {
+                    head.number >= target_block || head.number < parent.number
+                }) => {
                     // The watcher's tasks never exit on their own; a closed channel means
                     // they panicked, which nothing here can repair.
                     next_parent = Some(*passed.map_err(|_| eyre!("the head watcher is gone"))?);
@@ -1500,6 +1521,12 @@ async fn drive(
                             stamp.ts, restamped.ts
                         );
                         stamp = restamped;
+                        // What was signed under the old stamp can no longer land, and the
+                        // read-back only ever matches the stamp in force, so those prices
+                        // are done with. This is also what bounds the set: with no block
+                        // coming at all (an RPC outage, a halted chain) it would otherwise
+                        // take every price move for as long as that lasted.
+                        signed.clear();
                         // Forces a re-sign at the top of the loop. A withdrawn quote stays
                         // withdrawn: there is nothing to re-stamp until the price is usable.
                         gate.resign();
@@ -1525,7 +1552,25 @@ async fn drive(
         // between for the builder tasks to run — would overwrite the cancel before any of
         // them saw it. The Withdraw stands instead; writing it clears each task's
         // `live_block`, so nothing is re-sent after the one cancel.
-        if !halted {
+        //
+        // Nor when the head moved back. This block has not passed: the watcher found the
+        // head it had published was not the chain's and took an earlier one, so the block
+        // this pass quoted for may never come, or may come later with a quote for it still
+        // at the builders from a price that will be old by then. That quote is cancelled,
+        // like any other this loop stops standing behind, and the loop goes on from the
+        // head the watcher holds now.
+        let moved_back = !halted && next_parent.is_some_and(|next| next.number < target_block);
+        if moved_back {
+            tracing::warn!(
+                "[{label}] the chain head moved back from block {} to {}: withdrawing the \
+                 quote for block {target_block} and quoting from the new head",
+                parent.number,
+                next_parent.map_or(0, |next| next.number)
+            );
+            let _ = cmd.send(Command::Withdraw {
+                block_number: target_block,
+            });
+        } else if !halted {
             let _ = cmd.send(Command::Idle);
         }
 
@@ -1581,7 +1626,8 @@ async fn drive(
         // event says a block passed, and a reload that re-arms the lane within the slot
         // would have its new generation say the same block passed, the other way. The
         // observers hear of the halt from the latch's `Tripped` and the `LaneStopped`.
-        if !halted {
+        // Nor when the head moved back, for the same reason: no block passed.
+        if !halted && !moved_back {
             live.observers.emit(crate::observe::Event::Block {
                 pair: label.to_string(),
                 block: target_block,
@@ -1610,23 +1656,32 @@ async fn drive(
             return Ok(Ended::Halted);
         }
 
-        // Whether anything actually reached the chain. At least one builder's latest
+        // What the lane holds now that the block has passed. At least one builder's latest
         // answer being an ack of a non-empty transaction is the condition under which a
-        // landing was expected at all; without it the block says nothing about the lane.
+        // landing was expected at all, so only then does an update that is not there, or a
+        // read-back that failed, say anything about the lane (`unquoted`). The lane is read
+        // either way: a price in it under this block's stamp is there whether or not this
+        // pair was quoting, and when it was not, that price is the one fills were taken at.
+        //
+        // Not when the head moved back: the block has not been mined, so there is nothing
+        // to read, and reading it would `eth_call` a block that does not exist.
+        let quoted = summary.any_acked();
         let verify = async {
-            if summary.any_acked() {
-                verify_landed(
-                    client,
-                    &live.metrics,
-                    opts,
-                    params.lane,
-                    stamp.ts,
-                    target_block,
-                )
-                .await
-            } else {
-                Landing::NotQuoted
+            if moved_back {
+                return None;
             }
+            let landing = verify_landed(
+                client,
+                &live.metrics,
+                opts,
+                params.lane,
+                stamp.ts,
+                target_block,
+                &signed,
+                (signer_address, nonce),
+            )
+            .await;
+            Some(if quoted { landing } else { unquoted(landing) })
         };
         // This block's read-back and the next block's inputs depend on nothing but the
         // RPC, so they go out together: sequenced, each round-trip here was added to the
@@ -1650,36 +1705,61 @@ async fn drive(
             }
         };
         let (landing, next) = tokio::join!(verify, next);
-        // One counter over all four outcomes, recorded here rather than in `verify_landed`:
-        // `NotQuoted` never reaches that function, so counting inside it would leave the
-        // one outcome that means "nothing was on the wire" unrepresented.
-        live.metrics.landings(landing_label(landing)).inc();
-        // The lane's own read-back, for a pricer that adapts to what happened to its quotes
-        // (`BuildCtx::landings`): reported once the outcome is known, whatever it was.
-        live.values.report_landing(crate::pricing::LandingReport {
-            block: target_block,
-            landing: landing.into(),
-            at: std::time::Instant::now(),
-        });
-        live.observers.emit(crate::observe::Event::Landing {
-            pair: label.to_string(),
-            block: target_block,
-            outcome: landing.into(),
-        });
-        // Only a landing is worth a line. Most blocks have no update in them, because a
-        // builder includes it only when a swap hits this pair in the block it builds, and a
-        // line per such block would drown the ones that matter. The other outcomes are
-        // counted in the metric above, and a read-back that keeps failing is reported by
-        // the tracker below.
-        if landing == Landing::Landed {
-            tracing::info!("[{label}] block {target_block}: update landed");
+        if let Some(landing) = landing {
+            // One counter over every outcome, recorded here rather than in
+            // `verify_landed`: what a read-back means depends on whether the block was
+            // quoted, which is decided above.
+            live.metrics.landings(landing_label(landing)).inc();
+            // The lane's own read-back, for a pricer that adapts to what happened to its
+            // quotes (`BuildCtx::landings`): reported once the outcome is known, whatever
+            // it was.
+            live.values.report_landing(crate::pricing::LandingReport {
+                block: target_block,
+                landing: landing.into(),
+                at: std::time::Instant::now(),
+            });
+            live.observers.emit(crate::observe::Event::Landing {
+                pair: label.to_string(),
+                block: target_block,
+                outcome: landing.into(),
+            });
+            // Only a landing is worth a line. Most blocks have no update in them, because
+            // a builder includes it only when a swap hits this pair in the block it builds,
+            // and a line per such block would drown the ones that matter. The other
+            // outcomes are counted in the metric above, and a read-back that keeps failing
+            // is reported by the tracker below.
+            if landing == Landing::Landed && quoted {
+                tracing::info!("[{label}] block {target_block}: update landed");
+            }
+            // A builder is asked to drop a withdrawn quote, and nothing makes it. Worth
+            // knowing when one did not.
+            if landing == Landing::Landed && !quoted {
+                tracing::warn!(
+                    "[{label}] block {target_block}: an update of this pair's key landed, \
+                     though this updater had no quote standing for the block when it was \
+                     built (it had withdrawn it, or another updater of this pair signed it)"
+                );
+            }
+            // Said every time, unlike a miss: this is not a block without a swap. Another
+            // key priced this lane, and a fill at that price came out of this pair's vault.
+            if landing == Landing::Foreign {
+                tracing::warn!(
+                    "[{label}] block {target_block}: the lane holds a price stamped for \
+                     this block that this updater did not sign, and signer \
+                     {signer_address:#x} landed nothing in it, so another updater key of \
+                     {:#x} wrote the lane. Read the lane at that block, find the key in the \
+                     registry's UpdaterAdded log for this target, revoke it \
+                     (removeUpdater), and check the vault",
+                    opts.target
+                );
+            }
+            if let Some(alert) = landings.record(landing) {
+                tracing::warn!("[{label}] {alert}; signer {signer_address:#x}");
+            }
+            live.metrics
+                .consecutive_landing_misses
+                .set(landings.misses() as f64);
         }
-        if let Some(alert) = landings.record(landing) {
-            tracing::warn!("[{label}] {alert}; signer {signer_address:#x}");
-        }
-        live.metrics
-            .consecutive_landing_misses
-            .set(landings.misses() as f64);
         carried = summary;
         let Some(next) = next else {
             // --once, or a shutdown that interrupted the fetch.
@@ -4619,6 +4699,277 @@ mod tests {
             "the tracker's first miss must reach the gauge"
         );
 
+        harness.shutdown().await;
+    }
+
+    /// The head watcher moves the head back only when it re-anchors: the head it published
+    /// was not the chain's. A pair that had already taken that head as its parent used to
+    /// wait for a block past it, which never comes, until the process was restarted. It
+    /// goes on from the head that stands instead, inside the loop: no error, so no
+    /// supervised restart with its backoff and its reconnect of every builder.
+    #[tokio::test]
+    async fn a_head_that_moves_back_is_followed_from_where_it_now_stands() {
+        use crate::{
+            config::{MidBand, Pair},
+            supervisor::shutdown_channel,
+            update::ValueSource,
+        };
+        use ethrex_l2_rpc::signer::{LocalSigner, Signer};
+
+        let chain = ChainStub::spawn(99).await;
+        let client = EthClient::new(Url::parse(&chain.url).unwrap()).unwrap();
+        // No builders: the wire is not what this test is about, only what the loop tells
+        // the builder tasks to do.
+        let mut harness = Harness::spawn(&[], Duration::from_millis(20));
+
+        let secret = secp256k1::SecretKey::from_slice(&[0x22; 32]).unwrap();
+        let lane = U256::from(7);
+        let live = Live {
+            halt: Default::default(),
+            pair: Pair {
+                tokens: (
+                    Address::from_slice(&[0xa0; 20]),
+                    Address::from_slice(&[0xda; 20]),
+                ),
+                lane,
+                signer: Signer::from(LocalSigner::new(secret)),
+                label: "TEST".to_owned(),
+                band: MidBand {
+                    min: None,
+                    max: None,
+                },
+            },
+            values: ValueSource::fixed_for_tests(U256::one(), U256::exp10(17), 6),
+            latch: crate::guard::Latch::new(),
+            armed: false,
+            guard_kinds: Vec::new(),
+            deviation: None,
+            metrics: test_pair_metrics(),
+            venues: Vec::new(),
+            observers: Default::default(),
+        };
+        let params = UpdateParams {
+            registry: Address::from_slice(&[0x77; 20]),
+            target: Address::from_slice(&[0x99; 20]),
+            lane,
+            chain_id: 31337,
+        };
+        let opts = SendOpts {
+            registry: params.registry,
+            target: params.target,
+            chain_id: 31337,
+            no_pin: false,
+            mine: false,
+            once: false,
+            requote_ms: 20,
+            disable_cross_region: false,
+            price_decimals: 6,
+            recorder: None,
+        };
+        let names: Vec<String> = Vec::new();
+
+        let head_at = |number: u64| Head {
+            number,
+            timestamp: wall_clock_secs(),
+            base_fee_per_gas: Some(1_000_000_000),
+        };
+        // An absurd first head, which the loop takes as its parent and targets past.
+        let phantom = (1u64 << 60) + 1;
+        let (heads, mut head) = watch::channel(head_at(phantom - 1));
+        let (stop, cancel) = shutdown_channel();
+        // Every block the builder tasks were told to cancel, and every one they were told
+        // to quote, in order. A watch keeps only its latest value, but the loop awaits the
+        // RPC between any two of these, so each is seen.
+        let told = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listening = {
+            let (mut cmds, told) = (harness.cmd.subscribe(), told.clone());
+            tokio::spawn(async move {
+                while cmds.changed().await.is_ok() {
+                    let entry = match &*cmds.borrow_and_update() {
+                        Command::Withdraw { block_number } => ("withdraw", *block_number),
+                        Command::Quote(quote) => ("quote", quote.block_number),
+                        Command::Idle => continue,
+                    };
+                    told.lock().unwrap().push(entry);
+                }
+            })
+        };
+        let metrics = live.metrics.clone();
+        let reanchor = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            heads.send_replace(head_at(99));
+            // The loop is now on block 100. Stop it once it has got there.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+            while metrics.target_blocks.get() < 2 && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let _ = stop.send(true);
+            heads
+        });
+
+        let ended = tokio::time::timeout(
+            Duration::from_secs(5),
+            drive(
+                &client,
+                &live,
+                &params,
+                &harness.cmd,
+                &mut harness.events,
+                &names,
+                &opts,
+                &mut head,
+                cancel,
+            ),
+        )
+        .await
+        .expect("a head that moved back must be followed, not waited past");
+        assert_eq!(ended.expect("a re-anchor is not an error"), Ended::Finished);
+        assert_eq!(
+            live.metrics.target_blocks.get(),
+            2,
+            "the block that will not come, then block 100"
+        );
+        // The quote for the block that will not come is cancelled rather than left to
+        // idle (it may yet be mined, with a price that is old by then), and block 100 is
+        // quoted after it.
+        listening.abort();
+        let told = told.lock().unwrap().clone();
+        assert_eq!(
+            told,
+            [("quote", phantom), ("withdraw", phantom), ("quote", 100)],
+            "what the builder tasks were told"
+        );
+        // Nothing was read back for a block that was never mined, and none was counted.
+        let calls = chain.calls();
+        assert!(
+            !calls.iter().any(|method| method == "eth_call"),
+            "a block that was never mined must not be read back: {calls:?}"
+        );
+        for result in LandingResult::ALL {
+            assert_eq!(
+                live.metrics.landings(result).get(),
+                0,
+                "{}",
+                result.as_str()
+            );
+        }
+        let _heads = reanchor.await.unwrap();
+        harness.shutdown().await;
+    }
+
+    /// A block this pair had no quote standing for used to be booked `NotQuoted` without a
+    /// look at the lane, so a price another key wrote while the pair was withdrawn was
+    /// never seen. The lane is read back all the same. What the read-back cannot become is
+    /// a miss: here it does not decode, which on a quoted block is `Unknown` and counts
+    /// toward `PusherLandingUnverified`, and on this one is still just `NotQuoted`.
+    #[tokio::test]
+    async fn a_block_nobody_was_quoting_for_is_still_read_back() {
+        use crate::{
+            config::{MidBand, Pair},
+            supervisor::shutdown_channel,
+            update::ValueSource,
+        };
+        use ethrex_l2_rpc::signer::{LocalSigner, Signer};
+
+        let chain = ChainStub::spawn(99).await;
+        let client = EthClient::new(Url::parse(&chain.url).unwrap()).unwrap();
+        // No builders: the wire is not what this test is about, only what the loop tells
+        // the builder tasks to do.
+        let mut harness = Harness::spawn(&[], Duration::from_millis(20));
+
+        let secret = secp256k1::SecretKey::from_slice(&[0x22; 32]).unwrap();
+        let lane = U256::from(7);
+        let live = Live {
+            halt: Default::default(),
+            pair: Pair {
+                tokens: (
+                    Address::from_slice(&[0xa0; 20]),
+                    Address::from_slice(&[0xda; 20]),
+                ),
+                lane,
+                signer: Signer::from(LocalSigner::new(secret)),
+                label: "TEST".to_owned(),
+                band: MidBand {
+                    min: None,
+                    max: None,
+                },
+            },
+            values: ValueSource::fixed_for_tests(U256::one(), U256::exp10(17), 6),
+            latch: crate::guard::Latch::new(),
+            armed: false,
+            guard_kinds: Vec::new(),
+            deviation: None,
+            metrics: test_pair_metrics(),
+            venues: Vec::new(),
+            observers: Default::default(),
+        };
+        let params = UpdateParams {
+            registry: Address::from_slice(&[0x77; 20]),
+            target: Address::from_slice(&[0x99; 20]),
+            lane,
+            chain_id: 31337,
+        };
+        let opts = SendOpts {
+            registry: params.registry,
+            target: params.target,
+            chain_id: 31337,
+            no_pin: false,
+            mine: false,
+            // Ends `drive` after the one block this test is about.
+            once: true,
+            requote_ms: 20,
+            disable_cross_region: false,
+            price_decimals: 6,
+            recorder: None,
+        };
+        let names: Vec<String> = Vec::new();
+
+        let head_at = |number: u64| Head {
+            number,
+            timestamp: wall_clock_secs(),
+            base_fee_per_gas: Some(1_000_000_000),
+        };
+        let (heads, mut head) = watch::channel(head_at(99));
+        // No builder, so nothing is ever acknowledged: the block passes unquoted.
+        let passes = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            heads.send_replace(head_at(100));
+            heads
+        });
+
+        let ended = tokio::time::timeout(
+            Duration::from_secs(5),
+            drive(
+                &client,
+                &live,
+                &params,
+                &harness.cmd,
+                &mut harness.events,
+                &names,
+                &opts,
+                &mut head,
+                shutdown_channel().1,
+            ),
+        )
+        .await
+        .expect("drive must return once the target block has passed");
+        assert_eq!(ended.unwrap(), Ended::Finished);
+
+        assert_eq!(
+            live.metrics
+                .rpc_duration(RpcCall::EthCall)
+                .get_sample_count(),
+            1,
+            "the lane must be read back though nothing was quoted"
+        );
+        assert_eq!(live.metrics.landings(LandingResult::NotQuoted).get(), 1);
+        assert_eq!(
+            live.metrics.landings(LandingResult::Unknown).get(),
+            0,
+            "a read-back that says nothing about an unquoted block is not an unverified one"
+        );
+        assert_eq!(live.metrics.consecutive_landing_misses.get(), 0.0);
+        let _heads = passes.await.unwrap();
         harness.shutdown().await;
     }
 

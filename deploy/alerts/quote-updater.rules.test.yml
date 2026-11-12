@@ -164,3 +164,35 @@ tests:
             exp_annotations:
               summary: "ETH/USDT: okx has been delivering prices late for 5 minutes"
               description: "This venue's prices have been arriving later behind the exchange's own timestamps than max_source_lag_ms allows for five minutes, so it is out of the pair's average. quote_updater_venue_source_lag_ms says how far behind; a steady quote_updater_venue_future_stamps_total, or every stamped venue late by about the same amount, points at this host's clock instead."
+
+  # PusherForeignLaneWrite: one read-back that found a price the pair did not sign
+  # pages, on the first one. Landings and misses, however many, do not.
+  - interval: 1m
+    name: a lane holding a price its pair did not sign pages on the first one
+    input_series:
+      - series: 'quote_updater_landings_total{pair="WBTC/USDC",result="foreign"}'
+        values: "0x5 1x40"
+      - series: 'quote_updater_landings_total{pair="WETH/USDC",result="foreign"}'
+        values: "0x45"
+      - series: 'quote_updater_landings_total{pair="WETH/USDC",result="landed"}'
+        values: "0+1x45"
+      - series: 'quote_updater_landings_total{pair="WETH/USDC",result="missed"}'
+        values: "0+3x45"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: PusherForeignLaneWrite
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: PusherForeignLaneWrite
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              pair: WBTC/USDC
+              result: foreign
+            exp_annotations:
+              summary: "WBTC/USDC: another key wrote this lane"
+              description: "The updater read this lane back after a block and found a price stamped for that block that it did not sign, in a block where this pair's own key landed nothing. Another updater key of the same PropAMM wrote the lane: the registry authorizes a key for every lane of its target, not for one pair. A fill at that price came out of this pair's vault. The updater's log names the block. Read the lane there, find the key in the registry's UpdaterAdded log for the target, revoke it with removeUpdater, and check the vault's balances."
+      # Thirty minutes on, the one occurrence has left the window.
+      - eval_time: 40m
+        alertname: PusherForeignLaneWrite
+        exp_alerts: []
