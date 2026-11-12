@@ -37,6 +37,9 @@ use crate::{
 /// own: what it converges onto is exactly what the asker will keep or drop.
 pub(crate) struct ReloadRequest {
     pub(crate) config: Arc<RawConfig>,
+    /// The lanes halted on their breaker to bring back: restarted from `config`, trusting
+    /// the price they find. No other converge restarts a tripped lane (audit F-17).
+    pub(crate) rearm: Vec<U256>,
     pub(crate) reply: oneshot::Sender<Result<String, ReloadFailure>>,
 }
 
@@ -134,6 +137,36 @@ impl SharedConfig {
     /// [`Editing::reload`], on its own.
     pub(crate) async fn reload(&self) -> Result<String, ReloadFailure> {
         self.edit().await.reload().await
+    }
+
+    /// Re-arms the pairs `pick` chooses (audit F-17): each one halted on its circuit breaker
+    /// is restarted from its stanza as it is, and trusts the price it finds, which its line
+    /// in the answer names beside the trip it clears. The one way a tripped lane comes
+    /// back. A converge of the config as it is, checked like any other, so it can be
+    /// refused; it changes nothing in the config or the file. `pick` answers the pairs by
+    /// `key_env` and what that is for the line, or refuses (a pair that is not there).
+    pub(crate) async fn rearm<E>(
+        &self,
+        pick: impl FnOnce(&RawConfig) -> Result<(Vec<String>, String), E>,
+    ) -> Result<String, Refused<E>> {
+        let editing = self.edit().await;
+        let config = editing.config();
+        let (keys, what) = pick(&config).map_err(Refused::Change)?;
+        let lanes: Vec<U256> = config
+            .pairs
+            .iter()
+            .filter(|pair| keys.contains(&pair.key_env))
+            .filter_map(lane_of)
+            .collect();
+        match converge(&self.reloads, config, lanes).await {
+            Ok(summary) => Ok(format!("{what}. {summary}")),
+            Err(ReloadFailure::Partial(summary)) => Err(Refused::Reload(ReloadFailure::Partial(
+                format!("{what}, but the reload applied in part: {summary}"),
+            ))),
+            Err(ReloadFailure::Rejected(err)) => Err(Refused::Reload(ReloadFailure::Rejected(
+                format!("{what} was refused, and nothing changed: {err}"),
+            ))),
+        }
     }
 
     /// The kill switch (audit F-06). `pick` chooses the pairs to halt from the config as it
@@ -294,7 +327,7 @@ impl Editing<'_> {
             .unwrap_or_default();
 
         let candidate = Arc::new(candidate);
-        match converge(&shared.reloads, Arc::clone(&candidate)).await {
+        match converge(&shared.reloads, Arc::clone(&candidate), Vec::new()).await {
             Ok(summary) => {
                 shared.commit_change(&previous, candidate);
                 tracing::info!("{by} {what}; {summary}");
@@ -335,10 +368,10 @@ impl Editing<'_> {
     }
 
     /// Converges the running pairs onto the config as it is, changing nothing in it: the
-    /// way a lane its circuit breaker halted is brought back, and one whose feed never came
-    /// up is tried again.
+    /// way a lane whose feed never came up is tried again. A lane halted on its breaker
+    /// stays halted: only [`SharedConfig::rearm`] brings it back.
     pub(crate) async fn reload(&mut self) -> Result<String, ReloadFailure> {
-        converge(&self.shared.reloads, self.config()).await
+        converge(&self.shared.reloads, self.config(), Vec::new()).await
     }
 }
 
@@ -380,10 +413,15 @@ fn with_file_settings(
 async fn converge(
     reloads: &mpsc::Sender<ReloadRequest>,
     config: Arc<RawConfig>,
+    rearm: Vec<U256>,
 ) -> Result<String, ReloadFailure> {
     let (reply, answer) = oneshot::channel();
     reloads
-        .send(ReloadRequest { config, reply })
+        .send(ReloadRequest {
+            config,
+            rearm,
+            reply,
+        })
         .await
         .map_err(|_| {
             ReloadFailure::Rejected(

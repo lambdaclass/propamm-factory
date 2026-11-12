@@ -33,8 +33,9 @@
 //! | `DELETE /api/pairs/{key_env}`     | removes a pair                                   |
 //! | `POST /api/pairs/{key_env}/halt`  | stops a pair quoting at once, keeping it         |
 //! | `POST /api/pairs/{key_env}/resume`| clears a halt                                    |
+//! | `POST /api/pairs/{key_env}/rearm` | brings back a pair its circuit breaker halted    |
 //! | `POST /api/halt`                  | halts every pair                                 |
-//! | `POST /api/reload`                | restarts the pairs halted here, re-arms the rest |
+//! | `POST /api/reload`                | restarts the pairs halted here, retries the rest |
 //! | `GET /api/builders`               | every builder, without its API key               |
 //! | `POST /api/builders`              | adds a builder                                   |
 //! | `DELETE /api/builders/{name}`     | removes a builder                                |
@@ -301,6 +302,7 @@ async fn bind_with(
         )
         .route("/api/pairs/{key_env}/halt", post(halt_pair))
         .route("/api/pairs/{key_env}/resume", post(resume_pair))
+        .route("/api/pairs/{key_env}/rearm", post(rearm_pair))
         .route("/api/halt", post(halt_all))
         .route("/api/reload", post(reload))
         .route("/api/builders", get(list_builders).post(add_builder))
@@ -581,7 +583,8 @@ enum PairStatus {
     Live,
     /// Halted in the config: kept, not quoting.
     Halted,
-    /// Running, but its circuit breaker tripped: not quoting until a reload re-arms it.
+    /// Running, but its circuit breaker tripped: not quoting until its own re-arm brings it
+    /// back (`POST /api/pairs/{key_env}/rearm`).
     BreakerTripped,
     /// In the config, with no task: its feed never came up, say. A reload tries again.
     NotRunning,
@@ -815,6 +818,66 @@ async fn resume_pair(
     .await
 }
 
+/// Brings back a pair its circuit breaker halted (audit F-17): its lane is restarted from
+/// its stanza as it is and trusts the price it finds, which the answer names beside the trip
+/// it clears. Nothing else re-arms a breaker, a reload included, so this is someone deciding
+/// about this one pair, with that price in front of them. Checked like any change starting a
+/// pair, so it can be refused.
+async fn rearm_pair(
+    State(state): State<Backoffice>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(key_env): Path<String>,
+) -> Response {
+    let tripped = running(&state.states);
+    let rearmed = state
+        .config
+        .rearm(|config| {
+            let pair = config
+                .pairs
+                .iter()
+                .find(|pair| pair.key_env == key_env)
+                .ok_or_else(|| no_pair(&key_env))?;
+            if pair.halted {
+                return Err(ApiError::conflict(format!(
+                    "pair {key_env} is halted, not tripped; resume it with POST \
+                     /api/pairs/{key_env}/resume"
+                )));
+            }
+            if tripped.get(&key_env) != Some(&true) {
+                return Err(ApiError::conflict(format!(
+                    "pair {key_env} is not halted on its circuit breaker; there is nothing to \
+                     re-arm"
+                )));
+            }
+            Ok((vec![key_env.clone()], format!("re-armed pair {key_env}")))
+        })
+        .await;
+    if let Ok(line) = &rearmed {
+        tracing::info!("backoffice: {peer} {line}");
+    }
+    respond(rearmed, false)
+}
+
+/// The tail of a reload's answer naming the pairs left halted on their circuit breaker,
+/// which a reload no longer brings back (audit F-17); empty when there are none.
+fn tripped_note(states: &PairStates, config: &RawConfig) -> String {
+    let running = running(states);
+    let tripped: Vec<&str> = config
+        .pairs
+        .iter()
+        .filter(|pair| !pair.halted && running.get(&pair.key_env) == Some(&true))
+        .map(|pair| pair.key_env.as_str())
+        .collect();
+    if tripped.is_empty() {
+        return String::new();
+    }
+    format!(
+        ". Left halted on their circuit breaker, each to be re-armed with POST \
+         /api/pairs/{{key_env}}/rearm once its feed is trusted: {}",
+        tripped.join(", ")
+    )
+}
+
 /// [`halt_pair`], for every pair not halted already.
 async fn halt_all(
     State(state): State<Backoffice>,
@@ -866,7 +929,11 @@ async fn reload(
         .pairs
         .iter()
         .any(|pair| pair.halted && !is_explained(pair));
-    let kept = explained_halts(&current);
+    let kept = format!(
+        "{}{}",
+        explained_halts(&current),
+        tripped_note(&state.states, &current)
+    );
     if any_flagged {
         let mut result = editing
             .change(&by, |config| {
@@ -2344,6 +2411,94 @@ mod tests {
         // And an IP address, which needs no listing.
         let (status, body) = call(local, "GET", "/api/pairs", None).await;
         assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// Audit F-17: a pair halted on its breaker comes back only through its own re-arm, which
+    /// the service is asked for by lane, with the config as it is. A pair that is not
+    /// tripped, one halted rather than tripped, and one that is not there are refused
+    /// before anything is asked; and `POST /api/reload` names the tripped pairs it leaves.
+    #[tokio::test]
+    async fn a_tripped_pair_is_re_armed_by_its_own_route_alone() {
+        let (config, mut requests) = shared("rearm", |config| {
+            let mut halted = config.pairs[0].clone();
+            halted.tokens = vec![USDC.to_owned(), USDT.to_owned()];
+            halted.key_env = "UPDATER_KEY_USDC_USDT".to_owned();
+            halted.halted = true;
+            config.pairs.push(halted);
+        });
+        let states = PairStates::default();
+        let tripped = Arc::new(AtomicBool::new(false));
+        states
+            .lock()
+            .unwrap()
+            .insert(WETH_USDC.to_owned(), Arc::clone(&tripped));
+        let (local, _task) = bind(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::clone(&config),
+            test_client(),
+            states,
+            test_kinds(),
+            Access::default(),
+        )
+        .await
+        .unwrap();
+        let rearm = format!("/api/pairs/{WETH_USDC}/rearm");
+
+        let (status, body) = call(local, "POST", &rearm, None).await;
+        assert_eq!(status, StatusCode::CONFLICT, "not tripped: {body}");
+        let (status, body) = call(
+            local,
+            "POST",
+            "/api/pairs/UPDATER_KEY_USDC_USDT/rearm",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "halted, not tripped: {body}");
+        assert!(body["error"].as_str().unwrap().contains("resume"), "{body}");
+        let (status, _) = call(local, "POST", "/api/pairs/NO_SUCH_KEY/rearm", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            requests.try_recv().is_err(),
+            "nothing was asked of the service"
+        );
+
+        tripped.store(true, Ordering::SeqCst);
+        // A reload leaves it, and says so.
+        let service = tokio::spawn(async move {
+            let reload = requests.recv().await.unwrap();
+            assert!(reload.rearm.is_empty(), "a reload re-arms nothing");
+            let _ = reload.reply.send(Ok(
+                "reload: the config matches what is running; nothing to do".to_owned(),
+            ));
+            let rearm = requests.recv().await.unwrap();
+            let _ = rearm.reply.send(Ok(
+                "reload: 1 restarted; [WETH/USDC] re-armed, trusting mid 2500".to_owned(),
+            ));
+            rearm.rearm
+        });
+        let (status, body) = call(local, "POST", "/api/reload", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let message = body["message"].as_str().unwrap();
+        assert!(
+            message.contains("Left halted on their circuit breaker") && message.contains(WETH_USDC),
+            "{message}"
+        );
+
+        let (status, body) = call(local, "POST", &rearm, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("trusting mid 2500"),
+            "{body}"
+        );
+        let lanes = service.await.unwrap();
+        let weth: crate::Address = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+            .parse()
+            .unwrap();
+        let usdc: crate::Address = USDC.parse().unwrap();
+        assert_eq!(lanes, [config::lane_of(weth.min(usdc), weth.max(usdc))]);
     }
 
     /// An edit replaces the stanza and nothing that makes the pair what it is: not its key,
