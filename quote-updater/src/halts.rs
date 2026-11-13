@@ -15,6 +15,10 @@
 //!
 //! A flag belongs to the pair's lane, not to one run of it: a reload already in flight that
 //! starts the lane again hands the new run the same flag, set.
+//!
+//! A halt always wins. From the moment it sets the flag until it is recorded, the lane is
+//! held: a resume in flight that finishes meanwhile does not lift the flag, so the pair does
+//! not quote between that resume and the halt made after it.
 
 use std::{collections::BTreeMap, sync::Mutex};
 
@@ -46,52 +50,83 @@ impl HaltSignal {
     }
 }
 
+/// One lane's flag, and how many halts of it are set and not yet recorded.
+struct Flag {
+    set: watch::Sender<bool>,
+    held: usize,
+}
+
+impl Default for Flag {
+    fn default() -> Self {
+        Self {
+            set: watch::channel(false).0,
+            held: 0,
+        }
+    }
+}
+
 /// Every lane's halt flag, created on first ask.
 #[derive(Default)]
 pub(crate) struct HaltFlags {
-    flags: Mutex<BTreeMap<U256, watch::Sender<bool>>>,
+    flags: Mutex<BTreeMap<U256, Flag>>,
 }
 
 impl HaltFlags {
-    fn flags(&self) -> std::sync::MutexGuard<'_, BTreeMap<U256, watch::Sender<bool>>> {
+    fn flags(&self) -> std::sync::MutexGuard<'_, BTreeMap<U256, Flag>> {
         // A poisoned lock still holds a whole map: nothing is half-written under it.
         self.flags.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     /// The flag `lane`'s runs read, for the service to hand each one as it starts it.
     pub(crate) fn flag(&self, lane: U256) -> HaltSignal {
-        HaltSignal(
-            self.flags()
-                .entry(lane)
-                .or_insert_with(|| watch::channel(false).0)
-                .subscribe(),
-        )
+        HaltSignal(self.flags().entry(lane).or_default().set.subscribe())
     }
 
     /// The halt: every lane in `lanes` withdraws at once, woken if it was waiting.
     pub(crate) fn set(&self, lanes: &[U256]) {
         let mut flags = self.flags();
         for lane in lanes {
-            flags
-                .entry(*lane)
-                .or_insert_with(|| watch::channel(false).0)
-                .send_replace(true);
+            flags.entry(*lane).or_default().set.send_replace(true);
         }
     }
 
-    /// A resume, or a pair gone from the config: `lanes` may quote again.
-    pub(crate) fn clear(&self, lanes: &[U256]) {
-        let flags = self.flags();
+    /// [`Self::set`], held until [`Self::release`]: a halt not yet recorded, which no
+    /// [`Self::clear`] lifts meanwhile.
+    pub(crate) fn hold(&self, lanes: &[U256]) {
+        let mut flags = self.flags();
         for lane in lanes {
-            if let Some(flag) = flags.get(lane) {
-                flag.send_replace(false);
+            let flag = flags.entry(*lane).or_default();
+            flag.held += 1;
+            flag.set.send_replace(true);
+        }
+    }
+
+    /// The end of a [`Self::hold`]: the halt is recorded, or was refused. The flag stays as
+    /// it is.
+    pub(crate) fn release(&self, lanes: &[U256]) {
+        let mut flags = self.flags();
+        for lane in lanes {
+            if let Some(flag) = flags.get_mut(lane) {
+                flag.held = flag.held.saturating_sub(1);
             }
         }
     }
 
-    #[cfg(test)]
+    /// A resume, or a pair gone from the config: `lanes` may quote again. Not one a halt
+    /// holds: that halt is still to be recorded, and comes after whatever asked for this.
+    pub(crate) fn clear(&self, lanes: &[U256]) {
+        let flags = self.flags();
+        for lane in lanes {
+            if let Some(flag) = flags.get(lane).filter(|flag| flag.held == 0) {
+                flag.set.send_replace(false);
+            }
+        }
+    }
+
     pub(crate) fn is_set(&self, lane: U256) -> bool {
-        self.flags().get(&lane).is_some_and(|flag| *flag.borrow())
+        self.flags()
+            .get(&lane)
+            .is_some_and(|flag| *flag.set.borrow())
     }
 }
 
@@ -129,6 +164,21 @@ mod tests {
         tokio::task::yield_now().await;
         flags.set(&[U256::from(1)]);
         assert!(waiting.await.unwrap(), "woken, and reads the halt");
+    }
+
+    /// A halt not yet recorded is not lifted by a resume that finishes meanwhile; once it is
+    /// released, a later resume lifts it as any other.
+    #[test]
+    fn a_held_halt_is_not_lifted_until_it_is_released() {
+        let flags = HaltFlags::default();
+        let lane = U256::from(3);
+        flags.hold(&[lane]);
+        flags.clear(&[lane]);
+        assert!(flags.is_set(lane), "held: the resume does not lift it");
+        flags.release(&[lane]);
+        assert!(flags.is_set(lane), "released, and still set");
+        flags.clear(&[lane]);
+        assert!(!flags.is_set(lane));
     }
 
     /// A lane halted before any run of it asked for its flag still starts halted.

@@ -898,7 +898,9 @@ impl Service {
     pub(crate) async fn retire_halted(&mut self, halted: crate::state::Halted) {
         let mut retired = Vec::new();
         for lane in &halted.lanes {
-            if self.running.contains_key(lane) {
+            // Still halted: a notice read late, after a resume lifted the flag and has the
+            // lane quoting again, is not that lane's to stop.
+            if self.running.contains_key(lane) && self.halt_flags.is_set(*lane) {
                 retired.push(self.retire(*lane).await);
             }
         }
@@ -1165,8 +1167,9 @@ impl Service {
 }
 
 /// Why a reload did not leave every lane on the config it was handed, as the service
-/// answers a request for one. Two kinds, because the one who asked has to do opposite
-/// things with the change it was converging.
+/// answers a request for one. [`Self::Rejected`] and [`Self::Partial`] are the service's own
+/// verdicts, apart because the one who asked has to do opposite things with the change it
+/// was converging. [`Self::Fault`] is not a verdict on the config at all.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ReloadFailure {
     /// Refused whole: nothing changed and every pair is still quoting its previous config,
@@ -1177,6 +1180,11 @@ pub(crate) enum ReloadFailure {
     /// the lanes it reached, a halt among them, and dropping it would describe neither what
     /// runs nor what was asked for, and have the next reload undo the rest.
     Partial(String),
+    /// Not done, through no fault of the config asked for: the pusher is stopping, or
+    /// `state.rs` could not write the config file or put it back. Nothing running changed.
+    /// Apart from [`Self::Rejected`] so whoever asked can tell "fix the change" from
+    /// "something is wrong on this side"; the line says whether the file is as it was.
+    Fault(String),
 }
 
 /// Writes what a stopped generation leaves on series its replacement does not write for
@@ -1786,6 +1794,7 @@ mod tests {
             .halted
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let generation = service.reload_metrics.generation.get();
+        service.halt_flags.set(&[U256::from(1)]);
         drop(silenced.release);
 
         service
@@ -1802,6 +1811,28 @@ mod tests {
             "the tripped lane is still there, still halted"
         );
         assert_eq!(service.reload_metrics.generation.get(), generation + 1.0);
+    }
+
+    /// A halt notice read late, after a resume lifted the pair's kill switch, stops nothing:
+    /// the lane is quoting again, and the config says so.
+    #[tokio::test]
+    async fn a_halt_notice_for_a_pair_since_resumed_stops_nothing() {
+        let mut service = test_service(Vec::new());
+        let _resumed = register_fake_pair(&mut service, U256::from(1), "A/B");
+        service.halt_flags.set(&[U256::from(1)]);
+        service.halt_flags.clear(&[U256::from(1)]);
+
+        service
+            .retire_halted(crate::state::Halted {
+                lanes: vec![U256::from(1)],
+                config: Arc::new(crate::state::tests::a_config()),
+            })
+            .await;
+
+        assert!(
+            service.running.contains_key(&U256::from(1)),
+            "still running"
+        );
     }
 
     /// The generation check. A pair task announces itself as it ends, and by the time the
@@ -2691,13 +2722,16 @@ api_key = "k"
                     .map(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
             };
 
-            // Halted (the kill switch's notice), then resumed (the config as it was).
+            // Halted (the kill switch's flag and its notice), then resumed (the flag lifted,
+            // and the config as it was).
+            service.halt_flags.set(&[lane]);
             service
                 .retire_halted(crate::state::Halted {
                     lanes: vec![lane],
                     config: Arc::new(config.clone()),
                 })
                 .await;
+            service.halt_flags.clear(&[lane]);
             assert!(!service.running.contains_key(&lane));
             let applied = service.reload(&done, &config, &[]).await.expect("applied");
             assert!(applied.added.is_empty(), "{applied:?}");
