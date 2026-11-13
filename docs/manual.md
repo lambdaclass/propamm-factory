@@ -682,7 +682,14 @@ because its feed did not come up. Anything refused answers 4xx with `{"error": .
 changed nothing: 404 for an unknown pair or builder, 409 for a conflict (a key already taken,
 a pair already halted), 422 for a change that is invalid (a misspelt key included) or that the
 reload rejected, 400 for a body that does not parse as JSON, 415 for a `POST` or `PUT` not
-sent as `Content-Type: application/json`, 403 for a foreign `Origin`.
+sent as `Content-Type: application/json`, 403 for a foreign `Origin`. A fault on the
+pusher's side answers 5xx with `{"error": ...}`: 500 when the config file could not be
+written or put back, or the pusher is stopping (the message says whether the file is as it
+was), and 502 when the lookup could not read the token names on chain or ask the exchanges.
+
+A change that has started is finished whether or not its client is still there: hanging up
+mid-change (a `curl` timeout, a closed tab) does not stop it, and the config the API shows
+afterwards is the one that is running.
 
 **Only the names it is served under.** Being on the tailnet is enough to reach the API, and a
 browser on the tailnet sends whatever another site's page tells it to (audit F-02). One way
@@ -738,7 +745,7 @@ call the API over HTTPS too, whatever CORS says (a browser blocks mixed content)
 backoffice with a certificate (above), and list the front end's `https://` origin.
 
 **The lookup and the preview.** `GET /api/lookup` is the venue lookup described under the
-price sources above. The live prices run over one websocket per open preview. The client
+price sources above; one that cannot be made answers 502 and `{"error": ...}`. The live prices run over one websocket per open preview. The client
 sends `{"type": "set", "venue", "symbol", "weight"}` to connect a venue, or give it a new
 symbol or weight, and `{"type": "remove", "venue"}` to disconnect it; the server sends each
 venue's mid and the composite twice a second. A new weight reconnects nothing, so a change

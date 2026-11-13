@@ -261,16 +261,14 @@ async fn run_inner(
     // How the backoffice is reached, for every line that tells an operator where to go: by
     // the first name it answers to when it has one (over HTTPS, the one its certificate
     // names), by its address otherwise.
-    let backoffice_url = backoffice_addr.map(|addr| {
-        let scheme = if backoffice_tls.is_some() {
-            "https"
-        } else {
-            "http"
-        };
-        match backoffice_hosts.first() {
-            Some(name) => format!("{scheme}://{name}:{}", addr.port()),
-            None => format!("{scheme}://{addr}"),
-        }
+    let backoffice_scheme = if backoffice_tls.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    let backoffice_url = backoffice_addr.map(|addr| match backoffice_hosts.first() {
+        Some(name) => format!("{backoffice_scheme}://{name}:{}", addr.port()),
+        None => format!("{backoffice_scheme}://{addr}"),
     });
 
     // Loaded before anything connects, though nothing here needs the chain: the file is
@@ -719,11 +717,7 @@ async fn run_inner(
         // run is a surprise.
         let _backoffice = match backoffice_addr {
             Some(addr) => {
-                let scheme = if backoffice_tls.is_some() {
-                    "https"
-                } else {
-                    "http"
-                };
+                let scheme = backoffice_scheme;
                 let mut answering = Vec::new();
                 if !backoffice_hosts.is_empty() {
                     answering.push(format!("reached as {}", backoffice_hosts.join(", ")));

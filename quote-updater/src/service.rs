@@ -1056,8 +1056,9 @@ impl Service {
 }
 
 /// Why a reload did not leave every lane on the config it was handed, as the service
-/// answers a request for one. Two kinds, because the one who asked has to do opposite
-/// things with the change it was converging.
+/// answers a request for one. [`Self::Rejected`] and [`Self::Partial`] are the service's own
+/// verdicts, apart because the one who asked has to do opposite things with the change it
+/// was converging. [`Self::Fault`] is not a verdict on the config at all.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ReloadFailure {
     /// Refused whole: nothing changed and every pair is still quoting its previous config,
@@ -1068,6 +1069,11 @@ pub(crate) enum ReloadFailure {
     /// the lanes it reached, a halt among them, and dropping it would describe neither what
     /// runs nor what was asked for, and have the next reload undo the rest.
     Partial(String),
+    /// Not done, through no fault of the config asked for: the pusher is stopping, or
+    /// `state.rs` could not write the config file or put it back. Nothing running changed.
+    /// Apart from [`Self::Rejected`] so whoever asked can tell "fix the change" from
+    /// "something is wrong on this side"; the line says whether the file is as it was.
+    Fault(String),
 }
 
 /// Writes what a stopped generation leaves on series its replacement does not write for
