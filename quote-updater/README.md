@@ -40,10 +40,12 @@ impl Pricer for SkewedPricer {
     // half-spread out. The library converts both to what the contract stores.
     fn price(&mut self, tick: &TickCtx, _out: &mut Diagnostics) -> Result<PricerOutput, Refusal> {
         let market = tick.market()?;
-        Ok(PricerOutput::new(
-            market.scaled_fraction(self.cfg.half_spread)?,   // 0.0005 = 5 bp
-            market.shift(self.cfg.skew)?,                    // +0.01 = a mid 1% below market
-        ))
+        let half_spread = self.cfg.half_spread;
+        let delta = market.scaled_fraction(half_spread)?;    // 0.0005 = 5 bp; refuses < 0 or NaN
+        // Never move the mid further than the half-spread: past it you sell below the
+        // market price (or buy above it), and a taker pockets the difference.
+        let skew = self.cfg.skew.clamp(-half_spread, half_spread);
+        Ok(PricerOutput::new(delta, market.shift(skew)?))    // +0.0002 = a mid 2 bp below market
     }
 }
 

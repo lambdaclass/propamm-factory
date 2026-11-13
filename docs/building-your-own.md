@@ -59,9 +59,9 @@ What to know:
 - **The core still decides.** A pricer can refuse (`Refusal::new`, counted under the reason
   it declared), and the core withdraws anything unpublishable whatever a pricer returns: a
   spread of a whole unit or more, a zero mid, or a mid the contract cannot store (over 216
-  bits), each counted under its own `reason`. How far a mid may sit from the market is the
-  pair's `min_mid`/`max_mid` band, which applies to every kind alike; a kind with a bound
-  of its own checks it in `validate` or refuses the tick.
+  bits), each counted under its own `reason`. The pair's `min_mid`/`max_mid` band bounds
+  every kind's mid alike, as an absolute range; a kind with a bound of its own checks it
+  in `validate` or refuses the tick.
 - **Do not quote through the market.** The core does not compare your quote with the
   market: the band is an absolute range, not a distance from the market's mid. A pricer
   publishes one mid and one half-spread, so it buys at `mid·(1 − delta)` and sells at
@@ -72,10 +72,11 @@ What to know:
   next vault reading (every 12s), take the quote that went through the market, and repeat.
   So a pricer that moves its mid caps the move at its half-spread,
   `skew.clamp(-half_spread, half_spread)` before `market.shift(skew)`, which leaves the
-  market's mid between the two prices. The `volatile` kind caps its tilt this way, and so
-  do `examples/custom_pricer.rs`, `examples/tilted.rs` and `example/`'s `inventory_skew`. A
-  model that widens one side instead of moving both (the `volatile` kind's inventory
-  charge) cannot cross it at all.
+  market's mid between the two prices. Clamp only a half-spread already checked
+  (`market.scaled_fraction` or `validate`): `f64::clamp` panics on a negative or NaN
+  bound. The `volatile` kind caps its tilt this way, and so do `examples/custom_pricer.rs`,
+  `examples/tilted.rs` and `example/`'s `inventory_skew`. A model that widens one side
+  instead of moving both (the `volatile` kind's inventory charge) cannot cross it at all.
 - **Builds do not block.** A `pricer_fn` closure runs synchronously inside the lane's build,
   so a fetch there stalls startup or the reload, and the 30s build limit cannot interrupt
   it. A pricer that must fetch before it can price, or whose stanza needs checking against

@@ -68,13 +68,12 @@ struct SkewedPricer { cfg: Skewed }
 impl Pricer for SkewedPricer {
     fn price(&mut self, tick: &TickCtx, _: &mut Diagnostics) -> Result<PricerOutput, Refusal> {
         let market = tick.market()?;                         // the exchange price, as a person reads it
+        let half_spread = self.cfg.half_spread;
+        let delta = market.scaled_fraction(half_spread)?;    // 0.0005 = 5 bp; refuses < 0 or NaN
         // Never move the mid further than the half-spread: past it you sell below the
         // market price (or buy above it), and a taker pockets the difference.
-        let skew = self.cfg.skew.clamp(-self.cfg.half_spread, self.cfg.half_spread);
-        Ok(PricerOutput::new(
-            market.scaled_fraction(self.cfg.half_spread)?,   // 0.0005 = 5 bp
-            market.shift(skew)?,                             // +0.0002 = a mid 2 bp below market
-        ))
+        let skew = self.cfg.skew.clamp(-half_spread, half_spread);
+        Ok(PricerOutput::new(delta, market.shift(skew)?))    // +0.0002 = a mid 2 bp below market
     }
 }
 ```
@@ -103,7 +102,7 @@ Inside `price`, from the tick:
 - `tick.market()`: the pair's current market price. `market.mid_f64()` is the price as a
   number; `market.scaled_fraction(x)` turns a fraction into a half-spread the contract
   understands; `market.shift(x)` moves the mid by a fraction (positive shifts it below the
-  market).
+  market), which you keep within the half-spread, as above.
 - `Refusal::new(handle, "why")`: do not quote this block. The reason is counted in the
   metrics under the name you declared.
 
