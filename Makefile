@@ -18,11 +18,15 @@ ifneq ($(NIX),)
 # gnumake under DEVELOPER_DIR; the shell points that at its own SDK, which has none, so
 # every target died with `execv(.../usr/bin/gnumake): No such file or directory`.
 # Variables given on the command line still reach the inner make, through MAKEFLAGS.
+#
+# The `+` says what naming $(MAKE) said by itself, that the line is a make: it is run
+# under `make -n` too, where the inner make then lists the target's commands and runs
+# none.
 default:
-	@$(NIX) develop --command make --no-print-directory
+	+@$(NIX) develop --command make --no-print-directory
 
 $(filter-out install-nix shell,$(MAKECMDGOALS)):
-	@$(NIX) develop --command make --no-print-directory $@
+	+@$(NIX) develop --command make --no-print-directory $@
 
 shell:
 	$(NIX) develop
