@@ -542,6 +542,8 @@ would take the very price that tripped it as its reference (audit F-17). A tripp
 the config drops or halts is still removed or stopped, as any other pair would be, but its
 trip outlives it: resuming the pair, or adding it back, leaves it halted on its breaker (the
 backoffice shows it as `breaker_tripped`, and the answer says it was left) until its re-arm.
+While the config asks for such a pair, `breaker_tripped` stays at 1 for it, so
+`PusherBreakerTripped` keeps paging; it stops while the pair is halted or removed.
 Only a restart of the process forgets it, as a restart clears every breaker. A lane
 that trips while a reload happens to be rebuilding it is left halted too, rather than swapped
 for the rebuilt one, until its own re-arm.
