@@ -551,6 +551,8 @@ would take the very price that tripped it as its reference (audit F-17). A tripp
 the config drops or halts is still removed or stopped, as any other pair would be, but its
 trip outlives it: resuming the pair, or adding it back, leaves it halted on its breaker (the
 backoffice shows it as `breaker_tripped`, and the answer says it was left) until its re-arm.
+While the config asks for such a pair, `breaker_tripped` stays at 1 for it, so
+`PusherBreakerTripped` keeps paging; it stops while the pair is halted or removed.
 Only a restart of the process forgets it, as a restart clears every breaker. A lane
 that trips while a reload happens to be rebuilding it is left halted too, rather than swapped
 for the rebuilt one, until its own re-arm.
@@ -718,7 +720,14 @@ changed nothing: 404 for an unknown pair or builder, 409 for a conflict (a key a
 a pair already halted, a re-arm of a pair that is not tripped), 422 for a change that is
 invalid (a misspelt key included) or that the reload rejected, 400 for a body that does not
 parse as JSON, 415 for a `POST` or `PUT` not sent as `Content-Type: application/json`, 403 for
-a foreign `Origin`.
+a foreign `Origin`. A fault on the
+pusher's side answers 5xx with `{"error": ...}`: 500 when the config file could not be
+written or put back, or the pusher is stopping (the message says whether the file is as it
+was), and 502 when the lookup could not read the token names on chain or ask the exchanges.
+
+A change that has started is finished whether or not its client is still there: hanging up
+mid-change (a `curl` timeout, a closed tab) does not stop it, and the config the API shows
+afterwards is the one that is running.
 
 **Only the names it is served under.** Being on the tailnet is enough to reach the API, and a
 browser on the tailnet sends whatever another site's page tells it to (audit F-02). One way
@@ -774,7 +783,7 @@ call the API over HTTPS too, whatever CORS says (a browser blocks mixed content)
 backoffice with a certificate (above), and list the front end's `https://` origin.
 
 **The lookup and the preview.** `GET /api/lookup` is the venue lookup described under the
-price sources above. The live prices run over one websocket per open preview. The client
+price sources above; one that cannot be made answers 502 and `{"error": ...}`. The live prices run over one websocket per open preview. The client
 sends `{"type": "set", "venue", "symbol", "weight"}` to connect a venue, or give it a new
 symbol or weight, and `{"type": "remove", "venue"}` to disconnect it; the server sends each
 venue's mid and the composite twice a second. A new weight reconnects nothing, so a change
@@ -793,8 +802,11 @@ no re-check of the config on the chain, so another pair failing its checks canno
 it, and no RPC call, so a hung RPC cannot hold it up. Neither can a change already in
 flight, which the halt does not wait for (audit F-06). The halt is then recorded once that
 change is done, `halted = true` in the shared config and `config.toml`, and the lane is shut
-down in the background. A resume is a change like any other, checked and converged, since it
-starts the pair quoting again.
+down in the background. It is recorded even if the client hangs up before the answer. A halt
+made while a resume of the same pair is in flight wins: the pair stays silent and is halted
+again once the resume is done (and answers `already halted` only if that resume was refused).
+A resume is a change like any other, checked and converged, since it starts the pair quoting
+again.
 
 **Halting keeps the pair.** The updater treats a halted pair as absent: its quote is
 withdrawn at every builder, as a removal would, but the stanza and every setting stay in the

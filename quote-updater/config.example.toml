@@ -361,7 +361,7 @@ max_deviation = "0.002"
 # [pairs.pricing]
 # kind        = "skewed"
 # half_spread = 0.0005
-# skew        = 0.001
+# skew        = 0.0002
 
 # A pair can also run guards a binary registered, `[[pairs.guards]]` stanzas in the order
 # they judge, after the built-in deviation guard (which keeps its own keys, `max_deviation`

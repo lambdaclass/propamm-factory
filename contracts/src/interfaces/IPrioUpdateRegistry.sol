@@ -10,4 +10,8 @@ interface IPrioUpdateRegistry {
     function addUpdater(address updater) external;
 
     function removeUpdater(address updater) external;
+
+    /// Whether `updater` may write `target`'s lanes. Authorization is scoped per target: a
+    /// PropAMM's keys are recorded under the PropAMM's own address.
+    function isUpdater(address target, address updater) external view returns (bool);
 }

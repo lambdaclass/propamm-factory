@@ -431,7 +431,7 @@ impl UpdaterHandle {
         let config = self.config().await?;
         match config.reload().await {
             Ok(line) | Err(ReloadFailure::Partial(line)) => Ok(line),
-            Err(ReloadFailure::Rejected(line)) => Err(line),
+            Err(ReloadFailure::Rejected(line) | ReloadFailure::Fault(line)) => Err(line),
         }
     }
 
@@ -494,17 +494,22 @@ impl UpdaterHandle {
             .config
             .halt(
                 "handle:",
-                |raw| {
-                    let at = pair_index(&raw.pairs, tokens)?;
-                    let what = halt_line(&mut raw.pairs[at].clone(), reason)?;
-                    Ok::<_, eyre::Report>((vec![raw.pairs[at].key_env.clone()], what))
+                {
+                    let reason = reason.to_owned();
+                    move |raw| {
+                        let at = pair_index(&raw.pairs, tokens)?;
+                        let what = halt_line(&mut raw.pairs[at].clone(), &reason)?;
+                        Ok::<_, eyre::Report>((vec![raw.pairs[at].key_env.clone()], what))
+                    }
                 },
                 Some(reason),
             )
             .await;
         match halted {
             Ok(line) | Err(Refused::Reload(ReloadFailure::Partial(line))) => Ok(line),
-            Err(Refused::Reload(ReloadFailure::Rejected(line))) => Err(line),
+            Err(Refused::Reload(ReloadFailure::Rejected(line) | ReloadFailure::Fault(line))) => {
+                Err(line)
+            }
             Err(Refused::Change(err)) => Err(format!("{err:#}")),
         }
     }
@@ -538,7 +543,9 @@ impl UpdaterHandle {
             .await;
         match rearmed {
             Ok(line) | Err(Refused::Reload(ReloadFailure::Partial(line))) => Ok(line),
-            Err(Refused::Reload(ReloadFailure::Rejected(line))) => Err(line),
+            Err(Refused::Reload(ReloadFailure::Rejected(line) | ReloadFailure::Fault(line))) => {
+                Err(line)
+            }
             Err(Refused::Change(err)) => Err(format!("{err:#}")),
         }
     }
@@ -578,7 +585,9 @@ impl UpdaterHandle {
         // already halted.
         match changed {
             Ok(line) | Err(Refused::Reload(ReloadFailure::Partial(line))) => Ok(line),
-            Err(Refused::Reload(ReloadFailure::Rejected(line))) => Err(line),
+            Err(Refused::Reload(ReloadFailure::Rejected(line) | ReloadFailure::Fault(line))) => {
+                Err(line)
+            }
             Err(Refused::Change(err)) => Err(format!("{err:#}")),
         }
     }
@@ -600,7 +609,9 @@ impl UpdaterHandle {
             .await;
         match changed {
             Ok(line) | Err(Refused::Reload(ReloadFailure::Partial(line))) => Ok(line),
-            Err(Refused::Reload(ReloadFailure::Rejected(line))) => Err(line),
+            Err(Refused::Reload(ReloadFailure::Rejected(line) | ReloadFailure::Fault(line))) => {
+                Err(line)
+            }
             Err(Refused::Change(never)) => match never {},
         }
     }

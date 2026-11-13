@@ -987,9 +987,9 @@ mod tests {
     use super::*;
 
     /// A pair with no `min_mid`/`max_mid` says so when something could push its mid
-    /// anywhere: a feed, or a custom pricer with no market, which nothing but `delta < 1`
-    /// and a nonzero mid bounds (the core's mid-shift check needs a market to compare
-    /// against). A static mid, or any pair with a band, does not.
+    /// anywhere: a feed, or a custom pricer, which nothing but `delta < 1` and a nonzero
+    /// mid bounds (the core never compares a mid with the market, even when there is one).
+    /// A static mid, or any pair with a band, does not.
     #[test]
     fn a_pair_nothing_bounds_is_warned_about() {
         let spec = |text: &str| {

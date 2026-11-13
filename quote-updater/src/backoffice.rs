@@ -48,7 +48,9 @@
 //! A change answers `{"status": "applied" | "partial", "message": ...}` with a 2xx; a
 //! `partial` one is kept, though some pair kept its previous config or was stopped (see
 //! [`ReloadFailure::Partial`]). Anything refused answers `{"error": ...}` with a 4xx, and
-//! changed nothing.
+//! changed nothing. A fault on this side answers `{"error": ...}` with a 5xx: 500 for a
+//! change that could not be made (see [`ReloadFailure::Fault`]), 502 for a lookup that
+//! could not ask the chain or the venues.
 
 use std::{
     net::SocketAddr,
@@ -516,6 +518,16 @@ impl ApiError {
     fn invalid(message: impl Into<String>) -> Self {
         Self::new(StatusCode::UNPROCESSABLE_ENTITY, message)
     }
+
+    /// Nothing wrong with the request: this side could not do it.
+    fn fault(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, message)
+    }
+
+    /// Something this API asks on the caller's behalf (the chain, a venue) did not answer.
+    fn upstream(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_GATEWAY, message)
+    }
 }
 
 /// A body that is not JSON, or not the shape the route takes, says so in serde's words.
@@ -538,7 +550,9 @@ impl IntoResponse for ApiError {
 /// What a change answers. A partial apply is a 2xx, because the change is kept (a retry
 /// would find it already made), and says `partial` rather than `applied`, because a pair
 /// still runs its previous config, or was not started or stopped. A rejection is a 422:
-/// nothing changed.
+/// nothing changed. A fault on this side (the config file could not be written or put
+/// back, the pusher is stopping) is a 500, so a client can tell it from a change it should
+/// fix.
 fn respond(result: std::result::Result<String, Refused<ApiError>>, created: bool) -> Response {
     let kept = if created {
         StatusCode::CREATED
@@ -555,6 +569,9 @@ fn respond(result: std::result::Result<String, Refused<ApiError>>, created: bool
         }
         Err(Refused::Reload(ReloadFailure::Rejected(message))) => {
             ApiError::invalid(message).into_response()
+        }
+        Err(Refused::Reload(ReloadFailure::Fault(message))) => {
+            ApiError::fault(message).into_response()
         }
         Err(Refused::Change(err)) => err.into_response(),
     }
@@ -790,7 +807,7 @@ async fn halt_pair(
         .config
         .halt(
             &by,
-            |config| {
+            move |config| {
                 let pair = config
                     .pairs
                     .iter()
@@ -970,6 +987,9 @@ async fn reload(
         Err(ReloadFailure::Rejected(err)) => Err(Refused::Reload(ReloadFailure::Rejected(
             format!("the reload was rejected: {err}"),
         ))),
+        Err(ReloadFailure::Fault(err)) => Err(Refused::Reload(ReloadFailure::Fault(format!(
+            "the reload was not made: {err}"
+        )))),
     };
     respond(result, false)
 }
@@ -1133,10 +1153,7 @@ async fn lookup_pair(State(state): State<Backoffice>, Query(tokens): Query<Token
         config::parse_address(tokens.token0.trim()),
         config::parse_address(tokens.token1.trim()),
     ) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "token addresses are not valid"})),
-        )
+        return ApiError::new(StatusCode::BAD_REQUEST, "token addresses are not valid")
             .into_response();
     };
     let (base_symbol, quote_symbol) = tokio::join!(
@@ -1158,12 +1175,11 @@ async fn lookup_pair(State(state): State<Backoffice>, Query(tokens): Query<Token
             "could not read symbol() from both tokens on chain, so their names are unknown"
         )),
     };
-    let (found, error) = match found {
-        Ok(found) => (found, None),
-        Err(err) => (
-            crate::discover::Discovery::default(),
-            Some(format!("{err:#}")),
-        ),
+    // A lookup that could not be made is an error like any other here, and not a 200 a
+    // client has to open to find out: what it asks (the chain, the venues) did not answer.
+    let found = match found {
+        Ok(found) => found,
+        Err(err) => return ApiError::upstream(format!("{err:#}")).into_response(),
     };
     let venues: Vec<serde_json::Value> = VenueId::ALL
         .iter()
@@ -1186,9 +1202,11 @@ async fn lookup_pair(State(state): State<Backoffice>, Query(tokens): Query<Token
             })
         })
         .collect();
+    // `ok` and `error` are what a failed lookup used to answer with a 200; kept, constant,
+    // for a client written against that.
     Json(serde_json::json!({
-        "ok": error.is_none(),
-        "error": error,
+        "ok": true,
+        "error": null,
         "swapped": found.swapped,
         "base": found.base_symbol,
         "quote": found.quote_symbol,
@@ -2018,6 +2036,51 @@ mod tests {
         assert!(config::load_raw(config.path()).unwrap().pairs[0].halted);
         let (status, _) = call(local, "POST", &format!("/api/pairs/{WETH_USDC}/halt"), None).await;
         assert_eq!(status, StatusCode::CONFLICT, "already halted");
+    }
+
+    /// A change that could not be made through no fault of its own (here, a pusher that is
+    /// stopping) is a 500, apart from the 422 of a change to fix, and leaves everything as
+    /// it was.
+    #[tokio::test]
+    async fn a_fault_on_this_side_is_a_500_and_not_the_changes_mistake() {
+        let (local, config) = serve(
+            "fault",
+            |_| {},
+            Err(ReloadFailure::Fault("the pusher is stopping".to_owned())),
+        )
+        .await;
+        let before = std::fs::read_to_string(config.path()).unwrap();
+
+        let (status, body) = call(local, "DELETE", &format!("/api/pairs/{WETH_USDC}"), None).await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        let error = body["error"].as_str().unwrap();
+        assert!(error.contains("the pusher is stopping"), "{error}");
+        assert_eq!(std::fs::read_to_string(config.path()).unwrap(), before);
+        assert_eq!(config.snapshot().pairs.len(), 1);
+    }
+
+    /// A lookup that could not be made (here, no node to read the tokens' names from)
+    /// answers an error status and `{"error"}`, like everything else this API refuses, and
+    /// not a 200 to be opened.
+    #[tokio::test]
+    async fn a_lookup_that_cannot_be_made_is_an_error_and_not_a_200() {
+        let (local, _config) = serve("lookup-fails", |_| {}, accepted()).await;
+
+        let (status, body) = call(
+            local,
+            "GET",
+            &format!("/api/lookup?token0={USDC}&token1={USDT}"),
+            None,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("symbol()"),
+            "{body}"
+        );
+        assert!(body.get("ok").is_none(), "{body}");
     }
 
     /// The guard: a change only as JSON, and never from another site's page, whatever its
