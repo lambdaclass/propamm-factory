@@ -778,6 +778,12 @@ async fn run_inner(
                 // The backoffice or the handle, through the shared config, which waits for
                 // the verdict to keep or drop the change it carries.
                 Some(request) = reload_requests.recv() => {
+                    // A halt is recorded, and its notice sent, before any change made
+                    // after it asks for this reload: read first, so a resume never finds
+                    // the notice of the halt it lifts still waiting.
+                    while let Ok(halt) = halted.try_recv() {
+                        service.retire_halted(halt).await;
+                    }
                     let outcome = if args.flags.once {
                         // `--once` is a batch invocation: the pairs publish once and the run
                         // ends, so there is nothing still running to converge.

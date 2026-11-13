@@ -492,10 +492,13 @@ impl UpdaterHandle {
             .config
             .halt(
                 "handle:",
-                |raw| {
-                    let at = pair_index(&raw.pairs, tokens)?;
-                    let what = halt_line(&mut raw.pairs[at].clone(), reason)?;
-                    Ok::<_, eyre::Report>((vec![raw.pairs[at].key_env.clone()], what))
+                {
+                    let reason = reason.to_owned();
+                    move |raw| {
+                        let at = pair_index(&raw.pairs, tokens)?;
+                        let what = halt_line(&mut raw.pairs[at].clone(), &reason)?;
+                        Ok::<_, eyre::Report>((vec![raw.pairs[at].key_env.clone()], what))
+                    }
                 },
                 Some(reason),
             )

@@ -764,8 +764,11 @@ no re-check of the config on the chain, so another pair failing its checks canno
 it, and no RPC call, so a hung RPC cannot hold it up. Neither can a change already in
 flight, which the halt does not wait for (audit F-06). The halt is then recorded once that
 change is done, `halted = true` in the shared config and `config.toml`, and the lane is shut
-down in the background. A resume is a change like any other, checked and converged, since it
-starts the pair quoting again.
+down in the background. It is recorded even if the client hangs up before the answer. A halt
+made while a resume of the same pair is in flight wins: the pair stays silent and is halted
+again once the resume is done (and answers `already halted` only if that resume was refused).
+A resume is a change like any other, checked and converged, since it starts the pair quoting
+again.
 
 **Halting keeps the pair.** The updater treats a halted pair as absent: its quote is
 withdrawn at every builder, as a removal would, but the stanza and every setting stay in the

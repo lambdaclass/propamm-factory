@@ -803,7 +803,7 @@ async fn halt_pair(
         .config
         .halt(
             &by,
-            |config| {
+            move |config| {
                 let pair = config
                     .pairs
                     .iter()

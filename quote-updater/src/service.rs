@@ -845,7 +845,9 @@ impl Service {
     pub(crate) async fn retire_halted(&mut self, halted: crate::state::Halted) {
         let mut retired = Vec::new();
         for lane in &halted.lanes {
-            if self.running.contains_key(lane) {
+            // Still halted: a notice read late, after a resume lifted the flag and has the
+            // lane quoting again, is not that lane's to stop.
+            if self.running.contains_key(lane) && self.halt_flags.is_set(*lane) {
                 retired.push(self.retire(*lane).await);
             }
         }
@@ -1668,6 +1670,7 @@ mod tests {
             .halted
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let generation = service.reload_metrics.generation.get();
+        service.halt_flags.set(&[U256::from(1)]);
         drop(silenced.release);
 
         service
@@ -1684,6 +1687,28 @@ mod tests {
             "the tripped lane is still there, still halted"
         );
         assert_eq!(service.reload_metrics.generation.get(), generation + 1.0);
+    }
+
+    /// A halt notice read late, after a resume lifted the pair's kill switch, stops nothing:
+    /// the lane is quoting again, and the config says so.
+    #[tokio::test]
+    async fn a_halt_notice_for_a_pair_since_resumed_stops_nothing() {
+        let mut service = test_service(Vec::new());
+        let _resumed = register_fake_pair(&mut service, U256::from(1), "A/B");
+        service.halt_flags.set(&[U256::from(1)]);
+        service.halt_flags.clear(&[U256::from(1)]);
+
+        service
+            .retire_halted(crate::state::Halted {
+                lanes: vec![U256::from(1)],
+                config: Arc::new(crate::state::tests::a_config()),
+            })
+            .await;
+
+        assert!(
+            service.running.contains_key(&U256::from(1)),
+            "still running"
+        );
     }
 
     /// The generation check. A pair task announces itself as it ends, and by the time the

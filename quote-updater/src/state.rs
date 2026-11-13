@@ -148,76 +148,163 @@ impl SharedConfig {
         self.edit().await.reload().await
     }
 
-    /// The kill switch (audit F-06). `pick` chooses the pairs to halt from the config as it
-    /// is, by `key_env`, and says what that is for the line, or refuses (a pair that is not
-    /// there, one already halted).
+    /// The kill switch (audit F-06). `pick` chooses the pairs to halt from a config, by
+    /// `key_env`, and says what that is for the line, or refuses (a pair that is not there,
+    /// one already halted). It is asked twice, as below.
     ///
     /// Each pair's flag is set first: its lane reads it on its next tick and withdraws its
     /// quote at every builder. Nothing stands before that: no edit lock, no converge, no RPC
-    /// call, no other pair's check. Then, under the edit lock (after any change in flight,
-    /// which cannot lift the flag), the halt is recorded, `halted = true` and `reason` as
+    /// call, no other pair's check, and not the pair's own `halted` either. `pick` is asked
+    /// here of the config with every halt lifted, so a pair a resume in flight is about to
+    /// start is silenced like any other, and that resume does not lift the flag (it is held:
+    /// `halts.rs`).
+    ///
+    /// Then, under the edit lock (after any change in flight), `pick` is asked again, of the
+    /// config as it now is, and the halt is recorded, `halted = true` and `reason` as
     /// `halt_reason`, in the shared config and the file, which is what holds it across a
     /// restart. That is not converged either, so it cannot be refused. The service is told
-    /// last, to shut the silent lanes down.
+    /// last, to shut the silent lanes down. A refusal here (already halted, the resume
+    /// having been refused; gone, a removal having gone through) leaves the config as it is.
+    ///
+    /// The record runs in a task of its own and is only waited for here, as a change's does:
+    /// a caller that stops waiting (an HTTP client that hung up) does not leave a pair
+    /// silenced by a flag no config records.
     ///
     /// `Ok` is a halt in force and recorded. A file that cannot be written is
     /// [`ReloadFailure::Partial`]: the halt is in force and in the shared config, and the
     /// line says the file is behind it.
-    pub(crate) async fn halt<E>(
+    pub(crate) async fn halt<E: Send + 'static>(
         &self,
         by: &str,
-        pick: impl FnOnce(&RawConfig) -> Result<(Vec<String>, String), E>,
+        pick: impl Fn(&RawConfig) -> Result<(Vec<String>, String), E> + Send + 'static,
         reason: Option<&str>,
     ) -> Result<String, Refused<E>> {
-        let current = self.snapshot();
-        let (keys, what) = pick(&current).map_err(Refused::Change)?;
-        let lanes: Vec<U256> = current
-            .pairs
-            .iter()
-            .filter(|pair| keys.contains(&pair.key_env))
-            .filter_map(lane_of)
-            .collect();
-        self.inner.halt_flags.set(&lanes);
+        let mut unhalted = RawConfig::clone(&self.snapshot());
+        for pair in &mut unhalted.pairs {
+            pair.halted = false;
+        }
+        let (keys, what) = pick(&unhalted).map_err(Refused::Change)?;
+        let silenced = lanes_of(&unhalted, &keys);
+        self.inner.halt_flags.hold(&silenced);
         tracing::warn!("{by} {what}; withdrawing at every builder");
 
-        // The record, after any change in flight.
-        let _editing = self.edit().await;
-        let mut recorded = RawConfig::clone(&self.snapshot());
-        for pair in &mut recorded.pairs {
-            if keys.contains(&pair.key_env) {
-                pair.halted = true;
-                pair.halt_reason = reason.map(str::to_owned);
-            }
+        let recorded = tokio::spawn(record(
+            Arc::clone(&self.inner),
+            by.to_owned(),
+            pick,
+            reason.map(str::to_owned),
+            silenced,
+        ));
+        match recorded.await {
+            Ok(result) => result,
+            Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
+            Err(_) => Err(Refused::Reload(stopping())),
         }
-        let before = std::fs::read(&self.inner.path).ok();
-        let (written, note) = with_file_settings(&recorded, before.as_deref(), &self.inner.path);
-        let wrote = crate::config::write_raw_atomically(&self.inner.path, &written);
-        let recorded = Arc::new(recorded);
-        self.inner.commit(Arc::clone(&recorded));
-        // A service that has gone has nothing left to shut down.
-        let _ = self.inner.halts.send(Halted {
-            lanes,
-            config: recorded,
-        });
+    }
+}
 
-        let line = format!("{what}; its quote is withdrawn at every builder");
-        let note = note
-            .map(|note| format!(" Note: {note}."))
-            .unwrap_or_default();
-        match wrote {
-            Ok(()) => {
-                tracing::info!("{by} {line}");
-                Ok(format!("{line}.{note}"))
-            }
-            Err(err) => {
-                let line = format!(
-                    "{line}, but {} could not be written ({err:#}): the halt is in force, \
-                     and a restart would read the file without it, so fix it before then",
-                    self.inner.path.display()
-                );
-                tracing::warn!("{by} {line}");
-                Err(Refused::Reload(ReloadFailure::Partial(line)))
-            }
+/// The lanes of the pairs in `config` named by `keys`.
+fn lanes_of(config: &RawConfig, keys: &[String]) -> Vec<U256> {
+    config
+        .pairs
+        .iter()
+        .filter(|pair| keys.contains(&pair.key_env))
+        .filter_map(lane_of)
+        .collect()
+}
+
+/// The rest of [`SharedConfig::halt`], once the flags of `silenced` are set and held:
+/// records the halt after any change in flight and tells the service. Run as a task, so it
+/// finishes whoever is still waiting.
+async fn record<E>(
+    inner: Arc<Inner>,
+    by: String,
+    pick: impl Fn(&RawConfig) -> Result<(Vec<String>, String), E>,
+    reason: Option<String>,
+    silenced: Vec<U256>,
+) -> Result<String, Refused<E>> {
+    let _guard = Arc::clone(&inner.edits).lock_owned().await;
+    let current = inner.snapshot();
+    let picked = pick(&current);
+    let outcome = match picked {
+        Ok((keys, what)) => Ok(write_halt(&inner, &by, &current, keys, what, reason).await),
+        Err(refused) => Err(Refused::Change(refused)),
+    };
+    // No longer held. A lane silenced above and not halted in the config now (the pair is
+    // gone, or moved to other tokens) has nothing to keep it silent for.
+    inner.halt_flags.release(&silenced);
+    let now = inner.snapshot();
+    let halted: Vec<U256> = now
+        .pairs
+        .iter()
+        .filter(|pair| pair.halted)
+        .filter_map(lane_of)
+        .collect();
+    let stale: Vec<U256> = silenced
+        .into_iter()
+        .filter(|lane| !halted.contains(lane))
+        .collect();
+    inner.halt_flags.clear(&stale);
+    outcome?.map_err(Refused::Reload)
+}
+
+/// Records the halt of the pairs named by `keys` on top of `current`, under the edit lock:
+/// the shared config, the file, and the notice to the service.
+async fn write_halt(
+    inner: &Arc<Inner>,
+    by: &str,
+    current: &RawConfig,
+    keys: Vec<String>,
+    what: String,
+    reason: Option<String>,
+) -> Result<String, ReloadFailure> {
+    let mut recorded = current.clone();
+    for pair in &mut recorded.pairs {
+        if keys.contains(&pair.key_env) {
+            pair.halted = true;
+            pair.halt_reason = reason.clone();
+        }
+    }
+    let recorded = Arc::new(recorded);
+    // Again, for the lanes as they are now: a change that finished meanwhile may have moved
+    // a pair to other tokens.
+    let lanes = lanes_of(&recorded, &keys);
+    inner.halt_flags.set(&lanes);
+
+    let wrote = {
+        let (inner, recorded) = (Arc::clone(inner), Arc::clone(&recorded));
+        blocking(move || {
+            let before = std::fs::read(&inner.path).ok();
+            let (written, note) = with_file_settings(&recorded, before.as_deref(), &inner.path);
+            crate::config::write_raw_atomically(&inner.path, &written).map(|()| note)
+        })
+        .await
+        .unwrap_or_else(|_| Err(eyre::eyre!("the pusher is stopping")))
+    };
+    inner.commit(Arc::clone(&recorded));
+    // A service that has gone has nothing left to shut down.
+    let _ = inner.halts.send(Halted {
+        lanes,
+        config: recorded,
+    });
+
+    let line = format!("{what}; its quote is withdrawn at every builder");
+    match wrote {
+        Ok(note) => {
+            tracing::info!("{by} {line}");
+            let note = note
+                .map(|note| format!(" Note: {note}."))
+                .unwrap_or_default();
+            Ok(format!("{line}.{note}"))
+        }
+        Err(err) => {
+            let line = format!(
+                "{line}, but {} could not be written ({err:#}): the halt is in force, \
+                 and a restart would read the file without it, so fix it before then",
+                inner.path.display()
+            );
+            tracing::warn!("{by} {line}");
+            Err(ReloadFailure::Partial(line))
         }
     }
 }
@@ -618,6 +705,98 @@ api_key = "k"
         let notice = halted.try_recv().expect("the service is told");
         assert_eq!(notice.lanes, [the_lane()]);
         assert!(notice.config.pairs[0].halted);
+    }
+
+    /// A halt whose caller stops waiting while a change holds the edit lock (an HTTP client
+    /// that hung up) is recorded all the same, once that change is done: the pair is not
+    /// left silenced by a flag that neither the config nor the file knows of.
+    #[tokio::test]
+    async fn a_halt_is_recorded_when_its_caller_stops_waiting() {
+        let (shared, mut requests, mut halted) = on_disk_with_halts("halt-caller-gone");
+        let flag = shared.halt_flags().flag(the_lane());
+        let changing = tokio::spawn({
+            let shared = Arc::clone(&shared);
+            async move { shared.change("test:", set_deviation).await }
+        });
+        let stuck = requests.recv().await.expect("the change converges");
+
+        let halting = tokio::spawn({
+            let shared = Arc::clone(&shared);
+            async move { halt_it(&shared).await }
+        });
+        while !flag.is_set() {
+            tokio::task::yield_now().await;
+        }
+        halting.abort();
+        assert!(halting.await.unwrap_err().is_cancelled());
+
+        let _ = stuck.reply.send(Ok("reload: 1 restarted".to_owned()));
+        changing.await.unwrap().unwrap();
+        let notice = tokio::time::timeout(std::time::Duration::from_secs(5), halted.recv())
+            .await
+            .expect("the halt is recorded with nobody waiting for it")
+            .unwrap();
+        assert_eq!(notice.lanes, [the_lane()]);
+        assert!(shared.snapshot().pairs[0].halted);
+        assert!(
+            crate::config::load_raw(shared.path()).unwrap().pairs[0].halted,
+            "and the file keeps it"
+        );
+        assert!(flag.is_set());
+    }
+
+    /// A halt made while a resume of the same pair is in flight wins: it is not refused as
+    /// "already halted", the resume does not lift the flag when it lands, and the halt is
+    /// recorded after it. When that resume is refused instead, the pair is as halted as it
+    /// was, and only then is the halt told so.
+    #[tokio::test]
+    async fn a_halt_made_while_a_resume_is_in_flight_wins() {
+        let (shared, mut requests, _halted) = on_disk_with_halts("halt-over-resume");
+        let flag = shared.halt_flags().flag(the_lane());
+        halt_it(&shared).await.unwrap();
+
+        for accepted in [false, true] {
+            let resuming = tokio::spawn({
+                let shared = Arc::clone(&shared);
+                async move {
+                    shared
+                        .change("test:", |config| {
+                            config.pairs[0].halted = false;
+                            config.pairs[0].halt_reason = None;
+                            Ok::<_, eyre::Report>("resumed pair".to_owned())
+                        })
+                        .await
+                }
+            });
+            let request = requests.recv().await.expect("the resume converges");
+            let halting = tokio::spawn({
+                let shared = Arc::clone(&shared);
+                async move { halt_it(&shared).await }
+            });
+            // The halt runs as far as the edit lock, which the resume holds.
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            assert!(!halting.is_finished(), "not refused while the resume runs");
+
+            let _ = request.reply.send(if accepted {
+                Ok("reload: 1 added".to_owned())
+            } else {
+                Err(ReloadFailure::Rejected("preflight failed".to_owned()))
+            });
+            assert_eq!(resuming.await.unwrap().is_ok(), accepted);
+            assert!(flag.is_set(), "the resume did not lift the halt's flag");
+
+            let halt = halting.await.unwrap();
+            if accepted {
+                halt.expect("the halt lands on top of the resume");
+            } else {
+                assert!(matches!(halt, Err(Refused::Change("already halted"))));
+            }
+            let pair = &shared.snapshot().pairs[0];
+            assert!(pair.halted && pair.halt_reason.as_deref() == Some("desk"));
+            assert!(flag.is_set());
+        }
     }
 
     /// A resume lifts the kill switch once the service accepts it, and a refused one leaves
