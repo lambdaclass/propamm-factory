@@ -82,7 +82,7 @@ What to know:
   be verified, or was never quoted; a task started with `ctx.spawn` can await each with
   `next()`). Reading the vault is async,
   so it is the `Factory` path: `examples/tilted.rs` is a fixed spread tilted
-  by the vault's base share, and `make e2e-custom` runs it against the mocks. A test seeds
+  by the vault's base share, and `make e2e` runs it against the mocks. A test seeds
   these with `testing::build_ctx_with` and needs no chain. An HTTP client comes from
   `ctx.http()`: the run's one `reqwest::Client`, shared with the polled venues, so every
   lane draws on one connection pool (`quote_updater::reqwest` is the crate it belongs to,

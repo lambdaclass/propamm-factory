@@ -12,11 +12,17 @@ endif
 
 ifneq ($(NIX),)
 
+# `make` here, not $(MAKE): $(MAKE) is the path of the make that read this file, the
+# host's, and inside the shell it is the shell's own that has to run (flake.nix lists
+# gnumake). On macOS the host's is the Command Line Tools' wrapper, which looks for
+# gnumake under DEVELOPER_DIR; the shell points that at its own SDK, which has none, so
+# every target died with `execv(.../usr/bin/gnumake): No such file or directory`.
+# Variables given on the command line still reach the inner make, through MAKEFLAGS.
 default:
-	@$(NIX) develop --command $(MAKE) --no-print-directory
+	@$(NIX) develop --command make --no-print-directory
 
 $(filter-out install-nix shell,$(MAKECMDGOALS)):
-	@$(NIX) develop --command $(MAKE) --no-print-directory $@
+	@$(NIX) develop --command make --no-print-directory $@
 
 shell:
 	$(NIX) develop

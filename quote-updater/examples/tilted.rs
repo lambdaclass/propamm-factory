@@ -12,7 +12,7 @@
 //! tilt        = 0.01     # the mid moves by tilt × (base share − 0.5), in market terms
 //! ```
 //!
-//! `make e2e-custom` runs this binary against the mocks:
+//! `make e2e` runs this binary against the mocks:
 //! `cargo run -p quote-updater --example tilted -- --config c.toml`.
 
 use std::time::Duration;

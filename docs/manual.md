@@ -1330,7 +1330,8 @@ under `--check` and `--once`, and without the variable, in which case the run sa
 
 ### End-to-end test against mocks
 
-`make e2e` runs the binary against Python mocks of everything it talks to: a JSON-RPC chain,
+`make e2e` runs the `tilted` example (`quote-updater/examples/tilted.rs`, a pricer of its
+own registered on the library) against Python mocks of everything it talks to: a JSON-RPC chain,
 two builders speaking the maker protocol, and a Binance feed. A fixed script quotes two pairs
 (one at a fixed price, one from the Binance mock) through seven blocks, moves the price,
 kills one builder and ends with Ctrl-C. It then decodes every update the builders received
@@ -1345,12 +1346,21 @@ It needs Python 3.9+, `pip install -r e2e/requirements.txt` (aiohttp, websockets
 foundry's `cast`. Output lands in `target/e2e/`.
 
 ```bash
-make e2e                                             # a debug build of this checkout
-make e2e E2E_BINARY=target/release/quote-updater     # an already-built binary instead
-make e2e E2E_BASELINE=/path/to/binary/from/main      # both, compared
+make e2e                                             # the `tilted` example, built from this checkout
 ```
 
-With `E2E_BASELINE`, the second binary runs the same script on the same ports and the two
+The script behind it, `e2e/run.py`, also runs the kinds the library ships, with the second
+pair priced by `feed`, and can set two binaries side by side. `examples/minimal.rs` is the
+binary for that: it registers the shipped kinds and nothing else. Run these from
+`make shell`, which has Python's packages and `cast`:
+
+```bash
+cargo build -p quote-updater --example minimal
+python3 e2e/run.py --binary target/debug/examples/minimal                                # the shipped kinds
+python3 e2e/run.py --binary target/debug/examples/minimal --baseline /path/to/the/other  # both, compared
+```
+
+With `--baseline`, the second binary runs the same script on the same ports and the two
 are compared: the `--check` report, every signed byte (signatures are deterministic, and so
 is the mock chain) and every log line must match. That is how a refactor proves it changed
 nothing. Build the baseline from a `git worktree` of the other commit.
