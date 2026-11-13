@@ -149,12 +149,15 @@ struct Disputes {
 /// that says nothing else for [`REANCHOR_AFTER`] is believed.
 ///
 /// A reading *far ahead* of it is either absurd or true, and a true one is repeated and
-/// grows: the next reading is the same block or a few past it, and within
-/// [`REANCHOR_AFTER`] it is past it. So a run of them is believed only once it has grown;
-/// a node repeating one absurd number never is. Readings that agree with the standing head
-/// do not end this run. If they did, one replica stuck far behind would hold the head
-/// there for as long as it answered, its every reading vouching for a head the rest of the
-/// chain had left.
+/// grows: the next reading is the same block or one near it, and within
+/// [`REANCHOR_AFTER`] it is past where the run began. So a run of them is believed only
+/// once it has grown; a node repeating one absurd number never is. Near, and not only
+/// past: the replicas behind one endpoint are a block or two apart at every new block, so
+/// the readings of a chain that really is there dip as often as they rise, and a run that
+/// ended at every dip never lasted [`REANCHOR_AFTER`]. Readings that agree with the
+/// standing head do not end this run. If they did, one replica stuck far behind would hold
+/// the head there for as long as it answered, its every reading vouching for a head the
+/// rest of the chain had left.
 fn judge(
     standing: u64,
     number: u64,
@@ -174,11 +177,12 @@ fn judge(
     }
     let ahead = number > standing;
     let (run, same_claim) = if ahead {
-        // Only what the last reading could have grown into.
-        let reachable = disputes
+        // The chain the last reading was of: what it could have grown into, or a replica
+        // a little behind the one that gave it.
+        let near = disputes
             .ahead
-            .is_some_and(|run| number >= run.number && number - run.number <= MAX_HEAD_JUMP);
-        (&mut disputes.ahead, reachable)
+            .is_some_and(|run| number.abs_diff(run.number) <= MAX_HEAD_JUMP);
+        (&mut disputes.ahead, near)
     } else {
         // Whatever older block it is: replicas lag by different amounts, and a node
         // catching up reads a little further each time.
@@ -617,6 +621,23 @@ mod tests {
         assert_eq!(head.borrow().number, 1_003);
     }
 
+    /// Behind one endpoint the replicas are a block apart as often as not, so the readings
+    /// of a chain that moved far ahead dip by one every other read. Each dip used to start
+    /// the run over, so it never lasted `REANCHOR_AFTER` and the head stayed where the
+    /// outage had left it until the process was restarted.
+    #[tokio::test(start_paused = true)]
+    async fn a_chain_that_moved_far_ahead_is_followed_though_its_replicas_disagree() {
+        let (standing, head) = standing();
+        standing.publish(head_at(100));
+        // The head, and every other read a replica one block behind it.
+        let dipping =
+            |since: u64| move |at: u64| 1_000 + (since + at) / 12 - ((since + at) / 3) % 2;
+        read_every_3s(&standing, 36, dipping(0)).await;
+        assert_eq!(head.borrow().number, 100, "not before REANCHOR_AFTER");
+        read_every_3s(&standing, 3, dipping(36)).await;
+        assert_eq!(head.borrow().number, 1_003, "the dips did not end the run");
+    }
+
     /// One replica stuck far behind, answering every other read, used to be able to hold
     /// the head where it was: each of its answers agreed with the standing head and ended
     /// the dispute the rest of the chain had raised. Agreement does not end a run of
@@ -728,7 +749,7 @@ mod tests {
         assert_eq!(judge(100, 100, &mut d, at(50), gap), Verdict::Stands);
         assert_eq!(d.behind, None);
 
-        // Far ahead: a run only while each reading is what the last could have grown into.
+        // Far ahead: a run only while each reading is near the last.
         assert_eq!(judge(100, edge + 1, &mut d, at(60), gap), Verdict::Disputed);
         assert_eq!(judge(100, edge + 2, &mut d, at(66), gap), Verdict::Disputed);
         assert_eq!(d.ahead.map(|run| run.since), Some(at(60)));
@@ -736,9 +757,11 @@ mod tests {
         assert_eq!(judge(100, 100, &mut d, at(67), gap), Verdict::Stands);
         assert_eq!(judge(100, 101, &mut d, at(68), gap), Verdict::Follows);
         assert_eq!(d.ahead.map(|run| run.since), Some(at(60)));
-        // A lower claim, or one out of reach of the last, is another claim: a new run.
+        // A reading a little lower is the same chain, from a replica behind the one that
+        // gave the last: the run goes on.
         assert_eq!(judge(100, edge + 1, &mut d, at(70), gap), Verdict::Disputed);
-        assert_eq!(d.ahead.map(|run| run.since), Some(at(70)));
+        assert_eq!(d.ahead.map(|run| run.since), Some(at(60)));
+        // One out of reach of the last is another claim: a new run.
         let far = edge + 2 + MAX_HEAD_JUMP;
         assert_eq!(judge(100, far, &mut d, at(72), gap), Verdict::Disputed);
         assert_eq!(d.ahead.map(|run| run.since), Some(at(72)));
@@ -748,6 +771,12 @@ mod tests {
         assert_eq!(judge(100, far, &mut d, at(108), gap), Verdict::Disputed);
         // Grown by a block, it is a chain.
         assert_eq!(judge(100, far + 1, &mut d, at(109), gap), Verdict::Reanchor);
+        // Out of reach below the last is no replica's dip either: a new run.
+        assert_eq!(
+            judge(100, edge + 1, &mut d, at(110), gap),
+            Verdict::Disputed
+        );
+        assert_eq!(d.ahead.map(|run| run.since), Some(at(110)));
     }
 
     /// A poll slower than a slot still gets a run: four of its readings may be one.
