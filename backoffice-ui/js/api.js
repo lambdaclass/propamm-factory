@@ -4,8 +4,12 @@
 // under one address).
 //
 // Every POST and PUT goes as `Content-Type: application/json`, the bodiless ones (halt,
-// resume, reload) included: the API refuses a change sent any other way (audit F-02). No
-// credentials: the API has no login, and so no cookie to send.
+// resume, reload) included: the API refuses a change sent any other way (audit F-02). When
+// the backoffice takes a Google sign-in (auth.js), every request carries the ID token as
+// `Authorization: Bearer`. Never cookies (`credentials: "omit"`): a browser sends those on
+// its own, which is what a page on another site would use.
+
+import { currentToken, refused } from "./auth.js";
 
 const STORAGE_KEY = "backoffice-api";
 
@@ -74,6 +78,14 @@ export function socketUrl(path) {
   return url.href;
 }
 
+/** The subprotocols the preview socket is opened with: when signed in, the token, which a
+ * browser cannot put in a websocket's headers, and `backoffice`, which the API answers
+ * with. None otherwise, as a backoffice without sign-in expects. */
+export function socketProtocols() {
+  const token = currentToken();
+  return token ? ["backoffice", `bearer.${token}`] : undefined;
+}
+
 /** A request the API refused (`status` 4xx, `message` its `{"error"}`), or one that never
  * reached it (`status` 0). */
 export class ApiError extends Error {
@@ -109,6 +121,8 @@ function unreachable() {
 
 async function request(method, path, body) {
   const init = { method, cache: "no-store", credentials: "omit", headers: {} };
+  const token = currentToken();
+  if (token) init.headers.Authorization = `Bearer ${token}`;
   if (method === "POST" || method === "PUT") {
     init.headers["Content-Type"] = "application/json";
     if (body !== undefined) init.body = JSON.stringify(body);
@@ -128,6 +142,7 @@ async function request(method, path, body) {
   }
   if (!res.ok) {
     const why = data && typeof data.error === "string" ? data.error : text.slice(0, 300);
+    if (res.status === 401) refused(token);
     throw new ApiError(why || `${res.status} ${res.statusText}`, res.status);
   }
   if (data === null) {
@@ -139,6 +154,7 @@ async function request(method, path, body) {
 const enc = encodeURIComponent;
 
 export const api = {
+  auth: () => request("GET", "/api/auth"),
   pairs: () => request("GET", "/api/pairs"),
   pair: (key) => request("GET", `/api/pairs/${enc(key)}`),
   addPair: (pair) => request("POST", "/api/pairs", pair),

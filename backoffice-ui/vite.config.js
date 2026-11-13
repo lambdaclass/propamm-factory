@@ -10,7 +10,7 @@ export default defineConfig({
   // Relative asset paths, so dist/ works from any directory a server puts it under.
   base: "./",
   server: {
-    // Loopback only: this proxy is a way into an API with no login.
+    // Loopback only: this proxy is a way into the API, signed in or not.
     host: "127.0.0.1",
     // Beside the backoffice's 8088, and clear of Vite's 5173, which other projects take, and
     // Grafana's 3000. Strict, so a port in use fails rather than moving.

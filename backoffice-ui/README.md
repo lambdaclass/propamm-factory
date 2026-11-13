@@ -5,7 +5,7 @@ backoffice"): a page that reads and changes the pairs and builders through `/api
 nothing else. Plain JavaScript modules (`js/`), `index.html` and `style.css`, with no
 runtime dependencies; [pnpm](https://pnpm.io) and Vite serve them in development and build
 them into `dist/`, static files to deploy. The page loads nothing from anywhere but its own
-directory and the backoffice.
+directory and the backoffice, and Google's sign-in when the backoffice asks for one.
 
 ![The pairs and builders page, against the e2e mocks](screenshot.png)
 
@@ -23,6 +23,7 @@ What it does, each through the route named:
 | New pair, Edit | the pair's stanza as a form: tokens and `key_env`, the venue table, the bounds and the breaker, the pricing kind and its fields (`GET /api/kinds`), the guards, `allow_symbol_mismatch` |
 | New builder | `name`, `endpoint`, `api_key` and `disable_cross_region` (`POST /api/builders`) |
 | Settings | `target` and `[settings]`, read-only, and which backoffice this page talks to |
+| Sign in | shown on every route while the backoffice wants a Google sign-in and there is none |
 
 The venue table is live. Once both token addresses are in, `GET /api/lookup` fills in
 which exchanges list the pair, how each spells it, a weight from volume, and the volume.
@@ -45,11 +46,16 @@ websocket included, to the backoffice at `BACKOFFICE_API` (default
 install` and `pnpm dev`). Page and API then share an origin, so the backoffice needs nothing
 listed: the proxy keeps the `Host` the browser sent, an IP address, which the backoffice
 answers to, and the page's `Origin` names that same address. The dev server listens on
-loopback only, and should stay there: it is a way into an API with no login.
+loopback only, and should stay there: it is a way into the API, signed in or not.
 
 ```bash
 BACKOFFICE_API=http://100.64.1.2:8088 pnpm dev
 ```
+
+Against a backoffice with Google sign-in on, open the page as `http://localhost:8090`, not
+`http://127.0.0.1:8090`: Google takes no IP address as a sign-in origin, and `localhost` is
+the one exception to its HTTPS rule. List `http://localhost:8090` (and `http://localhost`)
+under the OAuth client's "Authorized JavaScript origins".
 
 ## Deploying
 
@@ -103,6 +109,30 @@ When the page cannot reach the API, the banner says so and names the likely caus
 backoffice is down, the page's origin is not listed, the name it is reached by is not listed
 with `--backoffice-host`, or an `https://` page is calling an `http://` backoffice.
 
+## Google sign-in
+
+When the backoffice is started with `--backoffice-google-client-id`, every request needs a
+Google sign-in by an account it lets in. The page finds out from the backoffice
+(`GET /api/auth`, which answers the client ID to sign in with); nothing is configured here.
+It then loads Google's sign-in script and shows a "Sign in with Google" button on every route
+until the operator has signed in. The ID token Google hands back is kept in memory only, sent
+as `Authorization: Bearer` on every request, and as a subprotocol on the preview's websocket,
+which a browser cannot give a header. The header shows who is signed in, and signs out.
+
+- **Reloading** signs in again, without a click when one account has signed in here before
+  (Google's auto-select).
+- **After about an hour** the token runs out. Two minutes before, Google is asked for a new
+  one, which it gives without a click when it can. When it cannot, the next request is
+  refused: the banner says so, the view and anything typed into it stay, and the header's
+  button signs in again before retrying.
+- **An account the backoffice does not let in** gets its refusal in the banner, naming the
+  address; sign out to switch accounts.
+- **The page's origin** has to be listed under the OAuth client's "Authorized JavaScript
+  origins": `https://` and a name (Google takes no IP address there), such as the tailnet
+  name the page is served under with its `tailscale cert` certificate.
+
+A backoffice without sign-in (or from before it, with no `/api/auth`) is used as before.
+
 ## What it does not do
 
 - **Guards are JSON.** No route lists the guard kinds a binary registers, so a pair's
@@ -113,12 +143,13 @@ with `--backoffice-host`, or an `https://` page is calling an `http://` backoffi
 - **A new `key_env` needs a restart.** The updater reads its environment once, at start, so a
   pair on a key that is not in it yet is refused until the key is added and the updater
   restarted.
-- **No login.** The API has none, so neither does this page. Anyone who can load it and reach
-  the backoffice can change the pairs; serve both on the tailnet only.
+- **No login of its own.** The page signs in only when the backoffice asks for it (above).
+  Without that, anyone who can load it and reach the backoffice can change the pairs; serve
+  both on the tailnet only, either way.
 
 What the page does to keep from being turned against the API it drives: it loads nothing
-from another site (its `Content-Security-Policy` allows scripts and styles from its own
-directory only), it puts everything the API and the exchanges answer into the page as text,
+from another site but Google's sign-in (its `Content-Security-Policy` allows scripts and
+styles from its own directory and `accounts.google.com/gsi/` only), it puts everything the API and the exchanges answer into the page as text,
 except a pricing kind's help, which the binary writes as HTML and which goes through an
 allowlist of tags first, and a builder's `api_key` is sent once and never shown again (the
 API never answers it).

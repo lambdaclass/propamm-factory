@@ -146,6 +146,17 @@ button:disabled { opacity: .55; cursor: progress; }
 .primary:hover { filter: brightness(1.08); background: var(--accent); border-color: var(--accent); }
 .danger { border-color: transparent; background: none; color: var(--danger); }
 .danger:hover { background: var(--danger-bg); border-color: transparent; }
+/* A button that reads as a link: the header's "sign out". */
+button.link {
+  padding: 0; border: none; background: none; font-size: inherit; font-weight: inherit;
+  color: var(--dim); text-decoration: underline; text-underline-offset: .2em;
+}
+button.link:hover { background: none; color: var(--ink); }
+
+/* Google's sign-in, when the backoffice asks for one. */
+.signin { max-width: 32rem; display: flex; flex-direction: column; gap: .8rem; }
+.signin p { margin: 0; }
+.signin-button { display: inline-block; min-height: 1.5rem; }
 :is(.btn, button, a, input, select, textarea, summary):focus-visible {
   outline: none; border-color: var(--accent);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);

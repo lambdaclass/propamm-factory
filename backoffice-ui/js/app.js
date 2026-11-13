@@ -8,8 +8,12 @@
 //   #/pairs/edit/<key>    one pair's stanza
 //   #/builders/new        a new builder
 //   #/settings            [settings], read-only, and which backoffice this page talks to
+//
+// When the backoffice takes a Google sign-in (auth.js), every route shows the sign-in until
+// the operator has signed in.
 
 import { api, apiBase, apiOverridden, configure, configuredBase, setApiBase } from "./api.js";
+import * as auth from "./auth.js";
 import { clear, h, shortAddress } from "./dom.js";
 import { pairView } from "./pair.js";
 import { go, notify, notifyError, notifyResult, onRerender, resultFlash, takeFlash } from "./ui.js";
@@ -17,6 +21,8 @@ import { go, notify, notifyError, notifyResult, onRerender, resultFlash, takeFla
 const view = document.getElementById("view");
 const apiLabel = document.getElementById("api-base");
 const targetLabel = document.getElementById("target");
+const whoTerm = document.getElementById("who-term");
+const whoLabel = document.getElementById("who");
 
 // ---------------------------------------------------------------------------------------
 // Routing
@@ -24,6 +30,7 @@ const targetLabel = document.getElementById("target");
 
 let dispose = null;
 let rendering = 0;
+let showingSignIn = false;
 
 function route(hash) {
   const path = hash.replace(/^#/, "") || "/";
@@ -57,8 +64,9 @@ async function render() {
     link.classList.toggle("current", link.getAttribute("href") === (location.hash || "#/"));
   }
   let cleanup = null;
+  showingSignIn = auth.required() && !auth.signedIn();
   try {
-    cleanup = await route(location.hash)(container);
+    cleanup = await (showingSignIn ? signInView : route(location.hash))(container);
   } catch (err) {
     if (token === rendering) {
       container.append(h("p", { class: "banner banner-err", role: "alert" }, err.message || String(err)));
@@ -428,11 +436,86 @@ function connectionCard() {
       notifyError(err);
       return;
     }
+    // Another backoffice may want a sign-in, or another one.
+    await auth.start(api.auth);
     showConnection();
+    showWho();
     go("#/settings", ["ok", `Talking to ${apiBase()}.`]);
   });
   return h("div", {}, h("div", { class: "sectionhead" }, h("h2", {}, "Connection")), form);
 }
+
+// ---------------------------------------------------------------------------------------
+// Sign-in
+// ---------------------------------------------------------------------------------------
+
+/** What every route shows while the backoffice wants a sign-in and there is none. */
+function signInView(root) {
+  const button = h("div", { class: "signin-button" });
+  root.append(
+    h("header", { class: "pagehead" }, h("h1", {}, "Sign in")),
+    h("div", { class: "card signin" },
+      h("p", {}, `The backoffice at ${apiBase()} takes requests only from a Google account it allows. ` +
+        "Sign in to see and change its pairs and builders."),
+      auth.loadError() ? h("p", { class: "banner banner-err", role: "alert" }, auth.loadError()) : button,
+      h("p", { class: "fieldhint" },
+        "Google checks who you are; the backoffice checks that the account is one it lets in " +
+          "(--backoffice-allow-domain, --backoffice-allow-email)."),
+    ),
+  );
+  auth.renderButton(button);
+}
+
+/** The header's line saying who is signed in, with a way out; or a way in. Hidden when the
+ * backoffice takes no sign-in. */
+function showWho() {
+  const on = auth.required();
+  whoTerm.hidden = !on;
+  whoLabel.hidden = !on;
+  clear(whoLabel);
+  if (!on) return;
+  if (auth.signedIn()) {
+    whoLabel.append(
+      auth.signedInAs(), " ",
+      h("button", { type: "button", class: "link", onclick: () => auth.signOut() }, "sign out"),
+    );
+  } else if (!showingSignIn) {
+    const button = h("span", { class: "signin-button" });
+    whoLabel.append(button);
+    auth.renderButton(button, "small");
+  } else {
+    whoLabel.append("not signed in");
+  }
+}
+
+// Set once the first view is drawn: until then, start draws it.
+let booted = false;
+// Whether a request was refused for a sign-in that ran out, for the line after the next one.
+let lapsed = false;
+
+auth.onChange((reason) => {
+  if (!booted) return;
+  if (reason === "expired") {
+    // The view stays, with whatever was being typed: sign in again from the header and
+    // retry what was refused.
+    lapsed = true;
+    showWho();
+    notify("err", "Your sign-in has run out or was refused. Sign in again (top right), then retry.");
+    return;
+  }
+  if (reason === "signed-in" && !showingSignIn) {
+    // A renewal before the hour was up says nothing; a sign-in after a refusal says to retry.
+    showWho();
+    showConnection();
+    if (lapsed) notify("ok", `Signed in again as ${auth.signedInAs()}. Retry what was refused.`);
+    lapsed = false;
+    return;
+  }
+  lapsed = false;
+  // Sign-in turned on or off, a first sign-in, or a sign-out: the view changes with it.
+  showConnection();
+  render().then(showWho);
+});
 
 // ---------------------------------------------------------------------------------------
 // Start
@@ -442,6 +525,10 @@ function connectionCard() {
 async function showConnection() {
   apiLabel.textContent = apiBase();
   apiLabel.title = apiOverridden() ? "saved on this browser (Settings)" : "from config.json";
+  if (auth.required() && !auth.signedIn()) {
+    targetLabel.textContent = "sign in to see";
+    return;
+  }
   targetLabel.textContent = "…";
   try {
     targetLabel.textContent = (await api.settings()).target;
@@ -451,7 +538,10 @@ async function showConnection() {
 }
 
 await configure();
+await auth.start(api.auth);
 showConnection();
-onRerender(render);
-window.addEventListener("hashchange", render);
-render();
+const show = () => render().then(showWho);
+onRerender(show);
+window.addEventListener("hashchange", show);
+booted = true;
+render().then(showWho);

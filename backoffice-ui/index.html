@@ -3,11 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<!-- Scripts and styles from this directory only, and nothing parsed from the API runs: the
-     page drives an API with no login. connect-src is open because where the backoffice is
-     comes from config.json (README.md). -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' http: https: ws: wss:; base-uri 'none'; form-action 'none'">
-<meta name="referrer" content="no-referrer">
+<!-- Scripts and styles from this directory only, and Google's sign-in (accounts.google.com/gsi/,
+     loaded only when the backoffice asks for a sign-in; js/auth.js), and nothing parsed from
+     the API runs. connect-src is open because where the backoffice is comes from config.json
+     (README.md). The referrer is the page's origin alone, which Google's sign-in reads. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' https://accounts.google.com/gsi/client; style-src 'self' https://accounts.google.com/gsi/style; frame-src https://accounts.google.com/gsi/; img-src 'self' data:; connect-src 'self' http: https: ws: wss:; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
 <title>quote-updater backoffice</title>
 <link rel="icon" href="data:,">
 <link rel="stylesheet" href="style.css">
@@ -25,6 +26,7 @@
   <dl class="meta">
     <dt>backoffice</dt><dd class="mono" id="api-base">…</dd>
     <dt>target</dt><dd class="mono" id="target">…</dd>
+    <dt id="who-term" hidden>signed in</dt><dd id="who" hidden></dd>
   </dl>
 </header>
 <main>
