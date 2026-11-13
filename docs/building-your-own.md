@@ -193,13 +193,14 @@ What to know:
   summary or its rejection (exactly what the backoffice's `POST /api/reload` gets), whose
   `shutdown()` stops it the graceful way, and whose `wait()` returns the `Outcome`. Ctrl-c
   is the caller's to wire to `shutdown()` on that path, as it is with `shutdown_on`. The handle's
-  `halt(tokens, reason)` and `resume(tokens)` are a kill switch: a halt is made the way a
-  backoffice change is, written to the config file as `halted = true` with `halt_reason`
-  beside it and applied at once, so no later reload undoes it and it survives a restart (a
-  `Latch` trip is re-armed by the next reload, so a kill switch is never built on one); the
+  `halt(tokens, reason)` and `resume(tokens)` are a kill switch. A halt is immediate: the
+  pair's lane withdraws its quote at every builder on its next tick, with no reload, no RPC
+  call and no other pair's check in the way, and no wait for a change in flight. It is then
+  written to the config file as `halted = true` with `halt_reason` beside it, so no later
+  reload undoes it and it survives a restart (a `Latch` trip is re-armed by the next reload,
+  so a kill switch is never built on one). A resume is a checked change like any other. The
   file is rewritten in full in the backoffice's canonical form, so comments in it are not
-  kept. Both are serialized with the backoffice's changes to the same config, and both are
-  refused in `--mode node`. `--help` and a usage error come
+  kept, and both are refused in `--mode node`. `--help` and a usage error come
   back from `from_env` as a `clap::Error` to `print()` and exit with its code (0 for help),
   not to propagate with `?`: the doc example on `UpdaterBuilder::run` is the whole pattern.
   A binary with flags of its own puts `#[command(flatten)] updater: Args` in its clap

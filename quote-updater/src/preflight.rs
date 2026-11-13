@@ -717,12 +717,15 @@ pub async fn build_report(
     // A failed read must not default to a reassuring value: a zero base fee reads as
     // unlimited runway, so an RPC failure here must surface as "unknown", never as
     // "every key is infinitely funded".
-    let base_fee = client
-        .get_block_by_number(BlockIdentifier::Tag(BlockTag::Latest), false)
-        .await
-        .ok()
-        .and_then(|block| block.header.base_fee_per_gas)
-        .map(U256::from);
+    // Every read here is bounded by `RPC_TIMEOUT`, as `call_view`'s are: a reload runs this,
+    // and an RPC that accepts and never answers would otherwise hold it, and the config
+    // lock it holds, for ever (audit F-06).
+    let base_fee =
+        crate::bounded(client.get_block_by_number(BlockIdentifier::Tag(BlockTag::Latest), false))
+            .await
+            .ok()
+            .and_then(|block| block.header.base_fee_per_gas)
+            .map(U256::from);
     if base_fee.is_none() {
         warnings.push(
             "could not read the latest block's base fee, so funding runway is unknown for \
@@ -738,9 +741,9 @@ pub async fn build_report(
     // EIP-7702 case, where the target has code and still is not a contract. That last one is
     // what a run on a mainnet fork with an anvil account as its target actually hits; see
     // `target_warning`.
-    let target_code = client
-        .get_code(config.target, BlockIdentifier::Tag(BlockTag::Latest))
-        .await;
+    let target_code =
+        crate::bounded(client.get_code(config.target, BlockIdentifier::Tag(BlockTag::Latest)))
+            .await;
     let target_kind = classify_target(target_code.as_deref().ok());
     warnings.extend(target_warning(config.target, target_kind));
     let target_has_code = target_kind == TargetKind::Contract;
@@ -813,7 +816,9 @@ pub async fn build_report(
                 // from a confirmed "no" — see `authorization_failure`.
                 let (answer, balance) = tokio::join!(
                     call_view(client, registry, calldata, None, None),
-                    client.get_balance(updater, BlockIdentifier::Tag(BlockTag::Latest)),
+                    crate::bounded(
+                        client.get_balance(updater, BlockIdentifier::Tag(BlockTag::Latest))
+                    ),
                 );
                 row.authorized = decode_one("r(bool)", answer.ok().as_deref())
                     .map(|value| value == Value::Bool(true));

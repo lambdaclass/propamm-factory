@@ -756,9 +756,23 @@ at most once every 2 seconds per preview however fast the client changes it. The
 refuses an `Origin` that is neither its own address nor a listed one, so another site cannot
 open it from an operator's browser.
 
-**Halting keeps the pair.** Halt sets `halted = true` on the pair in `config.toml`, and the
-updater treats a halted pair as absent: its quote is withdrawn at every builder, as a removal
-would, but the stanza and every setting stay in the file. It stays halted across changes and
+**A halt is immediate.** A halt (`POST /api/pairs/{key_env}/halt`, `POST /api/halt`, or a
+binary's `UpdaterHandle::halt`) is the kill switch, and is not a reload. It sets the pair's
+halt flag, which the pair's lane reads on every tick and is woken by: the lane withdraws its
+quote at every builder at once and sends nothing more. Nothing stands in the way. There is
+no re-check of the config on the chain, so another pair failing its checks cannot refuse
+it, and no RPC call, so a hung RPC cannot hold it up. Neither can a change already in
+flight, which the halt does not wait for (audit F-06). The halt is then recorded once that
+change is done, `halted = true` in the shared config and `config.toml`, and the lane is shut
+down in the background. It is recorded even if the client hangs up before the answer. A halt
+made while a resume of the same pair is in flight wins: the pair stays silent and is halted
+again once the resume is done (and answers `already halted` only if that resume was refused).
+A resume is a change like any other, checked and converged, since it starts the pair quoting
+again.
+
+**Halting keeps the pair.** The updater treats a halted pair as absent: its quote is
+withdrawn at every builder, as a removal would, but the stanza and every setting stay in the
+file. It stays halted across changes and
 restarts until someone resumes it, with its own `POST /api/pairs/{key_env}/resume` or with
 `POST /api/reload`, which clears the `halted` flag of every pair halted through the API along
 with re-arming pairs stopped on their circuit breaker. A halt with a `halt_reason` beside it
@@ -767,7 +781,8 @@ binary's kill switch), and the API's own halt writes none. The reload's answer n
 pair it left halted and its reason; only that pair's own resume (or the handle's `resume`)
 clears it. A halted pair's vault balances are still exported.
 
-**Every change is write, converge, and revert if refused.** The file is rewritten
+**Every change is write, converge, and revert if refused** (a halt aside, above). The file is
+rewritten
 atomically, the service converges onto it, and if that is rejected the previous file is put
 back before the API answers. So after every change the pairs and builders on disk describe
 what is running, and a bad change costs a rejected reload and nothing else. Without the

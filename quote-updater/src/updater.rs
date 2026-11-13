@@ -466,27 +466,50 @@ impl UpdaterHandle {
         }
     }
 
-    /// Stops the pair quoting and keeps it, with every setting, in the run's config and its
-    /// file: `halted = true` with `reason` beside it as `halt_reason`, then a reload, which
-    /// withdraws its quote at every builder exactly as removing it would. A halt is an
-    /// intent, not a judgement: no reload clears it, only [`Self::resume`] (or that pair's
-    /// own Resume in the backoffice, whose "Restart halted pairs" leaves a halt with a
-    /// reason as it is), and it survives a restart. That is what a kill switch is built on;
-    /// a [`crate::guard::Latch`] trip is not, since the next reload re-arms it.
+    /// The kill switch: stops the pair quoting at once and keeps it, with every setting, in
+    /// the run's config and its file. Its lane withdraws its quote at every builder on its
+    /// next tick, whatever else the run is doing: no reload, no RPC call and no other
+    /// pair's check stands in the way, so the halt is never refused for another pair's sake
+    /// and never waits on the chain. Then the halt is recorded, `halted = true` with
+    /// `reason` beside it as `halt_reason`. A halt is an intent, not a judgement: no reload
+    /// clears it, only [`Self::resume`] (or that pair's own resume in the backoffice, whose
+    /// `POST /api/reload` leaves a halt with a reason as it is), and it survives a restart.
+    /// A [`crate::guard::Latch`] trip is not that, since the next reload re-arms it.
     ///
-    /// Answers with what changed and the reload's summary (`Ok` too when the reload applied
-    /// in part because another pair's feed would not come up: the halt is kept and in
-    /// force, and the line says which pairs kept their previous config), or with why it was
-    /// refused, in which case the config and its file are as they were: no pair has these
-    /// tokens, it is already halted, the reload was rejected, or the run is in node mode
-    /// (by flag, variable or `[settings] mode`), which has no service to halt a pair in.
-    /// Serialized with the backoffice's changes, and written as the backoffice writes them:
-    /// the file is rewritten in full, in its canonical form, so comments in it are not
-    /// kept, keys are sorted and arrays re-wrapped; `config.example.toml` documents every
-    /// key.
+    /// Answers with what it halted, or with why it refused, in which case nothing changed:
+    /// no pair has these tokens, it is already halted, or the run is in node mode (by flag,
+    /// variable or `[settings] mode`), which has no service to halt a pair in. `Ok` too
+    /// when the halt is in force but the config file could not be written; the line says
+    /// so. The file is rewritten in full, in its canonical form, as the backoffice writes
+    /// it, so comments in it are not kept, keys are sorted and arrays re-wrapped;
+    /// `config.example.toml` documents every key.
     pub async fn halt(&self, tokens: (Address, Address), reason: &str) -> Result<String, String> {
-        self.edit(tokens, "halt", |pair| halt_line(pair, reason))
-            .await
+        let settled = self.settled().await?;
+        if settled.mode == crate::cli::Mode::Node {
+            return Err("node mode has no service to halt".to_owned());
+        }
+        let halted = settled
+            .config
+            .halt(
+                "handle:",
+                {
+                    let reason = reason.to_owned();
+                    move |raw| {
+                        let at = pair_index(&raw.pairs, tokens)?;
+                        let what = halt_line(&mut raw.pairs[at].clone(), &reason)?;
+                        Ok::<_, eyre::Report>((vec![raw.pairs[at].key_env.clone()], what))
+                    }
+                },
+                Some(reason),
+            )
+            .await;
+        match halted {
+            Ok(line) | Err(Refused::Reload(ReloadFailure::Partial(line))) => Ok(line),
+            Err(Refused::Reload(ReloadFailure::Rejected(line) | ReloadFailure::Fault(line))) => {
+                Err(line)
+            }
+            Err(Refused::Change(err)) => Err(format!("{err:#}")),
+        }
     }
 
     /// Clears a halt, whoever set it, and reloads: the pair quotes again at every builder.

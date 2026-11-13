@@ -128,6 +128,9 @@ pub(crate) struct Service {
     pub(crate) key_lookup: config::KeyLookup,
     /// The pricing kinds the binary registered, for checking and building custom pairs.
     pub(crate) kinds: Arc<crate::kinds::Kinds>,
+    /// Every pair's kill switch (`halts.rs`), shared with the shared config: each lane is
+    /// handed its pair's as it starts.
+    pub(crate) halt_flags: Arc<crate::halts::HaltFlags>,
 }
 
 /// `run` returning early (an error after the pairs started) must not leave their supervised
@@ -222,6 +225,9 @@ impl Service {
     ) {
         let Built { mut live, adopted } = built;
         let lane = spec.lane;
+        // The pair's kill switch, not a fresh one: a halt set while this run was being
+        // built (a reload in flight starting the lane again) is already on it.
+        live.halt = self.halt_flags.flag(lane);
         let label = live.pair.label.clone();
         let pair_metrics = live.metrics.clone();
         let venues: Vec<venue::VenueId> = live.venues.iter().map(|v| v.venue).collect();
@@ -807,6 +813,55 @@ impl Service {
         }
     }
 
+    /// Stops `lane` and retires its series: what a reload does to a pair removed or halted,
+    /// and the service to a pair its kill switch silenced. Answers the lane's label.
+    async fn retire(&mut self, lane: U256) -> String {
+        let (label, venues, guard_kinds) = self
+            .running
+            .get(&lane)
+            .map(|pair| {
+                (
+                    pair.label.clone(),
+                    pair.venues.clone(),
+                    pair.guard_kinds.clone(),
+                )
+            })
+            .unwrap_or_else(|| (config::lane_label(lane), Vec::new(), Vec::new()));
+        let stopped = self.stop(lane).await;
+        // Nothing reaps a `GaugeVec` child, so without this the lane's last readings stand
+        // for the life of the process — and a lane removed while halted would leave
+        // `breaker_tripped` at 1, paging under `PusherBreakerTripped` for a pair that is
+        // not configured any more, clearable only by the restart this whole feature exists
+        // to avoid.
+        self.quiesce(&label, &venues, &guard_kinds, &stopped.trip_sources);
+        label
+    }
+
+    /// A halt the kill switch made and the shared config recorded (`state.rs`): its lanes
+    /// withdrew on their own at their next tick, and are shut down here, as a reload shuts
+    /// down a halted pair, when the loop gets to it. Nothing else is touched: no other lane
+    /// is restarted or re-armed. The config is recorded as a reload's would be, and the
+    /// generation moves, since the config changed.
+    pub(crate) async fn retire_halted(&mut self, halted: crate::state::Halted) {
+        let mut retired = Vec::new();
+        for lane in &halted.lanes {
+            // Still halted: a notice read late, after a resume lifted the flag and has the
+            // lane quoting again, is not that lane's to stop.
+            if self.running.contains_key(lane) && self.halt_flags.is_set(*lane) {
+                retired.push(self.retire(*lane).await);
+            }
+        }
+        if !retired.is_empty() {
+            tracing::info!(
+                "halt: {} stopped; the kill switch had already withdrawn their quotes at \
+                 every builder",
+                retired.join(", ")
+            );
+        }
+        self.reload_metrics.generation.inc();
+        record_config(self.recorder.as_ref(), &halted.config, "halt");
+    }
+
     /// Converges the running pairs onto `raw`.
     ///
     /// An error here means nothing was touched — see [`Self::candidate`]. Past that point the
@@ -908,24 +963,7 @@ impl Service {
 
         let mut applied = Applied::default();
         for lane in removals {
-            let (label, venues, guard_kinds) = self
-                .running
-                .get(&lane)
-                .map(|pair| {
-                    (
-                        pair.label.clone(),
-                        pair.venues.clone(),
-                        pair.guard_kinds.clone(),
-                    )
-                })
-                .unwrap_or_else(|| (config::lane_label(lane), Vec::new(), Vec::new()));
-            let stopped = self.stop(lane).await;
-            // Nothing reaps a `GaugeVec` child, so without this the lane's last readings
-            // stand for the life of the process — and a lane removed while halted would
-            // leave `breaker_tripped` at 1, paging under `PusherBreakerTripped` for a pair
-            // that is not configured any more, clearable only by the restart this whole
-            // feature exists to avoid.
-            self.quiesce(&label, &venues, &guard_kinds, &stopped.trip_sources);
+            let label = self.retire(lane).await;
             // A pair the file keeps but halts is stopped exactly as a removed one, and said
             // apart: it is coming back on a resume, and the reason (a binary's kill switch
             // writes one) is what whoever resumes it will want to know.
@@ -1425,6 +1463,7 @@ mod tests {
             pair_states: backoffice::PairStates::default(),
             key_lookup: Arc::new(config::env_lookup),
             kinds: Arc::new(crate::kinds::Kinds::shipped()),
+            halt_flags: Arc::default(),
         }
     }
 
@@ -1616,6 +1655,59 @@ mod tests {
         assert_eq!(
             service.halted_lanes(),
             std::collections::BTreeSet::from([U256::from(1)])
+        );
+    }
+
+    /// Shutting down a lane the kill switch silenced touches that lane alone: another lane
+    /// halted on its breaker stays halted, neither restarted nor re-armed (audit F-17 is a
+    /// reload's, and a halt is not one), and the generation moves for the config change.
+    #[tokio::test]
+    async fn retiring_a_halted_lane_leaves_a_tripped_one_tripped() {
+        let mut service = test_service(Vec::new());
+        let silenced = register_fake_pair(&mut service, U256::from(1), "A/B");
+        let tripped = register_fake_pair(&mut service, U256::from(2), "C/D");
+        tripped
+            .halted
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let generation = service.reload_metrics.generation.get();
+        service.halt_flags.set(&[U256::from(1)]);
+        drop(silenced.release);
+
+        service
+            .retire_halted(crate::state::Halted {
+                lanes: vec![U256::from(1)],
+                config: Arc::new(crate::state::tests::a_config()),
+            })
+            .await;
+
+        assert!(!service.running.contains_key(&U256::from(1)), "retired");
+        assert_eq!(
+            service.halted_lanes(),
+            std::collections::BTreeSet::from([U256::from(2)]),
+            "the tripped lane is still there, still halted"
+        );
+        assert_eq!(service.reload_metrics.generation.get(), generation + 1.0);
+    }
+
+    /// A halt notice read late, after a resume lifted the pair's kill switch, stops nothing:
+    /// the lane is quoting again, and the config says so.
+    #[tokio::test]
+    async fn a_halt_notice_for_a_pair_since_resumed_stops_nothing() {
+        let mut service = test_service(Vec::new());
+        let _resumed = register_fake_pair(&mut service, U256::from(1), "A/B");
+        service.halt_flags.set(&[U256::from(1)]);
+        service.halt_flags.clear(&[U256::from(1)]);
+
+        service
+            .retire_halted(crate::state::Halted {
+                lanes: vec![U256::from(1)],
+                config: Arc::new(crate::state::tests::a_config()),
+            })
+            .await;
+
+        assert!(
+            service.running.contains_key(&U256::from(1)),
+            "still running"
         );
     }
 

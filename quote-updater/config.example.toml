@@ -36,7 +36,9 @@
 #
 # A pair with `halted = true` is kept, with every setting, and not run until the flag is
 # cleared (the backoffice's `POST /api/pairs/<key_env>/resume`, or a binary's
-# `UpdaterHandle::resume`). A binary's `UpdaterHandle::halt` sets the flag with a
+# `UpdaterHandle::resume`). A halt through the backoffice or a binary takes effect at once,
+# without a reload: the pair's quote is withdrawn on its next tick, whatever else the
+# updater is doing, and then the flag is written here. A binary's `UpdaterHandle::halt` sets the flag with a
 # `halt_reason` beside it, which the backoffice API shows and the reload logs. A halt with a
 # reason is a kill switch: `POST /api/reload` resumes only the pairs halted without one (the
 # API's own halt writes none) and names the rest, which only their own resume clears.
