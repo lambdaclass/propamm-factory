@@ -134,6 +134,12 @@ pub fn write_raw_atomically(path: &Path, config: &RawConfig) -> Result<()> {
     // now, expensive at the next reload.
     parse_file_settings(&rendered).wrap_err("the rendered config does not parse back")?;
 
+    write_bytes_atomically(path, rendered.as_bytes())
+}
+
+/// [`write_raw_atomically`] for bytes already rendered: how a rejected change puts back the
+/// file it replaced, exactly as it was.
+pub(crate) fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let tmp = dir.join(format!(
         ".{}.tmp",
@@ -154,7 +160,7 @@ pub fn write_raw_atomically(path: &Path, config: &RawConfig) -> Result<()> {
         let mut file = options
             .open(&tmp)
             .wrap_err_with(|| format!("failed to open {}", tmp.display()))?;
-        file.write_all(rendered.as_bytes())
+        file.write_all(bytes)
             .wrap_err_with(|| format!("failed to write {}", tmp.display()))?;
         // Before the rename: otherwise a crash could leave an empty file at the real path.
         file.sync_all()

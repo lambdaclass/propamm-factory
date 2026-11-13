@@ -430,7 +430,7 @@ impl UpdaterHandle {
         let config = self.config().await?;
         match config.reload().await {
             Ok(line) | Err(ReloadFailure::Partial(line)) => Ok(line),
-            Err(ReloadFailure::Rejected(line)) => Err(line),
+            Err(ReloadFailure::Rejected(line) | ReloadFailure::Fault(line)) => Err(line),
         }
     }
 
@@ -524,7 +524,9 @@ impl UpdaterHandle {
         // already halted.
         match changed {
             Ok(line) | Err(Refused::Reload(ReloadFailure::Partial(line))) => Ok(line),
-            Err(Refused::Reload(ReloadFailure::Rejected(line))) => Err(line),
+            Err(Refused::Reload(ReloadFailure::Rejected(line) | ReloadFailure::Fault(line))) => {
+                Err(line)
+            }
             Err(Refused::Change(err)) => Err(format!("{err:#}")),
         }
     }
@@ -546,7 +548,9 @@ impl UpdaterHandle {
             .await;
         match changed {
             Ok(line) | Err(Refused::Reload(ReloadFailure::Partial(line))) => Ok(line),
-            Err(Refused::Reload(ReloadFailure::Rejected(line))) => Err(line),
+            Err(Refused::Reload(ReloadFailure::Rejected(line) | ReloadFailure::Fault(line))) => {
+                Err(line)
+            }
             Err(Refused::Change(never)) => match never {},
         }
     }
