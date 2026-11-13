@@ -146,6 +146,7 @@ export const api = {
   removePair: (key) => request("DELETE", `/api/pairs/${enc(key)}`),
   halt: (key) => request("POST", `/api/pairs/${enc(key)}/halt`),
   resume: (key) => request("POST", `/api/pairs/${enc(key)}/resume`),
+  rearm: (key) => request("POST", `/api/pairs/${enc(key)}/rearm`),
   haltAll: () => request("POST", "/api/halt"),
   reload: () => request("POST", "/api/reload"),
   builders: () => request("GET", "/api/builders"),

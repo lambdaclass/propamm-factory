@@ -19,7 +19,7 @@ What it does, each through the route named:
 
 | Page | What it does |
 |---|---|
-| Pairs & builders | every pair with its status (`live`, `halted`, `breaker tripped`, `not running`), refreshed every 5s; halt, resume and delete one; halt all (`POST /api/halt`); restart halted pairs (`POST /api/reload`); every builder, and delete one |
+| Pairs & builders | every pair with its status (`live`, `halted`, `breaker tripped`, `not running`), refreshed every 5s; halt, resume and delete one; re-arm one its breaker tripped (`POST /api/pairs/{key_env}/rearm`); halt all (`POST /api/halt`); restart halted pairs (`POST /api/reload`, which re-arms nothing); every builder, and delete one |
 | New pair, Edit | the pair's stanza as a form: tokens and `key_env`, the venue table, the bounds and the breaker, the pricing kind and its fields (`GET /api/kinds`), the guards, `allow_symbol_mismatch` |
 | New builder | `name`, `endpoint`, `api_key` and `disable_cross_region` (`POST /api/builders`) |
 | Settings | `target` and `[settings]`, read-only, and which backoffice this page talks to |

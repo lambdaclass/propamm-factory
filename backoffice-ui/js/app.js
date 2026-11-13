@@ -2,7 +2,8 @@
 // written through the backoffice API (api.js). No third-party code runs in the page: Vite
 // only serves these modules in development and bundles them for dist/.
 //
-//   #/                    pairs and builders, with halt, resume, delete, halt all, reload
+//   #/                    pairs and builders, with halt, resume, re-arm, delete, halt all,
+//                         reload
 //   #/pairs/new           a new pair
 //   #/pairs/edit/<key>    one pair's stanza
 //   #/builders/new        a new builder
@@ -129,6 +130,22 @@ function pairRow(view, refresh) {
             refresh,
           ),
       }, "Halt");
+  // The one way back for a pair its circuit breaker halted: no reload, resume or edit
+  // re-arms it (audit F-17). The answer names the price the restarted lane now trusts.
+  const rearm =
+    status === "breaker_tripped" &&
+    h("button", {
+      type: "button",
+      title: "Restarts this pair's lane, which takes the price it finds now as its reference.",
+      onclick: (e) =>
+        act(
+          e.currentTarget,
+          `Re-arm ${key}? Its circuit breaker tripped. Re-arming restarts it, and it trusts the ` +
+            "price it finds now as its reference: check the feed first.",
+          () => api.rearm(key),
+          refresh,
+        ),
+    }, "Re-arm");
   return h("tr", {},
     h("td", { class: "mono" },
       key,
@@ -144,6 +161,7 @@ function pairRow(view, refresh) {
     h("td", {}, val(pair.max_deviation)),
     h("td", { class: "rowactions" },
       h("a", { class: "btn", href: `#/pairs/edit/${encodeURIComponent(key)}` }, "Edit"),
+      rearm,
       toggle,
       h("button", {
         type: "button",
@@ -246,7 +264,8 @@ async function overview(root) {
         type: "button",
         class: "primary",
         title:
-          "Resumes the pairs halted from here and re-arms tripped breakers. A pair halted with a " +
+          "Resumes the pairs halted from here and starts any pair that is not running. It re-arms " +
+          "no tripped breaker: that is each pair's own Re-arm. A pair halted with a " +
           "reason (a binary's kill switch) resumes only from its own row.",
         onclick: (e) => act(e.currentTarget, null, api.reload, refreshAll),
       }, "Restart halted pairs"),
