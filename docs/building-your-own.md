@@ -131,10 +131,12 @@ What to know:
   source, 0 once a reload rebuilds the lane, re-armed or not, and gone with the lane), and
   the watchdog's notice
   names it too.
-  A kill switch is therefore never a trip: "stop until I say so" is `halted = true` in the
-  file, which a reload does not undo, and `UpdaterHandle::halt` is how a binary writes it
-  (with a `halt_reason` the backoffice shows and the reload logs). A panic on the price path
-  now trips the lane instead of restarting the loop: buggy code gets a human, not a retry.
+  A kill switch is therefore never a trip: "stop until I say so" is `halted = true` with a
+  `halt_reason` beside it in the file, which a reload does not undo (the backoffice's
+  `POST /api/reload` resumes only pairs halted without a reason), and `UpdaterHandle::halt`
+  is how a binary writes it (with the `halt_reason` the backoffice API shows and the reload
+  logs). A panic on the price path now trips the lane instead of restarting the loop: buggy
+  code gets a human, not a retry.
 - **What the run watches.** `quote_updater_guards{pair,kind}` is 1 per registered guard a
   pair runs, and NaN once it no longer does (its stanza removed, or the lane);
   `quote_updater_extension_duration_seconds{pair,kind}` times every call into a
@@ -185,16 +187,19 @@ What to know:
   `Updater::builder().run(args).await`, which returns an `Outcome` instead of exiting, and use
   `shutdown_on(future)` to stop it your way. A binary with other work to do meanwhile calls
   `start(args)` instead: it spawns the run on the current runtime and hands back an
-  `UpdaterHandle` whose `reload()` re-reads the file and answers with the reload's summary
-  or its rejection (exactly what SIGHUP and the backoffice get), whose `shutdown()` stops
-  it the graceful way, and whose `wait()` returns the `Outcome`. Ctrl-c is the caller's to
-  wire to `shutdown()` on that path, as it is with `shutdown_on`. The handle's
-  `halt(tokens, reason)` and `resume(tokens)` are a kill switch: a halt is written to the
-  config file as `halted = true` with `halt_reason` beside it and applied by a reload, so
-  no later reload undoes it and it survives a restart (a `Latch` trip is re-armed by the
-  next reload, so a kill switch is never built on one); the file is rewritten in full in
-  the backoffice's canonical form, so comments in it are not kept. Both are serialized with the
-  backoffice's edits of the same file, and both are refused in `--mode node`. `--help` and a usage error come
+  `UpdaterHandle` whose `reload()` converges the running pairs onto the run's config as it
+  is (the one read from the file at start, with every change made since through the
+  backoffice or the handle; the file is not read again) and answers with the reload's
+  summary or its rejection (exactly what the backoffice's `POST /api/reload` gets), whose
+  `shutdown()` stops it the graceful way, and whose `wait()` returns the `Outcome`. Ctrl-c
+  is the caller's to wire to `shutdown()` on that path, as it is with `shutdown_on`. The handle's
+  `halt(tokens, reason)` and `resume(tokens)` are a kill switch: a halt is made the way a
+  backoffice change is, written to the config file as `halted = true` with `halt_reason`
+  beside it and applied at once, so no later reload undoes it and it survives a restart (a
+  `Latch` trip is re-armed by the next reload, so a kill switch is never built on one); the
+  file is rewritten in full in the backoffice's canonical form, so comments in it are not
+  kept. Both are serialized with the backoffice's changes to the same config, and both are
+  refused in `--mode node`. `--help` and a usage error come
   back from `from_env` as a `clap::Error` to `print()` and exit with its code (0 for help),
   not to propagate with `?`: the doc example on `UpdaterBuilder::run` is the whole pattern.
   A binary with flags of its own puts `#[command(flatten)] updater: Args` in its clap
@@ -202,8 +207,6 @@ What to know:
   hands `cli.updater` to `run`: precedence and the blank-variable rule hold on that path
   too, because `Args` records what was given inside clap's own parse. `Args::config_path()`
   is the one setting read back, for a file of the binary's own beside the updater's.
-  `systemd_unit("name")` puts your unit into the operator hints (how to reload after a
-  halt, how to restart after a settings change); without it they say `SIGHUP`.
   Logs are `tracing` events: `run_from_env()` installs `quote_updater::output::layer_for(..)`
   for this crate's lines and the targets named with `log_target`; a binary with a
   subscriber of its own adds `output::layer()` (or `layer_for`) to a registry-based

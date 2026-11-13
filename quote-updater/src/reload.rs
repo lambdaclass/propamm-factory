@@ -178,7 +178,7 @@ mod tests {
         );
     }
 
-    /// The rule that makes `systemctl --user reload` the way a halted pair comes back:
+    /// The rule that makes a reload (`POST /api/reload`) the way a halted pair comes back:
     /// nothing in the file changed, and the lane is still restarted.
     #[test]
     fn a_halted_pair_is_restarted_even_though_its_stanza_is_identical() {

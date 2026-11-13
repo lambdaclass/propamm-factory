@@ -123,11 +123,13 @@ Edit the three files:
     For example `UPDATER_KEY_WETH_USDC=0x...` and `UPDATER_KEY_USDC_USDT=0x...`.
   - `POSTGRES_PASSWORD`: password for the Postgres the updater records into. Any string.
   - `GRAFANA_ADMIN_PASSWORD`: password for Grafana's `admin` user.
-  - `BACKOFFICE_BIND` and `GRAFANA_BIND`: the IP of this server the backoffice (port 8088)
+  - `BACKOFFICE_BIND` and `GRAFANA_BIND`: the IP of this server the backoffice API (port 8088)
     and Grafana (port 3000) listen on. Neither has a login, so use a private IP such as the
     server's tailnet address. `127.0.0.1` keeps them reachable only from the server itself.
+  - `BACKOFFICE_TLS_CERT` and `BACKOFFICE_TLS_KEY`: optional, to serve the backoffice over
+    HTTPS with a certificate from `tailscale cert`; see step 7.
 - `config/config.toml`: the PropAMM address, the builders with their API keys, and the
-  pairs. Pairs can also be added later from the backoffice.
+  pairs. Pairs can also be added later through the backoffice API.
 - `alertmanager/slack-webhook`: the Slack webhook URL alerts go to.
 
 ## 6. Start it
@@ -141,9 +143,32 @@ docker compose up -d
 `--check` connects to the chain and reports anything wrong (a wallet not authorized or
 without ETH, a pair the contract doesn't have, a typo in the config).
 
-## 7. Inspect Grafana and the backoffice to manage updater/pair settings 
+## 7. Inspect Grafana, and manage pairs through the backoffice API
 
-Open `http://<IP from .env>:8088` to go into the backoffice and change pair settings, pair curves, etc.
+The backoffice is a JSON API at `http://<IP from .env>:8088/api/` (it serves no pages).
+Through it you add, change, halt and remove pairs and add or remove builders; each change is
+written to `config/config.toml` and applied without a restart. [manual.md](manual.md), "The
+backoffice", lists its routes. For example, to list the pairs and what each is doing:
+
+```bash
+curl http://<IP from .env>:8088/api/pairs
+```
+
+**HTTPS.** The backoffice is plain HTTP unless it is given a certificate. To serve it over
+HTTPS (which a front end served over HTTPS needs in order to call it), turn on HTTPS
+Certificates for the tailnet, write this host's certificate into `deploy/tls` with `tailscale
+cert`, and set `BACKOFFICE_TLS_CERT=/tls/backoffice.crt`,
+`BACKOFFICE_TLS_KEY=/tls/backoffice.key` and `BACKOFFICE_HOSTS=pusher.your-tailnet.ts.net`
+(the name the backoffice answers to besides its IP) in `.env`; then `docker compose up -d
+updater`, and reach it by that name, `https://pusher.your-tailnet.ts.net:8088/api/`. Renewing
+the certificate needs no restart. The steps, the renewal cron line and what can go wrong are
+in [`deploy/README.md`](../deploy/README.md), "HTTPS for the backoffice".
+
+`target` and `[settings]` are read once at start and only shown by the API: to change one,
+edit `config/config.toml` by hand and `docker compose restart updater` (changes made through
+the API in the meantime keep the edit). Pairs and builders are the other way round: change
+them through the API, since a hand edit of them waits for a restart and the next change made
+through the API overwrites it.
 
 If you add a new pair (and thus a new updater), the new updater key goes in `.env` first, then `docker compose up -d` so the updater picks it up.
 
@@ -197,6 +222,6 @@ pointing back at it, paused so nothing trades in between:
 ## Next steps
 
 The pairs quote with the pricing models the library ships. To tune their settings, change
-them from the backoffice. To change the pricing itself, write your own model or adjust the
+them through the backoffice API. To change the pricing itself, write your own model or adjust the
 example one: [pricing.md](pricing.md) covers what the shipped models do, how to write one,
 and what the library gives you to do it.

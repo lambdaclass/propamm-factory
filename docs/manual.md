@@ -156,20 +156,20 @@ and `quote_updater_vault_value_usd`). A paid-plan API key in `COINGECKO_API_KEY`
 requests to its paid API (`pro-api.coingecko.com`); once a minute is about 43,000 calls a
 month. `[settings.endpoints] coingecko` points them somewhere else, for a mock.
 
-You do not have to know how each venue spells a market. On the backoffice's pair form,
-once both token addresses are in, the venue table fills itself: the updater reads each
-token's `symbol()` on chain (a wrapped token is read as its underlying, `WETH` as `ETH`),
-asks every exchange for its own list of markets, and takes the tradable market whose base
-and quote are exactly those two names, with the name the exchange gives it. The one
-fallback: a pair quoted in USDC or USDT that an exchange does not list exactly takes
-whichever of that exchange's USDC, USDT and USD markets trades the most, with a note. Any
-other quote matches exactly or the row stays empty.
-Weights are suggested from each market's 24h volume (largest 10), and the three busiest are
-ticked. The ticked venues are then dialled live, with the
-same feed code the updater runs, and each one's mid plus the weighted composite stream into
-the table, so what would be published is on screen before Save. Nothing is saved until
-Save. A row the lookup could not fill is filled by hand, and its live price shows whether
-the symbol typed works.
+You do not have to know how each venue spells a market. The backoffice's lookup
+(`GET /api/lookup?token0=<address>&token1=<address>`) finds it from the two token
+addresses: the updater reads each token's `symbol()` on chain (a wrapped token is read as
+its underlying, `WETH` as `ETH`), asks every exchange for its own list of markets, and takes
+the tradable market whose base and quote are exactly those two names, with the name the
+exchange gives it. The one fallback: a pair quoted in USDC or USDT that an exchange does not
+list exactly takes whichever of that exchange's USDC, USDT and USD markets trades the most,
+with a note. Any other quote matches exactly or that venue has no suggestion.
+Weights are suggested from each market's 24h volume (largest 10). The preview
+(`GET /api/preview`, a websocket) then dials the venues you choose live, with the same feed
+code the updater runs, and streams each one's mid plus the weighted composite, so what would
+be published can be seen before the pair is added. Neither saves anything. A venue the
+lookup could not fill is filled by hand, and its live price in the preview shows whether
+the symbol typed works. [The backoffice](#the-backoffice) has the preview's details.
 
 `--check` dials every source and prints one line per venue under a multi-source row, so a
 venue with a wrong symbol, or one disagreeing with the others, shows up before anything is
@@ -242,8 +242,8 @@ pair whose venues are only those is refused the key, since it would do nothing. 
 itself falling behind is therefore still not seen by anything in the updater.
 
 1500 ms is a sensible value on any pair: it is a statement about the network and the
-exchange's queue, not about the token. The backoffice's pair form has the field; blank
-clears it, and a form loaded before the field existed keeps whatever the file sets.
+exchange's queue, not about the token. Through the backoffice it is a key of the pair's
+JSON like any other, and a `PUT` of the pair without it clears it.
 Rolling back to a version without this key: the config parser refuses keys it does not
 know, so remove `max_source_lag_ms` from every pair before downgrading.
 
@@ -460,30 +460,62 @@ report prints on every normal run too, before the first update is sent.
 
 ### Reloading the config
 
-The config file is not only the updater's startup input, it is the desired state of a
-running one. Send a SIGHUP and the updater re-reads it and converges the pairs it is running
-onto it:
+The config file is the updater's startup input; the desired state of a running one is held
+in memory. At start the updater reads `config.toml` once into a shared config, and from then
+on the config changes only through the [backoffice](#the-backoffice) API or a binary's
+`UpdaterHandle` (`halt` and `resume`). Each change is applied to a copy, the copy is written
+to `config.toml` (0600, rewritten in full, so comments in it are not kept), the updater
+converges the pairs it is running onto it, and it is kept only if that is accepted. A
+rejected change changes nothing, and the file is put back byte for byte; one that applies in
+part is kept (see [The backoffice](#the-backoffice)). So the pairs and builders in memory and
+in the file both describe what is running.
+
+A hand edit of `config.toml` takes effect only at the next start. What happens to it before
+then depends on what it changed. A write keeps the `target` and `[settings]` the file holds,
+so a hand edit of those, waiting for its restart, survives any change made through the API
+meanwhile. A hand edit of `[[pairs]]` or `[[builder]]` does not: the next change made through
+the API overwrites it, so change those through the API. A file that no longer parses has no
+`target` or `[settings]` to keep, so a change rewrites it whole from the running config and
+its answer says so. Check a hand edit before restarting onto it:
 
 ```bash
 $EDITOR config.toml
 my-quote-updater --config config.toml --check   # validate first; sends nothing
-kill -HUP $(pidof my-quote-updater)                         # or: kill -HUP $(pidof quote-updater)
 ```
 
-`target` and the `[settings]` table are read once at startup, and a reload that finds
-either changed is refused with the key named, rather than applied to the file and not the
-process.
+SIGHUP does not reload anything. The updater ignores it, in every mode, and logs where
+changes go instead:
+
+```
+SIGHUP ignored: config.toml is read once, at start; change the pairs and builders through the backoffice API, and reload with POST /api/reload
+```
+
+So `kill -HUP`, `systemctl reload` or a unit that still declares `ExecReload=` does nothing,
+rather than terminating the process without withdrawing its quotes; drop `ExecReload=` from a
+unit that has it.
+
+A reload is the convergence on its own, with no change behind it: `POST /api/reload` on the
+backoffice, or `UpdaterHandle::reload()` in a binary that `start`ed the updater. It converges
+the running pairs onto the config as it is, which re-arms a lane its circuit breaker halted
+and retries one whose feed never came up. Neither one re-reads the file. A run with neither
+a backoffice nor a handle cannot reload: a tripped pair there needs a restart, which clears
+every lane's breaker.
+
+`target` and the `[settings]` table are read once at startup and cannot change while the
+updater runs: the API only shows them (`GET /api/settings`, as read at start, not a hand
+edit waiting for its restart), so changing one is an edit of the file and a restart.
 
 A changed `[[builder]]` list *is* applied, but it restarts every lane rather than only the
 ones whose stanza moved: each builder connection is opened inside a pair's own quoting
-loop, so a lane cannot pick up a new list without being rebuilt. The reload dials the new
-list first and refuses the whole thing, touching nothing, unless at least one of them
+loop, so a lane cannot pick up a new list without being rebuilt. The updater dials the new
+list first and refuses the whole change, touching nothing, unless at least one of them
 connects. A lane opens its builders after it starts, unlike its feed, so without that check
 a typo would take every lane down at once.
 
-It diffs the file against what is running, per lane, and touches only what differs:
+Every change and every reload diffs the config against what is running, per lane, and
+touches only what differs:
 
-| In the file | Running | What happens |
+| In the config | Running | What happens |
 |---|---|---|
 | unchanged | quoting | **nothing** — no withdraw, no reconnect, no gap |
 | changed | quoting | restarted from the new stanza |
@@ -491,8 +523,8 @@ It diffs the file against what is running, per lane, and touches only what diffe
 | absent | quoting | quote withdrawn at every builder, then stopped |
 | new | — | started |
 
-Two properties make it safe to run casually. A reload that fails to validate applies
-**nothing** — a bad parse, a `target` that moved, a duplicate signer, a failed preflight all
+Two properties make it safe to run casually. A change that fails to validate applies
+**nothing** — a stanza that does not validate, a duplicate signer, a failed preflight all
 leave every pair exactly as it was. And a lane that is being started or restarted has its new
 feed dialled *before* the old one is stopped, so a stanza that turns out to be wrong costs
 that lane nothing: it keeps quoting on the config it already had, and only it is reported as
@@ -500,94 +532,271 @@ failed. Everything else is all-or-nothing; the feed dial is the one thing that c
 known without doing it.
 
 This is also how a pair halted by its circuit breaker comes back, with no edit needed — a
-halted lane is precisely a lane the file says should be quoting and which is not. The line it
-prints names what it cleared:
+halted lane is precisely a lane the config says should be quoting and which is not. The line
+it prints names what it cleared:
 
 ```
 reload: [WETH/USDC] re-armed, clearing the halt it took 14m ago on a 4.10% move from 0.000251 to 0.000261 (limit 2.00%)
 ```
 
 A reload re-arms **every** halted lane, including one you were not thinking about when you
-ran it. That is the cost of having a single verb rather than a separate "resume this pair",
-and why each one is named individually rather than folded into a count.
+ran it, and so does any change made through the backoffice, since each one converges too.
+That is the cost of having a single verb rather than a separate "resume this pair", and why
+each one is named individually rather than folded into a count.
 
-Some things still need a restart, and the updater refuses the reload and says which:
+Some things need a restart, because nothing changes them while the updater runs:
 
 - **`target`** — every lane's identity is derived from it.
 - **Command-line and environment settings** — `--mode`, `--rpc-url`, `--registry`,
   `--price-decimals`, `--requote-ms`.
 - **A newly added `UPDATER_KEY_*`** — systemd reads `EnvironmentFile` once, at exec, so a key
-  written into `.env` after the process started is not in its environment. Adding a pair
-  whose key was already there works.
+  written into `.env` after the process started is not in its environment, and a pair naming
+  it is refused. Adding a pair whose key was already there works.
 - **The `[settings]` table.** Every key in it is consumed once, at startup: the RPC client
   is built from `rpc_url`, the exporter bound to `metrics_addr`, the requote timer owned by
   each pair's loop.
 
 ### The backoffice
 
-Set `[settings] backoffice_addr` and the updater serves a small web page for the changes an
-operator actually makes: add or remove a pair, choose which venues its mid is averaged over
-and with what weights, edit a band or a `delta`, add or remove a builder, repoint a venue's
-endpoint, halt a pair (or all of them), and resume a halted pair. It is server-rendered HTML with
-plain form posts, and every change does exactly what an operator would have done over SSH:
-rewrite `config.toml` and reload. The one piece of JavaScript is on the pair form: it looks up
-which venues list a pair (`GET /pairs/lookup`, which asks each exchange) and shows each ticked
-venue's live price (a websocket to `/pairs/preview`). The form still works without it.
-
-The live prices run over one websocket per open page. Ticking a venue tells the server to
-connect to it, unticking tells it to disconnect that venue, and a new weight reconnects
-nothing, so a change never touches the other venues. The preview connects to the venues from
-this host, the same address the live feeds use, and a venue can block an address that opens
-too many connections, so it is kept small: at most 4 pages open at once, and each venue
-connected at most once every 2 seconds per page however fast the page changes it. The socket
-only opens from the backoffice's own page (it checks the browser's `Origin`), so another site
-cannot use a logged-in operator's session to open it.
+Set `[settings] backoffice_addr`, or `--backoffice-ip` and `--backoffice-port`, and the
+updater serves the backoffice: a JSON API, under
+`/api`, for the changes an operator actually makes: add or remove a pair, choose which venues
+its mid is averaged over and with what weights, edit a band or a `delta`, add or remove a
+builder, halt a pair (or all of them), resume a halted pair, and reload. It serves no pages
+(`GET /` answers 404 with an `{"error": ...}`), so whatever front end an operator uses, or
+`curl`, talks to it. Every change goes through the shared config described in
+[Reloading the config](#reloading-the-config): written to `config.toml`, then converged onto.
 
 ```toml
 [settings]
 backoffice_addr = "100.64.1.2:8088"   # this host's tailnet address
 ```
 
+or, on the command line (or as `BACKOFFICE_IP` and `BACKOFFICE_PORT`):
+
+```bash
+quote-updater --config config.toml --backoffice-ip 100.64.1.2 --backoffice-port 8088
+```
+
+Each flag overrides its half of `backoffice_addr`, as every flag overrides its `[settings]`
+key: `--backoffice-port 9000` against the file above serves `100.64.1.2:9000`. Either flag
+on its own turns the backoffice on; the half nothing gives is `127.0.0.1` for the address
+and `8088` for the port.
+
+**HTTPS.** Give it a certificate and its key and the backoffice is served over HTTPS only
+(and the preview over `wss://`); without them it is plain HTTP:
+
+```bash
+tailscale cert pusher.your-tailnet.ts.net    # writes pusher.your-tailnet.ts.net.crt and .key
+quote-updater --config config.toml --backoffice-ip 100.64.1.2 \
+  --backoffice-host pusher.your-tailnet.ts.net \
+  --backoffice-tls-cert pusher.your-tailnet.ts.net.crt \
+  --backoffice-tls-key pusher.your-tailnet.ts.net.key
+```
+
+Over HTTPS it is reached by the name its certificate names, so that name is listed with
+`--backoffice-host` (below); reached by its IP the certificate does not match, and a browser
+or `curl` refuses it.
+
+`--backoffice-tls-cert` (`BACKOFFICE_TLS_CERT`) is a PEM file holding the certificate and any
+intermediates, the server's own first; `--backoffice-tls-key` (`BACKOFFICE_TLS_KEY`) is its
+private key, one unencrypted PEM key in PKCS#8 (`BEGIN PRIVATE KEY`), SEC1 (`BEGIN EC PRIVATE
+KEY`, what `tailscale cert` writes) or PKCS#1 (`BEGIN RSA PRIVATE KEY`). The two go together:
+one without the other refuses the run, as do a file that does not read, a chain with no
+certificate, an encrypted key, or a key that is not the certificate's, each at startup
+(`--check` included) and naming its file. TLS 1.2 and 1.3, no client certificates. They are
+flags (and variables) only, not `[settings]` keys.
+
+A renewal needs no restart: the two files are looked at on every new connection, and when
+either has changed (its modification time or its size) they are read again. A pair that does
+not load, such as the moment between `tailscale cert` writing the certificate and writing its
+key, is warned about once and the certificate loaded before goes on being served until the
+files change again. A connection already open keeps the certificate it was made with. The
+`https://` address is the one to reach it by, and the one the halt notice names (by the first
+`--backoffice-host`); a client speaking plain HTTP to it gets its connection dropped, and the
+journal says why.
+
+| Route | What it does |
+|---|---|
+| `GET /api/pairs` | every pair, with what the updater is doing with it |
+| `POST /api/pairs` | adds a pair (its `[[pairs]]` stanza, as JSON) |
+| `GET /api/pairs/{key_env}` | one pair |
+| `PUT /api/pairs/{key_env}` | replaces a pair's stanza |
+| `DELETE /api/pairs/{key_env}` | removes a pair |
+| `POST /api/pairs/{key_env}/halt` | stops a pair quoting, keeping it |
+| `POST /api/pairs/{key_env}/resume` | clears a pair's halt |
+| `POST /api/halt` | halts every pair |
+| `POST /api/reload` | resumes the pairs halted through the API, then converges |
+| `GET /api/builders` | every builder, never with its `api_key` |
+| `POST /api/builders` | adds a builder |
+| `DELETE /api/builders/{name}` | removes a builder |
+| `GET /api/settings` | `config_path`, `target` and `[settings]`, read-only |
+| `GET /api/kinds` | the registered pricing kinds and their fields |
+| `GET /api/venues` | the venues a pair can read |
+| `GET /api/lookup?token0=&token1=` | which exchanges list a token pair; saves nothing |
+| `GET /api/preview?token0=&token1=` | a websocket of live venue mids; saves nothing |
+
+**Pairs.** `GET /api/pairs` answers each pair as `{"pair": ..., "status": ..., "pricing":
+...}`: `pair` is its `[[pairs]]` stanza as JSON, `status` is `live`, `halted`,
+`breaker_tripped` or `not_running`, and `pricing` is its kind's one-line summary. The body of
+a `POST /api/pairs` is the stanza as JSON, with the same keys as `config.toml`: `tokens`,
+`key_env`, `symbol` or `sources`, `min_sources`, `min_mid`, `max_mid`, `max_deviation`,
+`max_deviation_window`, `max_deviation_window_blocks`, `max_source_lag_ms`,
+`allow_symbol_mismatch`, `pricing` (`{"kind": ..., ...}`) and `guards`. A key it does not
+know is refused by name. A pair is added quoting, so a body with `halted` or `halt_reason` is
+refused, and so is a `key_env` another pair already has (409). A `PUT` takes the `pair` a
+`GET` answered, with the changes made; it replaces the whole stanza, so a key left out is
+cleared. A pair's `key_env` and `tokens` cannot change (a pair on other ones is a `DELETE`
+and a `POST`), and `halted` and `halt_reason` must stay as the `GET` showed them: only halt
+and resume change those.
+
+```bash
+curl -X POST -H 'Content-Type: application/json' http://100.64.1.2:8088/api/pairs -d '{
+  "tokens": ["0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"],
+  "symbol": "ETHUSDC",
+  "key_env": "UPDATER_KEY_WETH_USDC",
+  "min_mid": "0.0001",
+  "max_mid": "0.001",
+  "max_deviation": "0.02",
+  "pricing": {"kind": "feed", "delta": "0.0005"}
+}'
+curl -X POST -H 'Content-Type: application/json' http://100.64.1.2:8088/api/pairs/UPDATER_KEY_WETH_USDC/halt
+curl -X DELETE http://100.64.1.2:8088/api/pairs/UPDATER_KEY_WETH_USDC
+```
+
+**Builders.** `POST /api/builders` takes `{"name", "endpoint", "api_key",
+"disable_cross_region"}` (the last optional), and `GET /api/builders` never answers an
+`api_key`. Adding or removing one restarts every pair onto the new list, and an addition is
+refused if none of the builders would connect.
+
+**Kinds and venues.** `GET /api/kinds` lists each registered pricing kind as `{"kind",
+"help_html", "fields": [{"name", "placeholder", "hint", "number"}]}`, which is what a form for
+a pair's `pricing` table needs. The kinds the library ships read their stanza values as
+strings; a field with `"number": true` is sent as a JSON number. `GET /api/venues` lists each
+venue as `{"venue", "example", "default_endpoint", "polled"}`.
+
+**Answers.** A change that was made answers 2xx (201 for a `POST` that adds a pair or a
+builder) with `{"status": "applied" | "partial", "message": ...}`. `partial` means the change
+is kept and live on the pairs the reload reached, but some pair kept its previous config
+because its feed did not come up. Anything refused answers 4xx with `{"error": ...}` and
+changed nothing: 404 for an unknown pair or builder, 409 for a conflict (a key already taken,
+a pair already halted), 422 for a change that is invalid (a misspelt key included) or that the
+reload rejected, 400 for a body that does not parse as JSON, 415 for a `POST` or `PUT` not
+sent as `Content-Type: application/json`, 403 for a foreign `Origin`. A fault on the
+pusher's side answers 5xx with `{"error": ...}`: 500 when the config file could not be
+written or put back, or the pusher is stopping (the message says whether the file is as it
+was), and 502 when the lookup could not read the token names on chain or ask the exchanges.
+
+A change that has started is finished whether or not its client is still there: hanging up
+mid-change (a `curl` timeout, a closed tab) does not stop it, and the config the API shows
+afterwards is the one that is running.
+
+**Only the names it is served under.** Being on the tailnet is enough to reach the API, and a
+browser on the tailnet sends whatever another site's page tells it to (audit F-02). One way
+in is DNS rebinding: a site points its own domain at this host's address after its page has
+loaded, and to the browser that page and the API are then one origin, so the page can send
+anything and read every answer. What gives it away is the name the request is addressed to.
+So every request, reads included, must carry a `Host` that is an IP address, `localhost`, or
+a name listed with `--backoffice-host` (`BACKOFFICE_HOSTS`, comma-separated) or `[settings]
+backoffice_hosts`; anything else is refused with 403. Reached by IP, as in the example at the
+top, there is nothing to list. Reached by name (the tailnet name its certificate names, or a
+reverse proxy's), list the name alone, without scheme or port:
+
+```toml
+[settings]
+backoffice_addr  = "100.64.1.2:8088"
+backoffice_hosts = ["pusher.your-tailnet.ts.net"]
+```
+
+These are the backoffice's own names, the address requests are sent to. A front end's
+address, where its pages are served from, is an origin, for `--backoffice-cors-origin` below.
+A reverse proxy in front has to pass `Host` and `Origin` through unchanged, as Caddy does.
+
+**Only JSON, and only from origins it knows.** With no login, what the API must not do is
+act on a request an operator's browser sent without the operator meaning it. So every `POST`
+and `PUT` must carry `Content-Type: application/json`, even one with no body (halt, resume,
+reload), and any request but a `GET` whose `Origin` header is neither the API's own address
+nor an origin listed with `--backoffice-cors-origin` is refused with 403. `curl` and scripts
+send no `Origin` and are unaffected:
+
+```bash
+curl -X POST -H 'Content-Type: application/json' http://100.64.1.2:8088/api/reload
+```
+
+**CORS, for a front end on another origin.** A browser lets a page send JSON to another
+origin only after asking that origin, and the API says yes only to the origins listed with
+`--backoffice-cors-origin` (repeat it for more than one, or comma-separate them in
+`BACKOFFICE_CORS_ORIGINS`):
+
+```bash
+quote-updater --config config.toml --backoffice-ip 100.64.1.2 \
+  --backoffice-cors-origin http://100.64.1.2:3000
+```
+
+A page from a listed origin gets its preflight approved for `GET`, `POST`, `PUT` and `DELETE`
+with a `Content-Type` header, can read every answer, and can open the preview; no credentials
+are involved, since there is no login. Every other origin gets no CORS headers, and its
+changes are still refused. An origin is written as the browser sends it, scheme, host and
+port alone (`http://100.64.1.2:3000`, no path), and `*` is refused: it would let a page on any
+site an operator's browser visits drive the API. With none listed there is no CORS at all,
+and a browser front end has to be served under the API's own address, for instance by a
+reverse proxy that serves the UI and proxies `/api`. A front end served over HTTPS can only
+call the API over HTTPS too, whatever CORS says (a browser blocks mixed content): serve the
+backoffice with a certificate (above), and list the front end's `https://` origin.
+
+**The lookup and the preview.** `GET /api/lookup` is the venue lookup described under the
+price sources above; one that cannot be made answers 502 and `{"error": ...}`. The live prices run over one websocket per open preview. The client
+sends `{"type": "set", "venue", "symbol", "weight"}` to connect a venue, or give it a new
+symbol or weight, and `{"type": "remove", "venue"}` to disconnect it; the server sends each
+venue's mid and the composite twice a second. A new weight reconnects nothing, so a change
+never touches the other venues. The preview connects to the venues from this host, the same
+address the live feeds use, and a venue can block an address that opens too many
+connections, so it is kept small: at most 4 previews open at once, and each venue connected
+at most once every 2 seconds per preview however fast the client changes it. The socket also
+refuses an `Origin` that is neither its own address nor a listed one, so another site cannot
+open it from an operator's browser.
+
 **Halting keeps the pair.** Halt sets `halted = true` on the pair in `config.toml`, and the
 updater treats a halted pair as absent: its quote is withdrawn at every builder, as a removal
-would, but the stanza and every setting stay in the file. It stays halted across reloads and
-restarts until someone resumes it, from its row or with Restart halted pairs, which clears
-the `halted` flag of every pair halted from the page along with re-arming pairs stopped on
-their circuit breaker. A halt with a `halt_reason` beside it is left alone by that button: a
-binary's `UpdaterHandle::halt` always writes one (it is that binary's kill switch), and the
-page's own Halt writes none. The banner names each pair it left halted and its reason; only
-that pair's own Resume (or the handle's `resume`) clears it. A halted pair's vault balances
-are still exported.
+would, but the stanza and every setting stay in the file. It stays halted across changes and
+restarts until someone resumes it, with its own `POST /api/pairs/{key_env}/resume` or with
+`POST /api/reload`, which clears the `halted` flag of every pair halted through the API along
+with re-arming pairs stopped on their circuit breaker. A halt with a `halt_reason` beside it
+is left alone by that reload: a binary's `UpdaterHandle::halt` always writes one (it is that
+binary's kill switch), and the API's own halt writes none. The reload's answer names each
+pair it left halted and its reason; only that pair's own resume (or the handle's `resume`)
+clears it. A halted pair's vault balances are still exported.
 
-**Every change is write, reload, and revert if refused.** The file is rewritten atomically,
-the service is asked to reload it, and if the reload is rejected the previous file is put
-back before the page answers. So what is on disk always describes what is running, and a
-bad edit costs a rejected reload and nothing else. Without the revert a rejected edit would
-sit in the file until some later, unrelated reload silently applied it. A reload that applies
-only in part (some pair's feed would not come up, so that pair keeps its previous config or
-is not started) is not reverted: it already stopped, started and restarted every other lane
-it reached, a halt among them, and putting the file back would have the next reload undo
-that. The page shows it as an error all the same, saying the file kept the change, and the
-next reload retries the pair that failed.
+**Every change is write, converge, and revert if refused.** The file is rewritten
+atomically, the service converges onto it, and if that is rejected the previous file is put
+back before the API answers. So after every change the pairs and builders on disk describe
+what is running, and a bad change costs a rejected reload and nothing else. Without the
+revert a rejected change would sit in the file until the next start applied it. A change
+that applies only in part (some pair's feed would not come up, so that pair keeps its
+previous config or is not started) is not reverted: it already stopped, started and restarted every other lane it reached, a halt
+among them, and putting the config back would have the next reload undo that. The API
+answers it with `"status": "partial"`, saying the change was kept, and the next reload
+retries the pair that failed.
 
 **Builder mode only.** The reload it drives belongs to the per-lane service that builder
 mode runs; node mode pushes `updateState` on a timer and has no convergence to trigger. A
-`backoffice_addr` under `--mode node` is refused at startup rather than bound and left
-inert, so trying it locally means the mock-builder recipe below, not the anvil `make`
+backoffice (`backoffice_addr`, `--backoffice-ip` or `--backoffice-port`) under `--mode node`
+is refused at startup rather than bound and left inert, so trying it locally means the mock-builder recipe below, not the anvil `make`
 targets.
 
 **Access control is the tailnet.** There is no login. Binding an unspecified address
-(`0.0.0.0`) is refused at startup rather than warned about: unlike `/metrics`, which only
-leaks, this page writes, and anything that can reach it can repoint a pair's price source
+(`0.0.0.0` or `::`, from the file or `--backoffice-ip`) is refused at startup rather than
+warned about: unlike `/metrics`, which only
+leaks, this API writes, and anything that can reach it can repoint a pair's price source
 at a market of its choosing. Every change is logged with the peer that made it.
 
 A server with a backoffice may start with no pairs and no builders at all: `pairs = []`
 plus a `backoffice_addr` is a complete config, and everything else is added through the
-page. That is what lets a deploy seed a new server from two values (a target and an RPC
+API. That is what lets a deploy seed a new server from two values (a target and an RPC
 endpoint) instead of carrying its whole configuration as a secret.
 That is refused without one, because a updater quoting nothing is normally a config that
 failed to say what it meant, but on a server that is about to be configured through the
-browser it is just the first state, and refusing it would leave nowhere to do the
+API it is just the first state, and refusing it would leave nowhere to do the
 configuring.
 
 One thing it deliberately cannot do: a **new** `UPDATER_KEY_*` has to be in the process
@@ -595,13 +804,14 @@ environment already, since systemd reads `EnvironmentFile` once at exec, so addi
 with a brand new key is a redeploy and a restart. Builder changes do apply immediately,
 at the cost of restarting every lane onto the new list.
 
-A reload that does not fully take is worth noticing, because nothing else in the process
-says so — the pairs stay healthy and every other series reads exactly as before. Both ways it
-can happen are counted by `quote_updater_config_reloads_total` and alerted on:
+A change or reload that does not fully take is worth noticing, because nothing else in the
+process's health says so — the pairs stay healthy and every other series reads exactly as
+before. Both ways it can happen are counted by `quote_updater_config_reloads_total` and
+alerted on:
 
-- `result="rejected"` — the file did not validate, so nothing was touched. Every lane is on
-  the previous config, together. `PusherConfigReloadFailed`.
-- `result="partial"` — the file was applied, but a lane's feed would not come up, so that
+- `result="rejected"` — the change did not validate, so nothing was touched and the file
+  was put back. Every lane is on the previous config, together. `PusherConfigReloadFailed`.
+- `result="partial"` — the change was applied, but a lane's feed would not come up, so that
   lane is still on its old stanza (or was never started) while the rest moved. A mixture,
   which is the harder of the two to reason about. `PusherConfigReloadPartial`.
 
@@ -615,10 +825,6 @@ longer exists. Its counters stop where they are, which `rate()` already reads as
 
 Ctrl-c reaches every lane directly, including while a reload is in flight, so a shutdown
 during one still withdraws at every builder rather than being cut off at `TimeoutStopSec`.
-
-SIGHUP is handled in every mode. In `--mode node` and under `--once` there is no supervised
-pair set to converge, so the signal is acknowledged on stderr and otherwise ignored — it
-never terminates the process, which is what an unhandled SIGHUP would do.
 
 ### Configuring it with a `.env`
 
@@ -761,8 +967,8 @@ it holds is the price being judged. `min_mid`/`max_mid` is what covers a cold st
 
 A reload re-anchors the window for a pair whose stanza changed or that was halted. That is
 intended: resuming a halted pair means an operator has looked at the feed and accepted the
-price it resumes at. A `builders.toml` edit re-anchors every pair's window at once, though,
-since a changed builder list restarts every lane regardless of its own stanza.
+price it resumes at. A builder change re-anchors every pair's window at once, though, since
+a changed builder list restarts every lane regardless of its own stanza.
 
 The comparison is **tick to tick** — each print against the one before it — because what
 this catches is a *discontinuity*, which is what a bad print or a flash move looks like. It
@@ -793,7 +999,8 @@ slipping past a guard that only ever saw in-band prices and quietly resuming on 
 good one.
 
 **It does not come back on its own.** A tripped pair stays down until an operator has
-looked at the feed and reloaded the config (`kill -HUP $(pidof my-quote-updater)`; see
+looked at the feed and reloaded (`POST /api/reload` on the backoffice, or
+`UpdaterHandle::reload()` in a binary that `start`ed the updater; see
 [Reloading the config](#reloading-the-config)). That is deliberate: a breaker that re-arms
 itself decides, with no more information than it had when it tripped, that whatever caused a
 violent move has passed — and the cost of being wrong is quoting a bad price to every
@@ -804,7 +1011,8 @@ exactly what it means.
 What a reload changed is only *how* the human acts, not whether they have to. Recovery used
 to mean restarting the process, which brought the lane back by throwing away every other
 lane's breaker reference and stopping their quoting for the restart. A reload converges the
-one lane instead.
+one lane instead. A run with neither a backoffice nor a handle cannot reload, so there a
+tripped pair still needs that restart, which clears every lane's breaker.
 
 The breaker is per pair in both settings and state: each lane carries its own threshold, and
 a trip halts only that lane while every other pair keeps quoting at cadence.  A pair that
@@ -817,7 +1025,7 @@ prints one ack column per configured builder):
 [USDC/USDT] circuit breaker tripped: mid moved 4.12% > 2.00% (previous 0.9998, new 1.041)
 [USDC/USDT] quoting block 19999999: withdrawn (price deviation 4.12% exceeds the 2.00% limit)
 [USDC/USDT]   mock-a withdrawn
-[USDC/USDT] halted; this pair will not quote again until you reload (kill -HUP $(pidof my-quote-updater)) once the feed is trusted
+[USDC/USDT] halted; this pair will not quote again until a reload re-arms it once the feed is trusted (the halt notice says how this run reloads)
 ```
 
 The trip line and the halt line go to **stderr**, like every other alarm here; the block
@@ -835,15 +1043,20 @@ minute for as long as the process is up — one line at the trip and then silenc
 halted lane goes unnoticed for a day:
 
 ```
-1/3 pair(s) halted on their circuit breaker, 2 still quoting. Check that feed and reload once you trust it (kill -HUP $(pidof my-quote-updater))
+1/3 pair(s) halted on their circuit breaker, 2 still quoting. Check that feed and reload once you trust it (POST http://100.64.1.2:8088/api/reload)
 ```
+
+The part in brackets is how this run reloads: the backoffice's `POST .../api/reload`, or
+`UpdaterHandle::reload` for a binary that `start`ed the updater without one. A run with
+neither says it has no backoffice to reload through, and that setting
+`[settings] backoffice_addr` takes a restart.
 
 If nothing is left quoting, the line says so instead, and the updater **stays running**:
 
 ```
 nothing is quoting: 1/3 pair(s) halted on their circuit breaker, 2 waiting to restart. NOT
 exiting, because a restart would clear the breakers; check those feeds and reload once you
-trust them (kill -HUP $(pidof my-quote-updater))
+trust them (POST http://100.64.1.2:8088/api/reload)
 ```
 
 Staying up is the point, and doubly so now: exiting would be read by systemd, k8s or a shell
@@ -857,7 +1070,7 @@ them back.
 The same now goes for an outage with no halt in it, which used to exit non-zero so a
 supervisor would restart the process. It does not any more. The cause is usually the
 config, a restart reads that same config and fails the same way, and on a server run from
-the backoffice the exit takes down the page that could have fixed it. `PusherNothingQuoting`
+the backoffice the exit takes down the API that could have fixed it. `PusherNothingQuoting`
 already pages on exactly this condition, so the alerting keeps doing the useful half and the
 process stays up and says so.
 
@@ -982,9 +1195,10 @@ halted updater is a live process that nothing will restart and no liveness probe
 flag. `quote_updater_pairs_halted` and `quote_updater_breaker_tripped` are what say so.
 
 `quote_updater_config_reloads_total{result="rejected"}` is the same shape of problem one
-level up: a reload that failed to validate changed nothing, so every pair is quoting happily
-on the previous config while the config file says something else. No other series moves, because
-nothing is unhealthy — the gap is only between the file and what is running.
+level up: a change or reload that failed to validate changed nothing (and the file was put
+back), so every pair is quoting happily on the previous config while whoever made the change
+may believe it took. No other series moves, because nothing is unhealthy — the gap is only
+between what was asked for and what is running.
 `quote_updater_config_generation` counts the reloads that did apply.
 
 The alert rules for all of this live in `deploy/alerts/` (their thresholds are pinned to the same
@@ -1191,5 +1405,6 @@ UPDATER_KEY_WETH_USDC=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7b
 
 The pair quotes for a few seconds, then the log reports the trip, the mock prints a
 `CANCEL` line, and the run keeps going with nothing to quote until ctrl-c. Resuming it is a
-reload (`SIGHUP`, or a save from the backoffice) once the feed is trusted again.
+reload (`POST /api/reload`) once the feed is trusted again; this config sets no
+`backoffice_addr`, so here that is a restart instead.
 

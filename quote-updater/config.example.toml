@@ -15,29 +15,36 @@
 # drive everything from the command line against a file with no settings table at all,
 # while on a server the unit passes only `--config` and the file decides.
 #
-# This file is the desired state of a running updater, not just its startup input. Send it a
-# SIGHUP (`systemctl --user reload <unit>`) and it re-reads this file and converges:
-# a pair added here is started, one deleted is withdrawn at every builder and stopped, one
-# whose stanza changed is restarted from it, and a pair you did not touch keeps quoting
-# throughout. A reload that fails to validate changes nothing at all, so run `--check`
-# against the edited file first.
+# The updater reads this file once, at start. From then on its configuration changes only
+# through the backoffice API (`backoffice_addr` below) or a binary's `UpdaterHandle`, and
+# every such change is written back here and converged onto: a pair added is started, one
+# removed is withdrawn at every builder and stopped, one whose stanza changed is restarted
+# from it, and a pair nobody touched keeps quoting throughout. A change the updater rejects
+# changes nothing at all, and this file is put back exactly as it was. Each write rewrites
+# the file in full, so comments in it (these included) are not kept. A hand edit of this
+# file takes effect only at the next start; run `--check` against it first. A write keeps
+# the `target` and [settings] this file holds, so a hand edit of those waiting for a restart
+# survives changes made through the API meanwhile, but a hand edit of [[pairs]] or
+# [[builder]] is overwritten by the next one: change those through the API. SIGHUP does not
+# reload this file: the updater ignores the signal.
 #
-# A reload also brings back a pair halted by its circuit breaker — that lane is exactly a
-# lane this file says should be quoting and which is not. Do it once you trust the feed
-# again; see docs/manual.md, "Circuit breaker".
+# A reload (`POST /api/reload` on the backoffice, or a binary's `UpdaterHandle::reload`)
+# brings back a pair halted by its circuit breaker — that lane is exactly a lane the config
+# says should be quoting and which is not. Do it once you trust the feed again; see
+# docs/manual.md, "Circuit breaker". A run with neither a backoffice nor a handle cannot
+# reload, so a tripped pair there needs a restart, which clears every lane's breaker.
 #
-# It does not bring back a pair with `halted = true`: that one is kept, with every setting,
-# and not run until the flag is cleared (the backoffice's Resume, or a binary's
+# A pair with `halted = true` is kept, with every setting, and not run until the flag is
+# cleared (the backoffice's `POST /api/pairs/<key_env>/resume`, or a binary's
 # `UpdaterHandle::resume`). A binary's `UpdaterHandle::halt` sets the flag with a
-# `halt_reason` beside it, which the backoffice shows and the reload logs. A halt with a
-# reason is a kill switch: the backoffice's "Restart halted pairs" resumes only the pairs
-# halted without one (its own Halt writes none) and names the rest, which only their own
-# Resume clears.
+# `halt_reason` beside it, which the backoffice API shows and the reload logs. A halt with a
+# reason is a kill switch: `POST /api/reload` resumes only the pairs halted without one (the
+# API's own halt writes none) and names the rest, which only their own resume clears.
 #
-# `target` below is NOT reloadable, because every lane's identity is derived from it: the
-# updater refuses the reload and asks for a restart. Neither is a `key_env` naming a variable
-# that was not in the environment when the process started, since systemd reads .env only
-# at exec.
+# `target` below cannot change while the updater runs, because every lane's identity is
+# derived from it: the backoffice API only shows it, so changing it is an edit of this file
+# and a restart (changes made through the API meanwhile keep the edit). Nor can a pair use a `key_env` naming a variable that was not in the
+# environment when the process started, since systemd reads .env only at exec.
 
 # The PropAMM every lane below belongs to. All pairs share one target.
 target = "0x0000000000000000000000000000000000000000"
@@ -46,8 +53,9 @@ target = "0x0000000000000000000000000000000000000000"
 # back to the same default its flag has; a key given here is overridden by the flag or the
 # environment variable of the same name, if one was actually passed.
 #
-# None of these is reloadable. They are read once, at startup, so changing one is a
-# restart: the updater refuses the reload and says which key it was.
+# None of these can change while the updater runs. They are read once, at startup, and the
+# backoffice API only shows them, so changing one is an edit of this file and a restart;
+# changes made through the API meanwhile keep the edit.
 [settings]
 
 # Where updates go. "builder" (the default) signs each pair's per-block update and streams
@@ -102,29 +110,48 @@ disable_cross_region = false
 # Seconds between pushes in node mode. No effect in builder mode.
 # interval = 12
 
-# Serve the backoffice here: a small web page for adding and removing pairs and builders,
-# editing bands, and resuming a pair halted on its breaker, without a deploy. Unset
-# disables it, which is the default.
+# Serve the backoffice here: a JSON API, under /api, for adding, editing and removing pairs
+# and builders, halting and resuming pairs, and re-arming a pair halted on its breaker,
+# without a deploy. It serves no pages; docs/manual.md, "The backoffice", lists its routes.
+# Unset disables it, which is the default.
 #
 # It has no login of its own. Bind it to this host's *tailnet* address, so reaching it at
 # all means being on the tailnet and past its ACL; binding 0.0.0.0 is refused rather than
 # warned about, because unlike the metrics endpoint this one writes: anything that can
 # reach it can repoint a pair's price source.
 #
-# Every change it makes is written to this file and then reloaded. If the reload is
-# rejected the previous file is put back, so what is on disk always describes what is
-# running.
+# Every change it makes is written to this file and the running pairs are converged onto
+# it. If the updater rejects the change the previous file is put back, so the pairs and
+# builders on disk always describe what is running.
 #
 # Builder mode only. The reload it drives belongs to the per-lane service builder mode
 # runs, so setting this under mode = "node" is refused at startup rather than bound and
 # left inert.
 #
+# --backoffice-ip and --backoffice-port (BACKOFFICE_IP, BACKOFFICE_PORT) override the address
+# and the port half of this, each on its own; either flag alone turns the backoffice on, the
+# missing half being 127.0.0.1 or 8088. A browser front end served from another origin needs
+# that origin listed with --backoffice-cors-origin (BACKOFFICE_CORS_ORIGINS, comma-separated):
+# the API answers CORS for those origins only, and `*` is refused.
+#
+# It is plain HTTP unless --backoffice-tls-cert and --backoffice-tls-key (BACKOFFICE_TLS_CERT,
+# BACKOFFICE_TLS_KEY) name a PEM certificate and its key, `tailscale cert`'s included; then
+# it is HTTPS only, and a renewed certificate is picked up without a restart.
+#
 # Setting it also lets the updater start with no pairs and no builders, which is what makes
 # a fresh host bootable from a config file holding nothing but a target and this address:
-# everything else is then added through the page. Without a backoffice an empty [[pairs]]
+# everything else is then added through the API. Without a backoffice an empty [[pairs]]
 # stays refused, because a updater quoting nothing is normally a file that failed to say
 # what it meant.
 # backoffice_addr = "100.64.1.2:8088"
+#
+# The names it answers to besides an IP address and localhost, which it always does: the
+# name you reach it by, if not its IP (its tailnet name, which an HTTPS certificate from
+# `tailscale cert` names, or a reverse proxy's). The name alone, no scheme, port or path. A
+# request addressed to any other name is refused: that is what stops a site from pointing
+# its own domain at this host and driving the API from an operator's browser (DNS
+# rebinding). --backoffice-host / BACKOFFICE_HOSTS replaces this list.
+# backoffice_hosts = ["pusher.your-tailnet.ts.net"]
 
 # `tokens` is [base, quote] in market orientation — the order a human says the pair in.
 # The lane is keccak256 of the two address-sorted tokens, matching PropAMM._pairKey, and
@@ -160,7 +187,8 @@ max_mid = "0.001"
 # Trips this pair's circuit breaker when the streamed mid jumps more than this fraction
 # away from the mid observed before it (2% here): the live quote is withdrawn from every
 # builder and this lane stops quoting. It does not come back on a timer; resuming is an
-# operator reloading this file once they trust the feed. Other pairs keep quoting throughout.
+# operator's reload (`POST /api/reload`) once they trust the feed. Other pairs keep quoting
+# throughout.
 #
 # The band above catches a price that is absurd; this catches one that is merely
 # impossible to have arrived at honestly in one tick. Unset, the pair has no breaker.
@@ -189,8 +217,8 @@ max_deviation_window_blocks = "1000"
 # The same pair priced as a volatile one: instead of copying Binance's spread or sending a
 # fixed `delta`, we recompute the spread every block from how much the price has been moving
 # and how much of the vault's value is in WETH (see docs/manual.md, "Volatile pairs"). `gamma`, `k`
-# and `kappa` come as a set; the four below them have defaults. All seven are editable from
-# the backoffice, which is where γ, k and κ get tuned: they are guesses, nothing measures
+# and `kappa` come as a set; the four below them have defaults. All seven are editable through
+# the backoffice API, which is where γ, k and κ get tuned: they are guesses, nothing measures
 # them. A kind's keys live in its `[pairs.pricing]` table, which in TOML comes after the
 # pair's own keys.
 #
@@ -395,7 +423,7 @@ max_deviation = "0.002"
 # ---------------------------------------------------------------------------
 # The builders quoted in builder mode, one [[builder]] each. Previously their own
 # builders.toml; they live here now so the whole configuration is one file, which is also
-# what makes a reload a single atomic read.
+# what makes each change a single atomic write of it.
 #
 # Every configured builder is quoted with the same signed update, each over its own
 # connection and its own API key. One block's update is signed exactly once and sent
@@ -406,10 +434,10 @@ max_deviation = "0.002"
 # nothing connects is nearly always a typo or a revoked key. After that nothing is fatal: a
 # builder that goes down is redialed every 2s while the others keep quoting.
 #
-# Changing this list reloads, but unlike a pair edit it restarts every lane: each builder
-# connection is opened inside a pair's own quoting loop, so a lane cannot pick up a new list
-# without being rebuilt. The reload dials the new list first and refuses the whole thing,
-# touching nothing, unless at least one of them connects.
+# Changing this list through the backoffice applies at once, but unlike a pair edit it
+# restarts every lane: each builder connection is opened inside a pair's own quoting loop, so
+# a lane cannot pick up a new list without being rebuilt. The updater dials the new list
+# first and refuses the whole change, touching nothing, unless at least one of them connects.
 #
 # Regional endpoints are just separate entries: add titan-ap and titan-us alongside this
 # one to fan out across regions.

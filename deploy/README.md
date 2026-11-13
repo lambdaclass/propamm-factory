@@ -47,7 +47,7 @@ once per distinct error while polling carries the head.
 
 | Service | Where to reach it | What it holds |
 | --- | --- | --- |
-| updater | backoffice at `BACKOFFICE_BIND:8088` | quotes; rewrites `config/config.toml` from the backoffice |
+| updater | backoffice API at `BACKOFFICE_BIND:8088/api/`, over HTTPS once [set up](#https-for-the-backoffice) | quotes; rewrites `config/config.toml` on every change made through the backoffice |
 | grafana | `GRAFANA_BIND:3000`, user `admin` | the "Quote updater" dashboard; Prometheus and the recorder as datasources |
 | prometheus | `127.0.0.1:9090` | 90 days of `quote_updater_*` metrics; the rules from [`alerts/`](alerts/) |
 | alertmanager | `127.0.0.1:9093` | routes pages and tickets to `#propamm-alerts` |
@@ -58,22 +58,90 @@ in `.env`; the backoffice has none), so publish them on this host's tailnet addr
 nothing else: `BACKOFFICE_BIND` and `GRAFANA_BIND` in `.env`. Left at `127.0.0.1` they are
 reachable from the host only, or through an ssh tunnel.
 
+## HTTPS for the backoffice
+
+The backoffice is plain HTTP until it is given a certificate. The tailnet already encrypts
+the traffic; what HTTPS adds is a front end served over HTTPS being allowed to call it (a
+browser refuses an `https://` page's requests to an `http://` API). Tailscale issues the
+certificate, for this host's name on the tailnet.
+
+1. In the tailnet's admin console, under DNS, turn on MagicDNS and HTTPS Certificates.
+2. On this host, write the certificate and key into `deploy/tls`, under this host's full
+   tailnet name (`tailscale status --json | jq -r .Self.DNSName`, without the trailing dot):
+
+   ```bash
+   sudo tailscale cert \
+     --cert-file deploy/tls/backoffice.crt \
+     --key-file deploy/tls/backoffice.key \
+     pusher.your-tailnet.ts.net
+   ```
+
+3. In `.env`, point the updater at them (paths inside the container, where `deploy/tls` is
+   mounted at `/tls`), list the name it will be reached by, and keep `BACKOFFICE_BIND` this
+   host's tailnet address, the one that name resolves to:
+
+   ```bash
+   BACKOFFICE_TLS_CERT=/tls/backoffice.crt
+   BACKOFFICE_TLS_KEY=/tls/backoffice.key
+   BACKOFFICE_HOSTS=pusher.your-tailnet.ts.net
+   ```
+
+4. `docker compose up -d updater` (not `restart`: `.env` is read when the container is
+   created). The log says `backoffice API listening on https://…`, and from then on it is
+   HTTPS only:
+
+   ```bash
+   curl https://pusher.your-tailnet.ts.net:8088/api/pairs
+   ```
+
+Reach it by that name, not by its IP: the certificate names the host, so a client checking
+it (every browser, and `curl`) refuses `https://100.x.y.z:8088`. And list it in
+`BACKOFFICE_HOSTS`: the backoffice answers only to an IP address, `localhost` and the names
+listed there, which is what keeps another site from pointing its own domain at this host and
+driving the API from your browser (DNS rebinding). A request to an unlisted name gets a 403
+saying so. A front end on another origin also needs its own address listed with
+`BACKOFFICE_CORS_ORIGINS`, as its `https://` origin: `BACKOFFICE_HOSTS` is where requests
+are sent, `BACKOFFICE_CORS_ORIGINS` where the pages sending them come from.
+
+The certificate is short-lived (Let's Encrypt's, 90 days or less). Run the same `tailscale
+cert` command from cron or a systemd timer, daily say; it gets a new certificate as the
+current one nears its end:
+
+```bash
+# /etc/cron.d/backoffice-cert
+0 4 * * * root tailscale cert --cert-file /path/to/deploy/tls/backoffice.crt --key-file /path/to/deploy/tls/backoffice.key pusher.your-tailnet.ts.net
+```
+
+The updater looks at the two files on every new connection and reads them again when either
+changed, so a renewal needs no restart. A connection already open keeps the certificate it
+was made with. If the new pair does not load (the moment between the certificate and the key
+being written, say), the journal warns once and the old certificate goes on being served
+until the files change again. At start, a missing file, an encrypted key or a key that is not
+the certificate's refuses the run, naming the file: `docker compose run --rm updater
+--check` reports it. `deploy/tls` is gitignored apart from its `.gitkeep`: the key is a
+secret. [docs/manual.md](../docs/manual.md), "The backoffice", has the rest.
+
 ## Day to day
 
 ```bash
 docker compose logs -f updater                 # the run
 docker compose run --rm updater --check        # after editing config/config.toml by hand
-docker compose kill -s HUP updater             # reload the config without a restart
+docker compose restart updater                 # then this: the file is read only at start
+curl -X POST -H 'Content-Type: application/json' http://<BACKOFFICE_BIND>:8088/api/reload   # re-arm pairs halted by their breaker (https://<name>:8088 with HTTPS)
 docker compose up -d updater                   # after editing .env (keys, RPC_WS_URL); restart would not
 docker compose pull && docker compose up -d    # newer Prometheus, Alertmanager, Grafana, Postgres
 docker compose build updater && docker compose up -d updater   # a new build of the updater
 ```
 
-A reload (`SIGHUP`, or any save in the backoffice) re-reads `config.toml` and changes only
-the pairs and builders that changed; `target` and `[settings]` are read once at startup,
-and `.env` only when the container is created (`docker compose up -d`, not `restart`).
-[docs/manual.md](../docs/manual.md) covers the config file, the reload, the backoffice, the
-breaker, the metrics and the recorder.
+The updater reads `config.toml` once, at start. A change made through the backoffice API is
+written to it and touches only the pairs and builders that changed, so change those through
+the API: a hand edit of them waits for the next start, and the next change made through the
+API overwrites it. `target` and `[settings]` are not changed through the API, so they are a
+hand edit and a restart; changes made through the API in the meantime keep that edit. `.env`
+is read only when the container is created (`docker compose up -d`, not `restart`).
+The updater ignores `SIGHUP`, so `docker compose kill -s HUP` no longer reloads anything.
+[docs/manual.md](../docs/manual.md) covers the config file, the backoffice API and its
+reload, the breaker, the metrics and the recorder.
 
 ## Your own pricing models
 

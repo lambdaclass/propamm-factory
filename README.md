@@ -27,7 +27,8 @@ make local-down    # tear it all down when you're done
 
 This starts a local chain with anvil, deploys the factory and a PropAMM with a `USDC/USDT` pair, builds `example/`, and starts quoting that pair using Binance's live price as the mid.
 
-You can check out a backoffice to manage settings, pairs, etc at http://localhost:8088 and run
+The backoffice, a JSON API for managing pairs and builders, is at http://localhost:8088/api/
+([docs/manual.md](docs/manual.md), "The backoffice", lists its routes). You can also run
 
 ```
 make swap

@@ -108,7 +108,8 @@ pub enum Event {
         /// What the read-back found.
         outcome: LandingOutcome,
     },
-    /// A reload was asked for (SIGHUP, the backoffice, a handle) and answered.
+    /// A reload was asked for (a change through the backoffice API or a handle, or a plain
+    /// reload) and answered.
     #[non_exhaustive]
     Reload {
         /// How it went.

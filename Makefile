@@ -304,8 +304,8 @@ price-service:
 # The whole thing on a laptop: `make local`, then the two fake builders from e2e/ (they
 # include each block's update in the block they mine on anvil, every 12s), Prometheus and
 # Grafana with the production dashboard and rules, then example/ quoting the USDC/USDT pair
-# from Binance's live price through the builders, in builder mode, with the backoffice at
-# http://127.0.0.1:8088 and Grafana at http://127.0.0.1:3000. Ctrl-c stops all of it but
+# from Binance's live price through the builders, in builder mode, with the backoffice API at
+# http://127.0.0.1:8088/api/ and Grafana at http://127.0.0.1:3000. Ctrl-c stops all of it but
 # the chain; `make local-down` stops that.
 GRAFANA_ENV := GF_PATHS_DATA=$(CURDIR)/.local/grafana GF_PATHS_LOGS=$(CURDIR)/.local/grafana/log \
 	GF_PATHS_PLUGINS=$(CURDIR)/.local/grafana/plugins GF_PATHS_PROVISIONING=$(CURDIR)/deploy/grafana/provisioning \
@@ -328,7 +328,7 @@ quickstart: local
 	  --homepath "$$(dirname "$$(command -v grafana)")/../share/grafana" > .local/grafana.log 2>&1 & GRAF=$$!; \
 	trap 'kill $$MOCKS $$PROM $$GRAF 2>/dev/null; rm -f $(CURDIR)/.local/mocks.pid' EXIT; \
 	until grep -q READY .local/mocks.log 2>/dev/null; do sleep 0.2; done; \
-	echo "backoffice http://127.0.0.1:8088   grafana http://127.0.0.1:3000   prometheus http://127.0.0.1:9090"; \
+	echo "backoffice API http://127.0.0.1:8088/api/   grafana http://127.0.0.1:3000   prometheus http://127.0.0.1:9090"; \
 	cd example && $(PUSHER_KEY_ENV)=$(ANVIL_KEY) ./target/debug/my-propamm --config .local.toml --registry $(PUR_ADDR) --check && \
 	$(PUSHER_KEY_ENV)=$(ANVIL_KEY) ./target/debug/my-propamm --config .local.toml --registry $(PUR_ADDR)
 
