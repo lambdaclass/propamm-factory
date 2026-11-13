@@ -140,10 +140,12 @@ What to know:
 - **A trip is not a halt.** Every lane has a latch: a guard's `Trip`/`Halt`, a panic
   anywhere in a component's code (its `price`, `check`, `assess`, or a task it spawned), or
   a component's own `ctx.latch().trip(..)` trips it, the lane withdraws and stops, and only
-  a reload re-arms it, which is the circuit breaker's contract extended to everything. The
-  alarm and the re-arm line name what tripped (`quote_updater_trip_source{pair,source,cause}`
-  beside `breaker_tripped`, which stays the page: 1 while the lane is halted on that
-  source, 0 once a reload rebuilds the lane, re-armed or not, and gone with the lane), and
+  the pair's own re-arm brings it back (`POST /api/pairs/{key_env}/rearm`, or the handle's
+  `rearm`; no reload does), which is the circuit breaker's contract extended to everything.
+  The alarm and the re-arm line name what tripped
+  (`quote_updater_trip_source{pair,source,cause}` beside `breaker_tripped`, which stays the
+  page: 1 while the lane is halted on that source, 0 once the lane is rebuilt, which for a
+  lane halted on it means its re-arm, and gone with the lane), and
   the watchdog's notice
   names it too.
   A kill switch is therefore never a trip: "stop until I say so" is `halted = true` with a
@@ -212,10 +214,18 @@ What to know:
   pair's lane withdraws its quote at every builder on its next tick, with no reload, no RPC
   call and no other pair's check in the way, and no wait for a change in flight. It is then
   written to the config file as `halted = true` with `halt_reason` beside it, so no later
-  reload undoes it and it survives a restart (a `Latch` trip is re-armed by the next reload,
-  so a kill switch is never built on one). A resume is a checked change like any other. The
-  file is rewritten in full in the backoffice's canonical form, so comments in it are not
-  kept, and both are refused in `--mode node`. `--help` and a usage error come
+  reload undoes it and it survives a restart (a `Latch` trip is cleared by the pair's re-arm
+  and by any restart, so a kill switch is never built on one). A resume is a checked change
+  like any other. The file is rewritten in full in the backoffice's canonical form, so
+  comments in it are not kept, and both are refused in `--mode node`. The handle's
+  `rearm(tokens)` is how a binary brings back a pair its circuit breaker (or any trip)
+  halted, as `POST /api/pairs/{key_env}/rearm` does on the backoffice; `reload()` leaves
+  such a pair halted. The lane is restarted from its stanza as the run's config has it then
+  and trusts the price it finds, which the answer names beside the trip it clears. It is
+  checked like any change that starts a pair, so it can be refused, and it changes nothing
+  in the file. It is refused for a pair halted rather than tripped (that is `resume`'s) and
+  in `--mode node`, and leaves a pair that is not tripped as it is.
+  `--help` and a usage error come
   back from `from_env` as a `clap::Error` to `print()` and exit with its code (0 for help),
   not to propagate with `?`: the doc example on `UpdaterBuilder::run` is the whole pattern.
   A binary with flags of its own puts `#[command(flatten)] updater: Args` in its clap

@@ -28,11 +28,12 @@
 # [[builder]] is overwritten by the next one: change those through the API. SIGHUP does not
 # reload this file: the updater ignores the signal.
 #
-# A reload (`POST /api/reload` on the backoffice, or a binary's `UpdaterHandle::reload`)
-# brings back a pair halted by its circuit breaker — that lane is exactly a lane the config
-# says should be quoting and which is not. Do it once you trust the feed again; see
-# docs/manual.md, "Circuit breaker". A run with neither a backoffice nor a handle cannot
-# reload, so a tripped pair there needs a restart, which clears every lane's breaker.
+# A pair halted by its circuit breaker comes back only through its own re-arm (the
+# backoffice's `POST /api/pairs/<key_env>/rearm`, or a binary's `UpdaterHandle::rearm`). A
+# reload leaves it halted, and so does an edit of its own stanza. The re-armed lane trusts
+# the price it finds, which the re-arm's answer names. Do it once you trust the feed again;
+# see docs/manual.md, "Circuit breaker". A run with neither a backoffice nor a handle cannot
+# re-arm, so a tripped pair there needs a restart, which clears every lane's breaker.
 #
 # A pair with `halted = true` is kept, with every setting, and not run until the flag is
 # cleared (the backoffice's `POST /api/pairs/<key_env>/resume`, or a binary's
@@ -188,9 +189,9 @@ min_mid = "0.0001"
 max_mid = "0.001"
 # Trips this pair's circuit breaker when the streamed mid jumps more than this fraction
 # away from the mid observed before it (2% here): the live quote is withdrawn from every
-# builder and this lane stops quoting. It does not come back on a timer; resuming is an
-# operator's reload (`POST /api/reload`) once they trust the feed. Other pairs keep quoting
-# throughout.
+# builder and this lane stops quoting. It does not come back on a timer; bringing it back
+# is an operator's re-arm (`POST /api/pairs/<key_env>/rearm`) once they trust the feed.
+# Other pairs keep quoting throughout.
 #
 # The band above catches a price that is absurd; this catches one that is merely
 # impossible to have arrived at honestly in one tick. Unset, the pair has no breaker.
@@ -210,9 +211,10 @@ max_deviation = "0.02"
 # seconds, and bucketing can add up to a second more. That makes the guard marginally more
 # permissive than the block count suggests, not stricter.
 #
-# A reload re-anchors the window, so a pair resumed after a halt starts measuring from the
-# price it resumes at. That is what resuming means: an operator has looked at the feed and
-# accepted the current price.
+# A reload re-anchors the window of a pair it restarts, and a re-arm that of the pair it
+# re-arms, so a pair resumed or re-armed after a halt starts measuring from the price it
+# comes back at. That is what resuming or re-arming means: an operator has looked at the
+# feed and accepted the current price.
 max_deviation_window = "0.20"
 max_deviation_window_blocks = "1000"
 
@@ -291,7 +293,7 @@ pricing = { kind = "feed" }
 # A single process-wide number would have to be loose enough for the loosest pair.
 #
 # Set it to the move you would want to be woken up for, because that is what it means:
-# tripping stops this lane until a human has looked at the feed and reloaded.
+# tripping stops this lane until a human has looked at the feed and re-armed it.
 max_deviation = "0.002"
 
 # `symbol` is the short form of one Binance market. A pair can instead average the mid of
@@ -399,7 +401,7 @@ max_deviation = "0.002"
 #
 # `max_deviation` arms this pair's price circuit breaker; see the WETH/USDC and USDC/USDT
 # pairs above. Tripping stops the lane for good until a human intervenes: it withdraws its
-# quote and stops, and only a reload brings it back. Builder mode only — node mode sends
+# quote and stops, and only its re-arm brings it back. Builder mode only — node mode sends
 # updateState straight to the RPC and has no live quote to withdraw, so a config that arms
 # a breaker is refused under `--mode node` rather than quietly running unprotected. It
 # applies to a `symbol` pair only: a fixed `mid` cannot deviate, and setting one is an

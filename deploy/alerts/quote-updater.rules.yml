@@ -3,7 +3,7 @@
 # `up == 1` is deliberately NOT the primary health signal. The updater stays running when
 # every pair has halted on its circuit breaker — exiting would be read by systemd as
 # "restart me", which clears the very state a human is meant to look at, and it is also what
-# a reload needs to find in order to bring the lane back — and the unit is Restart=on-failure.
+# a re-arm needs to find in order to bring the lane back — and the unit is Restart=on-failure.
 # A fully halted updater is therefore a green process quoting nothing.
 # The page-severity rules below are about quoting, not liveness.
 #
@@ -22,10 +22,11 @@ groups:
             guard, the feed moved further in one tick than this pair's max_deviation allows;
             quote_updater_trip_source{pair,source,cause} says what tripped it and how (a
             registered guard, a panic, an external trip). It does NOT come back on its own.
-            Verify the feed, then reload (POST /api/reload on the backoffice) — which brings
-            this lane back without disturbing the others or clearing their breakers.
-            This alert resolves when someone reloads or restarts, which means someone acted
-            — not that the feed is fixed.
+            Verify the feed, then re-arm this pair (POST /api/pairs/{key_env}/rearm on the
+            backoffice) — which brings this lane back, trusting the price it names, without
+            disturbing the others or clearing their breakers. A reload does not bring it back.
+            This alert resolves when someone re-arms the pair or restarts, which means someone
+            acted — not that the feed is fixed.
 
       - alert: PusherNothingQuoting
         expr: >-

@@ -35,7 +35,7 @@ pub(crate) struct RunningPair {
     /// Set by `record_outcome` when this pair halts on its latch. Read by a reload to
     /// decide which lanes to bring back.
     halted: Arc<std::sync::atomic::AtomicBool>,
-    /// The lane's latch, which outlives the pair's `Live`: read when a reload re-arms the
+    /// The lane's latch, which outlives the pair's `Live`: read when its re-arm restarts the
     /// lane, so the line announcing that says exactly what it cleared.
     latch: crate::guard::Latch,
     /// Held so a reload can wait for this lane to actually be gone before starting its
@@ -71,6 +71,18 @@ impl RunningPair {
     fn is_halted(&self) -> bool {
         self.halted.load(std::sync::atomic::Ordering::SeqCst)
     }
+}
+
+/// A trip outliving its lane (audit F-17): a lane halted on its breaker that the service
+/// shut down since, by a halt or a removal. Kept so that resuming the pair, or adding it
+/// back, does not start it unasked: only its re-arm does, and that names this trip.
+pub(crate) struct KeptTrip {
+    key_env: String,
+    trip: Option<crate::guard::Trip>,
+    /// The label whose `breaker_tripped` reads 1 for this trip: set while the config asks
+    /// for the pair, so `PusherBreakerTripped` keeps paging for a pair that should be
+    /// quoting and is not, though no lane of it runs.
+    paging: Option<String>,
 }
 
 /// The running pairs, and everything needed to build another one.
@@ -131,6 +143,9 @@ pub(crate) struct Service {
     /// Every pair's kill switch (`halts.rs`), shared with the shared config: each lane is
     /// handed its pair's as it starts.
     pub(crate) halt_flags: Arc<crate::halts::HaltFlags>,
+    /// Trips whose lane is gone (see [`KeptTrip`]), by lane, until its re-arm. A process
+    /// restart forgets them, as it clears every breaker.
+    pub(crate) kept_trips: std::collections::BTreeMap<U256, KeptTrip>,
 }
 
 /// `run` returning early (an error after the pairs started) must not leave their supervised
@@ -172,6 +187,12 @@ struct Applied {
     /// run until the flag is cleared.
     halted: Vec<String>,
     restarted: Vec<String>,
+    /// One line per lane re-armed (audit F-17): the mid it now trusts and the trip it
+    /// cleared, so whoever re-armed it reads the price they accepted.
+    rearmed: Vec<String>,
+    /// Lanes the file would have started or rebuilt, left halted on their breaker until
+    /// their re-arm (audit F-17).
+    left_tripped: Vec<String>,
     /// Lanes whose feed would not come up. They keep running on their old config (or stay
     /// absent, if they were being added), and this is what says so.
     failed: Vec<String>,
@@ -184,6 +205,7 @@ impl Applied {
             && self.halted.is_empty()
             && self.restarted.is_empty()
             && self.failed.is_empty()
+            && self.left_tripped.is_empty()
     }
 
     /// The one line a reload prints. Names counts rather than every lane, because the
@@ -196,16 +218,25 @@ impl Applied {
             (self.removed.len(), "removed"),
             (self.halted.len(), "halted"),
             (self.failed.len(), "failed"),
+            (
+                self.left_tripped.len(),
+                "left halted on its breaker until its re-arm",
+            ),
         ] {
             if n > 0 {
                 parts.push(format!("{n} {what}"));
             }
         }
-        if parts.is_empty() {
+        let mut line = if parts.is_empty() {
             "reload: no change".to_owned()
         } else {
             format!("reload: {}", parts.join(", "))
+        };
+        for rearmed in &self.rearmed {
+            line.push_str("; ");
+            line.push_str(rearmed);
         }
+        line
     }
 }
 
@@ -509,11 +540,19 @@ impl Service {
     /// flag its breaker raises on a trip. Shared rather than copied, so a trip shows on the
     /// page as it happens, not at the next reload.
     fn publish_states(&self) {
-        let states = self
+        // A kept trip reads as tripped, so the backoffice shows it and takes its re-arm; a
+        // running lane on the same key wins.
+        let kept = self.kept_trips.values().map(|kept| {
+            (
+                kept.key_env.clone(),
+                Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            )
+        });
+        let running = self
             .running
             .values()
-            .map(|pair| (pair.spec.key_env.clone(), Arc::clone(&pair.halted)))
-            .collect();
+            .map(|pair| (pair.spec.key_env.clone(), Arc::clone(&pair.halted)));
+        let states = kept.chain(running).collect();
         *self
             .pair_states
             .lock()
@@ -750,13 +789,14 @@ impl Service {
         &mut self,
         done: &tokio::sync::mpsc::UnboundedSender<(U256, u64)>,
         raw: &config::RawConfig,
+        rearm: &[U256],
     ) -> std::result::Result<String, ReloadFailure> {
         // Held across the converge, so the watchdog does not read a count between two pair
         // sets. Cloned out first because the guard borrows it.
         let health = Arc::clone(&self.health);
         let outcome = {
             let _reloading = health.reloading();
-            self.reload(done, raw).await
+            self.reload(done, raw, rearm).await
         };
         match outcome {
             Ok(applied) => {
@@ -827,7 +867,25 @@ impl Service {
                 )
             })
             .unwrap_or_else(|| (config::lane_label(lane), Vec::new(), Vec::new()));
+        let key_env = self
+            .running
+            .get(&lane)
+            .map(|pair| pair.spec.key_env.clone());
         let stopped = self.stop(lane).await;
+        // A lane halted on its breaker keeps its trip past its own end, so that bringing its
+        // pair back (a resume, an add) does not re-arm it: only its re-arm does (audit
+        // F-17).
+        if let (true, Some(key_env)) = (stopped.halted, key_env) {
+            self.kept_trips.insert(
+                lane,
+                KeptTrip {
+                    key_env,
+                    trip: stopped.trip.clone(),
+                    paging: None,
+                },
+            );
+            self.publish_states();
+        }
         // Nothing reaps a `GaugeVec` child, so without this the lane's last readings stand
         // for the life of the process — and a lane removed while halted would leave
         // `breaker_tripped` at 1, paging under `PusherBreakerTripped` for a pair that is
@@ -835,6 +893,27 @@ impl Service {
         // to avoid.
         self.quiesce(&label, &venues, &guard_kinds, &stopped.trip_sources);
         label
+    }
+
+    /// Keeps `breaker_tripped` at 1 for every kept trip whose pair the config asks for
+    /// (`wanted`, by lane, with its label), and retires it for one it no longer does (halted
+    /// again, or removed). Without this a tripped pair halted and resumed, or removed and
+    /// added back, would sit stopped with `PusherBreakerTripped` resolved: its lane's
+    /// series went with the lane.
+    fn page_kept_trips(&mut self, wanted: &std::collections::BTreeMap<U256, String>) {
+        for (lane, kept) in &mut self.kept_trips {
+            let now = wanted.get(lane);
+            if kept.paging.as_ref() == now {
+                continue;
+            }
+            if let Some(was) = kept.paging.take() {
+                self.metrics.for_pair(&was).breaker_tripped.set(f64::NAN);
+            }
+            if let Some(label) = now {
+                self.metrics.for_pair(label).breaker_tripped.set(1.0);
+                kept.paging = Some(label.clone());
+            }
+        }
     }
 
     /// A halt the kill switch made and the shared config recorded (`state.rs`): its lanes
@@ -845,6 +924,14 @@ impl Service {
     pub(crate) async fn retire_halted(&mut self, halted: crate::state::Halted) {
         let mut retired = Vec::new();
         for lane in &halted.lanes {
+            // A kept trip of a pair now halted pages no more: nobody expects it to quote.
+            if let Some(was) = self
+                .kept_trips
+                .get_mut(lane)
+                .and_then(|kept| kept.paging.take())
+            {
+                self.metrics.for_pair(&was).breaker_tripped.set(f64::NAN);
+            }
             // Still halted: a notice read late, after a resume lifted the flag and has the
             // lane quoting again, is not that lane's to stop.
             if self.running.contains_key(lane) && self.halt_flags.is_set(*lane) {
@@ -875,9 +962,15 @@ impl Service {
         &mut self,
         done: &tokio::sync::mpsc::UnboundedSender<(U256, u64)>,
         raw: &config::RawConfig,
+        rearm: &[U256],
     ) -> Result<Applied> {
+        let rearm: std::collections::BTreeSet<U256> = rearm.iter().copied().collect();
         let (candidate, vault_pairs, halted_in_file) = self.candidate(raw).await?;
         let specs: Vec<config::PairSpec> = candidate.iter().map(|(spec, _)| spec.clone()).collect();
+        let wanted: std::collections::BTreeMap<U256, String> = candidate
+            .iter()
+            .map(|(spec, resolved)| (spec.lane, resolved.pair.label.clone()))
+            .collect();
 
         // Before anything is stopped, and fatal if nothing connects: every lane is about to
         // be rebuilt against this list.
@@ -889,13 +982,17 @@ impl Service {
         // vault to watch.
         self.vault_pairs.send_replace(vault_pairs);
 
+        let mut tripped = self.halted_lanes();
+        tripped.extend(self.kept_trips.keys().copied());
         let actions = reload::plan(
             &self.running_specs(),
             &specs,
-            &self.halted_lanes(),
+            &tripped,
+            &rearm,
             builders_changed,
         );
         if actions.is_empty() {
+            self.page_kept_trips(&wanted);
             return Ok(Applied::default());
         }
 
@@ -912,10 +1009,22 @@ impl Service {
 
         let mut removals = Vec::new();
         let mut starts = Vec::new();
+        let mut left_tripped = Vec::new();
         for action in actions {
             let lane = action.lane();
             match action {
                 reload::Action::Remove(lane) => removals.push(lane),
+                reload::Action::StayTripped(lane) => {
+                    let label = by_lane
+                        .get(&lane)
+                        .map(|resolved| resolved.pair.label.clone())
+                        .unwrap_or_else(|| config::lane_label(lane));
+                    tracing::info!(
+                        "reload: [{label}] left halted on its circuit breaker; re-arm it to \
+                         bring it back"
+                    );
+                    left_tripped.push(label);
+                }
                 reload::Action::Add(spec) | reload::Action::Restart(spec) => {
                     let resolved = by_lane
                         .remove(&lane)
@@ -961,7 +1070,10 @@ impl Service {
         ))
         .await;
 
-        let mut applied = Applied::default();
+        let mut applied = Applied {
+            left_tripped,
+            ..Applied::default()
+        };
         for lane in removals {
             let label = self.retire(lane).await;
             // A pair the file keeps but halts is stopped exactly as a removed one, and said
@@ -1012,16 +1124,89 @@ impl Service {
                     continue;
                 }
             };
+            // A lane that tripped while its replacement was being built (which can take a
+            // first price's wait) is not swapped for it unless this is its re-arm: that
+            // would re-arm it by the back door (audit F-17). It stays as it is, halted on
+            // the trip, and the replacement is dropped unstarted.
+            if !rearm.contains(&spec.lane)
+                && self
+                    .running
+                    .get(&spec.lane)
+                    .is_some_and(RunningPair::is_halted)
+            {
+                tracing::warn!(
+                    "reload: [{label}] tripped while this reload was rebuilding it; left \
+                     halted until it is re-armed"
+                );
+                drop(built);
+                continue;
+            }
+            let facts = self.running.get(&spec.lane).map(|pair| {
+                (
+                    pair.label.clone(),
+                    pair.venues.clone(),
+                    pair.guard_kinds.clone(),
+                    pair.spec.key_env.clone(),
+                )
+            });
             let stopped = self.stop(spec.lane).await;
+            // Read again now that the lane is gone: a trip that landed after the check
+            // above, as it was being stopped, is a trip all the same. The lane cannot be
+            // put back, so its trip is kept as a retired lane's is, and the replacement is
+            // dropped unstarted.
+            if stopped.halted && !rearm.contains(&spec.lane) {
+                tracing::warn!(
+                    "reload: [{label}] tripped as this reload was swapping it; left halted \
+                     until it is re-armed"
+                );
+                if let Some((was, venues, guard_kinds, key_env)) = facts {
+                    self.kept_trips.insert(
+                        spec.lane,
+                        KeptTrip {
+                            key_env,
+                            trip: stopped.trip.clone(),
+                            paging: None,
+                        },
+                    );
+                    self.publish_states();
+                    self.quiesce(&was, &venues, &guard_kinds, &stopped.trip_sources);
+                }
+                applied.left_tripped.push(label);
+                drop(built);
+                continue;
+            }
             starting.push((spec, was_running, label, built, stopped));
         }
         for (spec, was_running, label, built, stopped) in starting {
             let lane = spec.lane;
+            // The reference market's mid the new run starts from, read before it moves into
+            // `spawn`: for a re-armed lane, the price it now trusts in place of the one its
+            // breaker tripped on, which its answer names.
+            let trusted = built
+                .live
+                .values
+                .market_rx()
+                .and_then(|rx| *rx.borrow())
+                .map(|sample| feed::format_scaled(sample.mid, self.price_decimals));
             // What the generation just stopped leaves on series the new one does not write
             // for itself. Before `spawn`, so the new generation's seed and latch write
             // over these and never the other way round: a re-armed lane that trips again
             // at once on the same source reads 1 there, not this 0.
             retire_stopped(&built.live, &stopped);
+            // A re-arm of a lane whose trip outlived it (a halt, a removal): the trip it
+            // clears, for its line, once the new run is actually starting.
+            let kept = if rearm.contains(&lane) {
+                self.kept_trips.remove(&lane)
+            } else {
+                None
+            };
+            // The new run writes its own `breaker_tripped`; a kept trip paging under
+            // another label (the pair was renamed since) is retired here.
+            if let Some(was) = kept.as_ref().and_then(|kept| kept.paging.as_ref())
+                && *was != label
+            {
+                self.metrics.for_pair(was).breaker_tripped.set(f64::NAN);
+            }
             self.spawn(built, spec, done.clone());
             // The sources it tripped on, carried into the new generation for its removal
             // to retire, halted or not: a trip can land while a lane is being stopped.
@@ -1035,15 +1220,18 @@ impl Service {
                 tracing::info!("reload: [{label}] added");
                 applied.added.push(label.clone());
             }
-            if stopped.halted {
-                // Never silent. A reload run for an unrelated edit also re-arms any halted
-                // lane, which is the price of one verb — so the line says which guard it
-                // cleared and what tripped it, rather than letting a latch a human was meant
-                // to look at disappear into a summary count.
-                tracing::info!(
-                    "reload: [{label}] re-armed{}",
-                    rearm_detail(stopped.trip.as_ref())
-                );
+            if stopped.halted || kept.is_some() {
+                // Only a re-arm reaches here (audit F-17): a reload starts no lane its
+                // breaker halted unless asked to by name. Said in full, with the price the
+                // lane now trusts beside what tripped it, so whoever asked reads the price
+                // they accepted rather than a count.
+                let cleared = stopped
+                    .trip
+                    .as_ref()
+                    .or_else(|| kept.as_ref().and_then(|kept| kept.trip.as_ref()));
+                let line = rearmed_line(&label, trusted.as_deref(), cleared);
+                tracing::info!("reload: {line}");
+                applied.rearmed.push(line);
                 self.observers.emit(crate::observe::Event::Rearmed {
                     pair: label.clone(),
                 });
@@ -1053,6 +1241,7 @@ impl Service {
                 self.running[&lane].metrics.breaker_rearms.inc();
             }
         }
+        self.page_kept_trips(&wanted);
         Ok(applied)
     }
 }
@@ -1288,6 +1477,20 @@ fn rearm_detail(cleared: Option<&crate::guard::Trip>) -> String {
     )
 }
 
+/// What a re-arm answers for one lane: the reference market's mid it now trusts, when it
+/// has a market, beside the trip it cleared, which for the deviation breaker names the
+/// price before the trip and the one it tripped on.
+fn rearmed_line(
+    label: &str,
+    trusted: Option<&str>,
+    cleared: Option<&crate::guard::Trip>,
+) -> String {
+    let trusting = trusted
+        .map(|mid| format!(", trusting mid {mid}"))
+        .unwrap_or_default();
+    format!("[{label}] re-armed{trusting}{}", rearm_detail(cleared))
+}
+
 /// A coarse "how long ago", for an operator line rather than a measurement: a halted pusher
 /// is designed to sit for days, so seconds of precision on a two-day-old trip is noise.
 fn format_elapsed(elapsed: Duration) -> String {
@@ -1464,6 +1667,7 @@ mod tests {
             key_lookup: Arc::new(config::env_lookup),
             kinds: Arc::new(crate::kinds::Kinds::shipped()),
             halt_flags: Arc::default(),
+            kept_trips: Default::default(),
         }
     }
 
@@ -1641,7 +1845,7 @@ mod tests {
     }
 
     /// A halted lane is the one ending that must survive being reaped: it is exactly what a
-    /// reload has to find in order to re-arm it.
+    /// re-arm has to find in order to restart it.
     #[tokio::test]
     async fn a_halted_pair_stays_in_the_running_set_for_a_reload_to_find() {
         let mut service = test_service(Vec::new());
@@ -1994,8 +2198,8 @@ pricing = { kind = "feed" }
     }
 
     /// Clearing a latch has to be at least as loud as the trip was, and carry the same
-    /// numbers — it is the whole mitigation for a reload re-arming a lane the operator was
-    /// not thinking about when they ran it.
+    /// numbers, so whoever re-armed the lane reads exactly what they cleared, beside the
+    /// price they accepted in its place.
     #[test]
     fn the_rearm_line_repeats_the_trip_it_cleared() {
         let at = std::time::Instant::now() - Duration::from_secs(14 * 60);
@@ -2062,6 +2266,36 @@ pricing = { kind = "feed" }
         }
     }
 
+    /// A re-arm answers with the price the lane now trusts, beside the trip it cleared, so
+    /// whoever re-armed it reads what they accepted (audit F-17); and the summary carries it.
+    #[test]
+    fn a_rearm_line_names_the_mid_it_trusts() {
+        let trip = trip_at(
+            "on a 4.10% move from previous 1.00 to 1.04 (limit 2.00%)",
+            std::time::Instant::now(),
+        );
+        let line = rearmed_line("WETH/USDC", Some("1.041"), Some(&trip));
+        assert!(
+            line.starts_with("[WETH/USDC] re-armed, trusting mid 1.041, clearing the halt"),
+            "{line}"
+        );
+        assert!(
+            line.ends_with("from previous 1.00 to 1.04 (limit 2.00%)"),
+            "{line}"
+        );
+        assert_eq!(
+            rearmed_line("A/B", None, Some(&trip)),
+            format!("[A/B] re-armed{}", rearm_detail(Some(&trip))),
+            "no market, no mid"
+        );
+        let applied = Applied {
+            restarted: vec!["WETH/USDC".to_owned()],
+            rearmed: vec![line.clone()],
+            ..Applied::default()
+        };
+        assert_eq!(applied.summary(), format!("reload: 1 restarted; {line}"));
+    }
+
     #[test]
     fn a_reload_summary_names_every_kind_that_happened_and_no_others() {
         assert_eq!(Applied::default().summary(), "reload: no change");
@@ -2071,6 +2305,8 @@ pricing = { kind = "feed" }
             restarted: vec!["C/D".to_owned(), "E/F".to_owned()],
             removed: Vec::new(),
             halted: vec!["I/J".to_owned()],
+            rearmed: Vec::new(),
+            left_tripped: Vec::new(),
             failed: vec!["G/H".to_owned()],
         };
         assert_eq!(
@@ -2114,7 +2350,7 @@ pricing = { kind = "feed" }
         assert_eq!(health.census(), (1, 0, 2));
         assert!(
             halted.load(Ordering::SeqCst),
-            "the lane's own flag rises with the count, so a reload knows which one to re-arm"
+            "the lane's own flag rises with the count, so a re-arm knows which one to restart"
         );
         assert_eq!(
             health.trips(),
@@ -2229,6 +2465,9 @@ pricing = { kind = "feed" }
             /// trips before the service adopts it.
             #[serde(default)]
             trips: bool,
+            /// Takes a while to build, as a feed waiting for its first price does.
+            #[serde(default)]
+            slow: bool,
         }
 
         #[derive(Clone, serde::Deserialize)]
@@ -2293,6 +2532,9 @@ pricing = { kind = "feed" }
                 Box::pin(async move {
                     assert!(!cfg.panics_building, "build blew up");
                     eyre::ensure!(!cfg.broken, "broken is set");
+                    if cfg.slow {
+                        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                    }
                     if cfg.trips {
                         ctx.latch().trip(
                             "a",
@@ -2436,7 +2678,7 @@ api_key = "k"
 
             std::fs::write(&path, file("", &builder.url)).unwrap();
             let first = service
-                .reload(&done, &read(&path))
+                .reload(&done, &read(&path), &[])
                 .await
                 .expect("the first reload adds both lanes");
             assert_eq!(first.added.len(), 2, "{first:?}");
@@ -2444,7 +2686,7 @@ api_key = "k"
 
             std::fs::write(&path, file("broken = true", &builder.url)).unwrap();
             let second = service
-                .reload(&done, &read(&path))
+                .reload(&done, &read(&path), &[])
                 .await
                 .expect("one failed lane does not fail the file");
             assert_eq!(second.failed.len(), 1, "A's build failed: {second:?}");
@@ -2462,7 +2704,7 @@ api_key = "k"
 
             std::fs::write(&path, file("", &builder.url)).unwrap();
             service
-                .reload(&done, &read(&path))
+                .reload(&done, &read(&path), &[])
                 .await
                 .expect("the first reload adds both lanes");
             let before = specs(&service);
@@ -2471,7 +2713,7 @@ api_key = "k"
             let err = format!(
                 "{:#}",
                 service
-                    .reload(&done, &read(&path))
+                    .reload(&done, &read(&path), &[])
                     .await
                     .expect_err("rejected")
             );
@@ -2489,14 +2731,14 @@ api_key = "k"
 
             std::fs::write(&path, file("", &builder.url)).unwrap();
             service
-                .reload(&done, &read(&path))
+                .reload(&done, &read(&path), &[])
                 .await
                 .expect("the first reload adds both lanes");
             let before = specs(&service);
 
             std::fs::write(&path, file("panics_building = true", &builder.url)).unwrap();
             let second = service
-                .reload(&done, &read(&path))
+                .reload(&done, &read(&path), &[])
                 .await
                 .expect("a panicking build fails its lane, not the reload");
             assert_eq!(second.failed.len(), 1, "{second:?}");
@@ -2512,7 +2754,7 @@ api_key = "k"
 
             std::fs::write(&path, file("", &builder.url)).unwrap();
             service
-                .reload(&done, &read(&path))
+                .reload(&done, &read(&path), &[])
                 .await
                 .expect("the first reload adds both lanes");
             let before = specs(&service);
@@ -2525,7 +2767,7 @@ api_key = "k"
             let err = format!(
                 "{:#}",
                 service
-                    .reload(&done, &read(&path))
+                    .reload(&done, &read(&path), &[])
                     .await
                     .expect_err("rejected")
             );
@@ -2534,6 +2776,173 @@ api_key = "k"
                 "{err}"
             );
             assert_eq!(specs(&service), before, "nothing changed");
+        }
+
+        /// Audit F-17, the side doors: a tripped pair halted and resumed, or removed and
+        /// added back, is not started on the way back. Its trip outlived its lane, reads
+        /// as tripped to the backoffice, and only its re-arm starts it, naming that trip.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_trip_outlives_a_halt_or_a_removal_until_the_re_arm() {
+            let (mut service, _rpc, builder, path) = setup("reload-kept-trip").await;
+            let (done, _done_rx) = tokio::sync::mpsc::unbounded_channel();
+            std::fs::write(&path, file("", &builder.url)).unwrap();
+            let config = read(&path);
+            service
+                .reload(&done, &config, &[])
+                .await
+                .expect("the first reload adds both lanes");
+            let (lane, label) = lane_a(&service);
+            halt_on_a(&service, lane);
+            let tripped = |service: &Service| {
+                service
+                    .pair_states
+                    .lock()
+                    .unwrap()
+                    .get("KEY_A")
+                    .map(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+            };
+
+            // Halted (the kill switch's flag and its notice), then resumed (the flag lifted,
+            // and the config as it was).
+            service.halt_flags.set(&[lane]);
+            service
+                .retire_halted(crate::state::Halted {
+                    lanes: vec![lane],
+                    config: Arc::new(config.clone()),
+                })
+                .await;
+            service.halt_flags.clear(&[lane]);
+            assert!(!service.running.contains_key(&lane));
+            let applied = service.reload(&done, &config, &[]).await.expect("applied");
+            assert!(applied.added.is_empty(), "{applied:?}");
+            assert_eq!(applied.left_tripped, vec![label.clone()]);
+            assert!(
+                !service.running.contains_key(&lane),
+                "not started by the resume"
+            );
+            assert_eq!(tripped(&service), Some(true), "and reads as tripped");
+            let paging = |service: &Service| service.metrics.for_pair(&label).breaker_tripped.get();
+            assert_eq!(
+                paging(&service),
+                1.0,
+                "the config asks for the pair and it is not quoting: the alert holds"
+            );
+
+            // Removed, then added back.
+            std::fs::write(&path, file_without_a(&builder.url)).unwrap();
+            service
+                .reload(&done, &read(&path), &[])
+                .await
+                .expect("the removal applies");
+            assert!(
+                paging(&service).is_nan(),
+                "a pair the config no longer has pages nobody"
+            );
+            let applied = service.reload(&done, &config, &[]).await.expect("applied");
+            assert_eq!(applied.left_tripped, vec![label.clone()], "{applied:?}");
+            assert_eq!(paging(&service), 1.0, "added back, and paging again");
+            assert!(
+                !service.running.contains_key(&lane),
+                "not started by the add"
+            );
+
+            let applied = service
+                .reload(&done, &config, &[lane])
+                .await
+                .expect("its re-arm applies");
+            assert_eq!(applied.added, vec![label.clone()], "{applied:?}");
+            assert_eq!(applied.rearmed.len(), 1, "{applied:?}");
+            assert!(
+                applied.rearmed[0].contains("clearing the halt")
+                    && applied.rearmed[0].contains("first"),
+                "the re-arm names the trip it clears: {:?}",
+                applied.rearmed
+            );
+            assert!(service.running.contains_key(&lane));
+            assert_eq!(tripped(&service), Some(false));
+            assert!(service.kept_trips.is_empty());
+            assert_eq!(paging(&service), 0.0, "re-armed: the new run's own reading");
+        }
+
+        /// A trip that lands as the reload is stopping the lane to swap it, after the check
+        /// made before the stop, is not re-armed by the swap either: the replacement is
+        /// dropped, the trip is kept, and only the pair's re-arm starts it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_lane_that_trips_as_it_is_swapped_is_not_started() {
+            let (mut service, _rpc, builder, path) = setup("reload-trip-in-swap").await;
+            let (done, _done_rx) = tokio::sync::mpsc::unbounded_channel();
+            std::fs::write(&path, file("", &builder.url)).unwrap();
+            service
+                .reload(&done, &read(&path), &[])
+                .await
+                .expect("the first reload adds both lanes");
+            let (lane, label) = lane_a(&service);
+            let tripped = Arc::clone(&service.running[&lane].halted);
+            let mut stop = service.running[&lane].stop.subscribe();
+
+            std::fs::write(&path, file("slow = true", &builder.url)).unwrap();
+            let edited = read(&path);
+            let (applied, ()) = tokio::join!(service.reload(&done, &edited, &[]), async {
+                // Past the build and the check: the lane has just been asked to stop.
+                stop.changed().await.unwrap();
+                tripped.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            let applied = applied.expect("the reload applies");
+            assert!(applied.restarted.is_empty(), "{applied:?}");
+            assert_eq!(applied.left_tripped, vec![label.clone()], "{applied:?}");
+            assert!(
+                applied.rearmed.is_empty(),
+                "nobody re-armed it: {applied:?}"
+            );
+            assert!(!service.running.contains_key(&lane), "not started");
+            assert!(service.kept_trips.contains_key(&lane), "its trip is kept");
+            assert_eq!(service.metrics.for_pair(&label).breaker_tripped.get(), 1.0);
+
+            let applied = service
+                .reload(&done, &edited, &[lane])
+                .await
+                .expect("its re-arm applies");
+            assert_eq!(applied.added, vec![label], "{applied:?}");
+            assert!(service.running.contains_key(&lane));
+        }
+
+        /// Audit F-17, the back door: a lane that trips while a reload is rebuilding it (a
+        /// build that waits, as a feed's first price does) is not swapped for the rebuilt
+        /// run, which would re-arm it unasked. It stays halted on its trip, and its own
+        /// re-arm then brings it back on the stanza as it is.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_lane_that_trips_while_it_is_rebuilt_stays_halted() {
+            let (mut service, _rpc, builder, path) = setup("reload-trip-in-build").await;
+            let (done, _done_rx) = tokio::sync::mpsc::unbounded_channel();
+            std::fs::write(&path, file("", &builder.url)).unwrap();
+            service
+                .reload(&done, &read(&path), &[])
+                .await
+                .expect("the first reload adds both lanes");
+            let (lane, label) = lane_a(&service);
+            let tripped = Arc::clone(&service.running[&lane].halted);
+            let run = service.running[&lane].id;
+
+            std::fs::write(&path, file("slow = true", &builder.url)).unwrap();
+            let edited = read(&path);
+            let (applied, ()) = tokio::join!(service.reload(&done, &edited, &[]), async {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                tripped.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            let applied = applied.expect("the reload applies");
+            assert!(applied.restarted.is_empty(), "{applied:?}");
+            assert_eq!(
+                service.running[&lane].id, run,
+                "the tripped run is still the one"
+            );
+            assert!(service.halted_lanes().contains(&lane));
+
+            let applied = service
+                .reload(&done, &edited, &[lane])
+                .await
+                .expect("its re-arm applies");
+            assert_eq!(applied.restarted, vec![label], "{applied:?}");
+            assert!(!service.halted_lanes().contains(&lane));
         }
 
         /// A re-armed lane that trips again at once, on the same source, before or as the
@@ -2547,15 +2956,19 @@ api_key = "k"
 
             std::fs::write(&path, file("", &builder.url)).unwrap();
             service
-                .reload(&done, &read(&path))
+                .reload(&done, &read(&path), &[])
                 .await
                 .expect("the first reload adds both lanes");
             let (lane, label) = lane_a(&service);
             halt_on_a(&service, lane);
 
-            // A changed stanza whose build trips the new latch on the same source and cause.
+            // Its re-arm, onto a changed stanza whose build trips the new latch on the same
+            // source and cause.
             std::fs::write(&path, file("trips = true", &builder.url)).unwrap();
-            let applied = service.reload(&done, &read(&path)).await.expect("applied");
+            let applied = service
+                .reload(&done, &read(&path), &[lane])
+                .await
+                .expect("applied");
             assert_eq!(applied.restarted, vec![label.clone()], "{applied:?}");
             assert!(service.running[&lane].latch.tripped().is_some());
             assert_eq!(
@@ -2577,7 +2990,7 @@ api_key = "k"
 
             std::fs::write(&path, file("", &builder.url)).unwrap();
             service
-                .reload(&done, &read(&path))
+                .reload(&done, &read(&path), &[])
                 .await
                 .expect("the first reload adds both lanes");
             let (lane, label) = lane_a(&service);
@@ -2594,7 +3007,10 @@ api_key = "k"
             );
 
             std::fs::write(&path, file("broken = false", &builder.url)).unwrap();
-            let applied = service.reload(&done, &read(&path)).await.expect("applied");
+            let applied = service
+                .reload(&done, &read(&path), &[])
+                .await
+                .expect("applied");
             assert_eq!(applied.restarted, vec![label.clone()], "{applied:?}");
             assert_eq!(
                 service.metrics.trip_source(&label, "a", "external").get(),
@@ -2604,7 +3020,10 @@ api_key = "k"
             assert_eq!(service.metrics.for_pair(&label).breaker_tripped.get(), 0.0);
 
             std::fs::write(&path, file_without_a(&builder.url)).unwrap();
-            let applied = service.reload(&done, &read(&path)).await.expect("applied");
+            let applied = service
+                .reload(&done, &read(&path), &[])
+                .await
+                .expect("applied");
             assert_eq!(applied.removed, vec![label.clone()], "{applied:?}");
             assert!(
                 service
@@ -2630,14 +3049,17 @@ api_key = "k"
             )
             .unwrap();
             service
-                .reload(&done, &read(&path))
+                .reload(&done, &read(&path), &[])
                 .await
                 .expect("the first reload adds both lanes");
             let (_, label) = lane_a(&service);
             assert_eq!(service.metrics.for_pair(&label).guard("q").get(), 1.0);
 
             std::fs::write(&path, file("", &builder.url)).unwrap();
-            let applied = service.reload(&done, &read(&path)).await.expect("applied");
+            let applied = service
+                .reload(&done, &read(&path), &[])
+                .await
+                .expect("applied");
             assert_eq!(applied.restarted, vec![label.clone()], "{applied:?}");
             assert!(
                 service.metrics.for_pair(&label).guard("q").get().is_nan(),
@@ -2653,7 +3075,7 @@ api_key = "k"
 
             std::fs::write(&path, file("", &builder.url)).unwrap();
             service
-                .reload(&done, &read(&path))
+                .reload(&done, &read(&path), &[])
                 .await
                 .expect("the first reload adds both lanes");
             let before = specs(&service);
@@ -2662,7 +3084,7 @@ api_key = "k"
             let err = format!(
                 "{:#}",
                 service
-                    .reload(&done, &read(&path))
+                    .reload(&done, &read(&path), &[])
                     .await
                     .expect_err("rejected")
             );

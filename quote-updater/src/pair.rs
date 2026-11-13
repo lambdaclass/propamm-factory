@@ -1653,7 +1653,7 @@ mod tests {
 
         /// A component trips its own lane through the latch its build got: a model that
         /// sees its own inputs go bad stops the lane itself, with `cause = external`. (A
-        /// kill switch is a halt in the file, never this: a reload re-arms a latch.) A task
+        /// kill switch is a halt in the file, never this: a re-arm clears a latch.) A task
         /// that then returns is counted, since it fed nothing after.
         #[tokio::test]
         async fn a_component_can_trip_its_own_lane() {

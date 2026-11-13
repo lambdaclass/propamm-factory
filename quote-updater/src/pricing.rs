@@ -910,7 +910,7 @@ impl BuildCtx {
 
     /// The lane's latch, for a component to trip its own lane from its code or a task of
     /// its own (`cause = external`): a model that sees its inputs go bad, an oracle that
-    /// disagrees for too long. Not a kill switch: a reload re-arms every latch, so
+    /// disagrees for too long. Not a kill switch: the pair's re-arm clears a latch, so
     /// "stop until I say so" is a halt in the config file, never a trip. Under a test build
     /// context this is a latch of the context's own, readable back through the same call.
     pub fn latch(&self) -> crate::guard::Latch {
