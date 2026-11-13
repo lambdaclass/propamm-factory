@@ -146,6 +146,10 @@ pub(crate) struct Service {
     /// Trips whose lane is gone (see [`KeptTrip`]), by lane, until its re-arm. A process
     /// restart forgets them, as it clears every breaker.
     pub(crate) kept_trips: std::collections::BTreeMap<U256, KeptTrip>,
+    /// Called with a lane as it is asked to stop and before its task is waited for, so a
+    /// test can land a trip in exactly that window.
+    #[cfg(test)]
+    pub(crate) on_stopping: Option<Box<dyn Fn(U256) + Send + Sync>>,
 }
 
 /// `run` returning early (an error after the pairs started) must not leave their supervised
@@ -460,6 +464,10 @@ impl Service {
             pair.adopted.clone(),
         );
         pair.stop.send_replace(true);
+        #[cfg(test)]
+        if let Some(hook) = &self.on_stopping {
+            hook(lane);
+        }
         if let Err(err) = pair.task.await {
             tracing::error!(
                 "[{}] pair task did not stop cleanly: {err}",
@@ -1724,6 +1732,7 @@ mod tests {
             kinds: Arc::new(crate::kinds::Kinds::shipped()),
             halt_flags: Arc::default(),
             kept_trips: Default::default(),
+            on_stopping: None,
         }
     }
 
@@ -3141,17 +3150,22 @@ api_key = "k"
                 .await
                 .expect("the first reload adds both lanes");
             let (lane, label) = lane_a(&service);
+            // The trip lands once the lane has been asked to stop: past the build and the
+            // check made before the stop, and before the lane is read again.
             let tripped = Arc::clone(&service.running[&lane].halted);
-            let mut stop = service.running[&lane].stop.subscribe();
+            service.on_stopping = Some(Box::new(move |stopping| {
+                if stopping == lane {
+                    tripped.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }));
 
             std::fs::write(&path, file("slow = true", &builder.url)).unwrap();
             let edited = read(&path);
-            let (applied, ()) = tokio::join!(service.reload(&done, &edited, &[]), async {
-                // Past the build and the check: the lane has just been asked to stop.
-                stop.changed().await.unwrap();
-                tripped.store(true, std::sync::atomic::Ordering::SeqCst);
-            });
-            let applied = applied.expect("the reload applies");
+            let applied = service
+                .reload(&done, &edited, &[])
+                .await
+                .expect("the reload applies");
+            service.on_stopping = None;
             assert!(applied.restarted.is_empty(), "{applied:?}");
             assert_eq!(applied.left_tripped, vec![label.clone()], "{applied:?}");
             assert!(

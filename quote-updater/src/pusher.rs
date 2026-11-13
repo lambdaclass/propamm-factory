@@ -707,6 +707,8 @@ async fn run_inner(
             observers: observers.clone(),
             halt_flags: shared.halt_flags(),
             kept_trips: Default::default(),
+            #[cfg(test)]
+            on_stopping: None,
         };
         // From here a shutdown goes through the loop below, which withdraws every quote.
         quoting.store(true, std::sync::atomic::Ordering::SeqCst);
