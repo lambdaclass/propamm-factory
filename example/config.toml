@@ -24,7 +24,7 @@ max_deviation = "0.02"          # the library's built-in deviation breaker, stil
 [pairs.pricing]
 kind        = "inventory_skew"  # registered in main.rs
 half_spread = 0.0005            # 5 bp
-strength    = 0.02              # a 100% base vault pushes the mid 1% down
+strength    = 0.02              # 2 bp of mid per point of base share past 50%, capped at half_spread
 max_inventory_age_secs = 60
 
 [[pairs.guards]]
