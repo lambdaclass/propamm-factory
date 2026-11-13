@@ -7,10 +7,12 @@
 //! only if the service accepts: so the config in memory and the file on disk both describe
 //! what is running. `[settings]` are read once, at start, and the API only shows them.
 //!
-//! No login: the address it binds (`--backoffice-ip` and `--backoffice-port`, or `[settings]
+//! The address it binds (`--backoffice-ip` and `--backoffice-port`, or `[settings]
 //! backoffice_addr`) is the host's tailnet address, so reaching this API means being past
 //! the tailnet ACL. Binding every interface is refused, because unlike `/metrics` this API
-//! writes. Every change logs the peer that made it.
+//! writes. No login beyond that unless `--backoffice-google-client-id` is given: then every
+//! request also needs a Google sign-in by an allowed account (`auth.rs`, checked in
+//! [`guard`]). Every change logs the peer that made it, and who signed in.
 //!
 //! Plain HTTP unless `--backoffice-tls-cert` and `--backoffice-tls-key` are given; then
 //! HTTPS only, with the certificate read again whenever its files change (`tls.rs`).
@@ -44,6 +46,7 @@
 //! | `GET /api/venues`                 | the venues a pair can read                       |
 //! | `GET /api/lookup`                 | where a token pair trades; saves nothing         |
 //! | `GET /api/preview`                | a websocket of live venue mids; saves nothing    |
+//! | `GET /api/auth`                   | how a page signs in; needs no sign-in            |
 //!
 //! A change answers `{"status": "applied" | "partial", "message": ...}` with a 2xx; a
 //! `partial` one is kept, though some pair kept its previous config or was stopped (see
@@ -61,7 +64,7 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, Path, Query, State, rejection::JsonRejection},
+    extract::{ConnectInfo, Extension, Path, Query, State, rejection::JsonRejection},
     http::{Method, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -104,6 +107,8 @@ struct Backoffice {
     /// The names besides an IP address and `localhost` that requests may be addressed to,
     /// as [`parse_hosts`] writes them.
     hosts: Arc<[String]>,
+    /// Google sign-in, when it is on: what checks every request's token (`auth.rs`).
+    sign_in: Option<crate::auth::Verifier>,
 }
 
 /// Who may reach the API, and how: the names it answers to, the browser origins besides its
@@ -117,6 +122,8 @@ pub(crate) struct Access {
     pub(crate) origins: Vec<String>,
     /// `--backoffice-tls-cert` and `--backoffice-tls-key`, read.
     pub(crate) tls: Option<crate::tls::Tls>,
+    /// `--backoffice-google-client-id` and who it lets in; `None` takes no sign-in.
+    pub(crate) google: Option<crate::auth::GoogleSignIn>,
 }
 
 /// `0.0.0.0:8088` binds every interface, including whatever the host has facing the
@@ -131,8 +138,8 @@ pub(crate) fn refuse_unspecified_bind(addr: SocketAddr) -> Result<()> {
     eyre::ensure!(
         !is_unspecified_bind(addr),
         "the backoffice address is {addr}, which binds every interface on this host. This \
-         API rewrites the pusher's config and has no authentication of its own; bind it to \
-         the host's tailnet address instead (--backoffice-ip, or [settings] \
+         API rewrites the pusher's config, and is not to face whatever this host faces even \
+         behind a sign-in; bind it to the host's tailnet address instead (--backoffice-ip, or [settings] \
          backoffice_addr), where the tailnet ACL is the access control."
     );
     Ok(())
@@ -140,9 +147,9 @@ pub(crate) fn refuse_unspecified_bind(addr: SocketAddr) -> Result<()> {
 
 /// `--backoffice-cors-origin`, checked, and each written as a browser writes `Origin`
 /// (lowercase, no default port, no trailing slash), which is what both the CORS layer and
-/// [`guard`] compare a request's against, byte for byte. `*` and `null` are refused: the API
-/// has no login, so an origin that answers for any page would let any site an operator's
-/// browser visits drive it.
+/// [`guard`] compare a request's against, byte for byte. `*` and `null` are refused: unless
+/// Google sign-in is on the API has no login, so an origin that answers for any page would
+/// let any site an operator's browser visits drive it.
 pub(crate) fn parse_origins(origins: &[String]) -> Result<Vec<String>> {
     origins
         .iter()
@@ -152,8 +159,7 @@ pub(crate) fn parse_origins(origins: &[String]) -> Result<Vec<String>> {
             eyre::ensure!(
                 origin != "*",
                 "\"*\" would let a page on any site an operator's browser visits drive this \
-                 API, which has no login; list the front end's own origin, such as \
-                 http://100.64.1.2:3000"
+                 API; list the front end's own origin, such as http://100.64.1.2:3000"
             );
             let written = || {
                 eyre!(
@@ -223,7 +229,7 @@ fn cors(origins: &[String]) -> Option<tower_http::cors::CorsLayer> {
         tower_http::cors::CorsLayer::new()
             .allow_origin(tower_http::cors::AllowOrigin::list(origins))
             .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
-            .allow_headers([header::CONTENT_TYPE])
+            .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
             .max_age(Duration::from_secs(600)),
     )
 }
@@ -268,6 +274,7 @@ async fn bind_with(
     let origins = parse_origins(&access.origins).wrap_err("--backoffice-cors-origin")?;
     let hosts = parse_hosts(&access.hosts).wrap_err("--backoffice-host")?;
     let tls = access.tls;
+    let sign_in = access.google.map(crate::auth::Verifier::new).transpose()?;
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -292,6 +299,7 @@ async fn bind_with(
         preview_pages: Arc::new(tokio::sync::Semaphore::new(PREVIEW_PAGES)),
         origins: origins.clone().into(),
         hosts: hosts.into(),
+        sign_in: sign_in.clone(),
     };
 
     let app = Router::new()
@@ -312,6 +320,7 @@ async fn bind_with(
         .route("/api/venues", get(list_venues))
         .route("/api/lookup", get(lookup_pair))
         .route("/api/preview", get(preview_socket))
+        .route("/api/auth", get(auth_info))
         .fallback(|| async {
             ApiError::new(
                 StatusCode::NOT_FOUND,
@@ -331,10 +340,23 @@ async fn bind_with(
 
     // With connect info, so every change can be logged against its peer.
     let app = app.into_make_service_with_connect_info::<SocketAddr>();
+    // Google's keys kept fresh for as long as the API is served, in the same task, so
+    // ending it ends both.
+    let keep_keys_fresh = async move {
+        match sign_in {
+            Some(verifier) => verifier.keep_keys_fresh().await,
+            None => std::future::pending().await,
+        }
+    };
     let task = match tls {
         None => tokio::spawn(async move {
-            if let Err(err) = axum::serve(listener, app).await {
-                tracing::warn!("backoffice listener stopped: {err}");
+            tokio::select! {
+                served = axum::serve(listener, app).into_future() => {
+                    if let Err(err) = served {
+                        tracing::warn!("backoffice listener stopped: {err}");
+                    }
+                }
+                () = keep_keys_fresh => {}
             }
         }),
         Some(tls) => {
@@ -353,6 +375,7 @@ async fn bind_with(
                         }
                     }
                     () = accepting => {}
+                    () = keep_keys_fresh => {}
                 }
             })
         }
@@ -365,8 +388,10 @@ async fn bind_with(
 // Which requests are answered
 // ---------------------------------------------------------------------------
 
-/// Runs before every route. This API has no login, so what it must not do is act on a
-/// request that an operator's browser sent without the operator meaning it (audit F-02).
+/// Runs before every route. With Google sign-in on, a request first needs a token of an
+/// allowed account ([`signed_in`]); a browser never sends one on its own. Without it this API
+/// has no login, so what it must not do is act on a request that an operator's browser sent
+/// without the operator meaning it (audit F-02). Both ways, the checks below stand.
 /// A page on another site can make a browser send a plain form post anywhere, without
 /// asking and without the server's say; a `PUT`, a `DELETE`, or a post of JSON it cannot
 /// send without first asking this server, which says yes only to the origins
@@ -385,53 +410,189 @@ async fn bind_with(
 async fn guard(
     State(state): State<Backoffice>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    request: axum::extract::Request,
+    mut request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
     let method = request.method();
     let headers = request.headers();
+    let mut caller = Caller { peer, email: None };
     let refusal = if !host_allowed(headers, request.uri(), &state.hosts) {
-        Some((
+        Some(Refusal::new(
             StatusCode::FORBIDDEN,
             "this request was addressed to a name the backoffice does not answer to. It \
              answers to an IP address, to localhost, and to the names listed with \
              --backoffice-host or [settings] backoffice_hosts; list this one there and \
              restart if it is how you reach the backoffice",
         ))
-    } else if method.is_safe() {
-        None
-    } else if !origin_allowed(headers, &state.origins) {
-        Some((
-            StatusCode::FORBIDDEN,
-            "the backoffice only takes a change from a page served under its own address or \
-             an origin --backoffice-cors-origin lists, or from a client that is not a browser",
-        ))
-    } else if (method == Method::POST || method == Method::PUT) && !is_json(headers) {
-        Some((
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "send a change as JSON, with Content-Type: application/json, even one with no \
-             body",
-        ))
     } else {
-        None
+        match signed_in(&state, method, request.uri().path(), headers).await {
+            Err(refusal) => Some(refusal),
+            Ok(email) => {
+                caller.email = email;
+                if method.is_safe() {
+                    None
+                } else if !origin_allowed(headers, &state.origins) {
+                    Some(Refusal::new(
+                        StatusCode::FORBIDDEN,
+                        "the backoffice only takes a change from a page served under its own \
+                         address or an origin --backoffice-cors-origin lists, or from a client \
+                         that is not a browser",
+                    ))
+                } else if (method == Method::POST || method == Method::PUT) && !is_json(headers) {
+                    Some(Refusal::new(
+                        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                        "send a change as JSON, with Content-Type: application/json, even one \
+                         with no body",
+                    ))
+                } else {
+                    None
+                }
+            }
+        }
     };
     match refusal {
-        Some((status, why)) => {
+        Some(Refusal {
+            status,
+            why,
+            challenge,
+        }) => {
             let header = |name| {
                 headers
                     .get(name)
                     .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned())
             };
+            // Never the token: Host and Origin only.
             tracing::warn!(
-                "backoffice: refused {method} {} from {peer} (Host {:?}, Origin {:?}): {why}",
+                "backoffice: refused {method} {} from {caller} (Host {:?}, Origin {:?}): {why}",
                 request.uri().path(),
                 header(header::HOST),
                 header(header::ORIGIN),
             );
-            ApiError::new(status, why).into_response()
+            let mut response = ApiError::new(status, why).into_response();
+            if let Some(challenge) = challenge {
+                response.headers_mut().insert(
+                    header::WWW_AUTHENTICATE,
+                    axum::http::HeaderValue::from_static(challenge),
+                );
+            }
+            response
         }
-        None => next.run(request).await,
+        None => {
+            request.extensions_mut().insert(caller);
+            next.run(request).await
+        }
     }
+}
+
+/// Why [`guard`] turned a request away, and, for a missing or bad sign-in, the
+/// `WWW-Authenticate` challenge its 401 carries.
+struct Refusal {
+    status: StatusCode,
+    why: String,
+    challenge: Option<&'static str>,
+}
+
+impl Refusal {
+    fn new(status: StatusCode, why: impl Into<String>) -> Self {
+        Self {
+            status,
+            why: why.into(),
+            challenge: None,
+        }
+    }
+}
+
+/// Who made a request, for the line every change logs: the signed-in address when Google
+/// sign-in is on, and the peer's address always. Put on every request [`guard`] lets
+/// through, so a handler always finds it.
+#[derive(Clone, Debug)]
+struct Caller {
+    peer: SocketAddr,
+    email: Option<String>,
+}
+
+impl std::fmt::Display for Caller {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.email {
+            Some(email) => write!(f, "{email} ({})", self.peer),
+            None => write!(f, "{}", self.peer),
+        }
+    }
+}
+
+/// The subprotocol the preview websocket answers with, and the prefix of the one that
+/// carries the token: a browser cannot give a websocket an `Authorization` header, so a page
+/// opens it with `["backoffice", "bearer.<token>"]`. Kept out of the URL, which proxies and
+/// logs keep.
+const WS_PROTOCOL: &str = "backoffice";
+const WS_BEARER: &str = "bearer.";
+
+/// The ID token a request carries: `Authorization: Bearer <token>`, or a `bearer.<token>`
+/// websocket subprotocol ([`WS_BEARER`]).
+fn bearer(headers: &axum::http::HeaderMap) -> Option<&str> {
+    if let Some(value) = headers.get(header::AUTHORIZATION) {
+        let (scheme, token) = value.to_str().ok()?.split_once(' ')?;
+        return scheme
+            .eq_ignore_ascii_case("bearer")
+            .then(|| token.trim())
+            .filter(|token| !token.is_empty());
+    }
+    headers
+        .get_all(header::SEC_WEBSOCKET_PROTOCOL)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .find_map(|protocol| protocol.trim().strip_prefix(WS_BEARER))
+        .filter(|token| !token.is_empty())
+}
+
+/// With Google sign-in on, who signed in (see `auth.rs`), or why the request is turned away.
+/// `Ok(None)` when it is off, and for `GET /api/auth`, which tells a page how to sign in
+/// and so cannot ask it to have done so.
+async fn signed_in(
+    state: &Backoffice,
+    method: &Method,
+    path: &str,
+    headers: &axum::http::HeaderMap,
+) -> std::result::Result<Option<String>, Refusal> {
+    let Some(verifier) = &state.sign_in else {
+        return Ok(None);
+    };
+    if method == Method::GET && path == "/api/auth" {
+        return Ok(None);
+    }
+    let Some(token) = bearer(headers) else {
+        return Err(Refusal {
+            challenge: Some("Bearer"),
+            ..Refusal::new(
+                StatusCode::UNAUTHORIZED,
+                "sign in with Google: this backoffice answers only a request carrying the ID \
+                 token of an allowed account, as Authorization: Bearer <token>",
+            )
+        });
+    };
+    match verifier.verify(token).await {
+        Ok(email) => Ok(Some(email)),
+        Err(crate::auth::Denied::Unauthenticated(why)) => Err(Refusal {
+            challenge: Some("Bearer error=\"invalid_token\""),
+            ..Refusal::new(StatusCode::UNAUTHORIZED, why)
+        }),
+        Err(crate::auth::Denied::NotAllowed(why)) => Err(Refusal::new(StatusCode::FORBIDDEN, why)),
+        Err(crate::auth::Denied::NoKeys) => Err(Refusal::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the backoffice has not been able to fetch Google's signing keys yet, so it cannot \
+             check a sign-in; try again shortly",
+        )),
+    }
+}
+
+/// How a page signs in here: the Google OAuth client ID to sign in with, or `null` when
+/// this backoffice takes no sign-in. Answered to anyone the guard lets reach it, signed in
+/// or not, since a page asks before it can be.
+async fn auth_info(State(state): State<Backoffice>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "google_client_id": state.sign_in.as_ref().map(|verifier| verifier.client_id()),
+    }))
 }
 
 /// Whether the request is addressed to a name this API is served under: any IP address,
@@ -564,11 +725,11 @@ fn respond(result: std::result::Result<String, Refused<ApiError>>, created: bool
 /// handler changes anything, so none can skip the converge or the revert.
 async fn apply(
     state: &Backoffice,
-    peer: SocketAddr,
+    caller: &Caller,
     created: bool,
     change: impl FnOnce(&mut RawConfig) -> std::result::Result<String, ApiError>,
 ) -> Response {
-    let by = format!("backoffice: {peer}");
+    let by = format!("backoffice: {caller}");
     respond(state.config.change(&by, change).await, created)
 }
 
@@ -675,7 +836,7 @@ fn no_pair(key_env: &str) -> ApiError {
 /// A pair is added quoting; one to be added halted is added and then halted.
 async fn add_pair(
     State(state): State<Backoffice>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(caller): Extension<Caller>,
     body: std::result::Result<Json<RawPair>, JsonRejection>,
 ) -> std::result::Result<Response, ApiError> {
     let Json(pair) = body?;
@@ -686,7 +847,7 @@ async fn add_pair(
         )));
     }
     config::check_source_keys(&pair).map_err(|err| ApiError::invalid(format!("{err:#}")))?;
-    Ok(apply(&state, peer, true, move |config| {
+    Ok(apply(&state, &caller, true, move |config| {
         if config
             .pairs
             .iter()
@@ -713,7 +874,7 @@ async fn add_pair(
 /// switch by leaving the flag out.
 async fn edit_pair(
     State(state): State<Backoffice>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(caller): Extension<Caller>,
     Path(key_env): Path<String>,
     body: std::result::Result<Json<RawPair>, JsonRejection>,
 ) -> std::result::Result<Response, ApiError> {
@@ -726,7 +887,7 @@ async fn edit_pair(
         )));
     }
     config::check_source_keys(&edited).map_err(|err| ApiError::invalid(format!("{err:#}")))?;
-    Ok(apply(&state, peer, false, move |config| {
+    Ok(apply(&state, &caller, false, move |config| {
         let pair = config
             .pairs
             .iter_mut()
@@ -759,10 +920,10 @@ async fn edit_pair(
 
 async fn remove_pair(
     State(state): State<Backoffice>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(caller): Extension<Caller>,
     Path(key_env): Path<String>,
 ) -> Response {
-    apply(&state, peer, false, move |config| {
+    apply(&state, &caller, false, move |config| {
         let before = config.pairs.len();
         config.pairs.retain(|pair| pair.key_env != key_env);
         if config.pairs.len() == before {
@@ -782,10 +943,10 @@ async fn remove_pair(
 /// recorded, in the config and the file.
 async fn halt_pair(
     State(state): State<Backoffice>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(caller): Extension<Caller>,
     Path(key_env): Path<String>,
 ) -> Response {
-    let by = format!("backoffice: {peer}");
+    let by = format!("backoffice: {caller}");
     let halted = state
         .config
         .halt(
@@ -809,10 +970,10 @@ async fn halt_pair(
 
 async fn resume_pair(
     State(state): State<Backoffice>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(caller): Extension<Caller>,
     Path(key_env): Path<String>,
 ) -> Response {
-    apply(&state, peer, false, move |config| {
+    apply(&state, &caller, false, move |config| {
         set_halted(config, Some(&key_env), false)?;
         Ok(format!("resumed pair {key_env}"))
     })
@@ -826,7 +987,7 @@ async fn resume_pair(
 /// pair, so it can be refused.
 async fn rearm_pair(
     State(state): State<Backoffice>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(caller): Extension<Caller>,
     Path(key_env): Path<String>,
 ) -> Response {
     let tripped = running(&state.states);
@@ -854,7 +1015,7 @@ async fn rearm_pair(
         })
         .await;
     if let Ok(line) = &rearmed {
-        tracing::info!("backoffice: {peer} {line}");
+        tracing::info!("backoffice: {caller} {line}");
     }
     respond(rearmed, false)
 }
@@ -882,9 +1043,9 @@ fn tripped_note(states: &PairStates, config: &RawConfig) -> String {
 /// [`halt_pair`], for every pair not halted already.
 async fn halt_all(
     State(state): State<Backoffice>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(caller): Extension<Caller>,
 ) -> Response {
-    let by = format!("backoffice: {peer}");
+    let by = format!("backoffice: {caller}");
     let halted = state
         .config
         .halt(
@@ -919,11 +1080,8 @@ async fn halt_all(
 /// a reason is left as it is and named in the answer (see [`set_halted`]). Decided under
 /// the shared config's edit lock, so two at once cannot both see a flag the first is about
 /// to clear, which would have the second report an error for a restart that worked.
-async fn reload(
-    State(state): State<Backoffice>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-) -> Response {
-    let by = format!("backoffice: {peer}");
+async fn reload(State(state): State<Backoffice>, Extension(caller): Extension<Caller>) -> Response {
+    let by = format!("backoffice: {caller}");
     let mut editing = state.config.edit().await;
     let current = editing.config();
     let any_flagged = current
@@ -1009,11 +1167,11 @@ async fn list_builders(State(state): State<Backoffice>) -> Json<Vec<BuilderView>
 /// refuses a list none of whose builders would connect.
 async fn add_builder(
     State(state): State<Backoffice>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(caller): Extension<Caller>,
     body: std::result::Result<Json<BuilderConfig>, JsonRejection>,
 ) -> std::result::Result<Response, ApiError> {
     let Json(builder) = body?;
-    Ok(apply(&state, peer, true, move |config| {
+    Ok(apply(&state, &caller, true, move |config| {
         if config
             .builders
             .iter()
@@ -1036,10 +1194,10 @@ async fn add_builder(
 
 async fn remove_builder(
     State(state): State<Backoffice>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(caller): Extension<Caller>,
     Path(name): Path<String>,
 ) -> Response {
-    apply(&state, peer, false, move |config| {
+    apply(&state, &caller, false, move |config| {
         let before = config.builders.len();
         config.builders.retain(|builder| builder.name != name);
         if config.builders.len() == before {
@@ -1274,10 +1432,13 @@ async fn preview_socket(
     // The composite prices the sorted lane; a declared base that sorts second is inverted,
     // and the preview turns it back so the numbers read as the venues quote them.
     let inverted = base > quote;
-    ws.on_upgrade(move |socket| async move {
-        preview_session(socket, endpoints, inverted).await;
-        drop(page);
-    })
+    // Answered when offered, as a browser that sent its token as a subprotocol needs: it
+    // drops a socket that comes back with none of the ones it asked for.
+    ws.protocols([WS_PROTOCOL])
+        .on_upgrade(move |socket| async move {
+            preview_session(socket, endpoints, inverted).await;
+            drop(page);
+        })
 }
 
 /// Whether the request came from a page served from this same host: its `Origin` names
@@ -3378,5 +3539,280 @@ mod tests {
             assert!(answer.contains("400 Bad Request"), "{token0}: {answer}");
             assert!(answer.contains("not valid"), "{token0}: {answer}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Google sign-in
+    // -----------------------------------------------------------------------
+
+    use crate::auth::tests::{CLIENT_ID, KeysEndpoint, claims, sign, token};
+
+    /// [`serve_for`], with Google sign-in on: `example.com`'s Workspace and `ops@gmail.com`
+    /// let in, Google's keys at `keys`.
+    async fn serve_signed_in(
+        name: &str,
+        keys: &KeysEndpoint,
+        origins: &[String],
+    ) -> (SocketAddr, Arc<SharedConfig>) {
+        let (config, requests) = shared(name, |_| {});
+        service(requests, accepted());
+        let (local, _task) = bind(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::clone(&config),
+            test_client(),
+            PairStates::default(),
+            test_kinds(),
+            Access {
+                origins: origins.to_vec(),
+                google: Some(crate::auth::tests::sign_in(keys)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        (local, config)
+    }
+
+    /// The headers of a request signed in with `token`, sent as a client would a change.
+    fn signed(token: &str) -> Vec<(&'static str, String)> {
+        vec![
+            ("authorization", format!("Bearer {token}")),
+            ("content-type", "application/json".to_owned()),
+        ]
+    }
+
+    async fn call_signed(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        token: &str,
+    ) -> (StatusCode, Value) {
+        let headers = signed(token);
+        let headers: Vec<(&str, &str)> = headers.iter().map(|(n, v)| (*n, v.as_str())).collect();
+        call_with(addr, method, path, body, &headers).await
+    }
+
+    /// With sign-in on, every route answers 401 to a request with no token, reads included,
+    /// and says how to sign in; all but `GET /api/auth`, which tells a page what to sign in
+    /// with. Unknown routes too, so nothing is learnt about what exists.
+    #[tokio::test]
+    async fn with_sign_in_every_route_but_auth_needs_a_token() {
+        let keys = KeysEndpoint::spawn("a").await;
+        let (local, config) = serve_signed_in("signin-routes", &keys, &[]).await;
+        let pair = format!("/api/pairs/{WETH_USDC}");
+        let routes = [
+            ("GET", "/api/pairs".to_owned()),
+            ("POST", "/api/pairs".to_owned()),
+            ("GET", pair.clone()),
+            ("PUT", pair.clone()),
+            ("DELETE", pair.clone()),
+            ("POST", format!("{pair}/halt")),
+            ("POST", format!("{pair}/resume")),
+            ("POST", format!("{pair}/rearm")),
+            ("POST", "/api/halt".to_owned()),
+            ("POST", "/api/reload".to_owned()),
+            ("GET", "/api/builders".to_owned()),
+            ("POST", "/api/builders".to_owned()),
+            ("DELETE", "/api/builders/titan".to_owned()),
+            ("GET", "/api/settings".to_owned()),
+            ("GET", "/api/kinds".to_owned()),
+            ("GET", "/api/venues".to_owned()),
+            ("GET", "/api/lookup?token0=0x1&token1=0x2".to_owned()),
+            ("GET", "/api/preview".to_owned()),
+            ("GET", "/api/no-such-route".to_owned()),
+        ];
+        for (method, path) in &routes {
+            let response = reqwest::Client::new()
+                .request(method.parse().unwrap(), format!("http://{local}{path}"))
+                .header("content-type", "application/json")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 401, "{method} {path}");
+            assert_eq!(
+                response.headers()["www-authenticate"],
+                "Bearer",
+                "{method} {path}"
+            );
+        }
+        assert!(!config.snapshot().pairs[0].halted, "nothing changed");
+
+        let (status, body) = call(local, "GET", "/api/auth", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["google_client_id"], CLIENT_ID);
+    }
+
+    /// An allowed account's token is let in, and its change is made; another account's,
+    /// however good, is refused with 403; a bad token with 401, saying why.
+    #[tokio::test]
+    async fn only_an_allowed_account_gets_in() {
+        let keys = KeysEndpoint::spawn("a").await;
+        let (local, config) = serve_signed_in("signin-accounts", &keys, &[]).await;
+        let halt = format!("/api/pairs/{WETH_USDC}/halt");
+
+        let workspace = sign("a", &claims("alice@example.com", Some("example.com")));
+        let (status, body) = call_signed(local, "GET", "/api/pairs", None, &workspace).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let outsider = sign("a", &claims("eve@other.com", Some("other.com")));
+        let (status, body) = call_signed(local, "POST", &halt, None, &outsider).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("eve@other.com"),
+            "{body}"
+        );
+        assert!(!config.snapshot().pairs[0].halted);
+
+        let mut expired = claims("ops@gmail.com", None);
+        expired["exp"] = serde_json::json!(1);
+        let response = reqwest::Client::new()
+            .get(format!("http://{local}/api/pairs"))
+            .bearer_auth(sign("a", &expired))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 401);
+        assert_eq!(
+            response.headers()["www-authenticate"],
+            "Bearer error=\"invalid_token\""
+        );
+        let body: Value = response.json().await.unwrap();
+        assert!(
+            body["error"].as_str().unwrap().contains("expired"),
+            "{body}"
+        );
+
+        let (status, body) = call_signed(local, "POST", &halt, None, &token("ops@gmail.com")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(config.snapshot().pairs[0].halted);
+    }
+
+    /// The F-06 half: Google's keys endpoint hanging does not hold up a halt signed with a
+    /// key already fetched.
+    #[tokio::test]
+    async fn a_halt_does_not_wait_for_googles_keys() {
+        let keys = KeysEndpoint::spawn("a").await;
+        let (local, config) = serve_signed_in("signin-halt", &keys, &[]).await;
+        let ops = token("ops@gmail.com");
+        let (status, body) = call_signed(local, "GET", "/api/pairs", None, &ops).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        keys.stall();
+        let (status, body) = tokio::time::timeout(
+            Duration::from_secs(1),
+            call_signed(local, "POST", "/api/halt", None, &ops),
+        )
+        .await
+        .expect("the halt answers without a fetch");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(config.snapshot().pairs[0].halted);
+    }
+
+    /// A front end on another origin: the preflight lets it send `Authorization`, and a 401
+    /// reaches its page readable, rather than as a network error it cannot tell apart.
+    #[tokio::test]
+    async fn a_front_end_on_another_origin_can_sign_in_and_read_a_refusal() {
+        let keys = KeysEndpoint::spawn("a").await;
+        let (local, _config) = serve_signed_in("signin-cors", &keys, &[UI.to_owned()]).await;
+        let client = reqwest::Client::new();
+
+        let preflight = client
+            .request(reqwest::Method::OPTIONS, format!("http://{local}/api/halt"))
+            .header("origin", UI)
+            .header("access-control-request-method", "POST")
+            .header(
+                "access-control-request-headers",
+                "authorization, content-type",
+            )
+            .send()
+            .await
+            .unwrap();
+        assert!(preflight.status().is_success(), "{}", preflight.status());
+        let allowed = preflight.headers()["access-control-allow-headers"]
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(allowed.contains("authorization"), "{allowed}");
+
+        let refused = client
+            .get(format!("http://{local}/api/pairs"))
+            .header("origin", UI)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status().as_u16(), 401);
+        assert_eq!(refused.headers()["access-control-allow-origin"], UI);
+
+        let signed_in = client
+            .get(format!("http://{local}/api/pairs"))
+            .header("origin", UI)
+            .bearer_auth(token("ops@gmail.com"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(signed_in.status().as_u16(), 200);
+    }
+
+    /// The preview websocket, which a browser cannot give a header: the token as a
+    /// subprotocol opens it, answered as `backoffice`; none is refused before the upgrade.
+    #[tokio::test]
+    async fn the_preview_takes_its_token_as_a_subprotocol() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let keys = KeysEndpoint::spawn("a").await;
+        let (local, _config) = serve_signed_in("signin-preview", &keys, &[]).await;
+        let request = |protocols: Option<String>| {
+            let mut request = format!(
+                "ws://{local}/api/preview?token0=0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2\
+                 &token1=0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+            )
+            .into_client_request()
+            .unwrap();
+            let headers = request.headers_mut();
+            headers.insert("origin", format!("http://{local}").parse().unwrap());
+            if let Some(protocols) = protocols {
+                headers.insert("sec-websocket-protocol", protocols.parse().unwrap());
+            }
+            request
+        };
+
+        match tokio_tungstenite::connect_async(request(None)).await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                assert_eq!(response.status().as_u16(), 401)
+            }
+            other => panic!("opened with no token: {:?}", other.map(|_| ())),
+        }
+
+        let offered = format!("backoffice, bearer.{}", token("ops@gmail.com"));
+        let (_page, response) = tokio_tungstenite::connect_async(request(Some(offered)))
+            .await
+            .expect("opened with a token");
+        assert_eq!(response.headers()["sec-websocket-protocol"], "backoffice");
+    }
+
+    /// With sign-in off, `GET /api/auth` says so and nothing asks for a token.
+    #[tokio::test]
+    async fn without_sign_in_auth_says_there_is_none() {
+        let (local, _config) = serve("signin-off", |_| {}, accepted()).await;
+        let (status, body) = call(local, "GET", "/api/auth", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["google_client_id"], Value::Null);
+        let (status, _) = call(local, "GET", "/api/pairs", None).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// A change's log line names who signed in, beside the peer.
+    #[test]
+    fn a_caller_reads_as_who_signed_in_and_from_where() {
+        let peer: SocketAddr = "100.64.1.5:51234".parse().unwrap();
+        let signed_in = Caller {
+            peer,
+            email: Some("alice@example.com".to_owned()),
+        };
+        assert_eq!(
+            signed_in.to_string(),
+            "alice@example.com (100.64.1.5:51234)"
+        );
+        assert_eq!(Caller { peer, email: None }.to_string(), "100.64.1.5:51234");
     }
 }

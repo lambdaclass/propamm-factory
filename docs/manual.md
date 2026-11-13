@@ -667,6 +667,7 @@ journal says why.
 | `GET /api/venues` | the venues a pair can read |
 | `GET /api/lookup?token0=&token1=` | which exchanges list a token pair; saves nothing |
 | `GET /api/preview?token0=&token1=` | a websocket of live venue mids; saves nothing |
+| `GET /api/auth` | the Google client ID a page signs in with, or `null`; needs no sign-in |
 
 **Pairs.** `GET /api/pairs` answers each pair as `{"pair": ..., "status": ..., "pricing":
 ...}`: `pair` is its `[[pairs]]` stanza as JSON, `status` is `live`, `halted`,
@@ -741,8 +742,8 @@ These are the backoffice's own names, the address requests are sent to. A front 
 address, where its pages are served from, is an origin, for `--backoffice-cors-origin` below.
 A reverse proxy in front has to pass `Host` and `Origin` through unchanged, as Caddy does.
 
-**Only JSON, and only from origins it knows.** With no login, what the API must not do is
-act on a request an operator's browser sent without the operator meaning it. So every `POST`
+**Only JSON, and only from origins it knows.** With or without Google sign-in (below), what
+the API must not do is act on a request an operator's browser sent without the operator meaning it. So every `POST`
 and `PUT` must carry `Content-Type: application/json`, even one with no body (halt, resume,
 re-arm, reload), and any request but a `GET` whose `Origin` header is neither the API's own
 address nor an origin listed with `--backoffice-cors-origin` is refused with 403. `curl` and
@@ -763,8 +764,9 @@ quote-updater --config config.toml --backoffice-ip 100.64.1.2 \
 ```
 
 A page from a listed origin gets its preflight approved for `GET`, `POST`, `PUT` and `DELETE`
-with a `Content-Type` header, can read every answer, and can open the preview; no credentials
-are involved, since there is no login. Every other origin gets no CORS headers, and its
+with a `Content-Type` header (and `Authorization`, for sign-in), can read every answer, a
+refusal included, and can open the preview. No cookies are involved: a sign-in travels in a
+header the page sets. Every other origin gets no CORS headers, and its
 changes are still refused. An origin is written as the browser sends it, scheme, host and
 port alone (`http://100.64.1.2:3000`, no path), and `*` is refused: it would let a page on any
 site an operator's browser visits drive the API. With none listed there is no CORS at all,
@@ -772,6 +774,64 @@ and a browser front end has to be served under the API's own address, for instan
 reverse proxy that serves the UI and proxies `/api`. A front end served over HTTPS can only
 call the API over HTTPS too, whatever CORS says (a browser blocks mixed content): serve the
 backoffice with a certificate (above), and list the front end's `https://` origin.
+
+**Google sign-in (optional).** Off unless `--backoffice-google-client-id` is given
+(`BACKOFFICE_GOOGLE_CLIENT_ID`). With it, every request needs the Google ID token of an
+allowed account as `Authorization: Bearer <token>`, reads included. Without one the API
+answers 401; with a token that does not check out, 401 saying why (expired, issued to
+another application, not signed by Google); with a good sign-in by an account that is not let
+in, 403. Who is let in:
+
+- `--backoffice-allow-domain example.com` (`BACKOFFICE_ALLOW_DOMAINS`, comma-separated):
+  every account of that Google Workspace. Matched on the domain Google says manages the
+  account (the token's `hd` claim), never on the address, so a personal Google account
+  opened under a work address is not let in. `gmail.com` is refused: a personal account
+  belongs to no Workspace, so it would let no one in.
+- `--backoffice-allow-email ops@example.com` (`BACKOFFICE_ALLOW_EMAILS`, comma-separated):
+  one account, by its verified address.
+
+A client ID with neither is refused at startup, since every Google account would get in, and
+so is a list without a client ID.
+
+```bash
+quote-updater --config config.toml --backoffice-ip 100.64.1.2 \
+  --backoffice-host pusher.your-tailnet.ts.net \
+  --backoffice-tls-cert pusher.your-tailnet.ts.net.crt \
+  --backoffice-tls-key pusher.your-tailnet.ts.net.key \
+  --backoffice-cors-origin https://ui.your-tailnet.ts.net \
+  --backoffice-google-client-id 1234-abc.apps.googleusercontent.com \
+  --backoffice-allow-domain example.com
+```
+
+The client is created in the Google Cloud console, under APIs & Services, Credentials: an
+OAuth client ID of type "Web application", used for this backoffice alone (any token Google
+issues for that client ID is one the backoffice takes), with the front end's origin under "Authorized
+JavaScript origins". Google takes only an HTTPS origin under a name there, not an IP address
+(`http://localhost` is the exception, for development); a tailnet name with a `tailscale
+cert` certificate is one. No redirect URI and no client secret: the backoffice checks tokens
+and never exchanges a code for one. A consent screen of user type "Internal" also keeps
+sign-in to your Workspace's accounts at Google's end.
+
+With sign-in on there is no way around it, from this host either: if nobody can sign in
+(Google unreachable since before the keys were first fetched, say), the only halt left is
+stopping the process, whose ctrl-c withdraws every quote. The preview checks its token when
+it opens, and stays open past the token's expiry until it is closed.
+
+A token is let in when it is signed by one of Google's published keys (RS256 only), issued
+by Google, for this client ID, not expired, and for a verified address. The keys are fetched
+from `https://www.googleapis.com/oauth2/v3/certs` at start and again as Google's
+`Cache-Control` says, so the host needs outbound HTTPS to Google; a failed fetch keeps the
+keys already held and is tried again. A request never waits for that fetch while the key
+its token was signed with is known, so a halt does not depend on reaching Google (audit
+F-06). Until the first fetch succeeds every request answers 503.
+
+For a page: `GET /api/auth` answers `{"google_client_id": "..."}`, or `null` when sign-in is
+off, without a token, so a front end knows what to sign in with. An ID token is good until
+it expires (about an hour); after that the API answers 401 and the page signs in again. A browser cannot give a websocket a
+header, so the preview takes its token as a subprotocol: open it with `["backoffice",
+"bearer.<token>"]`, and the API answers `backoffice`. There is no second kind of credential
+for scripts: with sign-in on, `curl` needs a token as a page does. Tokens are never logged;
+every change is logged with the signed-in address beside the peer.
 
 **The lookup and the preview.** `GET /api/lookup` is the venue lookup described under the
 price sources above. The live prices run over one websocket per open preview. The client
@@ -827,11 +887,13 @@ backoffice (`backoffice_addr`, `--backoffice-ip` or `--backoffice-port`) under `
 is refused at startup rather than bound and left inert, so trying it locally means the mock-builder recipe below, not the anvil `make`
 targets.
 
-**Access control is the tailnet.** There is no login. Binding an unspecified address
+**Access control is the tailnet**, and Google sign-in when it is on (above). Binding an
+unspecified address
 (`0.0.0.0` or `::`, from the file or `--backoffice-ip`) is refused at startup rather than
 warned about: unlike `/metrics`, which only
 leaks, this API writes, and anything that can reach it can repoint a pair's price source
-at a market of its choosing. Every change is logged with the peer that made it.
+at a market of its choosing. Every change is logged with the peer that made it, and with
+sign-in on, the address that signed in.
 
 A server with a backoffice may start with no pairs and no builders at all: `pairs = []`
 plus a `backoffice_addr` is a complete config, and everything else is added through the

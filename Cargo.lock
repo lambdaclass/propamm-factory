@@ -3160,6 +3160,7 @@ dependencies = [
  "eyre",
  "futures-util",
  "hex",
+ "jsonwebtoken",
  "native-tls",
  "prometheus",
  "rand 0.8.8",
