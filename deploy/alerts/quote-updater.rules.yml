@@ -413,17 +413,34 @@ groups:
             update's own encoding, none of which recover on their own — check the updater's
             stderr for the error itself.
 
+      # Held exactly as long as PusherFeedDown, which inhibits it (alertmanager.yml). They
+      # become true together: the composite writes feed_last_tick only when it publishes,
+      # beside feed_up = 1, so a lane that stops publishing stops both. A shorter hold here
+      # would post at 90s every episode PusherFeedDown waits out, before the alert that
+      # silences it exists.
       - alert: PusherFeedStale
         expr: time() - quote_updater_feed_last_tick_timestamp_seconds > 30
-        for: 1m
+        for: 5m
         labels: { severity: ticket }
         annotations:
           summary: "{{ $labels.pair }}: no accepted sample for over 30s"
           description: "Past MAX_PRICE_AGE, so the updater is refusing to publish and the lane is withdrawn."
 
+      # `for: 5m`, not the 2m this had. At 2m it was the busiest rule in the channel, almost
+      # all of it episodes that cleared on their own: each posted a ticket and then its
+      # resolve one group_interval later, which is why every one of them seemed to last five
+      # minutes. A feed down five minutes straight is the case worth a message; a pair that
+      # keeps dipping for less is a pattern to find on the dashboard, not a message per dip.
+      #
+      # 5m is PusherVenueFeedDown's hold. PusherFeedSampleNotCurrent already reads this same
+      # condition at 5m (the composite zeroes the pair's feed_sample_current beside feed_up),
+      # so how often it fired before this change is how many episodes still get through.
+      #
+      # The cost: a lasting outage is ticketed three minutes later. The lane is withdrawn
+      # meanwhile, so it is quoting nothing, not quoting wrong.
       - alert: PusherFeedDown
         expr: quote_updater_feed_up == 0
-        for: 2m
+        for: 5m
         labels: { severity: ticket }
         annotations:
           summary: "{{ $labels.pair }}: fewer than min_sources venues have a fresh price"
