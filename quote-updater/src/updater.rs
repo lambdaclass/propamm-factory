@@ -461,7 +461,10 @@ impl UpdaterHandle {
     pub async fn reload(&self) -> Result<String, String> {
         let (reply, answer) = oneshot::channel();
         self.reloads
-            .send(ReloadRequest { reply })
+            .send(ReloadRequest {
+                reply,
+                rearm_only: None,
+            })
             .await
             .map_err(|_| "the updater has stopped".to_owned())?;
         // A dropped reply is the run ending with the request unread, which only the paths
