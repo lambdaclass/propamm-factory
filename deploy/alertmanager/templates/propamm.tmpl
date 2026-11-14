@@ -43,14 +43,23 @@
 {{- end }}
 
 {{/*
-  The audit receiver's title. Same body as everything else, but no "FIRING ×N ·" prefix:
-  PusherConfigChanged reports a reload that worked, and leading with the word this file uses
-  for outages reads as an incident to anyone scanning the channel. There is also never more
-  than one of it — config_generation is process-wide — so the count the other title carries
+  The audit receiver's title and body. No "FIRING ×N ·" prefix: PusherConfigChanged reports a
+  reload that worked, and leading with the word this file uses for outages reads as an
+  incident to anyone scanning the channel. There is also never more than one firing — each
+  reload's alert resolves as the next one's fires — so the count the other title carries
   would always be ×1.
+
+  The body is the description alone, which is the list of what changed. The alert name and
+  the pair that `propamm.text` puts above it say nothing here: the title already names the
+  pairs, and the alert carries no `pair` label to print.
 */}}
 {{ define "propamm.audit.title" -}}
 {{ if .CommonAnnotations.summary }}{{ .CommonAnnotations.summary }}
 {{- else }}{{ .GroupLabels.alertname }}{{ end }}
+{{- end }}
+
+{{ define "propamm.audit.text" -}}
+{{ range .Alerts.Firing }}{{ .Annotations.description }}
+{{ end -}}
 {{- end }}
 

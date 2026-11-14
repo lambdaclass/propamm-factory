@@ -68,6 +68,7 @@ mod builder;
 mod cli;
 mod composite;
 mod config;
+mod config_diff;
 mod discover;
 mod exporter;
 mod feed;

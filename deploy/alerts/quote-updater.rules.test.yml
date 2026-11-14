@@ -6,7 +6,8 @@
 #
 # Scoped to PusherSignerNearlyDry and its level check PusherSignerDry, plus
 # PusherStockCalendarEnding and PusherStockCalendarEnded and PusherVenueLate (at the end),
-# which are new enough to want their labels and wording proven. The first is a `predict_linear`, which is the only
+# which are new enough to want their labels and wording proven, and PusherConfigChanged, whose
+# whole message is rendered from other series by `query`. The first is a `predict_linear`, which is the only
 # expression in the file whose *silence* is a designed behaviour rather than a side effect of
 # a comparison coming out false: one NaN sample anywhere in the range suppresses it entirely,
 # and that is what stops a failed eth_getBalance paging an operator about a key that is fine.
@@ -228,3 +229,126 @@ tests:
             exp_annotations:
               summary: "ETH/USDT: okx has been delivering prices late for 5 minutes"
               description: "This venue's prices have been arriving later behind the exchange's own timestamps than max_source_lag_ms allows for five minutes, so it is out of the pair's average. quote_updater_venue_source_lag_ms says how far behind; a steady quote_updater_venue_future_stamps_total, or every stamped venue late by about the same amount, points at this host's clock instead."
+
+  # PusherConfigChanged: the message is the reload's change lines, grouped by pair and in
+  # the order the updater numbered them, and a second reload inside the first one's window
+  # is a second alert with its own lines rather than nothing. Reload 1 lands at 6m with a
+  # retune and a re-arm; reload 2 at 9m replaces its lines (the `stale` is what a scrape
+  # that no longer has them records) with five sections, which the title cuts to three
+  # and a count.
+  - interval: 1m
+    name: a reload's changes are listed, and the next reload is sent on its own
+    input_series:
+      - series: 'quote_updater_config_change_reloads_total'
+        values: "0x5 1x2 2x12"
+      - series: 'quote_updater_config_change{reload="1",outcome="applied",section="USDC/USDT",note="re-armed, settings unchanged"}'
+        values: "_x6 1x2 stale"
+      - series: 'quote_updater_config_change{reload="1",outcome="applied",section="WETH/USDC",setting="max_deviation",old="0.02",new="0.03"}'
+        values: "_x6 2x2 stale"
+      - series: 'quote_updater_config_change{reload="1",outcome="applied",section="WETH/USDC",setting="pricing.delta",old="0.0005",new="0.0008"}'
+        values: "_x6 3x2 stale"
+      - series: 'quote_updater_config_change{reload="2",outcome="applied",section="builders",note="every pair restarted onto the new list"}'
+        values: "_x9 1x12"
+      - series: 'quote_updater_config_change{reload="2",outcome="applied",section="builders",setting="titan-eu.endpoint",old="wss://eu.rpc.titanbuilder.xyz",new="wss://us.rpc.titanbuilder.xyz"}'
+        values: "_x9 2x12"
+      - series: 'quote_updater_config_change{reload="2",outcome="applied",section="DAI/USDC",note="removed"}'
+        values: "_x9 3x12"
+      - series: 'quote_updater_config_change{reload="2",outcome="applied",section="SOL/USDC",note="added"}'
+        values: "_x9 4x12"
+      - series: 'quote_updater_config_change{reload="2",outcome="applied",section="USDC/USDT",setting="pricing.api_key",note="changed (hidden)"}'
+        values: "_x9 5x12"
+      - series: 'quote_updater_config_change{reload="2",outcome="applied",section="WBTC/USDC",note="halted: kill switch"}'
+        values: "_x9 6x12"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: PusherConfigChanged
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: PusherConfigChanged
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              reload: "1"
+              outcome: applied
+            exp_annotations:
+              summary: "Config reloaded: USDC/USDT, WETH/USDC"
+              description: |-
+                ```
+                USDC/USDT
+                  re-armed, settings unchanged
+                WETH/USDC
+                  max_deviation            0.02       → 0.03
+                  pricing.delta            0.0005     → 0.0008
+                ```
+                Nothing is wrong; this is a record, here so the change is visible beside whatever it may explain. Long values are cut and long lists trimmed: the journal has every line.
+      # The first reload's alert has resolved and only the second's fires.
+      - eval_time: 10m
+        alertname: PusherConfigChanged
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              reload: "2"
+              outcome: applied
+            exp_annotations:
+              summary: "Config reloaded: builders, DAI/USDC, SOL/USDC and 2 more"
+              description: |-
+                ```
+                builders
+                  every pair restarted onto the new list
+                  titan-eu.endpoint        wss://eu.rpc.titanbuilder.xyz → wss://us.rpc.titanbuilder.xyz
+                DAI/USDC
+                  removed
+                SOL/USDC
+                  added
+                USDC/USDT
+                  pricing.api_key          changed (hidden)
+                WBTC/USDC
+                  halted: kill switch
+                ```
+                Nothing is wrong; this is a record, here so the change is visible beside whatever it may explain. Long values are cut and long lists trimmed: the journal has every line.
+      # Ten minutes on, the change has aged out of the window.
+      - eval_time: 20m
+        alertname: PusherConfigChanged
+        exp_alerts: []
+
+  # A partial reload is announced as one: what the pairs that took it changed, and the pair
+  # that did not take it, under a title and a closing line that say so.
+  - interval: 1m
+    name: a partial reload lists what it changed and what failed
+    input_series:
+      - series: 'quote_updater_config_change_reloads_total'
+        values: "0x2 1x10"
+      - series: 'quote_updater_config_change{reload="1",outcome="partial",section="SOL/USDC",note="failed: kept its previous settings"}'
+        values: "_x3 1x10"
+      - series: 'quote_updater_config_change{reload="1",outcome="partial",section="WETH/USDC",setting="pricing.delta",old="0.0008",new="0.0006"}'
+        values: "_x3 2x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: PusherConfigChanged
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              reload: "1"
+              outcome: partial
+            exp_annotations:
+              summary: "Config partly reloaded: SOL/USDC, WETH/USDC"
+              description: |-
+                ```
+                SOL/USDC
+                  failed: kept its previous settings
+                WETH/USDC
+                  pricing.delta            0.0008     → 0.0006
+                ```
+                Not every pair took the new file: the ones marked failed kept their previous settings, and PusherConfigReloadPartial says what to do. The rest is a record of what changed. Long values are cut and long lists trimmed: the journal has every line.
+
+  # A restart resets the count, which `changes()` counts, but a fresh process has no change
+  # lines until it reloads: nothing fires, with no restart guard in the rule.
+  - interval: 1m
+    name: a restart is not a config change
+    input_series:
+      - series: 'quote_updater_config_change_reloads_total'
+        values: "3x5 0x10"
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: PusherConfigChanged
+        exp_alerts: []

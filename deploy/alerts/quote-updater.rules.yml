@@ -316,36 +316,56 @@ groups:
       # band, the two land in the same channel in the right order, and nobody has to go and
       # ask who touched what.
       #
-      # `config_generation` rather than `config_reloads_total{result="applied"}`: the gauge
-      # advances only when every configured pair made it onto the new file, which is exactly
-      # the event worth announcing. A partial apply deliberately does not move it and has
-      # PusherConfigReloadPartial of its own.
+      # The message says what changed, setting by setting, from
+      # `quote_updater_config_change`: one series per line, written by each reload that moved
+      # a lane and replaced whole by the next one, valued by its place in the list so
+      # `sort()` puts the lines back in order (`config_diff` in the updater writes them,
+      # secrets redacted and long values cut).
       #
-      # The `unless` is what keeps this honest rather than noisy. A restart resets the gauge
-      # to 0, and a drop from 3 to 0 is a change like any other to `changes()` — so without
-      # it every deploy and every `systemctl restart` posts "the config changed", which is
-      # the fastest way to teach a channel to ignore an audit line. `start_time_seconds`
-      # moves on exactly those restarts and on nothing else, and the two windows are the same
-      # width so the suppression covers precisely the window the restart is inside of.
+      # A partial reload is announced too, as "partly reloaded", with its failed pairs
+      # listed as such. The lanes it moved did move, and the reload that later fixes the
+      # failed pair moves only that one, so this is the only message that will ever say
+      # what the others changed. PusherConfigReloadPartial still raises the ticket that says
+      # what to do about the failure. Which is why the window reads
+      # `config_change_reloads_total`, written with the lines, and not `config_generation`,
+      # which a partial reload deliberately does not move.
+      #
+      # `by (reload)` makes each reload a different alert. Alertmanager tells alerts apart by
+      # their labels only, so with a single label set a second reload inside the first one's
+      # window would change nothing it sends, and the second change would never reach the
+      # channel. As it is, the second reload's lines replace the first's, the first alert
+      # resolves (silently: the audit receiver does not send resolutions), and the second is
+      # sent.
+      #
+      # No restart guard. A restart resets the count to 0, which `changes()` counts, but the
+      # new process exports no lines until it reloads, so the left side is empty and nothing
+      # fires. The guard this used to carry (`unless` the start time moved) also hid a real
+      # reload made within ten minutes of a restart.
       #
       # Fires for about ten minutes and then resolves on its own, which is what a window
       # function does rather than an oversight: there is no state to sit in, only an event
       # that ages out of the window.
       - alert: PusherConfigChanged
         expr: >-
-          changes(quote_updater_config_generation[10m]) > 0
-            unless
-          changes(quote_updater_start_time_seconds[10m]) > 0
+          max by (reload, outcome) (quote_updater_config_change)
+            and on ()
+          (changes(quote_updater_config_change_reloads_total[10m]) > 0)
         for: 0m
         labels: { severity: ticket }
         annotations:
-          summary: "Config reloaded: every pair moved onto a new config.toml"
-          description: >-
-            A reload validated and applied in full, so every configured pair is now quoting the
-            shape the file describes — a delta, a band, a max_deviation or a pricing knob may
-            have changed on a lane that never stopped quoting. Nothing is wrong; this is here
-            so the change is visible beside whatever it may explain. The journal names what was
-            applied, per pair.
+          # "Config reloaded: WETH/USDC, USDC/USDT, SOL/USDC and 2 more", in the order the
+          # lines below list them.
+          summary: >-
+            Config {{ if eq $labels.outcome "partial" }}partly {{ end }}reloaded: {{ range $i, $s := query "sort(min by (section) (quote_updater_config_change))" }}{{ if lt $i 3 }}{{ if $i }}, {{ end }}{{ $s.Labels.section }}{{ end }}{{ end }}{{ with query "count(count by (section) (quote_updater_config_change)) - 3 > 0" }} and {{ . | first | value }} more{{ end }}
+          # A setting line has `old` and `new`; a hidden change has a setting and a note; a
+          # note line has neither. Literal (`|`), not folded: the code block needs its
+          # newlines.
+          description: |-
+            ```
+            {{ $section := "" }}{{ range query "sort(quote_updater_config_change)" }}{{ if ne .Labels.section $section }}{{ $section = .Labels.section }}{{ .Labels.section }}
+            {{ end }}  {{ if .Labels.old }}{{ printf "%-24s %-10s → %s" .Labels.setting .Labels.old .Labels.new }}{{ else if .Labels.setting }}{{ printf "%-24s %s" .Labels.setting .Labels.note }}{{ else }}{{ .Labels.note }}{{ end }}
+            {{ end }}```
+            {{ if eq $labels.outcome "partial" }}Not every pair took the new file: the ones marked failed kept their previous settings, and PusherConfigReloadPartial says what to do. The rest is a record of what changed.{{ else }}Nothing is wrong; this is a record, here so the change is visible beside whatever it may explain.{{ end }} Long values are cut and long lists trimmed: the journal has every line.
 
       - alert: PusherBreakerApproaching
         expr: max_over_time(quote_updater_breaker_deviation_ratio[30m]) > 0.6
