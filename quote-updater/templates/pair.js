@@ -25,17 +25,21 @@
   }));
   const isAddress = (s) => /^0x[0-9a-fA-F]{40}$/.test((s || "").trim());
 
-  // Columns the static page does not have: a tick box, the share, the live mid.
+  // Columns the static page does not have: a tick box, the share, the live mid, the
+  // round trip to the venue from this host (median / p95, with the mean and the count on
+  // hover): a ping every ten seconds over the same socket the live mid comes over, or
+  // each fetch for a polled venue.
   const head = table.querySelector("thead tr");
   head.insertAdjacentHTML("afterbegin", "<th>");
-  head.querySelector("th:nth-child(4)").insertAdjacentHTML("afterend", "<th>share<th>live mid<th>24h volume");
+  head.querySelector("th:nth-child(4)").insertAdjacentHTML("afterend", "<th>share<th>live mid<th>latency<th>24h volume");
   for (const row of rows) {
     row.tr.insertAdjacentHTML("afterbegin", '<td class=tick><input type=checkbox></td>');
     row.tick = row.tr.querySelector("td.tick input");
     row.tick.checked = row.symbol.value.trim() !== "";
-    row.weight.parentElement.insertAdjacentHTML("afterend", "<td class=share></td><td class=live></td><td class=volume></td>");
+    row.weight.parentElement.insertAdjacentHTML("afterend", "<td class=share></td><td class=live></td><td class=latency></td><td class=volume></td>");
     row.share = row.tr.querySelector("td.share");
     row.live = row.tr.querySelector("td.live");
+    row.latency = row.tr.querySelector("td.latency");
     row.volumeCell = row.tr.querySelector("td.volume");
     // The static note column is the no-script fallback; the script's columns replace it.
     row.note.textContent = "";
@@ -182,7 +186,7 @@
     clearTimeout(reopenTimer);
     if (socket) { socket.onclose = null; socket.close(); socket = null; }
     sent = new Map();
-    for (const row of rows) row.live.textContent = "";
+    for (const row of rows) { row.live.textContent = ""; row.latency.textContent = ""; row.latency.title = ""; }
     compositeLine.hidden = true;
     if (!isAddress(token0.value) || !isAddress(token1.value)) { socketTokens = ""; return; }
     socketTokens = tokensKey();
@@ -205,8 +209,15 @@
         seen.add(v.venue);
         row.live.textContent = v.mid === null ? (v.age_ms === null ? "connecting…" : "no price") : fmt(v.mid, 6) + (v.fresh ? "" : " (stale)");
         row.live.classList.toggle("stale", v.mid !== null && !v.fresh);
+        if (v.latency) {
+          row.latency.textContent = `${v.latency.p50_ms} / ${v.latency.p95_ms} ms`;
+          row.latency.title = `median / p95 of the last ${v.latency.samples} round trip${v.latency.samples === 1 ? "" : "s"}; mean ${v.latency.avg_ms} ms`;
+        } else {
+          row.latency.textContent = "";
+          row.latency.title = "";
+        }
       }
-      for (const row of rows) if (!seen.has(row.venue)) row.live.textContent = sent.has(row.venue) ? "connecting…" : "";
+      for (const row of rows) if (!seen.has(row.venue)) { row.live.textContent = sent.has(row.venue) ? "connecting…" : ""; row.latency.textContent = ""; row.latency.title = ""; }
       compositeLine.hidden = data.venues.length === 0;
       compositeLine.textContent = data.composite === null
         ? `composite: waiting for a fresh venue (${data.fresh} fresh)`
