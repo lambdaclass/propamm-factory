@@ -39,8 +39,8 @@ services:
       - "host.docker.internal:host-gateway"
     ports:
       # The backoffice. It refuses to bind every interface, so the config binds the fixed
-      # address below and compose publishes it on the host address you choose. The API has
-      # no login: publish it on your tailnet address, never a public one.
+      # address below and compose publishes it on the host address you choose. Publish it on
+      # your tailnet address, never a public one, with or without Google sign-in.
       - "${BACKOFFICE_BIND:-127.0.0.1}:8088:8088"
     networks:
       propamm:

@@ -60,6 +60,11 @@ tower-http = { version = "0.6.11", features = ["cors"] }
 # but rustls, rustls-webpki and tokio-rustls are now compiled in. Measured: a release build
 # of example/ went from 10.18 MB to 11.44 MB (+1.26 MB, macOS arm64), this code included.
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
+# The backoffice's Google sign-in (auth.rs): checks an ID token's RS256 signature against
+# Google's published keys, and its claims. Already compiled in through ethrex-rpc, with the
+# same (default) features, so zero new package entries in Cargo.lock and nothing new to
+# build. Pinned to the version that tree locks.
+jsonwebtoken = "9.3.1"
 
 # ethrex has no standalone lightweight client crate yet, so the client (EthClient, calldata
 # encoding, signer) comes from the node's workspace crates. Pinned to one rev so the five

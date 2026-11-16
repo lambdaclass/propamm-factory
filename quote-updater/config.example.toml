@@ -119,8 +119,9 @@ disable_cross_region = false
 # without a deploy. It serves no pages; docs/manual.md, "The backoffice", lists its routes.
 # Unset disables it, which is the default.
 #
-# It has no login of its own. Bind it to this host's *tailnet* address, so reaching it at
-# all means being on the tailnet and past its ACL; binding 0.0.0.0 is refused rather than
+# It has no login of its own unless Google sign-in is on (below). Bind it to this host's
+# *tailnet* address either way, so reaching it at all means being on the tailnet and past its
+# ACL; binding 0.0.0.0 is refused rather than
 # warned about, because unlike the metrics endpoint this one writes: anything that can
 # reach it can repoint a pair's price source.
 #
@@ -141,6 +142,11 @@ disable_cross_region = false
 # It is plain HTTP unless --backoffice-tls-cert and --backoffice-tls-key (BACKOFFICE_TLS_CERT,
 # BACKOFFICE_TLS_KEY) name a PEM certificate and its key, `tailscale cert`'s included; then
 # it is HTTPS only, and a renewed certificate is picked up without a restart.
+#
+# --backoffice-google-client-id (BACKOFFICE_GOOGLE_CLIENT_ID) requires a Google sign-in on
+# every request: the ID token of an account --backoffice-allow-domain (a Workspace domain,
+# BACKOFFICE_ALLOW_DOMAINS) or --backoffice-allow-email (BACKOFFICE_ALLOW_EMAILS) lets in, as
+# Authorization: Bearer. No client secret; see docs/manual.md, "Google sign-in".
 #
 # Setting it also lets the updater start with no pairs and no builders, which is what makes
 # a fresh host bootable from a config file holding nothing but a target and this address:

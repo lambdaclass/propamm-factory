@@ -405,7 +405,7 @@ groups:
       # above catch a reload that was *refused* or that half-applied, and a reload that
       # succeeds cleanly says nothing at all. A running updater's config is changed through
       # the backoffice API, which writes config.toml and converges onto it on an operator's
-      # behalf and has no login, only a tailnet address (deploy/README.md). So delta,
+      # behalf, behind a tailnet address and an optional Google sign-in (deploy/README.md). So delta,
       # max_deviation or a band can change on a quoting lane with no trace outside the journal.
       #
       # What it buys is adjacency. When a page arrives twenty minutes after someone widened a

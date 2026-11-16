@@ -62,6 +62,7 @@ pub mod prelude {
     };
 }
 
+mod auth;
 mod backoffice;
 mod breaker;
 mod builder;
