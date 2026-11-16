@@ -155,11 +155,12 @@ export function signOut() {
   changed("signed-out");
 }
 
-/** Google's sign-in button, drawn into `el`. */
-export function renderButton(el, size = "large") {
+/** Google's sign-in button, drawn into `el`, `width` pixels wide. The page shows its own
+ * button and lays this one over it, unseen (app.js `googleButton`): only Google's own button
+ * can start the sign-in, and what it looks like is not this page's to choose. */
+export function renderButton(el, size, width) {
   if (!gsi) return;
-  const dark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
-  gsi.renderButton(el, { type: "standard", theme: dark ? "filled_black" : "outline", size, text: "signin_with" });
+  gsi.renderButton(el, { type: "standard", theme: "outline", size, width, text: "signin_with" });
 }
 
 /** The token's claims, read for the address and the expiry only. Never trusted: the
