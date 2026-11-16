@@ -8,8 +8,12 @@
 //   #/pairs/edit/<key>    one pair's stanza
 //   #/builders/new        a new builder
 //   #/settings            [settings], read-only, and which backoffice this page talks to
+//
+// When the backoffice takes a Google sign-in (auth.js), every route shows the sign-in until
+// the operator has signed in.
 
 import { api, apiBase, apiOverridden, configure, configuredBase, setApiBase } from "./api.js";
+import * as auth from "./auth.js";
 import { clear, h, shortAddress } from "./dom.js";
 import { pairView } from "./pair.js";
 import { go, notify, notifyError, notifyResult, onRerender, resultFlash, takeFlash } from "./ui.js";
@@ -17,6 +21,8 @@ import { go, notify, notifyError, notifyResult, onRerender, resultFlash, takeFla
 const view = document.getElementById("view");
 const apiLabel = document.getElementById("api-base");
 const targetLabel = document.getElementById("target");
+const whoTerm = document.getElementById("who-term");
+const whoLabel = document.getElementById("who");
 
 // ---------------------------------------------------------------------------------------
 // Routing
@@ -24,6 +30,7 @@ const targetLabel = document.getElementById("target");
 
 let dispose = null;
 let rendering = 0;
+let showingSignIn = false;
 
 function route(hash) {
   const path = hash.replace(/^#/, "") || "/";
@@ -57,8 +64,10 @@ async function render() {
     link.classList.toggle("current", link.getAttribute("href") === (location.hash || "#/"));
   }
   let cleanup = null;
+  showingSignIn = auth.required() && !auth.signedIn();
+  document.body.classList.toggle("signing-in", showingSignIn);
   try {
-    cleanup = await route(location.hash)(container);
+    cleanup = await (showingSignIn ? signInView : route(location.hash))(container);
   } catch (err) {
     if (token === rendering) {
       container.append(h("p", { class: "banner banner-err", role: "alert" }, err.message || String(err)));
@@ -434,11 +443,103 @@ function connectionCard() {
       notifyError(err);
       return;
     }
+    // Another backoffice may want a sign-in, or another one.
+    await auth.start(api.auth);
     showConnection();
+    showWho();
     go("#/settings", ["ok", `Talking to ${apiBase()}.`]);
   });
   return h("div", {}, h("div", { class: "sectionhead" }, h("h2", {}, "Connection")), form);
 }
+
+// ---------------------------------------------------------------------------------------
+// Sign-in
+// ---------------------------------------------------------------------------------------
+
+const GOOGLE_G = "data:image/svg+xml," + encodeURIComponent(
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">' +
+    '<path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/>' +
+    '<path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/>' +
+    '<path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/>' +
+    '<path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/>' +
+    "</svg>",
+);
+
+/** A sign-in button in this page's own look. Google's real button lies over it, unseen, and
+ * takes the click: nothing else may start the sign-in. */
+function googleButton(compact = false) {
+  const width = compact ? 150 : 260;
+  const layer = h("span", { class: "gbutton-real" });
+  const button = h("span", { class: compact ? "gbutton compact" : "gbutton", style: `width: ${width}px` },
+    h("span", { class: "gbutton-face", "aria-hidden": "true" },
+      h("img", { src: GOOGLE_G, alt: "" }), "Sign in with Google"),
+    layer,
+  );
+  auth.renderButton(layer, compact ? "medium" : "large", width);
+  return button;
+}
+
+/** What every route shows while the backoffice wants a sign-in and there is none: a screen
+ * of its own, without the bar above (render sets `signing-in` on the body). */
+function signInView(root) {
+  root.append(
+    h("div", { class: "card signin" },
+      h("div", { class: "signin-brand" }, "quote-updater"),
+      h("h1", {}, "Sign in to the backoffice"),
+      auth.loadError() ? h("p", { class: "banner banner-err", role: "alert" }, auth.loadError()) : googleButton(),
+      h("p", { class: "fieldhint" }, apiBase()),
+    ),
+  );
+}
+
+/** The header's line saying who is signed in, with a way out; or a way in. Hidden when the
+ * backoffice takes no sign-in. */
+function showWho() {
+  const on = auth.required();
+  whoTerm.hidden = !on;
+  whoLabel.hidden = !on;
+  clear(whoLabel);
+  if (!on) return;
+  if (auth.signedIn()) {
+    whoLabel.append(
+      auth.signedInAs(), " ",
+      h("button", { type: "button", class: "link", onclick: () => auth.signOut() }, "sign out"),
+    );
+  } else if (!showingSignIn) {
+    whoLabel.append(googleButton(true));
+  } else {
+    whoLabel.append("not signed in");
+  }
+}
+
+// Set once the first view is drawn: until then, start draws it.
+let booted = false;
+// Whether a request was refused for a sign-in that ran out, for the line after the next one.
+let lapsed = false;
+
+auth.onChange((reason) => {
+  if (!booted) return;
+  if (reason === "expired") {
+    // The view stays, with whatever was being typed: sign in again from the header and
+    // retry what was refused.
+    lapsed = true;
+    showWho();
+    notify("err", "Your sign-in has run out or was refused. Sign in again (top right), then retry.");
+    return;
+  }
+  if (reason === "signed-in" && !showingSignIn) {
+    // A renewal before the hour was up says nothing; a sign-in after a refusal says to retry.
+    showWho();
+    showConnection();
+    if (lapsed) notify("ok", `Signed in again as ${auth.signedInAs()}. Retry what was refused.`);
+    lapsed = false;
+    return;
+  }
+  lapsed = false;
+  // Sign-in turned on or off, a first sign-in, or a sign-out: the view changes with it.
+  showConnection();
+  render().then(showWho);
+});
 
 // ---------------------------------------------------------------------------------------
 // Start
@@ -448,6 +549,10 @@ function connectionCard() {
 async function showConnection() {
   apiLabel.textContent = apiBase();
   apiLabel.title = apiOverridden() ? "saved on this browser (Settings)" : "from config.json";
+  if (auth.required() && !auth.signedIn()) {
+    targetLabel.textContent = "sign in to see";
+    return;
+  }
   targetLabel.textContent = "…";
   try {
     targetLabel.textContent = (await api.settings()).target;
@@ -466,8 +571,11 @@ if (window.top !== window.self) {
   );
 } else {
   await configure();
+  await auth.start(api.auth);
   showConnection();
-  onRerender(render);
-  window.addEventListener("hashchange", render);
-  render();
+  const show = () => render().then(showWho);
+  onRerender(show);
+  window.addEventListener("hashchange", show);
+  booted = true;
+  render().then(showWho);
 }

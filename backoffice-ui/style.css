@@ -146,10 +146,40 @@ button:disabled { opacity: .55; cursor: progress; }
 .primary:hover { filter: brightness(1.08); background: var(--accent); border-color: var(--accent); }
 .danger { border-color: transparent; background: none; color: var(--danger); }
 .danger:hover { background: var(--danger-bg); border-color: transparent; }
-:is(.btn, button, a, input, select, textarea, summary):focus-visible {
-  outline: none; border-color: var(--accent);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);
+/* A button that reads as a link: the header's "sign out". */
+button.link {
+  padding: 0; border: none; background: none; font-size: inherit; font-weight: inherit;
+  color: var(--dim); text-decoration: underline; text-underline-offset: .2em;
 }
+button.link:hover { background: none; color: var(--ink); }
+
+/* Google's sign-in, when the backoffice asks for one: a screen of its own. */
+body.signing-in header.top { display: none; }
+body.signing-in main {
+  min-height: 100vh; padding: 1.25rem;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+}
+.signin {
+  width: 22rem; max-width: 100%; padding: 2.4rem 2rem 2rem;
+  display: flex; flex-direction: column; align-items: center; gap: 1.4rem; text-align: center;
+}
+.signin-brand { font-size: .8rem; color: var(--dim); letter-spacing: .02em; }
+.signin h1 { margin: -.9rem 0 0; font-size: 1.25rem; }
+.signin p { margin: 0; }
+/* This page's button, with Google's own laid over it and unseen: Google's takes the click.
+   Clipped, because Google's draws at whatever size it likes until its styles arrive. */
+.gbutton { position: relative; display: inline-block; height: 40px; overflow: hidden; border-radius: 6px; vertical-align: middle; }
+.gbutton.compact { height: 32px; }
+.gbutton-face {
+  display: flex; align-items: center; justify-content: center; gap: .6rem; height: 100%;
+  font-size: .88rem; font-weight: 500; color: var(--ink);
+  background: var(--panel); border: 1px solid var(--line-strong); border-radius: 6px;
+}
+.gbutton.compact .gbutton-face { font-size: .78rem; gap: .45rem; }
+.gbutton-face img { width: 18px; height: 18px; }
+.gbutton.compact .gbutton-face img { width: 14px; height: 14px; }
+.gbutton:hover .gbutton-face { border-color: var(--faint); background: var(--hover); }
+.gbutton-real { position: absolute; inset: 0; opacity: .001; color-scheme: light; }
 
 /* Forms */
 .card {

@@ -16,7 +16,7 @@
 //      them. The composite line is the number that would be published.
 //   3. On save, an unticked venue is left out of `sources`.
 
-import { api, socketUrl } from "./api.js";
+import { api, socketProtocols, socketUrl } from "./api.js";
 import { append, clear, h, helpFragment, isAddress, money } from "./dom.js";
 import { go, notifyError, resultFlash } from "./ui.js";
 
@@ -345,7 +345,7 @@ export async function pairView(root, { key }) {
     const query = `token0=${encodeURIComponent(token0.value.trim())}&token1=${encodeURIComponent(token1.value.trim())}`;
     let ws;
     try {
-      ws = new WebSocket(socketUrl(`/api/preview?${query}`));
+      ws = new WebSocket(socketUrl(`/api/preview?${query}`), socketProtocols());
     } catch (err) {
       showComposite(`live prices unavailable: ${err.message}`);
       return;
