@@ -1623,7 +1623,7 @@ async fn drive(
         }
         // Once per block, what the summary line says, for the observers: never per tick.
         // Not on a halt, which broke out before `target_block` was mined (see below): the
-        // event says a block passed, and a reload that re-arms the lane within the slot
+        // event says a block passed, and a re-arm of the lane within the slot
         // would have its new generation say the same block passed, the other way. The
         // observers hear of the halt from the latch's `Tripped` and the `LaneStopped`.
         // Nor when the head moved back, for the same reason: no block passed.
@@ -1650,8 +1650,8 @@ async fn drive(
         // "block N passed" for a block that has not, and book a spurious miss.
         if halted {
             tracing::warn!(
-                "[{label}] halted; this pair will not quote again until a reload re-arms it \
-                 once the feed is trusted (the halt notice says how this run reloads)"
+                "[{label}] halted; this pair will not quote again until it is re-armed, \
+                 once the feed is trusted (the halt notice says how)"
             );
             return Ok(Ended::Halted);
         }

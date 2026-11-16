@@ -73,14 +73,14 @@ fn ignore_hangup(tasks: &mut Tasks, config: &std::path::Path) {
     }
 }
 
-/// How the halt notice tells an operator to reload: the one thing that re-arms a lane its
-/// breaker halted without restarting the others. `backoffice` is its base URL, scheme
-/// included.
-fn reload_hint(backoffice: Option<&str>, handle: bool) -> String {
+/// How the halt notice tells an operator to re-arm a pair its breaker halted: the one
+/// thing that brings it back without restarting the others, one pair at a time (audit
+/// F-17). `backoffice` is its base URL, scheme included.
+fn rearm_hint(backoffice: Option<&str>, handle: bool) -> String {
     match (backoffice, handle) {
-        (Some(url), _) => format!("POST {url}/api/reload"),
-        (None, true) => "UpdaterHandle::reload".to_owned(),
-        (None, false) => "this run has no backoffice to reload through; set [settings] \
+        (Some(url), _) => format!("POST {url}/api/pairs/<key_env>/rearm"),
+        (None, true) => "UpdaterHandle::rearm".to_owned(),
+        (None, false) => "this run has no backoffice to re-arm through; set [settings] \
                           backoffice_addr, which takes a restart"
             .to_owned(),
     }
@@ -643,7 +643,7 @@ async fn run_inner(
             // Named in the notice, so it says where to go and fix it. The configured
             // address, not the bound one, since the listener is opened further down.
             let backoffice_url = backoffice_url.clone();
-            let reload_hint = reload_hint(backoffice_url.as_deref(), settled.is_some());
+            let rearm_hint = rearm_hint(backoffice_url.as_deref(), settled.is_some());
             tasks.spawn(async move {
                 let mut last_notice: Option<tokio::time::Instant> = None;
                 loop {
@@ -659,7 +659,7 @@ async fn run_inner(
                                     health.census(),
                                     backoffice_url.as_deref(),
                                     &health.trips(),
-                                    &reload_hint
+                                    &rearm_hint
                                 )
                             );
                         }
@@ -720,6 +720,9 @@ async fn run_inner(
             kinds: Arc::clone(&kinds),
             observers: observers.clone(),
             halt_flags: shared.halt_flags(),
+            kept_trips: Default::default(),
+            #[cfg(test)]
+            on_stopping: None,
         };
         // From here a shutdown goes through the loop below, which withdraws every quote.
         quoting.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -805,7 +808,9 @@ async fn run_inner(
                             "--once has no running pair set to reload".to_owned(),
                         ))
                     } else {
-                        service.reload_and_report(&done, &request.config).await
+                        service
+                            .reload_and_report(&done, &request.config, &request.rearm)
+                            .await
                     };
                     let _ = request.reply.send(outcome);
                 }
@@ -827,8 +832,8 @@ async fn run_inner(
         // prevent: zero reads as success to a shell loop or `Restart=always`, and non-zero is
         // precisely what `Restart=on-failure` acts on. The loop above is now what keeps the
         // process up — it exits only when the operator asks it to — and it does something the
-        // park could not: a reload brings the halted lane back without the restart that would
-        // have cleared every other lane's breaker too.
+        // park could not: the pair's re-arm brings the halted lane back without the restart
+        // that would have cleared every other lane's breaker too.
         //
         // `--once` is unchanged. It is a batch invocation, not a service: a script or CI job
         // is waiting on it, and a trip means the run did not do what it was asked, so it fails
@@ -1650,7 +1655,8 @@ api_key = "k"
     }
 
     /// A halt is an intent, in the file: a reload leaves it alone and only `resume` clears
-    /// it. A trip is a judgement, on the latch: the next reload re-arms the lane.
+    /// it. A trip is a judgement, on the latch: a reload leaves it too, and only the pair's
+    /// re-arm clears it (audit F-17).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_halt_survives_a_reload_and_a_trip_does_not() {
         use std::{
@@ -1704,7 +1710,8 @@ api_key = "k"
             .expect_err("nothing to resume");
         assert!(err.contains("not halted"), "{err}");
 
-        // The trip: the guard halts the lane on the next block, and a reload re-arms it.
+        // The trip: the guard halts the lane on the next block. A reload leaves it halted
+        // (audit F-17); only its own re-arm brings it back, naming the mid it now trusts.
         killed.store(true, Ordering::SeqCst);
         fx.rpc.set_head(101);
         assert!(
@@ -1712,12 +1719,76 @@ api_key = "k"
             "the tripped lane withdraws"
         );
         killed.store(false, Ordering::SeqCst);
-        let quotes = fx.builder.count();
         let line = tokio::time::timeout(ten, handle.reload())
             .await
             .expect("the run answers")
-            .expect("the reload re-arms");
-        assert!(line.contains("1 restarted"), "{line}");
+            .expect("the reload applies");
+        assert!(
+            line.contains("nothing to do"),
+            "a reload re-arms nothing: {line}"
+        );
+        let quotes = fx.builder.count();
+        fx.rpc.set_head(102);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            fx.builder.received()[quotes..]
+                .iter()
+                .all(|frame| frame.tx.is_empty()),
+            "the tripped lane stays halted through the reload"
+        );
+        // Nor does an edit of its own stanza bring it back: that is not someone deciding
+        // they trust the feed again.
+        tokio::time::timeout(
+            ten,
+            handle.change(|config| {
+                config.pairs[0].min_mid = Some("0.5".to_owned());
+            }),
+        )
+        .await
+        .expect("answered")
+        .expect("the edit applies");
+        let quotes = fx.builder.count();
+        fx.rpc.set_head(103);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            fx.builder.received()[quotes..]
+                .iter()
+                .all(|frame| frame.tx.is_empty()),
+            "the tripped lane stays halted through an edit of its own stanza"
+        );
+        // Nor a halt and a resume: the trip outlives the halted lane.
+        tokio::time::timeout(ten, handle.halt(fx.tokens, "desk"))
+            .await
+            .expect("answered")
+            .expect("the halt applies");
+        let resumed = tokio::time::timeout(ten, handle.resume(fx.tokens))
+            .await
+            .expect("answered")
+            .expect("the resume applies");
+        assert!(
+            resumed.contains("left halted on its breaker"),
+            "the resume says the trip still holds: {resumed}"
+        );
+        let quotes = fx.builder.count();
+        fx.rpc.set_head(104);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            fx.builder.received()[quotes..]
+                .iter()
+                .all(|frame| frame.tx.is_empty()),
+            "the tripped pair stays halted through a halt and a resume"
+        );
+        let quotes = fx.builder.count();
+        let line = tokio::time::timeout(ten, handle.rearm(fx.tokens))
+            .await
+            .expect("the run answers")
+            .expect("the re-arm applies");
+        // A fixed-price pair has no market to trust a price from: the line names the trip
+        // it cleared (`a_rearm_line_names_the_mid_it_trusts` covers a pair with a market).
+        assert!(
+            line.contains("1 added") && line.contains("re-armed, clearing the halt"),
+            "started again by its re-arm, naming the trip it clears: {line}"
+        );
         assert!(
             fx.builder.wait_for(quotes + 1, ten).await,
             "the re-armed lane quotes"
@@ -2137,7 +2208,7 @@ api_key = "k"
     }
 
     /// An observer registered on the builder sees the run's transitions in order (a lane
-    /// started, tripped and stopped, re-armed by a reload, halted by the handle) and one
+    /// started, tripped and stopped, re-armed by its re-arm, halted by the handle) and one
     /// `Block` per block that passed, never one per tick, with the block's landing. None
     /// for the block a halt broke out of: it has not passed, and the generation the reload
     /// re-arms is the one that sees it pass and says so.
@@ -2177,7 +2248,7 @@ api_key = "k"
         fx.rpc.set_head(101);
         assert!(fx.builder.wait_for(2, ten).await, "block 101 is quoted");
 
-        // The trip, on the next block; then a reload re-arms the lane.
+        // The trip, on the next block; then its re-arm.
         killed.store(true, Ordering::SeqCst);
         fx.rpc.set_head(102);
         assert!(
@@ -2186,7 +2257,7 @@ api_key = "k"
         );
         killed.store(false, Ordering::SeqCst);
         let quotes = fx.builder.count();
-        let line = tokio::time::timeout(ten, handle.reload())
+        let line = tokio::time::timeout(ten, handle.rearm(fx.tokens))
             .await
             .expect("answered")
             .expect("re-arms");
@@ -2342,7 +2413,7 @@ api_key = "k"
         );
 
         killed.store(false, Ordering::SeqCst);
-        tokio::time::timeout(ten, handle.reload())
+        tokio::time::timeout(ten, handle.rearm(fx.tokens))
             .await
             .expect("answered")
             .expect("re-arms");

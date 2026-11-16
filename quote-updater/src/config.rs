@@ -2105,6 +2105,7 @@ disable_cross_region = false
             &running,
             &desired.pairs,
             &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
             false,
         );
         assert!(actions.is_empty(), "{actions:?}");

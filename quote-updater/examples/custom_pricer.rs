@@ -1,5 +1,6 @@
 //! A quote updater with one custom pricing model, `skewed`: the market mid moved by a
-//! fixed fraction, at a fixed half-spread. A pair opts in with a stanza:
+//! fixed fraction, at a fixed half-spread, and never by more than that half-spread, so the
+//! quote stays around the market's mid. A pair opts in with a stanza:
 //!
 //! ```toml
 //! [[pairs]]
@@ -10,7 +11,7 @@
 //! [pairs.pricing]
 //! kind        = "skewed"
 //! half_spread = 0.0005
-//! skew        = 0.001
+//! skew        = 0.0002
 //! ```
 //!
 //! Everything else (config, reload, builders, metrics, the band and the core's backstop)
@@ -35,8 +36,12 @@ impl Pricer for SkewedPricer {
     fn price(&mut self, tick: &TickCtx, out: &mut Diagnostics) -> Result<PricerOutput, Refusal> {
         let market = tick.market()?;
         out.set(&self.book, market.half_spread());
-        let delta = market.scaled_fraction(self.cfg.half_spread)?;
-        Ok(PricerOutput::new(delta, market.shift(self.cfg.skew)?))
+        let half_spread = self.cfg.half_spread;
+        let delta = market.scaled_fraction(half_spread)?;
+        // Past the half-spread the quote is through the market: we would sell below its
+        // mid or buy above it, and a taker unwinds that on the market at our cost.
+        let skew = self.cfg.skew.clamp(-half_spread, half_spread);
+        Ok(PricerOutput::new(delta, market.shift(skew)?))
     }
 }
 

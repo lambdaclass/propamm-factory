@@ -128,7 +128,7 @@ secret. [docs/manual.md](../docs/manual.md), "The backoffice", has the rest.
 docker compose logs -f updater                 # the run
 docker compose run --rm updater --check        # after editing config/config.toml by hand
 docker compose restart updater                 # then this: the file is read only at start
-curl -X POST -H 'Content-Type: application/json' http://<BACKOFFICE_BIND>:8088/api/reload   # re-arm pairs halted by their breaker (https://<name>:8088 with HTTPS)
+curl -X POST -H 'Content-Type: application/json' http://<BACKOFFICE_BIND>:8088/api/pairs/<key_env>/rearm   # re-arm a pair halted by its breaker, once its feed is trusted (https://<name>:8088 with HTTPS)
 docker compose up -d updater                   # after editing .env (keys, RPC_WS_URL); restart would not
 docker compose pull && docker compose up -d    # newer Prometheus, Alertmanager, Grafana, Postgres
 docker compose build updater && docker compose up -d updater   # a new build of the updater

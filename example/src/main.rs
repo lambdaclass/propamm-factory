@@ -2,7 +2,8 @@
 //! of our own, one per extension point the library offers.
 //!
 //! - A pricing model, `inventory_skew`: a fixed half-spread, with the mid pushed away from
-//!   the side our vault is long, so fills rebalance us. It reads the vault through the
+//!   the side our vault is long, so fills rebalance us, and never pushed further than the
+//!   half-spread, so the quote stays around the market's mid. It reads the vault through the
 //!   library (`ctx.inventory()`), so it is a `Factory` (its build is async).
 //! - A market guard, `venue_spread`: trips the lane when the venues behind the composite
 //!   price disagree by more than a limit. Runs on every composite sample.
@@ -32,8 +33,9 @@ use serde::Deserialize;
 struct InventorySkewCfg {
     /// Published as the delta: a fraction of the mid (0.0005 = 5 bp).
     half_spread: f64,
-    /// How far the mid moves per unit of imbalance: skew = strength * (base_share - 0.5).
-    /// At strength 0.02 a vault that is 100% base pushes the mid 1% down.
+    /// How far the mid moves per unit of imbalance: skew = strength * (base_share - 0.5),
+    /// capped at `half_spread` either way. At strength 0.02 the mid moves 2 bp for every
+    /// point of base share past 50%, until it has moved by the half-spread.
     strength: f64,
     /// A vault reading older than this refuses the tick (seconds).
     #[serde(default = "default_max_inventory_age_secs")]
@@ -73,12 +75,19 @@ impl Pricer for InventorySkew {
         }
 
         let share = reading.base_share(market.mid_f64());
-        let skew = self.cfg.strength * (share - 0.5);
+        // Never further than the half-spread, where one of our two prices sits on the
+        // market's mid. Past it the quote is through the market: long base we would sell it
+        // below the market's price (short, buy it above), and a taker who put the vault
+        // there fills that and unwinds on the market, at our cost, again after every vault
+        // reading. The core does not check this for a pricer, so every pricer that moves
+        // its mid has to: the shipped `volatile` kind caps its tilt the same way.
+        let half_spread = self.cfg.half_spread;
+        let skew = (self.cfg.strength * (share - 0.5)).clamp(-half_spread, half_spread);
         out.set(&self.base_share, share);
         out.set(&self.skew, skew);
 
         Ok(PricerOutput::new(
-            market.scaled_fraction(self.cfg.half_spread)?,
+            market.scaled_fraction(half_spread)?,
             // Long base (share > 0.5) gives a positive skew, and we want to sell base, so the
             // mid must go down. The library's `shift(+x)` publishes a mid x below the market
             // (the volatile model's tilt direction), so the skew is passed as is.
@@ -101,8 +110,9 @@ const FIELDS: &[FormField] = &[
     FormField::number(
         "strength",
         "0.02",
-        "how far the mid moves per unit of imbalance. 0.02: a vault that is all base pushes \
-         the mid 1% down.",
+        "how far the mid moves per unit of imbalance. 0.02: the mid moves 2 bp for every \
+         point of base share past 50%. It never moves further than half_spread, so the \
+         quote stays around the market price.",
     ),
     FormField::number(
         "max_inventory_age_secs",
