@@ -145,7 +145,8 @@ pub enum ReloadOutcome {
     Applied,
     /// The file was refused: nothing changed.
     Rejected,
-    /// Applied, but some lane kept its previous config.
+    /// Applied, but some lane kept its previous config, was not started, or was stopped
+    /// because the change took out a builder it quoted to.
     Partial,
 }
 

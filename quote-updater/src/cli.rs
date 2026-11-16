@@ -12,7 +12,7 @@ use clap::{CommandFactory, FromArgMatches, Parser, builder::FalseyValueParser};
 use ethrex_common::Address;
 use eyre::{Result, WrapErr, bail, ensure};
 
-use crate::{MAX_PRICE_DECIMALS, config, venue};
+use crate::{PRICE_DECIMALS, config, venue};
 
 /// Mainnet PrioUpdateRegistry (MAX_UPDATE_AGE = 0, MAX_UPDATE_LEAD_TIME = 0). The
 /// deployment PropAMM reads from since 2026-09-15. The first one, at
@@ -116,10 +116,10 @@ pub(crate) struct Flags {
     pub(crate) registry: Address,
 
     /// Decimal places the published mid and delta are scaled by. PropAMM reads both at
-    /// 1e18 (its PRICE_SCALE and SPREAD_SCALE), the default. A config with an inverted
-    /// pair caps this at 38, because inverting squares the scale.
-    #[arg(long, env = "PRICE_DECIMALS", default_value_t = 18)]
-    #[arg(value_parser = clap::value_parser!(u32).range(..=MAX_PRICE_DECIMALS as i64))]
+    /// 1e18 (its PRICE_SCALE and SPREAD_SCALE), so 18 is the default and the only value
+    /// accepted: there is nothing to set here.
+    #[arg(long, env = "PRICE_DECIMALS", default_value_t = PRICE_DECIMALS)]
+    #[arg(value_parser = parse_price_decimals)]
     pub(crate) price_decimals: u32,
 
     /// Binance WebSocket base endpoint (overridable for binance.us or a mock)
@@ -245,6 +245,15 @@ pub(crate) struct Flags {
     /// it, so it belongs in `.env` beside the updater keys. See record.rs.
     #[arg(long, env = "RECORD_DB_URL")]
     pub(crate) record_db_url: Option<String>,
+
+    /// How many days of recorded history to keep. Rows older than this are deleted from
+    /// the tables that grow with time (feed.mids, feed.quotes, feed.vault_balances), once
+    /// at startup and hourly after; the config history is never deleted. Unset keeps
+    /// everything, and the database then grows for as long as the updater runs. Beside
+    /// --record-db-url, and like it a flag or environment variable only.
+    #[arg(long, env = "RECORD_RETENTION_DAYS")]
+    #[arg(value_parser = clap::value_parser!(u32).range(1..))]
+    pub(crate) record_retention_days: Option<u32>,
 }
 
 impl Flags {
@@ -483,12 +492,9 @@ pub(crate) fn apply_file_settings(
     if let Some(decimals) = settings.price_decimals
         && !given("price_decimals")
     {
-        // The bound clap puts on --price-decimals, repeated because its range parser
-        // cannot be reached from here.
-        ensure!(
-            decimals <= MAX_PRICE_DECIMALS,
-            "[settings] price_decimals is {decimals}; the maximum is {MAX_PRICE_DECIMALS}"
-        );
+        // The check clap runs on --price-decimals, repeated because its parser cannot be
+        // reached from here.
+        crate::ensure_price_decimals(decimals, "[settings] price_decimals")?;
         args.flags.price_decimals = decimals;
     }
     if let Some(url) = &settings.binance_ws
@@ -537,6 +543,17 @@ pub(crate) fn apply_file_settings(
         }
     }
     Ok(())
+}
+
+/// clap's parser for `--price-decimals`, which needs a `String` error. Delegates so the
+/// one rule about the scale (and its message) is the one `[settings]` is held to.
+fn parse_price_decimals(s: &str) -> Result<u32, String> {
+    let decimals: u32 = s
+        .parse()
+        .map_err(|_| format!("{s:?} is not a number of decimal places"))?;
+    crate::ensure_price_decimals(decimals, "--price-decimals")
+        .map(|()| decimals)
+        .map_err(|e| format!("{e:#}"))
 }
 
 /// clap's parser, which needs a `String` error. Delegates so the one address-parsing
@@ -705,7 +722,7 @@ mod tests {
             requote_ms: Some(25),
             interval: Some(3),
             metrics_addr: Some("127.0.0.1:9464".to_owned()),
-            price_decimals: Some(6),
+            price_decimals: Some(18),
             disable_cross_region: Some(true),
             ..Default::default()
         };
@@ -715,7 +732,7 @@ mod tests {
         assert_eq!(args.flags.rpc_url, "https://from-the-file.example");
         assert_eq!(args.flags.requote_ms, 25);
         assert_eq!(args.flags.interval, 3);
-        assert_eq!(args.flags.price_decimals, 6);
+        assert_eq!(args.flags.price_decimals, 18);
         assert!(args.flags.disable_cross_region);
         assert_eq!(
             args.flags.metrics_addr,
@@ -772,10 +789,12 @@ mod tests {
             (
                 "price_decimals",
                 config::FileSettings {
-                    price_decimals: Some(60),
+                    // Inside the old ceiling, and the dangerous side of 18: a mid a
+                    // trillionth of the price.
+                    price_decimals: Some(6),
                     ..Default::default()
                 },
-                "price_decimals",
+                "price_decimals is 6",
             ),
             (
                 "backoffice_addr",
@@ -964,6 +983,32 @@ mod tests {
             Address::from_slice(&hex::decode("Da7AfEeD021EAFC1c1Af9C362dE477DaD0396B81").unwrap())
         );
         assert!(parse_address("0x123").is_err());
+    }
+
+    /// The scale is not a choice: PropAMM reads 1e18, and a flag naming anything else used
+    /// to be taken and every pair published a power of ten off.
+    #[test]
+    fn the_price_decimals_flag_takes_18_and_nothing_else() {
+        assert_eq!(parse_price_decimals("18"), Ok(18));
+        for wrong in ["0", "6", "17", "19", "38", "59"] {
+            let err = parse_price_decimals(wrong).unwrap_err();
+            assert!(err.contains("1e18"), "{wrong}: {err}");
+        }
+        assert!(parse_price_decimals("eighteen").is_err());
+        // Through clap: the default stands, 18 said aloud is fine, anything else is refused
+        // before the config is even read.
+        let with = |decimals: &str| {
+            Args::try_parse_from([
+                "quote-updater",
+                "--config",
+                "config.toml",
+                "--price-decimals",
+                decimals,
+            ])
+        };
+        assert_eq!(defaulted_args().flags.price_decimals, 18);
+        assert_eq!(with("18").expect("parses").flags.price_decimals, 18);
+        assert!(with("6").is_err());
     }
 
     /// The removed variables must not silently become inert: someone whose service starts

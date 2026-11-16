@@ -62,6 +62,11 @@ def pick_ports():
 # What the custom run's WETH/USDC pair is priced with; checks.py computes the expectation.
 TILTED = {"half_spread": "0.0005", "tilt": "0.01"}
 
+# The plain run's: the mock book copied as it is, which is what checks.py expects back. The
+# floor is stated, and below that book's 0.25 bp half-spread, because a `feed` pair with no
+# floor of its own is held at 1 bp and the run would then be checking the floor.
+FEED = 'pricing = { kind = "feed", min_delta = "0.00001" }\n'
+
 
 def config(ports, custom=False):
     pricing = f"""
@@ -69,7 +74,7 @@ def config(ports, custom=False):
 kind        = "tilted"
 half_spread = {TILTED['half_spread']}
 tilt        = {TILTED['tilt']}
-""" if custom else 'pricing = { kind = "feed" }\n'
+""" if custom else FEED
     builders = "".join(f"""
 [[builder]]
 name = "{name}"

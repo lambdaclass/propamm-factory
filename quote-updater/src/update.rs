@@ -727,7 +727,14 @@ impl ValueSource {
     ) -> Self {
         Self::new(
             Box::new(crate::pricing::FeedPricer {
-                delta,
+                // No floor: these tests are about the loop around the pricer, and read the
+                // book's own half-spread back out of it. The floor is `Feed::resolve`'s.
+                spread: delta.map_or(
+                    crate::pricing::FeedSpread::Book {
+                        floor: U256::zero(),
+                    },
+                    crate::pricing::FeedSpread::Stated,
+                ),
                 spread_scale: crate::config::spread_scale(price_decimals),
             }),
             "feed",

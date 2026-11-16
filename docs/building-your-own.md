@@ -54,8 +54,8 @@ What to know:
   reload and under `--check`; under `--check` every guard is also built, as the run builds
   it before the lane quotes, so a guard that cannot be built (a quote guard reading a
   diagnostic the pair's pricer never declares) fails the check under its row instead of
-  passing it and refusing the start; a failed build keeps the old lane quoting and reports
-  the reload partial. A panic in any of them counts as that failure, not as the process's.
+  passing it and refusing the start; a failed build keeps the old lane quoting (or stops it,
+  when the change took a builder out of its list) and reports the reload partial. A panic in any of them counts as that failure, not as the process's.
 - **The core still decides.** A pricer can refuse (`Refusal::new`, counted under the reason
   it declared), and the core withdraws anything unpublishable whatever a pricer returns: a
   spread of a whole unit or more, a zero mid, or a mid the contract cannot store (over 216
@@ -100,7 +100,7 @@ What to know:
   be verified, or was never quoted; a task started with `ctx.spawn` can await each with
   `next()`). Reading the vault is async,
   so it is the `Factory` path: `examples/tilted.rs` is a fixed spread tilted
-  by the vault's base share, and `make e2e-custom` runs it against the mocks. A test seeds
+  by the vault's base share, and `make e2e` runs it against the mocks. A test seeds
   these with `testing::build_ctx_with` and needs no chain. An HTTP client comes from
   `ctx.http()`: the run's one `reqwest::Client`, shared with the polled venues, so every
   lane draws on one connection pool (`quote_updater::reqwest` is the crate it belongs to,
@@ -244,4 +244,6 @@ What to know:
 - **Build settings.** Copy the `[profile.release]` from this repository's root `Cargo.toml`
   (Cargo only reads a profile from the binary's own workspace). The library refuses to start
   when built with `panic = "abort"`, which would turn one pair's panic into every pair's.
+  Keep its `overflow-checks = true`: a release build otherwise lets an integer overflow
+  wrap, and a wrapped number is carried on as if it were right.
 

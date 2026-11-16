@@ -712,7 +712,7 @@ fn parse_threshold(fraction: &str, price_decimals: u32, key: &str, at: &str) -> 
         "{at}: {key} {fraction} is zero at {price_decimals} decimals, so the second \
          price would trip it and halt the pair"
     );
-    // Digits beyond `--price-decimals` are dropped by `parse_decimal_scaled`, which
+    // Digits beyond the price's decimals are dropped by `parse_decimal_scaled`, which
     // quietly tightens the guard: 0.0000015 at 6 decimals reads as 0.000001. A threshold
     // that is not what the config says is the misconfiguration the zero and upper-bound
     // checks exist to prevent, so it is refused the same way. Trailing zeros are not
@@ -722,9 +722,9 @@ fn parse_threshold(fraction: &str, price_decimals: u32, key: &str, at: &str) -> 
         .map_or(0, |(_, digits)| digits.trim_end_matches('0').len());
     ensure!(
         fraction_digits <= price_decimals as usize,
-        "{at}: {key} {fraction} has more decimal digits than the {price_decimals} \
-         decimals of --price-decimals can hold, so it would be read as {read}; use at most \
-         {price_decimals} decimals, or raise --price-decimals",
+        "{at}: {key} {fraction} has more decimal digits than the {price_decimals} a \
+         published price is scaled by, so it would be read as {read}; use at most \
+         {price_decimals} decimals",
         read = format_scaled(threshold_scaled, price_decimals)
     );
     // Bounded above as well as below, and for the same reason. Every line of prose about
