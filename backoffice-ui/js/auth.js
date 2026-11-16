@@ -6,8 +6,10 @@
 // accounts.google.com: the one thing this page loads from another site, see index.html's
 // Content-Security-Policy), signs the operator in, and keeps the ID token Google hands it in
 // memory only. Every request carries it as `Authorization: Bearer` (api.js), and the preview
-// socket as a subprotocol, since a browser cannot give a websocket a header. Nothing is
-// stored: a reload signs in again, without a click when Google can (auto-select).
+// socket as a subprotocol, since a browser cannot give a websocket a header. The token is
+// also kept in sessionStorage, so a reload of this tab stays signed in: Google gives a token
+// without a click only now and then (not twice within ten minutes, not after a dismissed
+// prompt). It goes when the tab closes, on sign-out, and when the backoffice refuses it.
 //
 // An ID token is good for about an hour. Two minutes before it runs out, Google is asked for
 // a new one, which it gives without a click when it can. When it cannot, the next request
@@ -15,6 +17,7 @@
 
 const GSI = "https://accounts.google.com/gsi/client";
 const RENEW_EARLY_MS = 2 * 60 * 1000;
+const KEPT = "backoffice.signin";
 
 let ask = null;
 let clientId = null;
@@ -78,7 +81,7 @@ async function discover() {
   if (clientId) {
     try {
       await ready();
-      gsi.prompt();
+      if (!restore()) gsi.prompt();
     } catch (err) {
       gsiError = err.message || String(err);
     }
@@ -121,6 +124,11 @@ function accept(credential) {
   const claims = readClaims(credential);
   token = credential;
   who = typeof claims.email === "string" ? claims.email : "a Google account";
+  try {
+    sessionStorage.setItem(KEPT, JSON.stringify({ clientId, credential }));
+  } catch {
+    // No storage here (a private window, blocked site data): a reload signs in again.
+  }
   clearTimeout(renewTimer);
   if (typeof claims.exp === "number") {
     const wait = Math.max(0, claims.exp * 1000 - Date.now() - RENEW_EARLY_MS);
@@ -135,6 +143,34 @@ function forget() {
   clearTimeout(renewTimer);
 }
 
+/** Forgets the token here and in the tab's storage. */
+function discard() {
+  forget();
+  try {
+    sessionStorage.removeItem(KEPT);
+  } catch {
+    // Nothing was kept.
+  }
+}
+
+/** Takes back the token this tab kept before a reload, if it was given for this client ID
+ * and has more than the renewal margin left. The backoffice still checks it. */
+function restore() {
+  try {
+    const kept = JSON.parse(sessionStorage.getItem(KEPT) || "null");
+    if (!kept || kept.clientId !== clientId || typeof kept.credential !== "string") return false;
+    const exp = readClaims(kept.credential).exp;
+    if (typeof exp !== "number" || exp * 1000 - Date.now() <= RENEW_EARLY_MS) {
+      sessionStorage.removeItem(KEPT);
+      return false;
+    }
+    accept(kept.credential);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** A request with `sent` was answered 401. A backoffice not known to want a sign-in is asked
  * again (it may have been restarted with one); a token is dropped only if it is still the
  * one that was refused, not one a renewal brought in since. */
@@ -144,14 +180,14 @@ export function refused(sent) {
     return;
   }
   if (token === null || token !== sent) return;
-  forget();
+  discard();
   changed("expired");
 }
 
 /** Signs out of this page, and keeps Google from signing straight back in. */
 export function signOut() {
   if (gsi) gsi.disableAutoSelect();
-  forget();
+  discard();
   changed("signed-out");
 }
 

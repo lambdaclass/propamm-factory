@@ -126,12 +126,14 @@ When the backoffice is started with `--backoffice-google-client-id`, every reque
 Google sign-in by an account it lets in. The page finds out from the backoffice
 (`GET /api/auth`, which answers the client ID to sign in with); nothing is configured here.
 It then loads Google's sign-in script and shows a "Sign in with Google" button on every route
-until the operator has signed in. The ID token Google hands back is kept in memory only, sent
-as `Authorization: Bearer` on every request, and as a subprotocol on the preview's websocket,
-which a browser cannot give a header. The header shows who is signed in, and signs out.
+until the operator has signed in. The ID token Google hands back is kept in the tab's
+`sessionStorage`, sent as `Authorization: Bearer` on every request, and as a subprotocol on
+the preview's websocket, which a browser cannot give a header. The header shows who is signed
+in, and signs out.
 
-- **Reloading** signs in again, without a click when one account has signed in here before
-  (Google's auto-select).
+- **Reloading** stays signed in: the token is taken back from the tab's storage. It is
+  dropped when the tab closes, on sign-out, and when the backoffice refuses it; a new tab
+  signs in again, without a click when Google allows it (auto-select).
 - **After about an hour** the token runs out. Two minutes before, Google is asked for a new
   one, which it gives without a click when it can. When it cannot, the next request is
   refused: the banner says so, the view and anything typed into it stay, and the header's
