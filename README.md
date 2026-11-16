@@ -28,7 +28,9 @@ make local-down    # tear it all down when you're done
 This starts a local chain with anvil, deploys the factory and a PropAMM with a `USDC/USDT` pair, builds `example/`, and starts quoting that pair using Binance's live price as the mid.
 
 The backoffice, a JSON API for managing pairs and builders, is at http://localhost:8088/api/
-([docs/manual.md](docs/manual.md), "The backoffice", lists its routes). You can also run
+([docs/manual.md](docs/manual.md), "The backoffice", lists its routes). For pages to drive it
+from, run `make backoffice-ui` in another terminal (it needs [pnpm](https://pnpm.io)) and open
+http://127.0.0.1:8090 ([backoffice-ui/](backoffice-ui/README.md)). You can also run
 
 ```
 make swap

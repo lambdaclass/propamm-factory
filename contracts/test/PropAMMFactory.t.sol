@@ -2,9 +2,11 @@
 pragma solidity ^0.8.35;
 
 import {Test} from "forge-std/Test.sol";
-import {PropAMM} from "../src/PropAMM.sol";
-import {PropAMMFactory} from "../src/PropAMMFactory.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {PropAMM, InvalidOracle, NotAToken, UpdaterAlreadyAuthorized} from "../src/PropAMM.sol";
+import {CreationIsDisabled, PropAMMFactory} from "../src/PropAMMFactory.sol";
 import {IPropAMM} from "../src/interfaces/IPropAMM.sol";
+import {MockERC20} from "./mocks/MockERC20.sol";
 
 /// Recording stand-in for the registry: creating an instance calls addUpdater on the registry
 /// address it is created against, which holds no code in the test environment, so setUp etches this
@@ -36,6 +38,9 @@ contract PropAMMFactoryTest is Test {
     /// owner-only functions without pranking. Creating one for someone else, which is what the
     /// parameter is for, is covered by test_createPropAMM_ownerIsTheParamNotTheCreator.
     address owner = address(this);
+    /// The factory's own owner, the one account that can disable creation. Deliberately not
+    /// `owner`, so tests can tell the two apart.
+    address factoryOwner = makeAddr("factory-owner");
     address vault = makeAddr("vault");
     address updater = makeAddr("updater");
     address secondUpdater = makeAddr("second-updater");
@@ -43,11 +48,17 @@ contract PropAMMFactoryTest is Test {
     /// The updater set every test creates with, more than one so the plural path is the default.
     address[] updaters;
     PropAMM.PairConfig[] pairs;
+    /// MockERC20's runtime, etched wherever a test lists a token: `_addPair` refuses a token
+    /// address without code, and the mainnet addresses below have none on a bare test chain.
+    bytes tokenCode;
 
     function setUp() public {
         vm.etch(PUR_ADDR, address(new RegistryStub()).code);
         vm.etch(OTHER_PUR_ADDR, address(new RegistryStub()).code);
-        factory = new PropAMMFactory();
+        tokenCode = address(new MockERC20()).code;
+        vm.etch(USDC, tokenCode);
+        vm.etch(USDT, tokenCode);
+        factory = new PropAMMFactory(factoryOwner);
         updaters.push(updater);
         updaters.push(secondUpdater);
         pairs.push(PropAMM.PairConfig({token0: USDC, token1: USDT, vault: vault}));
@@ -126,10 +137,38 @@ contract PropAMMFactoryTest is Test {
         assertFalse(RegistryStub(PUR_ADDR).isUpdater(propAmm, updater));
     }
 
-    /// Two events per creation, in this order: the instance's own PairAdded (emitted inside
-    /// initialize, so from the predicted address, before the proxy constructor returns), then the
-    /// factory's PropAMMCreated. The creation event names neither pairs nor vaults; PairAdded is
-    /// where indexers read them.
+    /// The documented creation flow passes no updaters, so nothing at creation would call the
+    /// oracle: the factory path has to refuse an address without code too. Audit F-12.
+    function test_createPropAMM_refusesAnOracleWithoutCode() public {
+        address eoa = makeAddr("eoa-oracle");
+        vm.expectRevert(abi.encodeWithSelector(InvalidOracle.selector, eoa));
+        factory.createPropAMM(owner, eoa, new address[](0), pairs);
+    }
+
+    /// Pairs listed at creation go through the same `_addPair` check as `addPair`. Audit F-13.
+    function test_createPropAMM_refusesATokenWithoutCode() public {
+        address ghost = makeAddr("ghost");
+        PropAMM.PairConfig[] memory p = new PropAMM.PairConfig[](1);
+        p[0] = PropAMM.PairConfig({token0: ghost, token1: USDC, vault: vault});
+        vm.expectRevert(abi.encodeWithSelector(NotAToken.selector, ghost));
+        factory.createPropAMM(owner, PUR_ADDR, updaters, p);
+    }
+
+    /// `initialize` adds updaters the way `addUpdater` does, so a key listed twice is refused
+    /// rather than logged twice. Audit F-16.
+    function test_createPropAMM_refusesADuplicateUpdater() public {
+        address[] memory twice = new address[](2);
+        twice[0] = updater;
+        twice[1] = updater;
+        vm.expectRevert(abi.encodeWithSelector(UpdaterAlreadyAuthorized.selector, PUR_ADDR, updater));
+        factory.createPropAMM(owner, PUR_ADDR, twice, pairs);
+    }
+
+    /// The instance's own events come first, from the predicted address, before the proxy
+    /// constructor returns: one UpdaterAuthorized per updater, then one PairAdded per pair. The
+    /// factory's PropAMMCreated comes last. The creation event names neither pairs nor vaults;
+    /// PairAdded is where indexers read them. (This test pins the PairAdded → PropAMMCreated order;
+    /// the UpdaterAuthorized events are pinned in PropAMM.t.sol.)
     function test_createPropAMM_emitsPairAddedThenCreated() public {
         address predicted = factory.computeAddress(address(this), owner, PUR_ADDR, updaters, pairs);
         vm.expectEmit(true, true, true, true, predicted);
@@ -182,7 +221,7 @@ contract PropAMMFactoryTest is Test {
         assertEq(first.getPairs().length, 1);
 
         vm.prank(address(this));
-        first.addPair(makeAddr("token-a"), makeAddr("token-b"), vault);
+        first.addPair(_token("token-a"), _token("token-b"), vault);
         assertEq(first.getPairs().length, 2);
         assertEq(second.getPairs().length, 1);
     }
@@ -191,8 +230,8 @@ contract PropAMMFactoryTest is Test {
     /// another, and keeps no rights over what it deployed.
     function test_createPropAMM_ownerIsTheParamNotTheCreator() public {
         address theirOwner = makeAddr("their-owner");
-        address tokenA = makeAddr("token-a");
-        address tokenB = makeAddr("token-b");
+        address tokenA = _token("token-a");
+        address tokenB = _token("token-b");
         PropAMM propAmm = PropAMM(factory.createPropAMM(theirOwner, PUR_ADDR, updaters, pairs));
 
         assertEq(propAmm.owner(), theirOwner);
@@ -240,6 +279,8 @@ contract PropAMMFactoryTest is Test {
         address wbtc = 0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599;
         address weth = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
         address vaultB = makeAddr("vault-b");
+        vm.etch(wbtc, tokenCode);
+        vm.etch(weth, tokenCode);
         PropAMM.PairConfig[] memory three = new PropAMM.PairConfig[](3);
         three[0] = PropAMM.PairConfig({token0: USDC, token1: USDT, vault: vault});
         three[1] = PropAMM.PairConfig({token0: weth, token1: USDC, vault: vaultB});
@@ -263,8 +304,8 @@ contract PropAMMFactoryTest is Test {
 
     function test_ownerCanManagePairs() public {
         PropAMM propAmm = PropAMM(factory.createPropAMM(owner, PUR_ADDR, updaters, pairs));
-        address tokenA = makeAddr("token-a");
-        address tokenB = makeAddr("token-b");
+        address tokenA = _token("token-a");
+        address tokenB = _token("token-b");
         propAmm.addPair(tokenA, tokenB, vault);
         assertEq(propAmm.getPairs().length, 2);
         propAmm.removePair(USDC, USDT);
@@ -300,7 +341,9 @@ contract PropAMMFactoryTest is Test {
         vm.expectRevert();
         propAmm.removeUpdater(updater);
         vm.expectRevert();
-        propAmm.addPair(makeAddr("token-a"), makeAddr("token-b"), vault);
+        propAmm.removeUpdaterFrom(PUR_ADDR, updater);
+        vm.expectRevert();
+        propAmm.addPair(_token("token-a"), _token("token-b"), vault);
         vm.expectRevert();
         propAmm.removePair(USDC, USDT);
         vm.expectRevert();
@@ -313,6 +356,169 @@ contract PropAMMFactoryTest is Test {
         propAmm.pause();
         vm.expectRevert();
         propAmm.unpause();
+        vm.expectRevert();
+        propAmm.withdrawERC20(USDC, rando, 1);
+        vm.expectRevert();
+        propAmm.transferOwnership(rando);
         vm.stopPrank();
+    }
+
+    /// An instance is set up once, by the factory, and nobody can set it up again: not with
+    /// `initialize`, and not with a migration step. An instance pointed at a price source of a
+    /// caller's choosing fills at whatever price that source names, out of vaults that have
+    /// approved it, so the oracle must stay the owner's to change, through `setOracle`.
+    function test_nobodyCanReinitializeAFactoryInstance() public {
+        PropAMM propAmm = PropAMM(factory.createPropAMM(owner, PUR_ADDR, updaters, pairs));
+        address rando = makeAddr("rando");
+        // A real contract: `initialize` refuses an oracle without code, which would make the call
+        // below revert whether or not the instance can be initialized again.
+        address evilOracle = address(new RegistryStub());
+
+        vm.startPrank(rando);
+        vm.expectRevert();
+        propAmm.initialize(rando, new address[](0), evilOracle, new PropAMM.PairConfig[](0));
+        // The migration step `reinitializeV2(address)` is gone: no function answers its selector.
+        (bool ok,) = address(propAmm).call(abi.encodeWithSignature("reinitializeV2(address)", evilOracle));
+        assertFalse(ok);
+        vm.stopPrank();
+
+        assertEq(address(propAmm.oracle()), PUR_ADDR);
+        assertEq(propAmm.owner(), owner);
+    }
+
+    function test_constructor_setsFactoryOwnerWithCreationOpen() public view {
+        assertEq(factory.owner(), factoryOwner);
+        assertFalse(factory.creationDisabled());
+    }
+
+    function test_constructor_revertsOnZeroOwner() public {
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableInvalidOwner.selector, address(0)));
+        new PropAMMFactory(address(0));
+    }
+
+    /// The factory's owner can stop creation, and has no say over the instances themselves.
+    function test_factoryOwnerCannotManageInstances() public {
+        PropAMM propAmm = PropAMM(factory.createPropAMM(owner, PUR_ADDR, updaters, pairs));
+        vm.prank(factoryOwner);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, factoryOwner));
+        propAmm.addPair(_token("token-a"), _token("token-b"), vault);
+    }
+
+    function test_disableCreation_emitsAndStopsCreation() public {
+        vm.expectEmit(true, true, true, true, address(factory));
+        emit PropAMMFactory.CreationDisabled();
+        vm.prank(factoryOwner);
+        factory.disableCreation();
+
+        assertTrue(factory.creationDisabled());
+        vm.expectRevert(CreationIsDisabled.selector);
+        factory.createPropAMM(owner, PUR_ADDR, updaters, pairs);
+        assertEq(factory.allPropAMMsLength(), 0);
+    }
+
+    /// Only the factory's owner: not an outsider, and not the owner of an instance it created.
+    function test_disableCreation_onlyFactoryOwner() public {
+        factory.createPropAMM(owner, PUR_ADDR, updaters, pairs);
+        address rando = makeAddr("rando");
+
+        vm.prank(rando);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, rando));
+        factory.disableCreation();
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, owner));
+        factory.disableCreation();
+
+        assertFalse(factory.creationDisabled());
+        factory.createPropAMM(makeAddr("another-owner"), PUR_ADDR, updaters, pairs);
+        assertEq(factory.allPropAMMsLength(), 2);
+    }
+
+    /// Disabling is one-way: calling it again reverts rather than emitting a second event, and a
+    /// new owner inherits a factory that stays disabled, with no way to turn creation back on.
+    function test_disableCreation_isIrrevocable() public {
+        vm.prank(factoryOwner);
+        factory.disableCreation();
+
+        vm.prank(factoryOwner);
+        vm.expectRevert(CreationIsDisabled.selector);
+        factory.disableCreation();
+
+        address newOwner = makeAddr("new-factory-owner");
+        vm.prank(factoryOwner);
+        factory.transferOwnership(newOwner);
+        vm.prank(newOwner);
+        factory.acceptOwnership();
+
+        assertEq(factory.owner(), newOwner);
+        assertTrue(factory.creationDisabled());
+        vm.prank(newOwner);
+        vm.expectRevert(CreationIsDisabled.selector);
+        factory.createPropAMM(owner, PUR_ADDR, updaters, pairs);
+    }
+
+    /// Disabling stops new instances only. Those already created stay listed and stay their
+    /// owners' to manage and upgrade, and computeAddress still names where they live.
+    function test_disableCreation_leavesExistingInstancesAlone() public {
+        PropAMM propAmm = PropAMM(factory.createPropAMM(owner, PUR_ADDR, updaters, pairs));
+        address newImplementation = address(new PropAMM());
+
+        vm.prank(factoryOwner);
+        factory.disableCreation();
+
+        assertEq(factory.allPropAMMsLength(), 1);
+        assertEq(factory.allPropAMMs(0), address(propAmm));
+        assertEq(factory.propAMMsOf(address(this))[0], address(propAmm));
+        assertEq(factory.computeAddress(address(this), owner, PUR_ADDR, updaters, pairs), address(propAmm));
+
+        propAmm.addPair(_token("token-a"), _token("token-b"), vault);
+        assertEq(propAmm.getPairs().length, 2);
+        propAmm.upgradeToAndCall(newImplementation, "");
+        assertEq(propAmm.owner(), owner);
+    }
+
+    /// Ownership moves in two steps: the account named holds no power until it accepts.
+    function test_transferOwnership_isTwoStep() public {
+        address newOwner = makeAddr("new-factory-owner");
+        vm.prank(factoryOwner);
+        factory.transferOwnership(newOwner);
+
+        assertEq(factory.owner(), factoryOwner);
+        assertEq(factory.pendingOwner(), newOwner);
+        vm.prank(newOwner);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, newOwner));
+        factory.disableCreation();
+
+        vm.prank(newOwner);
+        factory.acceptOwnership();
+        assertEq(factory.owner(), newOwner);
+
+        vm.prank(factoryOwner);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, factoryOwner));
+        factory.disableCreation();
+        vm.prank(newOwner);
+        factory.disableCreation();
+        assertTrue(factory.creationDisabled());
+    }
+
+    /// Renouncing ownership is the opposite commitment: nobody can disable creation afterwards,
+    /// so the factory stays open for good.
+    function test_renounceOwnership_leavesCreationOpenForGood() public {
+        vm.prank(factoryOwner);
+        factory.renounceOwnership();
+
+        assertEq(factory.owner(), address(0));
+        vm.prank(factoryOwner);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, factoryOwner));
+        factory.disableCreation();
+
+        assertFalse(factory.creationDisabled());
+        factory.createPropAMM(owner, PUR_ADDR, updaters, pairs);
+        assertEq(factory.allPropAMMsLength(), 1);
+    }
+
+    /// A labelled address with token code, so `_addPair` accepts it. Etches only (no CREATE), so
+    /// it is safe between a cheatcode expectation and the call it guards.
+    function _token(string memory label) internal returns (address t) {
+        t = makeAddr(label);
+        vm.etch(t, tokenCode);
     }
 }

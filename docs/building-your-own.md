@@ -18,7 +18,7 @@ A pricing model is a `Pricer`: built once per lane configuration, asked for a pr
 tick, and handed the pair's market in the orientation a person says it (USDC per WETH,
 however the lane carries it). `examples/custom_pricer.rs` is a complete binary
 in 30 lines of code, compiled by CI: a `skewed` kind that publishes the market mid moved by a
-fixed fraction at a fixed half-spread. Its `main` is the whole assembly:
+fixed fraction at a fixed half-spread, and by no more than that half-spread. Its `main` is the whole assembly:
 
 ```rust
 fn main() -> std::process::ExitCode {
@@ -43,7 +43,7 @@ key_env = "UPDATER_KEY_WETH_USDC"
 [pairs.pricing]
 kind        = "skewed"
 half_spread = 0.0005
-skew        = 0.001
+skew        = 0.0002
 ```
 
 What to know:
@@ -59,9 +59,24 @@ What to know:
 - **The core still decides.** A pricer can refuse (`Refusal::new`, counted under the reason
   it declared), and the core withdraws anything unpublishable whatever a pricer returns: a
   spread of a whole unit or more, a zero mid, or a mid the contract cannot store (over 216
-  bits), each counted under its own `reason`. How far a mid may sit from the market is the
-  pair's `min_mid`/`max_mid` band, which applies to every kind alike; a kind with a bound
-  of its own checks it in `validate` or refuses the tick.
+  bits), each counted under its own `reason`. The pair's `min_mid`/`max_mid` band bounds
+  every kind's mid alike, as an absolute range; a kind with a bound of its own checks it
+  in `validate` or refuses the tick.
+- **Do not quote through the market.** The core does not compare your quote with the
+  market: the band is an absolute range, not a distance from the market's mid. A pricer
+  publishes one mid and one half-spread, so it buys at `mid·(1 − delta)` and sells at
+  `mid/(1 − delta)`. Move the mid off the market's by more than the half-spread and one of
+  those crosses it: you sell below the market's price, or buy above it, and a taker fills
+  that and unwinds on the market at the vault's cost. It is worst when the move follows the
+  vault's inventory, because then a taker can cause it: unbalance the vault, wait for the
+  next vault reading (every 12s), take the quote that went through the market, and repeat.
+  So a pricer that moves its mid caps the move at its half-spread,
+  `skew.clamp(-half_spread, half_spread)` before `market.shift(skew)`, which leaves the
+  market's mid between the two prices. Clamp only a half-spread already checked
+  (`market.scaled_fraction` or `validate`): `f64::clamp` panics on a negative or NaN
+  bound. The `volatile` kind caps its tilt this way, and so do `examples/custom_pricer.rs`,
+  `examples/tilted.rs` and `example/`'s `inventory_skew`. A model that widens one side
+  instead of moving both (the `volatile` kind's inventory charge) cannot cross it at all.
 - **Builds do not block.** A `pricer_fn` closure runs synchronously inside the lane's build,
   so a fetch there stalls startup or the reload, and the 30s build limit cannot interrupt
   it. A pricer that must fetch before it can price, or whose stanza needs checking against
@@ -82,7 +97,7 @@ What to know:
   be verified, or was never quoted; a task started with `ctx.spawn` can await each with
   `next()`). Reading the vault is async,
   so it is the `Factory` path: `examples/tilted.rs` is a fixed spread tilted
-  by the vault's base share, and `make e2e-custom` runs it against the mocks. A test seeds
+  by the vault's base share, and `make e2e` runs it against the mocks. A test seeds
   these with `testing::build_ctx_with` and needs no chain. An HTTP client comes from
   `ctx.http()`: the run's one `reqwest::Client`, shared with the polled venues, so every
   lane draws on one connection pool (`quote_updater::reqwest` is the crate it belongs to,
@@ -226,4 +241,6 @@ What to know:
 - **Build settings.** Copy the `[profile.release]` from this repository's root `Cargo.toml`
   (Cargo only reads a profile from the binary's own workspace). The library refuses to start
   when built with `panic = "abort"`, which would turn one pair's panic into every pair's.
+  Keep its `overflow-checks = true`: a release build otherwise lets an integer overflow
+  wrap, and a wrapped number is carried on as if it were right.
 

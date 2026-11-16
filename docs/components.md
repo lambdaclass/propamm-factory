@@ -13,8 +13,14 @@ prices from, `updaters` are the addresses allowed to publish prices, and `pairs`
 `(token0, token1, vault)`: the two tokens and the wallet that holds the inventory for that
 pair. Each pair can have its own vault.
 
+The factory has an owner of its own, set when it is deployed, whose one power is
+`disableCreation`: it stops `createPropAMM` for good and emits `CreationDisabled`. Nothing turns
+creation back on. Instances already created keep working, and the factory's owner has no say
+over them.
+
 `PropAMM` is the instance. The owner can add and remove pairs (`addPair`, `setPairVault`),
-add and remove updaters (`addUpdater`, `removeUpdater`) and pause it. Traders call `swap`;
+add and remove updaters (`addUpdater`, `removeUpdater`, and `removeUpdaterFrom` for a registry
+the instance has moved away from), point it at another registry (`setOracle`) and pause it. Traders call `swap`;
 anyone can call `quote` and `isActive` to see what a trade would get.
 
 Instances also implement `IPropAMMFillable`, advertised through ERC-165, which
@@ -56,10 +62,11 @@ publish, without sending anything. [`manual.md`](manual.md) is the operating man
 
 **The backoffice** is a JSON API the updater serves under `/api`. Through it you add and
 remove pairs, pick the exchanges a pair follows and their weights, change a pair's pricing
-settings, add builders, and halt or resume a pair. It serves no pages: a front end of your
-own, or `curl`, talks to it. Every change is written to the config file and applied without
-a restart. You put it on a private address (your tailnet), and can also require a Google
-sign-in from an allowed Workspace domain or address.
+settings, add builders, and halt or resume a pair. It serves no pages: a front end, such as
+the one in [`backoffice-ui/`](../backoffice-ui/README.md), or `curl`, talks to it. Every
+change is written to the config file and applied without a restart. You put it on a private
+address (your tailnet), and can also require a Google sign-in from an allowed Workspace
+domain or address.
 
 ## Monitoring
 

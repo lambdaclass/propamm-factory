@@ -6,6 +6,11 @@
 //! and the pair's band. So a pricer only ever makes the updater more cautious: it can
 //! withdraw a quote, never publish one the core would refuse.
 //!
+//! What the core does not judge is where a pricer's quote sits against the market. A pricer
+//! that moves its mid off the market's (to rebalance a vault, say) must keep the market's
+//! mid between the two prices it publishes, which means moving the mid by no more than its
+//! half-spread: see [`Market::shift`].
+//!
 //! Everything a pricer sees is exact and in lane orientation, with helpers for the f64
 //! world: [`Market::mid_f64`] reads the market the way a person says it (USDC per WETH,
 //! whichever way the lane carries it), and [`Market::scaled_fraction`], [`Market::shift`]
@@ -31,7 +36,10 @@ pub use self::inputs::{
 };
 pub use self::{feed::Feed, fixed::Fixed, volatile::Volatile};
 #[cfg(test)]
-pub(crate) use self::{feed::FeedPricer, fixed::FixedPricer};
+pub(crate) use self::{
+    feed::{FeedPricer, Spread as FeedSpread},
+    fixed::FixedPricer,
+};
 
 use crate::{
     feed::{PriceSample, parse_decimal_scaled},
@@ -423,6 +431,15 @@ impl Market {
 
     /// The mid moved by `skew` in market orientation: `+0.01` publishes a mid 1% below the
     /// market's (the volatile model's tilt direction), returned in lane orientation.
+    ///
+    /// Keep `skew` within the half-spread published beside it, `±delta`. We buy at
+    /// `mid·(1 − skew)·(1 − delta)` and sell at `mid·(1 − skew)/(1 − delta)`, so at
+    /// `skew = delta` we sell at the market's mid, and past it below: the quote is through
+    /// the market, and a taker fills it and unwinds on the market at the vault's cost. A
+    /// skew that follows the vault's inventory makes that repeatable, since whoever
+    /// unbalances the vault moves the quote. Nothing in the core checks this (the band is an
+    /// absolute bound on the mid, not a distance from the market), so the pricer clamps:
+    /// `skew.clamp(-delta, delta)`, as the volatile model does with its tilt.
     pub fn shift(&self, skew: f64) -> Result<U256, Refusal> {
         shifted_mid(self.mid, skew, self.inverted, self.price_decimals)
             .map_err(|err| Refusal::core(UnusableKind::DeltaOverflow, format!("{err:#}")))
@@ -652,6 +669,10 @@ impl Diagnostics {
 /// the pair's band (`min_mid`/`max_mid`) is the operator's bound
 /// on the mid and is checked after it. Severity only goes up: this can withdraw a quote,
 /// never publish one.
+///
+/// It does not compare the mid with the market's: a pricer may price off something other
+/// than the pair's reference market, so keeping a quote from going through the market is
+/// the pricer's to do (see [`Market::shift`]).
 pub(crate) fn backstop(
     out: PricerOutput,
     market: Option<&Market>,

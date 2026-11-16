@@ -35,6 +35,9 @@
             pkgs.gnumake
             pkgs.curl
             pkgs.jq
+            # backoffice-ui/ (make backoffice-ui). Its package.json pins pnpm's own version
+            # (packageManager) and Node's (devEngines.runtime).
+            pkgs.pnpm
             # The TLS the exchange and builder websockets use links against the system OpenSSL.
             pkgs.pkg-config
             pkgs.openssl

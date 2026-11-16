@@ -48,6 +48,21 @@ const MAX_BACKLOG: usize = 7_200;
 const MAX_PENDING_BALANCES: usize = 4_096;
 const RECONNECT_MIN: Duration = Duration::from_secs(1);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
+/// How often rows older than the retention are deleted, when one is set. Hourly keeps each
+/// delete to an hour's worth of rows once the first has caught up, and a table that is a
+/// few hours over its retention is nobody's problem.
+const PRUNE_EVERY: Duration = Duration::from_secs(3_600);
+/// The tables that grow with time, each with a `ts` in seconds saying when a row is from:
+/// the ones a retention deletes from. Nothing ever removed a row from them, so they grew
+/// for as long as the updater ran (a quote row per lane per block, a mid row per price
+/// change). The rest (`tokens`, `pairs`, `config_changes`) grow with what is configured,
+/// not with time, and are the record of what ran: never deleted from.
+const PRUNED_TABLES: [&str; 3] = ["mids", "quotes", "vault_balances"];
+/// How many rows one delete takes. Each is a transaction of its own, so the first prune of
+/// a database that grew for a year is many small ones: a bounded amount of WAL at a time,
+/// on a disk that is usually why the retention was set, and nothing to redo if the process
+/// stops between two.
+const PRUNE_BATCH: i64 = 10_000;
 
 /// The latest book a feed reported for one symbol, in market orientation.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -552,16 +567,25 @@ fn select_rows(
     (mid_rows, balance_rows)
 }
 
+/// The `ts` below which a row is past `retention` at `now`, both in seconds.
+fn retention_cutoff(now: i64, retention: Duration) -> i64 {
+    now.saturating_sub(i64::try_from(retention.as_secs()).unwrap_or(i64::MAX))
+}
+
 /// Runs the writer for the life of the process. Returns once `shutdown` is set and the last
 /// rows have been written (or given up on, after one attempt).
+///
+/// `retention` is how long a row of the time-series tables is kept (`PRUNED_TABLES`);
+/// `None` keeps every row, which is what the recorder always did.
 #[must_use = "await this at shutdown, or the last second of rows is lost"]
 pub fn spawn(
     url: String,
     recorder: Recorder,
     mut shutdown: Shutdown,
+    retention: Option<Duration>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut writer = Writer::new(url);
+        let mut writer = Writer::new(url, retention);
         let mut mids = Cadence::default();
         let mut balances = Cadence::default();
         let mut ticker = tokio::time::interval(FLUSH_EVERY);
@@ -597,6 +621,10 @@ pub fn spawn(
             if stopping {
                 return;
             }
+            // After the flush and never at shutdown: the rows just handed over come first,
+            // and a delete is not worth holding an exit for. Started, not awaited: it runs
+            // on a task and a connection of its own (see `Writer::prune`).
+            writer.prune(now_secs());
         }
     })
 }
@@ -622,6 +650,24 @@ struct Writer {
     /// Writes that failed in a row. Past `MAX_WRITE_FAILURES` the queued rows are dropped:
     /// a batch Postgres rejects for what it contains would otherwise be replayed forever.
     write_failures: u32,
+    /// How long a time-series row is kept, if rows are deleted at all.
+    retention: Option<Duration>,
+    /// When rows past the retention are next deleted. Starts due, so a database that grew
+    /// for a year before the retention was set is caught up on the first connection.
+    prune_at: tokio::time::Instant,
+    /// The delete in flight, if one is.
+    pruning: Option<Pruning>,
+}
+
+/// A prune running on its own task, aborted when the writer goes: at shutdown, whose last
+/// flush must not wait behind a delete, and when the writer's task is itself aborted.
+/// Aborting drops its connection, which rolls back the one batch in flight and no more.
+struct Pruning(tokio::task::JoinHandle<()>);
+
+impl Drop for Pruning {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Consecutive failed writes before the queue is abandoned. Three at the growing backoff
@@ -630,8 +676,11 @@ struct Writer {
 const MAX_WRITE_FAILURES: u32 = 3;
 
 impl Writer {
-    fn new(url: String) -> Self {
+    fn new(url: String, retention: Option<Duration>) -> Self {
         Self {
+            retention,
+            prune_at: tokio::time::Instant::now(),
+            pruning: None,
             url,
             client: None,
             mids: Vec::new(),
@@ -821,6 +870,48 @@ impl Writer {
         }
     }
 
+    /// Starts deleting the time-series rows older than the retention, when one is set, it
+    /// is time, and the last delete has finished.
+    ///
+    /// On a task and a connection of its own, never on the writer's. A delete takes as
+    /// long as there is to delete, and this loop is what samples the mids: awaited here, a
+    /// long one left a hole in `feed.mids` its whole length, and a shutdown during it lost
+    /// the last flush. Only while the writer is connected, which is what says the database
+    /// is up and the schema is there.
+    fn prune(&mut self, now: i64) {
+        let Some(retention) = self.retention else {
+            return;
+        };
+        if self
+            .pruning
+            .as_ref()
+            .is_some_and(|task| !task.0.is_finished())
+        {
+            return;
+        }
+        self.pruning = None;
+        if tokio::time::Instant::now() < self.prune_at || self.client.is_none() {
+            return;
+        }
+        self.prune_at = tokio::time::Instant::now() + PRUNE_EVERY;
+        let (url, cutoff) = (self.url.clone(), retention_cutoff(now, retention));
+        self.pruning = Some(Pruning(tokio::spawn(async move {
+            // A failure is logged and waited out like a success: nothing is lost by a
+            // late delete, and what was deleted before it failed stays deleted.
+            match delete_older_than(&url, cutoff).await {
+                Ok(0) => {}
+                Ok(rows) => tracing::info!(
+                    "[record] deleted {rows} rows older than the {}-day retention",
+                    retention.as_secs() / 86_400
+                ),
+                Err(err) => tracing::warn!(
+                    "[record] could not delete rows past the retention ({err:#}); trying \
+                     again in {PRUNE_EVERY:?}"
+                ),
+            }
+        })));
+    }
+
     /// Dials, runs the connection on its own task, and makes sure the tables exist.
     async fn connect(&self) -> eyre::Result<tokio_postgres::Client> {
         // Plain TCP: the database is on this host (loopback), see the deploy. A URL asking
@@ -841,6 +932,38 @@ impl Writer {
 /// the two can never disagree. Idempotent, and cheap enough to run on every connect.
 async fn migrate(client: &tokio_postgres::Client) -> Result<(), tokio_postgres::Error> {
     client.batch_execute(include_str!("../sql/feed.sql")).await
+}
+
+/// One batch of a table's delete: its oldest `$2` rows from before `$1` (seconds). Oldest
+/// first and by `ts`, which the `*_ts` indexes in feed.sql are there to seek on; by `ctid`
+/// so the rows found are the rows deleted, with no second look for them.
+fn delete_batch(table: &str) -> String {
+    format!(
+        "delete from feed.{table} where ctid = any(array(\
+         select ctid from feed.{table} where ts < $1 order by ts limit $2))"
+    )
+}
+
+/// Deletes every row of the time-series tables from before `cutoff` (seconds), over a
+/// connection dialled for it, and says how many went. `PRUNE_BATCH` rows a statement,
+/// each its own transaction, until a table has no more.
+async fn delete_older_than(url: &str, cutoff: i64) -> eyre::Result<u64> {
+    let (client, connection) = tokio_postgres::connect(url, NoTls).await?;
+    // Ends by itself when `client` is dropped, at the end of this function or when the
+    // task running it is aborted.
+    tokio::spawn(connection);
+    let mut deleted = 0;
+    for table in PRUNED_TABLES {
+        let statement = delete_batch(table);
+        loop {
+            let rows = client.execute(&statement, &[&cutoff, &PRUNE_BATCH]).await?;
+            deleted += rows;
+            if rows < PRUNE_BATCH as u64 {
+                break;
+            }
+        }
+    }
+    Ok(deleted)
 }
 
 /// One statement for the batch. A live row replaces a backfilled one for the same second
@@ -1073,7 +1196,7 @@ mod tests {
 
     #[test]
     fn a_batch_never_holds_one_key_twice() {
-        let mut w = Writer::new(String::new());
+        let mut w = Writer::new(String::new(), None);
         let row = |ts: i64, mid: f64| MidRow {
             symbol: "ETHUSDC".into(),
             ts,
@@ -1114,7 +1237,7 @@ mod tests {
             terms: None,
         };
         let stamp = |row: QuoteRow| Latest::default().stamp(row);
-        let mut writer = Writer::new(String::new());
+        let mut writer = Writer::new(String::new(), None);
         writer.queue(
             Vec::new(),
             Vec::new(),
@@ -1240,7 +1363,7 @@ mod tests {
             terms,
         };
         let stamp = |row: QuoteRow| Latest::default().stamp(row);
-        let mut writer = Writer::new(String::new());
+        let mut writer = Writer::new(String::new(), None);
         writer.queue(
             Vec::new(),
             Vec::new(),
@@ -1337,9 +1460,66 @@ api_key = "very-secret"
         assert_eq!(b.len(), 1);
     }
 
+    /// Nothing ever deleted a row, so the tables grew for as long as the updater ran. With
+    /// a retention, rows from before the cutoff go; without one, nothing is ever due.
+    #[tokio::test(start_paused = true)]
+    async fn a_retention_sets_the_cutoff_and_none_never_prunes() {
+        let day = Duration::from_secs(86_400);
+        assert_eq!(
+            retention_cutoff(1_700_000_000, 90 * day),
+            1_700_000_000 - 90 * 86_400
+        );
+        // A retention longer than the clock has run reaches back before every row.
+        assert_eq!(retention_cutoff(100, 90 * day), 100 - 90 * 86_400);
+        assert_eq!(retention_cutoff(i64::MIN + 5, day), i64::MIN);
+        // Exactly the tables that carry a time and grow with it; the config history
+        // (`config_changes`, `pairs`) and `tokens` are not among them.
+        assert_eq!(PRUNED_TABLES, ["mids", "quotes", "vault_balances"]);
+        for table in PRUNED_TABLES {
+            assert!(
+                include_str!("../sql/feed.sql")
+                    .contains(&format!("create table if not exists feed.{table} (")),
+                "{table} is not a table of the schema"
+            );
+        }
+
+        // Each has an index that leads with `ts`, for the delete to seek on.
+        let schema = include_str!("../sql/feed.sql");
+        for index in [
+            "mids_ts on feed.mids (ts)",
+            "quotes_ts on feed.quotes (ts)",
+            "vault_balances_ts on feed.vault_balances (ts)",
+        ] {
+            assert!(
+                schema.contains(&format!("create index if not exists {index};")),
+                "{index}"
+            );
+        }
+        assert_eq!(
+            delete_batch("mids"),
+            "delete from feed.mids where ctid = any(array(select ctid from feed.mids \
+             where ts < $1 order by ts limit $2))"
+        );
+
+        // No retention: never due, however long it runs. No database: nothing is dialled
+        // for a delete, and it stays due for the tick the database is back.
+        let mut keeps = Writer::new(String::new(), None);
+        let mut prunes = Writer::new(String::new(), Some(90 * day));
+        let due = prunes.prune_at;
+        tokio::time::advance(2 * PRUNE_EVERY).await;
+        keeps.prune(now_secs());
+        prunes.prune(now_secs());
+        assert!(keeps.pruning.is_none() && prunes.pruning.is_none());
+        assert_eq!(
+            prunes.prune_at, due,
+            "with no connection the delete is not spent"
+        );
+        assert!(keeps.client.is_none() && prunes.client.is_none());
+    }
+
     #[test]
     fn the_backlog_is_bounded_and_counts_what_it_dropped() {
-        let mut w = Writer::new(String::new());
+        let mut w = Writer::new(String::new(), None);
         let rows: Vec<MidRow> = (0..MAX_BACKLOG as i64 + 10)
             .map(|i| MidRow {
                 symbol: "ETHUSDC".into(),
