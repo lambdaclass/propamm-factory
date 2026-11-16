@@ -442,6 +442,9 @@ max_deviation = "0.002"
 # restarts every lane: each builder connection is opened inside a pair's own quoting loop, so
 # a lane cannot pick up a new list without being rebuilt. The updater dials the new list
 # first and refuses the whole change, touching nothing, unless at least one of them connects.
+# A lane that cannot be rebuilt onto a list that lost a builder (or changed any field of its
+# entry) is stopped, its quote withdrawn at every builder, rather than left quoting to the
+# removed one; the next reload starts it again.
 #
 # Regional endpoints are just separate entries: add titan-ap and titan-us alongside this
 # one to fan out across regions.

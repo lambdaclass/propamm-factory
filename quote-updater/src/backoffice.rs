@@ -46,7 +46,7 @@
 //! | `GET /api/preview`                | a websocket of live venue mids; saves nothing    |
 //!
 //! A change answers `{"status": "applied" | "partial", "message": ...}` with a 2xx; a
-//! `partial` one is kept, though some pair kept its previous config (see
+//! `partial` one is kept, though some pair kept its previous config or was stopped (see
 //! [`ReloadFailure::Partial`]). Anything refused answers `{"error": ...}` with a 4xx, and
 //! changed nothing. A fault on this side answers `{"error": ...}` with a 5xx: 500 for a
 //! change that could not be made (see [`ReloadFailure::Fault`]), 502 for a lookup that
@@ -549,9 +549,10 @@ impl IntoResponse for ApiError {
 
 /// What a change answers. A partial apply is a 2xx, because the change is kept (a retry
 /// would find it already made), and says `partial` rather than `applied`, because a pair
-/// still runs its previous config. A rejection is a 422: nothing changed. A fault on this
-/// side (the config file could not be written or put back, the pusher is stopping) is a
-/// 500, so a client can tell it from a change it should fix.
+/// still runs its previous config, or was not started or stopped. A rejection is a 422:
+/// nothing changed. A fault on this side (the config file could not be written or put
+/// back, the pusher is stopping) is a 500, so a client can tell it from a change it should
+/// fix.
 fn respond(result: std::result::Result<String, Refused<ApiError>>, created: bool) -> Response {
     let kept = if created {
         StatusCode::CREATED

@@ -146,6 +146,10 @@ pub(crate) struct Service {
     /// Trips whose lane is gone (see [`KeptTrip`]), by lane, until its re-arm. A process
     /// restart forgets them, as it clears every breaker.
     pub(crate) kept_trips: std::collections::BTreeMap<U256, KeptTrip>,
+    /// Called with a lane as it is asked to stop and before its task is waited for, so a
+    /// test can land a trip in exactly that window.
+    #[cfg(test)]
+    pub(crate) on_stopping: Option<Box<dyn Fn(U256) + Send + Sync>>,
 }
 
 /// `run` returning early (an error after the pairs started) must not leave their supervised
@@ -194,8 +198,12 @@ struct Applied {
     /// their re-arm (audit F-17).
     left_tripped: Vec<String>,
     /// Lanes whose feed would not come up. They keep running on their old config (or stay
-    /// absent, if they were being added), and this is what says so.
+    /// absent, if they were being added), and this is what says so; unless they are also
+    /// in `stopped`.
     failed: Vec<String>,
+    /// The failed lanes that were stopped rather than kept: the reload took a builder out
+    /// of the list they quoted to (audit F-18). Not running until a reload starts them.
+    stopped: Vec<String>,
 }
 
 impl Applied {
@@ -237,6 +245,28 @@ impl Applied {
             line.push_str(rearmed);
         }
         line
+    }
+
+    /// What a partial reload's answer adds to its line: where the lanes that failed were
+    /// left. "Kept their previous config" would read a stopped lane as quoting.
+    fn failed_detail(&self) -> String {
+        let mut parts = Vec::new();
+        if self.failed.len() > self.stopped.len() {
+            parts.push("some pairs kept their previous config".to_owned());
+        }
+        if !self.stopped.is_empty() {
+            parts.push(format!(
+                "{} stopped rather than left quoting to a builder this change removed; a \
+                 reload starts {} again",
+                self.stopped.join(", "),
+                if self.stopped.len() == 1 {
+                    "it"
+                } else {
+                    "them"
+                },
+            ));
+        }
+        format!("{}, see the journal", parts.join("; "))
     }
 }
 
@@ -434,6 +464,10 @@ impl Service {
             pair.adopted.clone(),
         );
         pair.stop.send_replace(true);
+        #[cfg(test)]
+        if let Some(hook) = &self.on_stopping {
+            hook(lane);
+        }
         if let Err(err) = pair.task.await {
             tracing::error!(
                 "[{}] pair task did not stop cleanly: {err}",
@@ -830,7 +864,8 @@ impl Service {
                 // kind, because unlike a rejection the change is kept.
                 if result == metrics::Reload::Partial {
                     return Err(ReloadFailure::Partial(format!(
-                        "{line} — some pairs kept their previous config, see the journal"
+                        "{line} — {}",
+                        applied.failed_detail()
                     )));
                 }
                 Ok(line)
@@ -958,6 +993,10 @@ impl Service {
     /// all-or-nothing, because whether a feed comes up is not knowable without dialling it,
     /// and the startup rule of failing everything is exactly wrong here — at startup nothing
     /// is serving anyone yet, while here the other lanes are quoting to takers.
+    ///
+    /// The one exception is a reload that takes a builder out of the list (or changes any
+    /// field of its entry): a lane kept on its old config would go on quoting to it, so a
+    /// lane that cannot be rebuilt onto the new list is stopped instead (audit F-18).
     async fn reload(
         &mut self,
         done: &tokio::sync::mpsc::UnboundedSender<(U256, u64)>,
@@ -998,6 +1037,14 @@ impl Service {
 
         // Before anything is spawned. Each running pair holds the `Arc` it was built with,
         // which is why they all have to be restarted.
+        //
+        // First, whether the new list drops an entry the old one had (a builder removed, or
+        // any field of its entry changed): the lanes still on the old list quote to it, and
+        // one whose rebuild fails cannot be left so (audit F-18). A list that only adds builders
+        // leaves a failed lane quoting where it was told to, as any failed rebuild does.
+        let builder_dropped = new_builders
+            .as_ref()
+            .is_some_and(|new| self.builders.builders.iter().any(|old| !new.contains(old)));
         if let Some(builders) = new_builders {
             self.builders = Arc::new(config::BuildersConfig { builders });
         }
@@ -1113,6 +1160,22 @@ impl Service {
         for (spec, was_running, label, built) in built {
             let built = match built {
                 Ok(built) => built,
+                Err(err) if was_running && builder_dropped => {
+                    // Its old config quotes to a builder this reload took out of the list:
+                    // stopped, which withdraws its quote at every builder it had, that one
+                    // included (audit F-18). Stopped as a removal is, so a trip it carries
+                    // outlives it and only its re-arm clears it. Nothing quotes the lane
+                    // until a reload starts it again, which the next one does.
+                    let label = self.retire(spec.lane).await;
+                    tracing::warn!(
+                        "reload: [{label}] {err:#}; stopped it, its quote withdrawn at every \
+                         builder, rather than leave it quoting to a builder this reload \
+                         removed. Reload to start it again"
+                    );
+                    applied.stopped.push(label.clone());
+                    applied.failed.push(label);
+                    continue;
+                }
                 Err(err) => {
                     let kept = if was_running {
                         "leaving it quoting on the config it already had"
@@ -1256,9 +1319,10 @@ pub(crate) enum ReloadFailure {
     /// so the change is dropped and the file written for it put back.
     Rejected(String),
     /// Applied to every lane it reached, but at least one kept its previous config (or was
-    /// not started) because its feed would not come up. The change is kept: it is live on
-    /// the lanes it reached, a halt among them, and dropping it would describe neither what
-    /// runs nor what was asked for, and have the next reload undo the rest.
+    /// not started, or was stopped: audit F-18) because its feed would not come up. The
+    /// change is kept: it is live on the lanes it reached, a halt among them, and dropping
+    /// it would describe neither what runs nor what was asked for, and have the next reload
+    /// undo the rest.
     Partial(String),
     /// Not done, through no fault of the config asked for: the pusher is stopping, or
     /// `state.rs` could not write the config file or put it back. Nothing running changed.
@@ -1438,8 +1502,8 @@ fn refuse_unresolvable_keys(
 /// Which result one applied reload counts as.
 ///
 /// The distinction the counter exists for. A lane whose feed would not come up is left on
-/// its old stanza while every other lane moved, so `pairs.toml` now describes only *part* of
-/// what is running — and that is a worse thing for an operator to be wrong about than a
+/// its old stanza (or stopped, when its old builder list lost a builder) while every other
+/// lane moved, so `pairs.toml` now describes only *part* of what is running — and that is a worse thing for an operator to be wrong about than a
 /// rejection, which at least leaves every lane on the previous config together. Counting it
 /// as a clean apply would leave nothing at all able to see it: the pairs stay healthy, no
 /// other series moves, and the one line saying so scrolls past in the journal.
@@ -1668,6 +1732,7 @@ mod tests {
             kinds: Arc::new(crate::kinds::Kinds::shipped()),
             halt_flags: Arc::default(),
             kept_trips: Default::default(),
+            on_stopping: None,
         }
     }
 
@@ -2308,12 +2373,49 @@ pricing = { kind = "feed" }
             rearmed: Vec::new(),
             left_tripped: Vec::new(),
             failed: vec!["G/H".to_owned()],
+            stopped: Vec::new(),
         };
         assert_eq!(
             applied.summary(),
             "reload: 1 added, 2 restarted, 1 halted, 1 failed"
         );
         assert!(!applied.is_empty());
+    }
+
+    /// A partial reload's answer says where its failed lanes were left: a stopped one is not
+    /// read as still quoting (audit F-18).
+    #[test]
+    fn a_partial_reload_says_which_failed_lanes_were_stopped() {
+        let kept = Applied {
+            failed: vec!["A/B".to_owned()],
+            ..Applied::default()
+        };
+        assert_eq!(
+            kept.failed_detail(),
+            "some pairs kept their previous config, see the journal"
+        );
+
+        let stopped = Applied {
+            failed: vec!["A/B".to_owned()],
+            stopped: vec!["A/B".to_owned()],
+            ..Applied::default()
+        };
+        assert_eq!(
+            stopped.failed_detail(),
+            "A/B stopped rather than left quoting to a builder this change removed; a reload \
+             starts it again, see the journal"
+        );
+
+        let both = Applied {
+            failed: vec!["A/B".to_owned(), "C/D".to_owned(), "E/F".to_owned()],
+            stopped: vec!["C/D".to_owned(), "E/F".to_owned()],
+            ..Applied::default()
+        };
+        assert_eq!(
+            both.failed_detail(),
+            "some pairs kept their previous config; C/D, E/F stopped rather than left quoting \
+             to a builder this change removed; a reload starts them again, see the journal"
+        );
     }
 
     /// The distinction `supervise` cannot make for itself. It stops on `Ok` either way, so
@@ -2697,6 +2799,177 @@ api_key = "k"
             assert_eq!(specs(&service), before, "A still runs on its old stanza");
         }
 
+        /// A second `[[builder]]` stanza, to append to [`file`].
+        fn and_builder(name: &str, endpoint: &str) -> String {
+            format!(
+                "\n[[builder]]\nname = \"{name}\"\nendpoint = \"{endpoint}\"\napi_key = \"k\"\n"
+            )
+        }
+
+        /// How many quotes `endpoint` has been sent under distinct uuids: one per lane per
+        /// connection, so a lane started again counts anew.
+        fn quoted_under(endpoint: &crate::builder::mock::Mock) -> usize {
+            endpoint
+                .received()
+                .iter()
+                .filter(|update| !update.tx.is_empty())
+                .map(|update| update.uuid.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+        }
+
+        /// The uuids whose last update at `endpoint` is a quote rather than a withdraw: the
+        /// quotes it still holds.
+        fn standing(endpoint: &crate::builder::mock::Mock) -> usize {
+            let mut last = BTreeMap::new();
+            for update in endpoint.received() {
+                last.insert(update.uuid, !update.tx.is_empty());
+            }
+            last.values().filter(|quoting| **quoting).count()
+        }
+
+        /// A head watcher on the mock chain, for a test whose lanes have to sign: without
+        /// one they wait for a first block and send nothing. Keep the tasks alive.
+        fn watch_head(service: &mut Service) -> crate::tasks::Tasks {
+            let mut tasks = crate::tasks::Tasks::default();
+            service.head = crate::head::spawn(
+                &mut tasks,
+                service.client.clone(),
+                crate::head::poll_interval(service.opts.requote_ms),
+                crate::head::POLL_TIMEOUT,
+                None,
+                service.metrics.register_head().unwrap(),
+            );
+            tasks
+        }
+
+        /// Audit F-18: a builder taken out of the list while one lane's rebuild onto the new
+        /// list fails. That lane is stopped, its quote withdrawn at every builder it had, the
+        /// removed one included, rather than left quoting to the builder this change took
+        /// out. The reload is partial and says so, and the next one starts the lane on the
+        /// new list.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_lane_whose_rebuild_fails_stops_quoting_to_a_removed_builder() {
+            let (mut service, _rpc, kept, path) = setup("reload-removed-builder").await;
+            let _head = watch_head(&mut service);
+            let removed = crate::builder::mock::spawn(crate::builder::mock::Behaviour::Ack).await;
+            let (done, _done_rx) = tokio::sync::mpsc::unbounded_channel();
+            let ten = std::time::Duration::from_secs(10);
+            let settle = std::time::Duration::from_millis(300);
+
+            std::fs::write(
+                &path,
+                file("", &kept.url) + &and_builder("gone", &removed.url),
+            )
+            .unwrap();
+            let first = service
+                .reload(&done, &read(&path), &[])
+                .await
+                .expect("the first reload adds both lanes");
+            assert_eq!(first.added.len(), 2, "{first:?}");
+            let (lane, label) = lane_a(&service);
+            // Both lanes quoting to the builder about to go, so "nothing more" below is
+            // not vacuous.
+            tokio::time::timeout(ten, async {
+                while quoted_under(&removed) < 2 {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("both lanes quote to the builder about to be removed");
+
+            std::fs::write(&path, file("broken = true", &kept.url)).unwrap();
+            let second = service
+                .reload(&done, &read(&path), &[])
+                .await
+                .expect("one failed lane does not fail the file");
+
+            // Nothing more reaches the removed builder, while the lanes still tick: B keeps
+            // quoting to the one that stayed.
+            let (at_removed, at_kept) = (removed.count(), kept.count());
+            assert!(
+                kept.wait_for(at_kept + 5, ten).await,
+                "B still quotes to the kept builder"
+            );
+            tokio::time::sleep(settle).await;
+            assert_eq!(
+                removed.count(),
+                at_removed,
+                "the removed builder was sent {} more updates after the reload",
+                removed.count() - at_removed
+            );
+            assert_eq!(
+                standing(&removed),
+                0,
+                "every quote at the removed builder was withdrawn"
+            );
+            assert!(
+                !service.running.contains_key(&lane),
+                "A is not left running on the old list"
+            );
+            assert_eq!(second.failed, vec![label.clone()], "{second:?}");
+            assert_eq!(second.stopped, vec![label.clone()], "{second:?}");
+            assert_eq!(second.restarted.len(), 1, "B moved: {second:?}");
+
+            // The next reload, with A buildable again, starts it on the new list, and the
+            // removed builder still hears nothing.
+            let before = quoted_under(&kept);
+            std::fs::write(&path, file("", &kept.url)).unwrap();
+            let third = service
+                .reload(&done, &read(&path), &[])
+                .await
+                .expect("A builds now");
+            assert_eq!(third.added, vec![label], "{third:?}");
+            tokio::time::timeout(ten, async {
+                while quoted_under(&kept) <= before {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("A quotes to the kept builder again");
+            tokio::time::sleep(settle).await;
+            assert_eq!(
+                removed.count(),
+                at_removed,
+                "nothing more at the removed builder"
+            );
+        }
+
+        /// A builder added, none taken out: a lane whose rebuild fails sends to no builder
+        /// the config dropped, so it keeps quoting on what it had, as any failed rebuild
+        /// does.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_lane_whose_rebuild_fails_on_an_added_builder_keeps_quoting() {
+            let (mut service, _rpc, kept, path) = setup("reload-added-builder").await;
+            let added = crate::builder::mock::spawn(crate::builder::mock::Behaviour::Ack).await;
+            let (done, _done_rx) = tokio::sync::mpsc::unbounded_channel();
+
+            std::fs::write(&path, file("", &kept.url)).unwrap();
+            service
+                .reload(&done, &read(&path), &[])
+                .await
+                .expect("the first reload adds both lanes");
+            let (lane, _) = lane_a(&service);
+            let before = specs(&service);
+
+            std::fs::write(
+                &path,
+                file("broken = true", &kept.url) + &and_builder("new", &added.url),
+            )
+            .unwrap();
+            let second = service
+                .reload(&done, &read(&path), &[])
+                .await
+                .expect("one failed lane does not fail the file");
+            assert_eq!(second.failed.len(), 1, "A's build failed: {second:?}");
+            assert!(second.stopped.is_empty(), "{second:?}");
+            assert_eq!(
+                specs(&service).get(&lane),
+                before.get(&lane),
+                "A still runs on its old stanza"
+            );
+        }
+
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_stanza_that_fails_validate_rejects_the_whole_reload() {
             let (mut service, _rpc, builder, path) = setup("reload-validate").await;
@@ -2877,17 +3150,22 @@ api_key = "k"
                 .await
                 .expect("the first reload adds both lanes");
             let (lane, label) = lane_a(&service);
+            // The trip lands once the lane has been asked to stop: past the build and the
+            // check made before the stop, and before the lane is read again.
             let tripped = Arc::clone(&service.running[&lane].halted);
-            let mut stop = service.running[&lane].stop.subscribe();
+            service.on_stopping = Some(Box::new(move |stopping| {
+                if stopping == lane {
+                    tripped.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }));
 
             std::fs::write(&path, file("slow = true", &builder.url)).unwrap();
             let edited = read(&path);
-            let (applied, ()) = tokio::join!(service.reload(&done, &edited, &[]), async {
-                // Past the build and the check: the lane has just been asked to stop.
-                stop.changed().await.unwrap();
-                tripped.store(true, std::sync::atomic::Ordering::SeqCst);
-            });
-            let applied = applied.expect("the reload applies");
+            let applied = service
+                .reload(&done, &edited, &[])
+                .await
+                .expect("the reload applies");
+            service.on_stopping = None;
             assert!(applied.restarted.is_empty(), "{applied:?}");
             assert_eq!(applied.left_tripped, vec![label.clone()], "{applied:?}");
             assert!(

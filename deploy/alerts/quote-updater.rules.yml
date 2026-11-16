@@ -358,11 +358,12 @@ groups:
         for: 0m
         labels: { severity: ticket }
         annotations:
-          summary: "A config reload only partly applied; some pairs are on the old config"
+          summary: "A config reload only partly applied; some pairs are on the old config or stopped"
           description: >-
             The updater kept a config change but at least one pair's feed would not come up,
-            so that pair is still quoting its previous config (or was never started) while
-            the rest moved onto the new one. Nothing is mispriced and no quote is wrong — the
+            so that pair is still quoting its previous config (or was never started, or was
+            stopped because the change removed a builder it quoted to) while the rest moved
+            onto the new one. Nothing is mispriced and no quote is wrong — the
             pairs that failed are named in the journal, usually a wrong symbol or a blocked
             endpoint. Fix them through the backoffice API, or retry them with
             POST /api/reload.
