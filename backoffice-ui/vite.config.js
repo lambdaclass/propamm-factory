@@ -6,6 +6,14 @@ import { defineConfig } from "vite";
 // The backoffice `make quickstart` runs, unless BACKOFFICE_API names another.
 const api = process.env.BACKOFFICE_API || "http://127.0.0.1:8088";
 
+// The page is never shown inside another site's frame, where a click meant for that site
+// can be made to land on one of its buttons. A `<meta>` policy cannot say this; only a
+// response header can, so whatever serves dist/ must send it too (README.md).
+const noFraming = {
+  "Content-Security-Policy": "frame-ancestors 'none'",
+  "X-Frame-Options": "DENY",
+};
+
 export default defineConfig({
   // Relative asset paths, so dist/ works from any directory a server puts it under.
   base: "./",
@@ -16,6 +24,7 @@ export default defineConfig({
     // Grafana's 3000. Strict, so a port in use fails rather than moving.
     port: 8090,
     strictPort: true,
+    headers: noFraming,
     proxy: {
       "/api": {
         target: api,
@@ -32,6 +41,7 @@ export default defineConfig({
     host: "127.0.0.1",
     port: 8091,
     strictPort: true,
+    headers: noFraming,
   },
   build: {
     // app.js awaits config.json at the top level.
