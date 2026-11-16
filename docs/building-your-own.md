@@ -97,7 +97,7 @@ What to know:
   be verified, or was never quoted; a task started with `ctx.spawn` can await each with
   `next()`). Reading the vault is async,
   so it is the `Factory` path: `examples/tilted.rs` is a fixed spread tilted
-  by the vault's base share, and `make e2e-custom` runs it against the mocks. A test seeds
+  by the vault's base share, and `make e2e` runs it against the mocks. A test seeds
   these with `testing::build_ctx_with` and needs no chain. An HTTP client comes from
   `ctx.http()`: the run's one `reqwest::Client`, shared with the polled venues, so every
   lane draws on one connection pool (`quote_updater::reqwest` is the crate it belongs to,
@@ -241,4 +241,6 @@ What to know:
 - **Build settings.** Copy the `[profile.release]` from this repository's root `Cargo.toml`
   (Cargo only reads a profile from the binary's own workspace). The library refuses to start
   when built with `panic = "abort"`, which would turn one pair's panic into every pair's.
+  Keep its `overflow-checks = true`: a release build otherwise lets an integer overflow
+  wrap, and a wrapped number is carried on as if it were right.
 

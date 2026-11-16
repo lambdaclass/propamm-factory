@@ -600,7 +600,21 @@ async fn run_inner(
     let recording = match (&recorder, &args.flags.record_db_url) {
         (Some(recorder), Some(url)) => {
             tracing::info!("recording the feed and vault balances to postgres");
-            let writer = record::spawn(url.clone(), recorder.clone(), cancel.clone());
+            let retention = args
+                .flags
+                .record_retention_days
+                .map(|days| Duration::from_secs(u64::from(days) * 86_400));
+            match retention {
+                Some(_) => tracing::info!(
+                    "recorded rows older than {} days are deleted",
+                    args.flags.record_retention_days.unwrap_or_default()
+                ),
+                None => tracing::info!(
+                    "no RECORD_RETENTION_DAYS: recorded rows are kept forever, and the \
+                     database grows for as long as this runs"
+                ),
+            }
+            let writer = record::spawn(url.clone(), recorder.clone(), cancel.clone(), retention);
             tasks.adopt(&writer);
             Some(writer)
         }

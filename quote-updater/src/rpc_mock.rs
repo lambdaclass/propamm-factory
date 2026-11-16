@@ -65,8 +65,10 @@ struct State {
     /// than a timeout — waiting out RPC_TIMEOUT to test one costs the suite three seconds
     /// per retry for something the endpoint can just refuse.
     failing: HashSet<String>,
-    /// `eth_call` selectors to answer with an error, for a failure one view call reaches
-    /// while every other call (preflight's included) still answers.
+    /// `eth_call` selectors that revert, with the data each reverts with, for a refusal one
+    /// call reaches while every other call (preflight's included) still answers. Answered
+    /// the way a node answers a call that reverts: error code 3, "execution reverted".
+    reverts: HashMap<Vec<u8>, Vec<u8>>,
     /// Every request, by method, with the moment it arrived.
     calls: Vec<(String, Instant)>,
 }
@@ -94,6 +96,7 @@ impl MockRpc {
             decimals: HashMap::new(),
             delays: HashMap::new(),
             failing: HashSet::new(),
+            reverts: HashMap::new(),
             calls: Vec::new(),
         }));
         let served = state.clone();
@@ -111,26 +114,22 @@ impl MockRpc {
                             state.calls.push((method.clone(), Instant::now()));
                             (
                                 state.delays.get(&method).copied(),
-                                state.answer(&method, &request["params"]),
+                                state.respond(&method, &request["params"]),
                             )
                         };
                         if let Some(delay) = delay {
                             tokio::time::sleep(delay).await;
                         }
                         let body = match result {
-                            Some(result) => serde_json::json!({
+                            Ok(result) => serde_json::json!({
                                 "id": request["id"],
                                 "jsonrpc": "2.0",
                                 "result": result,
                             }),
-                            None => serde_json::json!({
+                            Err(error) => serde_json::json!({
                                 "id": request["id"],
                                 "jsonrpc": "2.0",
-                                "error": {
-                                    "code": -32601,
-                                    "message": format!("mock rpc: unsupported method {method}"),
-                                    "data": null,
-                                },
+                                "error": error,
                             }),
                         }
                         .to_string();
@@ -278,6 +277,13 @@ impl MockRpc {
             .insert(token, symbol.to_owned());
     }
 
+    /// Makes every `eth_call` to `signature` (as `symbol()`) revert with `data`, on any
+    /// contract, until the mock is dropped.
+    pub(crate) fn set_revert(&self, signature: &str, data: Vec<u8>) {
+        let selector = ethrex_common::utils::keccak(signature.as_bytes()).0[..4].to_vec();
+        self.state.lock().unwrap().reverts.insert(selector, data);
+    }
+
     /// When each request for `method` arrived, in order.
     pub(crate) fn calls(&self, method: &str) -> Vec<Instant> {
         self.state
@@ -312,6 +318,41 @@ impl State {
             base_fee_per_gas: Some(1_000_000_000),
             ..Default::default()
         }
+    }
+
+    /// The JSON result for `method`, or the JSON-RPC error object it is answered with: a
+    /// revert for an `eth_call` whose selector `set_revert` named, "unsupported method" for
+    /// anything [`Self::answer`] does not serve.
+    fn respond(
+        &self,
+        method: &str,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, serde_json::Value> {
+        if method == "eth_call" && !self.failing.contains(method) {
+            let call = &params[0];
+            let data = call["input"]
+                .as_str()
+                .or_else(|| call["data"].as_str())
+                .unwrap_or("0x");
+            let data = hex::decode(data.strip_prefix("0x").unwrap_or(data)).unwrap_or_default();
+            if let Some(reverted) = data
+                .get(..4)
+                .and_then(|selector| self.reverts.get(selector))
+            {
+                return Err(serde_json::json!({
+                    "code": 3,
+                    "message": "execution reverted",
+                    "data": format!("0x{}", hex::encode(reverted)),
+                }));
+            }
+        }
+        self.answer(method, params).ok_or_else(|| {
+            serde_json::json!({
+                "code": -32601,
+                "message": format!("mock rpc: unsupported method {method}"),
+                "data": null,
+            })
+        })
     }
 
     /// The JSON result for `method`, or None for one this mock does not serve.

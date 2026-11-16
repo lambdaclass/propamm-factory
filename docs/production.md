@@ -100,6 +100,12 @@ The api to send builders quote updates is permissioned, behind an API key. You w
 - Quasar: `wss://rpc.quasar.win/ws/sendquoteupdate`
 - BuilderNet: `wss://direct-eu.buildernet.org/ws/sendquoteupdate`
 
+Quote only the builders you trust to do what the protocol asks of them. Every quote the
+updater sends is a signed transaction that stays valid for its whole slot, and withdrawing
+one only asks the builder to drop it, so each builder you add (and each region it forwards
+to) can include any price it was sent during the slot. More in
+[manual.md](manual.md), "Builder mode".
+
 ## 5. Fill in the config on the server
 
 Clone the repo, then in `deploy/`:
@@ -122,10 +128,13 @@ Edit the three files:
     The name is yours to pick; the pair's config refers to it by that name (`key_env`).
     For example `UPDATER_KEY_WETH_USDC=0x...` and `UPDATER_KEY_USDC_USDT=0x...`.
   - `POSTGRES_PASSWORD`: password for the Postgres the updater records into. Any string.
+  - `RECORD_RETENTION_DAYS`: how many days of recorded history to keep in that Postgres.
+    Blank keeps everything, and the database then grows for as long as the updater runs.
   - `GRAFANA_ADMIN_PASSWORD`: password for Grafana's `admin` user.
   - `BACKOFFICE_BIND` and `GRAFANA_BIND`: the IP of this server the backoffice API (port 8088)
-    and Grafana (port 3000) listen on. Neither has a login, so use a private IP such as the
-    server's tailnet address. `127.0.0.1` keeps them reachable only from the server itself.
+    and Grafana (port 3000) listen on. The backoffice API has no login, and Grafana only the
+    `admin` password above, so use a private IP such as the server's tailnet address.
+    `127.0.0.1` keeps them reachable only from the server itself.
   - `BACKOFFICE_TLS_CERT` and `BACKOFFICE_TLS_KEY`: optional, to serve the backoffice over
     HTTPS with a certificate from `tailscale cert`; see step 7.
 - `config/config.toml`: the PropAMM address, the builders with their API keys, and the

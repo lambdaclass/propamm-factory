@@ -92,8 +92,9 @@ disable_cross_region = false
 # this back at it.
 # registry = "0xDa7AfEeD021EAFC1c1Af9C362dE477DaD0396B81"
 
-# Decimal places the published mid and delta are scaled by. PropAMM reads both at 1e18,
-# which is the default. Capped at 38 when any pair inverts, because inverting squares it.
+# Decimal places the published mid and delta are scaled by. PropAMM reads both at 1e18, so
+# 18 is the default and the only value accepted: at any other scale every price is off by a
+# power of ten, and the updater refuses to start. There is nothing to set here.
 # price_decimals = 18
 
 # Binance WebSocket base endpoint; override for binance.us or a mock. The older spelling
@@ -171,11 +172,14 @@ key_env = "UPDATER_KEY_WETH_USDC"
 # How this pair turns its market into the [delta, mid] it publishes. Every pair names a
 # pricing kind, and the binary decides which kinds exist by registering them (README,
 # "What you can plug in"); the three this crate ships are `feed`, `fixed` and `volatile`, and a
-# binary may register its own beside them. `feed` publishes the streamed mid with the
-# book's own half-spread, or with `delta` as the half-spread:
-# pricing = { kind = "feed", delta = "0.0005" }. Any key the kind takes goes in the same
-# table, and only that kind reads and checks it.
-pricing = { kind = "feed" }
+# binary may register its own beside them. `feed` publishes the streamed mid with `delta` as
+# the half-spread: pricing = { kind = "feed", delta = "0.0005" }. With no `delta` it copies
+# the book's own half-spread, and never publishes less than `min_delta`: a liquid book's
+# half-spread is a fraction of a basis point, which suits a quote the venue can pull in
+# milliseconds and not one that stands for a whole block. `min_delta` defaults to "0.0001"
+# (1 bp) when left out; state the one your pair should have. Any key the kind takes goes in
+# the same table, and only that kind reads and checks it.
+pricing = { kind = "feed", min_delta = "0.0005" }
 # The band this pair's published mid must fall inside. Nothing else catches a corrupt book,
 # and one would otherwise put an arbitrary price on chain that the next fill prices against.
 # A mid outside the band is refused: the RPC service skips the push, and Titan mode
@@ -279,7 +283,7 @@ tokens  = ["0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599",
            "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"]
 symbol  = "BTCUSDC"
 key_env = "UPDATER_KEY_WBTC_USDC"
-pricing = { kind = "feed" }
+pricing = { kind = "feed", min_delta = "0.0005" }
 
 [[pairs]]
 # USDC, USDT.
@@ -287,7 +291,7 @@ tokens  = ["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
            "0xdAC17F958D2ee523a2206206994597C13D831ec7"]
 symbol  = "USDCUSDT"
 key_env = "UPDATER_KEY_USDC_USDT"
-pricing = { kind = "feed" }
+pricing = { kind = "feed", min_delta = "0.0002" }
 # Why the threshold is per pair and not one setting for the run: on a stablecoin, the 2%
 # above is a depeg the breaker exists to catch, while on ETHUSDC it is an ordinary hour.
 # A single process-wide number would have to be loose enough for the loosest pair.
@@ -419,8 +423,10 @@ max_deviation = "0.002"
 # was meant to be guarded and is not shows up before anything is published.
 #
 # `allow_symbol_mismatch = true` opts a pair out of the startup check that its stream
-# matches its tokens. Required only when pricing a pair off a deliberately different
-# market, e.g. quoting WETH/USDC from ETHUSDT.
+# matches its tokens. Required when pricing a pair off a deliberately different market,
+# e.g. quoting WETH/USDC from ETHUSDT, and for a token whose `symbol()` cannot be read: the
+# check has nothing to compare the stream with, so the pair fails `--check` until this says
+# you compared them yourself.
 
 # ---------------------------------------------------------------------------
 # Builders
@@ -448,6 +454,12 @@ max_deviation = "0.002"
 #
 # Regional endpoints are just separate entries: add titan-ap and titan-us alongside this
 # one to fan out across regions.
+#
+# Keep this list to builders you trust. Every requote within a slot is a complete signed
+# transaction, valid for the whole slot, and a withdraw only asks a builder to drop it: any
+# builder holding the stream (and any region it passes it to) can include any version of a
+# slot's quote, an earlier price or a withdrawn one included. See docs/manual.md, "Builder
+# mode".
 
 [[builder]]
 # How this builder appears in the logs. Must be unique across the file.

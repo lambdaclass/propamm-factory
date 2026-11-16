@@ -133,15 +133,17 @@ pub enum LandingResult {
     Missed,
     Unknown,
     NotQuoted,
+    Foreign,
 }
 
 impl LandingResult {
     /// Declaration order is load-bearing: children are indexed by `variant as usize`.
-    pub const ALL: [LandingResult; 4] = [
+    pub const ALL: [LandingResult; 5] = [
         LandingResult::Landed,
         LandingResult::Missed,
         LandingResult::Unknown,
         LandingResult::NotQuoted,
+        LandingResult::Foreign,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -150,6 +152,7 @@ impl LandingResult {
             LandingResult::Missed => "missed",
             LandingResult::Unknown => "unknown",
             LandingResult::NotQuoted => "not_quoted",
+            LandingResult::Foreign => "foreign",
         }
     }
 }
@@ -346,7 +349,7 @@ pub struct PairMetrics {
     pub target_blocks: IntCounter,
     pub signer_balance_wei: Gauge,
     pub signer_runway_updates: Gauge,
-    landings: [IntCounter; 4],
+    landings: [IntCounter; 5],
     pub consecutive_landing_misses: Gauge,
     // Counted in `Service::spawn` (`service.rs`), at the call that passes `supervise` its
     // closure: see the comment there for why (a `supervise` parameter would cost seven existing
@@ -794,7 +797,8 @@ impl Metrics {
             landings: counter(
                 &r,
                 "quote_updater_landings_total",
-                "Per-block landing outcomes.",
+                "Per-block landing outcomes. foreign: the lane holds a price for the block \
+                 that another key wrote.",
                 &["pair", "result"],
             )?,
             consecutive_landing_misses: gauge(

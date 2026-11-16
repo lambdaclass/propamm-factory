@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::venue::{Connection, Keepalive, Quote};
-use crate::venues::{rfc3339_utc, unwrap_alias};
+use crate::venues::{book_stamp, unwrap_alias};
 
 pub const DEFAULT_ENDPOINT: &str = "wss://ws-feed.exchange.coinbase.com";
 
@@ -50,10 +50,10 @@ pub fn parse_stamped(text: &str) -> Result<Option<(Quote, Option<SystemTime>)>> 
         serde_json::from_str(text).map_err(|err| eyre!(err).wrap_err("not a coinbase frame"))?;
     match frame.kind.as_str() {
         "ticker" => match (frame.best_bid, frame.best_ask) {
-            (Some(bid), Some(ask)) => Ok(Some((
-                Quote::Book { bid, ask },
-                frame.time.as_deref().and_then(rfc3339_utc),
-            ))),
+            (Some(bid), Some(ask)) => {
+                let stamp = book_stamp(&bid, &ask, frame.time.as_deref());
+                Ok(Some((Quote::Book { bid, ask }, stamp)))
+            }
             _ => Err(eyre!("ticker without best_bid/best_ask")),
         },
         "error" => Err(eyre!(
@@ -72,6 +72,7 @@ pub fn expected_symbol(base: &str, quote: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::venues::rfc3339_utc;
 
     #[test]
     fn subscribes_to_the_ticker_and_heartbeat_of_one_product() {

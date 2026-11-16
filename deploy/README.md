@@ -53,10 +53,11 @@ once per distinct error while polling carries the head.
 | alertmanager | `127.0.0.1:9093` | routes pages and tickets to `#propamm-alerts` |
 | postgres | compose network only | the `feed` schema the recorder writes (quotes, mids, vault balances, config history) |
 
-Neither the backoffice nor Grafana has a login worth the name (Grafana's admin password is
-in `.env`; the backoffice has none), so publish them on this host's tailnet address and
-nothing else: `BACKOFFICE_BIND` and `GRAFANA_BIND` in `.env`. Left at `127.0.0.1` they are
-reachable from the host only, or through an ssh tunnel.
+The backoffice has no login at all. Grafana has one, a single `admin` account whose
+password is `GRAFANA_ADMIN_PASSWORD` in `.env`, and that is all that stands in front of the
+dashboards and the recorder's database behind them. Publish both on this host's tailnet
+address and nothing else: `BACKOFFICE_BIND` and `GRAFANA_BIND` in `.env`. Left at
+`127.0.0.1` they are reachable from the host only, or through an ssh tunnel.
 
 ## HTTPS for the backoffice
 
