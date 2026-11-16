@@ -20,8 +20,8 @@ use super::{
 use crate::volatile::{self, RawKnobs, VolatileParams};
 
 /// The `volatile` stanza, every knob as written. γ, k and κ come as a set; the rest default
-/// (see [`VolatileParams::parse`]). Strings, parsed and bounded in `validate`, so the
-/// backoffice's form can write what it posts.
+/// (see [`VolatileParams::parse`]). Strings, parsed and bounded in `validate`, so a pair
+/// form can send what its inputs hold.
 #[derive(Clone, Debug, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VolatileConfig {

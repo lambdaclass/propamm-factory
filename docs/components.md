@@ -19,7 +19,8 @@ creation back on. Instances already created keep working, and the factory's owne
 over them.
 
 `PropAMM` is the instance. The owner can add and remove pairs (`addPair`, `setPairVault`),
-add and remove updaters (`addUpdater`, `removeUpdater`) and pause it. Traders call `swap`;
+add and remove updaters (`addUpdater`, `removeUpdater`, and `removeUpdaterFrom` for a registry
+the instance has moved away from), point it at another registry (`setOracle`) and pause it. Traders call `swap`;
 anyone can call `quote` and `isActive` to see what a trade would get.
 
 Instances also implement `IPropAMMFillable`, advertised through ERC-165, which
@@ -37,8 +38,8 @@ Sources and tests are in [`contracts/`](../contracts/). `make test` runs the tes
 
 A Rust program built on the `quote-updater` library. The library does the heavy lifting:
 connecting to exchange price feeds, signing the update every block, sending it to the
-builders, checking it landed, exposing metrics, reloading the config while running, and
-serving the backoffice. What you write is the part that decides the price.
+builders, checking it landed, exposing metrics, applying config changes while running, and
+serving the backoffice API. What you write is the part that decides the price.
 
 The library ships three pricing models you can use as they are:
 
@@ -61,10 +62,11 @@ pricing model with which settings, and the name of the environment variable hold
 pair's signing key. `--check` validates all of it against the chain and prints what it would
 publish, without sending anything. [`manual.md`](manual.md) is the operating manual.
 
-**The backoffice** is a web page the updater serves. From it you add and remove pairs,
-pick the exchanges a pair follows and their weights, change a pair's pricing settings, add
-builders, and halt or resume a pair. Every change is written to the config file and applied
-without a restart. It has no login, so you put it on a private address (your tailnet).
+**The backoffice** is a JSON API the updater serves under `/api`. Through it you add and
+remove pairs, pick the exchanges a pair follows and their weights, change a pair's pricing
+settings, add builders, and halt or resume a pair. It serves no pages: a front end of your
+own, or `curl`, talks to it. Every change is written to the config file and applied without
+a restart. It has no login, so you put it on a private address (your tailnet).
 
 ## Monitoring
 

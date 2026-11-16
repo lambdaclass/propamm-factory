@@ -14,7 +14,8 @@ requote_ms = 50
 # Prometheus scrapes it there. Not published on the host.
 metrics_addr = "0.0.0.0:9464"
 # The updater's fixed address on the compose network (compose.yaml); compose publishes it on
-# the host at BACKOFFICE_BIND:8088. The page edits this file and reloads the updater.
+# the host at BACKOFFICE_BIND:8088. A change made through its API (docs/manual.md, "The
+# backoffice") is written to this file and applied to the running updater.
 backoffice_addr = "172.28.0.10:8088"
 
 [[builder]]

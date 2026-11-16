@@ -9,7 +9,7 @@ target = "__PROPAMM__"
 mode = "builder"
 rpc_url = "http://127.0.0.1:8545"
 metrics_addr = "127.0.0.1:9464"
-# The page for adding pairs, changing their settings and halting them.
+# The backoffice API (under /api) for adding pairs, changing their settings and halting them.
 backoffice_addr = "127.0.0.1:8088"
 
 # Where the vault's tokens get a USD price: the mocks' stand-in, not the real API.

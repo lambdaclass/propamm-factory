@@ -163,7 +163,7 @@ impl Health {
     /// exists.
     ///
     /// This is also how a re-armed lane stops being counted as halted. `halt` has no direct
-    /// inverse because nothing needs one: a reload brings a halted pair back by stopping it
+    /// inverse because nothing needs one: a re-arm brings a halted pair back by stopping it
     /// and starting a new one, so the count comes down here, on the way out, and back up
     /// through [`Self::add_pair`]. While a restart was the only way back there was nothing to
     /// un-count at all — clearing a latch was a whole new process.
@@ -674,7 +674,7 @@ mod tests {
     }
 
     /// The whole life of a reloaded lane, in the order a reload drives it: started, halted
-    /// on its breaker, re-armed by a reload, then removed by a later one. Every count has
+    /// on its breaker, re-armed, then removed by a later reload. Every count has
     /// to come back to where it began, because these are the numbers `all_down` and the
     /// watchdog decide on.
     #[test]
@@ -689,7 +689,7 @@ mod tests {
         assert!(health.any_halted());
         assert!(health.all_down());
 
-        // What a reload's re-arm actually is: the halted pair is stopped, and a fresh one
+        // What a re-arm actually is: the halted pair is stopped, and a fresh one
         // is started on the same lane.
         health.remove_pair(true);
         health.add_pair();

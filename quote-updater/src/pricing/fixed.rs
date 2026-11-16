@@ -31,7 +31,7 @@ pub struct FixedConfig {
     pub mid: String,
     pub delta: String,
     /// Publish with no market to compare the price with: a smoke test's, never a real
-    /// pair's. A TOML bool, or the text `"true"`/`"false"` the backoffice form posts.
+    /// pair's. A TOML bool, or the text `"true"`/`"false"` a pair form sends.
     #[serde(default, deserialize_with = "flag")]
     pub unguarded: bool,
 }
@@ -388,7 +388,7 @@ mod tests {
 
     /// With no market, nothing could stop a fixed price through a depeg, so the stanza
     /// needs a market (`symbol` or `sources`) or says it is a smoke test with `unguarded`.
-    /// The form posts `"true"` as a string, so that reads as the flag too. Audit F-04.
+    /// A pair form sends `"true"` as a string, so that reads as the flag too. Audit F-04.
     #[test]
     fn a_fixed_price_needs_a_market_unless_it_says_it_is_unguarded() {
         let mut pair = testing::pair();

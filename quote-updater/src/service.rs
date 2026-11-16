@@ -1,10 +1,10 @@
 //! The builder-mode service: every pair the process is running, and the convergence of
-//! that set onto the config file on each reload. `reload::plan` decides what differs; this
-//! is what acts on it, with the rule that a lane whose stanza did not change is left
+//! that set onto the config it is handed on each reload (the shared config, `state.rs`, or
+//! a change to it waiting on this verdict). `reload::plan` decides what differs; this is
+//! what acts on it, with the rule that a lane whose stanza did not change is left
 //! completely alone.
 
 use std::{
-    path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -35,7 +35,7 @@ pub(crate) struct RunningPair {
     /// Set by `record_outcome` when this pair halts on its latch. Read by a reload to
     /// decide which lanes to bring back.
     halted: Arc<std::sync::atomic::AtomicBool>,
-    /// The lane's latch, which outlives the pair's `Live`: read when a reload re-arms the
+    /// The lane's latch, which outlives the pair's `Live`: read when its re-arm restarts the
     /// lane, so the line announcing that says exactly what it cleared.
     latch: crate::guard::Latch,
     /// Held so a reload can wait for this lane to actually be gone before starting its
@@ -73,6 +73,18 @@ impl RunningPair {
     }
 }
 
+/// A trip outliving its lane (audit F-17): a lane halted on its breaker that the service
+/// shut down since, by a halt or a removal. Kept so that resuming the pair, or adding it
+/// back, does not start it unasked: only its re-arm does, and that names this trip.
+pub(crate) struct KeptTrip {
+    key_env: String,
+    trip: Option<crate::guard::Trip>,
+    /// The label whose `breaker_tripped` reads 1 for this trip: set while the config asks
+    /// for the pair, so `PusherBreakerTripped` keeps paging for a pair that should be
+    /// quoting and is not, though no lane of it runs.
+    paging: Option<String>,
+}
+
 /// The running pairs, and everything needed to build another one.
 ///
 /// Exists because the pair set is no longer fixed at startup: a reload adds, removes and
@@ -90,14 +102,11 @@ pub(crate) struct Service {
     /// Whether this process may run with no pairs, i.e. whether a backoffice is bound.
     /// Startup and every reload have to agree.
     pub(crate) backoffice_bound: bool,
-    /// As it was at startup, so a reload can refuse a changed key by name.
-    pub(crate) file_settings: config::FileSettings,
     pub(crate) head: tokio::sync::watch::Receiver<head::Head>,
     pub(crate) metrics: Arc<metrics::Metrics>,
     pub(crate) health: Arc<supervisor::Health>,
     pub(crate) endpoints: venue::Endpoints,
     pub(crate) price_decimals: u32,
-    pub(crate) config_path: PathBuf,
     pub(crate) registry: Address,
     pub(crate) reload_metrics: metrics::ReloadMetrics,
     /// Every symbol's price history, kept here so a reload that rebuilds a volatile pair
@@ -131,6 +140,12 @@ pub(crate) struct Service {
     pub(crate) key_lookup: config::KeyLookup,
     /// The pricing kinds the binary registered, for checking and building custom pairs.
     pub(crate) kinds: Arc<crate::kinds::Kinds>,
+    /// Every pair's kill switch (`halts.rs`), shared with the shared config: each lane is
+    /// handed its pair's as it starts.
+    pub(crate) halt_flags: Arc<crate::halts::HaltFlags>,
+    /// Trips whose lane is gone (see [`KeptTrip`]), by lane, until its re-arm. A process
+    /// restart forgets them, as it clears every breaker.
+    pub(crate) kept_trips: std::collections::BTreeMap<U256, KeptTrip>,
 }
 
 /// `run` returning early (an error after the pairs started) must not leave their supervised
@@ -172,6 +187,12 @@ struct Applied {
     /// run until the flag is cleared.
     halted: Vec<String>,
     restarted: Vec<String>,
+    /// One line per lane re-armed (audit F-17): the mid it now trusts and the trip it
+    /// cleared, so whoever re-armed it reads the price they accepted.
+    rearmed: Vec<String>,
+    /// Lanes the file would have started or rebuilt, left halted on their breaker until
+    /// their re-arm (audit F-17).
+    left_tripped: Vec<String>,
     /// Lanes whose feed would not come up. They keep running on their old config (or stay
     /// absent, if they were being added), and this is what says so.
     failed: Vec<String>,
@@ -184,6 +205,7 @@ impl Applied {
             && self.halted.is_empty()
             && self.restarted.is_empty()
             && self.failed.is_empty()
+            && self.left_tripped.is_empty()
     }
 
     /// The one line a reload prints. Names counts rather than every lane, because the
@@ -196,16 +218,25 @@ impl Applied {
             (self.removed.len(), "removed"),
             (self.halted.len(), "halted"),
             (self.failed.len(), "failed"),
+            (
+                self.left_tripped.len(),
+                "left halted on its breaker until its re-arm",
+            ),
         ] {
             if n > 0 {
                 parts.push(format!("{n} {what}"));
             }
         }
-        if parts.is_empty() {
+        let mut line = if parts.is_empty() {
             "reload: no change".to_owned()
         } else {
             format!("reload: {}", parts.join(", "))
+        };
+        for rearmed in &self.rearmed {
+            line.push_str("; ");
+            line.push_str(rearmed);
         }
+        line
     }
 }
 
@@ -225,6 +256,9 @@ impl Service {
     ) {
         let Built { mut live, adopted } = built;
         let lane = spec.lane;
+        // The pair's kill switch, not a fresh one: a halt set while this run was being
+        // built (a reload in flight starting the lane again) is already on it.
+        live.halt = self.halt_flags.flag(lane);
         let label = live.pair.label.clone();
         let pair_metrics = live.metrics.clone();
         let venues: Vec<venue::VenueId> = live.venues.iter().map(|v| v.venue).collect();
@@ -506,11 +540,19 @@ impl Service {
     /// flag its breaker raises on a trip. Shared rather than copied, so a trip shows on the
     /// page as it happens, not at the next reload.
     fn publish_states(&self) {
-        let states = self
+        // A kept trip reads as tripped, so the backoffice shows it and takes its re-arm; a
+        // running lane on the same key wins.
+        let kept = self.kept_trips.values().map(|kept| {
+            (
+                kept.key_env.clone(),
+                Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            )
+        });
+        let running = self
             .running
             .values()
-            .map(|pair| (pair.spec.key_env.clone(), Arc::clone(&pair.halted)))
-            .collect();
+            .map(|pair| (pair.spec.key_env.clone(), Arc::clone(&pair.halted)));
+        let states = kept.chain(running).collect();
         *self
             .pair_states
             .lock()
@@ -614,34 +656,29 @@ impl Service {
     /// Parses and checks a candidate config without touching anything that is running.
     ///
     /// All-or-nothing, and deliberately every check startup makes. A reload that applied the
-    /// half of a file it liked would leave the running pairs matching neither the old config
-    /// nor the new one, which is the one state this design must never produce: the whole
-    /// promise is that after a reload the file describes what is running.
+    /// half of a config it liked would leave the running pairs matching neither the old
+    /// config nor the new one, which is the one state this design must never produce: the
+    /// whole promise is that after a reload the shared config describes what is running.
     ///
     /// Returns each stanza beside the pair it resolves to, in file order, and the token
     /// pairs whose vaults the exporter should watch (halted pairs included).
     async fn candidate(
         &self,
+        raw: &config::RawConfig,
     ) -> Result<(
         Vec<(config::PairSpec, ResolvedPair)>,
         Vec<(Address, Address)>,
         Vec<config::PairSpec>,
     )> {
-        let config = config::load_config(
-            &self.config_path,
-            self.price_decimals,
-            self.backoffice_bound,
-        )?;
+        // No target or `[settings]` check: those are read once, at boot, and nothing that
+        // changes the shared config after that (the backoffice API, an `UpdaterHandle`)
+        // can change them.
+        let config =
+            config::config_from_raw(raw.clone(), self.price_decimals, self.backoffice_bound)?;
         // A reload naming an unregistered kind, or a stanza its kind cannot read, changes
         // nothing: refused here, before anything is stopped.
         self.kinds.check(&config)?;
 
-        refuse_target_change(config.target, self.opts.target, &self.config_path)?;
-        refuse_settings_change(
-            &config::load_file_settings(&self.config_path)?,
-            &self.file_settings,
-            &self.config_path,
-        )?;
         // No `refuse_breakers_in_node_mode` here: a `Service` only exists in builder mode
         // (node mode leaves `builders` as None and never reaches the loop that builds one),
         // so there is no node-mode reload for it to catch. Startup still makes the check.
@@ -700,23 +737,26 @@ impl Service {
         ))
     }
 
-    /// The file's builder list, if it differs from the connected one and at least one of
-    /// the new entries can be reached. `Ok(None)` means nothing to do.
+    /// The candidate's builder list, if it differs from the connected one and at least one
+    /// of the new entries can be reached. `Ok(None)` means nothing to do.
     ///
     /// The dial is real. Every lane is about to be rebuilt against this list, and a lane
     /// opens its builders *after* it starts, unlike its feed, so a list that connects to
     /// nothing would take them all down. One connection is the bar, the same bar startup
     /// clears.
-    async fn reloadable_builders(&self) -> Result<Option<Vec<config::BuilderConfig>>> {
-        // `--builders` means the connected list came from somewhere the config file does
-        // not control, so the file's own list is not what produced it and must not replace
+    async fn reloadable_builders(
+        &self,
+        raw: &config::RawConfig,
+    ) -> Result<Option<Vec<config::BuilderConfig>>> {
+        // `--builders` means the connected list came from somewhere the config does not
+        // control, so the config's own list is not what produced it and must not replace
         // it either.
         // No mode check: a `Service` only exists in builder mode, so reaching here means
         // there are builder connections to rebuild.
         if !self.builders_from_config {
             return Ok(None);
         }
-        let desired = config::load_raw(&self.config_path)?.builders;
+        let desired = raw.builders.clone();
         if desired == self.builders.builders {
             return Ok(None);
         }
@@ -729,10 +769,9 @@ impl Service {
             .count();
         ensure!(
             live > 0,
-            "the [[builder]] list in {} changed, but none of its {} builders would connect, \
-             and every pair has to be rebuilt to pick up a new list. Nothing was changed; \
-             check the endpoints and API keys.",
-            self.config_path.display(),
+            "the [[builder]] list changed, but none of its {} builders would connect, and \
+             every pair has to be rebuilt to pick up a new list. Nothing was changed; check \
+             the endpoints and API keys.",
             desired.len(),
         );
         tracing::info!(
@@ -743,20 +782,21 @@ impl Service {
         Ok(Some(desired))
     }
 
-    /// Shared by SIGHUP and the backoffice, so the journal and the counters cannot drift
-    /// apart. The return value is for the backoffice and the handle, which have to know
-    /// whether to keep the edit they wrote: see [`ReloadFailure`].
+    /// Every reload goes through here, so the journal and the counters cannot drift apart.
+    /// The return value is for whoever asked (`state.rs`), which has to know whether to
+    /// keep the change it is converging: see [`ReloadFailure`].
     pub(crate) async fn reload_and_report(
         &mut self,
         done: &tokio::sync::mpsc::UnboundedSender<(U256, u64)>,
-        config_path: &std::path::Path,
+        raw: &config::RawConfig,
+        rearm: &[U256],
     ) -> std::result::Result<String, ReloadFailure> {
         // Held across the converge, so the watchdog does not read a count between two pair
         // sets. Cloned out first because the guard borrows it.
         let health = Arc::clone(&self.health);
         let outcome = {
             let _reloading = health.reloading();
-            self.reload(done).await
+            self.reload(done, raw, rearm).await
         };
         match outcome {
             Ok(applied) => {
@@ -774,23 +814,20 @@ impl Service {
                     self.reload_metrics.generation.inc();
                 }
                 // Every applied reload, whether or not a lane moved: the recorder keeps a
-                // row only when the file differs from the last one it kept, so this costs
+                // row only when the config differs from the last one it kept, so this costs
                 // nothing when nothing changed and catches a change the last record missed.
                 if result == metrics::Reload::Applied {
-                    record_config(self.recorder.as_ref(), config_path, "reload");
+                    record_config(self.recorder.as_ref(), raw, "reload");
                 }
                 let line = if applied.is_empty() {
-                    format!(
-                        "reload: {} matches what is running; nothing to do",
-                        config_path.display()
-                    )
+                    "reload: the config matches what is running; nothing to do".to_owned()
                 } else {
                     applied.summary()
                 };
                 tracing::info!("{line}");
                 // A failure to the caller even though it applied: the backoffice must not
                 // say a change is live while a pair is still on its old config. Its own
-                // kind, because unlike a rejection it must not put the file back.
+                // kind, because unlike a rejection the change is kept.
                 if result == metrics::Reload::Partial {
                     return Err(ReloadFailure::Partial(format!(
                         "{line} — some pairs kept their previous config, see the journal"
@@ -816,7 +853,103 @@ impl Service {
         }
     }
 
-    /// Re-reads the config file and converges the running pairs onto it.
+    /// Stops `lane` and retires its series: what a reload does to a pair removed or halted,
+    /// and the service to a pair its kill switch silenced. Answers the lane's label.
+    async fn retire(&mut self, lane: U256) -> String {
+        let (label, venues, guard_kinds) = self
+            .running
+            .get(&lane)
+            .map(|pair| {
+                (
+                    pair.label.clone(),
+                    pair.venues.clone(),
+                    pair.guard_kinds.clone(),
+                )
+            })
+            .unwrap_or_else(|| (config::lane_label(lane), Vec::new(), Vec::new()));
+        let key_env = self
+            .running
+            .get(&lane)
+            .map(|pair| pair.spec.key_env.clone());
+        let stopped = self.stop(lane).await;
+        // A lane halted on its breaker keeps its trip past its own end, so that bringing its
+        // pair back (a resume, an add) does not re-arm it: only its re-arm does (audit
+        // F-17).
+        if let (true, Some(key_env)) = (stopped.halted, key_env) {
+            self.kept_trips.insert(
+                lane,
+                KeptTrip {
+                    key_env,
+                    trip: stopped.trip.clone(),
+                    paging: None,
+                },
+            );
+            self.publish_states();
+        }
+        // Nothing reaps a `GaugeVec` child, so without this the lane's last readings stand
+        // for the life of the process — and a lane removed while halted would leave
+        // `breaker_tripped` at 1, paging under `PusherBreakerTripped` for a pair that is
+        // not configured any more, clearable only by the restart this whole feature exists
+        // to avoid.
+        self.quiesce(&label, &venues, &guard_kinds, &stopped.trip_sources);
+        label
+    }
+
+    /// Keeps `breaker_tripped` at 1 for every kept trip whose pair the config asks for
+    /// (`wanted`, by lane, with its label), and retires it for one it no longer does (halted
+    /// again, or removed). Without this a tripped pair halted and resumed, or removed and
+    /// added back, would sit stopped with `PusherBreakerTripped` resolved: its lane's
+    /// series went with the lane.
+    fn page_kept_trips(&mut self, wanted: &std::collections::BTreeMap<U256, String>) {
+        for (lane, kept) in &mut self.kept_trips {
+            let now = wanted.get(lane);
+            if kept.paging.as_ref() == now {
+                continue;
+            }
+            if let Some(was) = kept.paging.take() {
+                self.metrics.for_pair(&was).breaker_tripped.set(f64::NAN);
+            }
+            if let Some(label) = now {
+                self.metrics.for_pair(label).breaker_tripped.set(1.0);
+                kept.paging = Some(label.clone());
+            }
+        }
+    }
+
+    /// A halt the kill switch made and the shared config recorded (`state.rs`): its lanes
+    /// withdrew on their own at their next tick, and are shut down here, as a reload shuts
+    /// down a halted pair, when the loop gets to it. Nothing else is touched: no other lane
+    /// is restarted or re-armed. The config is recorded as a reload's would be, and the
+    /// generation moves, since the config changed.
+    pub(crate) async fn retire_halted(&mut self, halted: crate::state::Halted) {
+        let mut retired = Vec::new();
+        for lane in &halted.lanes {
+            // A kept trip of a pair now halted pages no more: nobody expects it to quote.
+            if let Some(was) = self
+                .kept_trips
+                .get_mut(lane)
+                .and_then(|kept| kept.paging.take())
+            {
+                self.metrics.for_pair(&was).breaker_tripped.set(f64::NAN);
+            }
+            // Still halted: a notice read late, after a resume lifted the flag and has the
+            // lane quoting again, is not that lane's to stop.
+            if self.running.contains_key(lane) && self.halt_flags.is_set(*lane) {
+                retired.push(self.retire(*lane).await);
+            }
+        }
+        if !retired.is_empty() {
+            tracing::info!(
+                "halt: {} stopped; the kill switch had already withdrawn their quotes at \
+                 every builder",
+                retired.join(", ")
+            );
+        }
+        self.reload_metrics.generation.inc();
+        record_config(self.recorder.as_ref(), &halted.config, "halt");
+    }
+
+    /// Converges the running pairs onto `raw`.
     ///
     /// An error here means nothing was touched — see [`Self::candidate`]. Past that point the
     /// feeds are dialled **before** anything is stopped, so a stanza that turns out to be
@@ -828,13 +961,20 @@ impl Service {
     async fn reload(
         &mut self,
         done: &tokio::sync::mpsc::UnboundedSender<(U256, u64)>,
+        raw: &config::RawConfig,
+        rearm: &[U256],
     ) -> Result<Applied> {
-        let (candidate, vault_pairs, halted_in_file) = self.candidate().await?;
+        let rearm: std::collections::BTreeSet<U256> = rearm.iter().copied().collect();
+        let (candidate, vault_pairs, halted_in_file) = self.candidate(raw).await?;
         let specs: Vec<config::PairSpec> = candidate.iter().map(|(spec, _)| spec.clone()).collect();
+        let wanted: std::collections::BTreeMap<U256, String> = candidate
+            .iter()
+            .map(|(spec, resolved)| (spec.lane, resolved.pair.label.clone()))
+            .collect();
 
         // Before anything is stopped, and fatal if nothing connects: every lane is about to
         // be rebuilt against this list.
-        let new_builders = self.reloadable_builders().await?;
+        let new_builders = self.reloadable_builders(raw).await?;
         let builders_changed = new_builders.is_some();
 
         // Past the last check that refuses the whole file, and before the early return
@@ -842,13 +982,17 @@ impl Service {
         // vault to watch.
         self.vault_pairs.send_replace(vault_pairs);
 
+        let mut tripped = self.halted_lanes();
+        tripped.extend(self.kept_trips.keys().copied());
         let actions = reload::plan(
             &self.running_specs(),
             &specs,
-            &self.halted_lanes(),
+            &tripped,
+            &rearm,
             builders_changed,
         );
         if actions.is_empty() {
+            self.page_kept_trips(&wanted);
             return Ok(Applied::default());
         }
 
@@ -865,10 +1009,22 @@ impl Service {
 
         let mut removals = Vec::new();
         let mut starts = Vec::new();
+        let mut left_tripped = Vec::new();
         for action in actions {
             let lane = action.lane();
             match action {
                 reload::Action::Remove(lane) => removals.push(lane),
+                reload::Action::StayTripped(lane) => {
+                    let label = by_lane
+                        .get(&lane)
+                        .map(|resolved| resolved.pair.label.clone())
+                        .unwrap_or_else(|| config::lane_label(lane));
+                    tracing::info!(
+                        "reload: [{label}] left halted on its circuit breaker; re-arm it to \
+                         bring it back"
+                    );
+                    left_tripped.push(label);
+                }
                 reload::Action::Add(spec) | reload::Action::Restart(spec) => {
                     let resolved = by_lane
                         .remove(&lane)
@@ -914,26 +1070,12 @@ impl Service {
         ))
         .await;
 
-        let mut applied = Applied::default();
+        let mut applied = Applied {
+            left_tripped,
+            ..Applied::default()
+        };
         for lane in removals {
-            let (label, venues, guard_kinds) = self
-                .running
-                .get(&lane)
-                .map(|pair| {
-                    (
-                        pair.label.clone(),
-                        pair.venues.clone(),
-                        pair.guard_kinds.clone(),
-                    )
-                })
-                .unwrap_or_else(|| (config::lane_label(lane), Vec::new(), Vec::new()));
-            let stopped = self.stop(lane).await;
-            // Nothing reaps a `GaugeVec` child, so without this the lane's last readings
-            // stand for the life of the process — and a lane removed while halted would
-            // leave `breaker_tripped` at 1, paging under `PusherBreakerTripped` for a pair
-            // that is not configured any more, clearable only by the restart this whole
-            // feature exists to avoid.
-            self.quiesce(&label, &venues, &guard_kinds, &stopped.trip_sources);
+            let label = self.retire(lane).await;
             // A pair the file keeps but halts is stopped exactly as a removed one, and said
             // apart: it is coming back on a resume, and the reason (a binary's kill switch
             // writes one) is what whoever resumes it will want to know.
@@ -982,16 +1124,89 @@ impl Service {
                     continue;
                 }
             };
+            // A lane that tripped while its replacement was being built (which can take a
+            // first price's wait) is not swapped for it unless this is its re-arm: that
+            // would re-arm it by the back door (audit F-17). It stays as it is, halted on
+            // the trip, and the replacement is dropped unstarted.
+            if !rearm.contains(&spec.lane)
+                && self
+                    .running
+                    .get(&spec.lane)
+                    .is_some_and(RunningPair::is_halted)
+            {
+                tracing::warn!(
+                    "reload: [{label}] tripped while this reload was rebuilding it; left \
+                     halted until it is re-armed"
+                );
+                drop(built);
+                continue;
+            }
+            let facts = self.running.get(&spec.lane).map(|pair| {
+                (
+                    pair.label.clone(),
+                    pair.venues.clone(),
+                    pair.guard_kinds.clone(),
+                    pair.spec.key_env.clone(),
+                )
+            });
             let stopped = self.stop(spec.lane).await;
+            // Read again now that the lane is gone: a trip that landed after the check
+            // above, as it was being stopped, is a trip all the same. The lane cannot be
+            // put back, so its trip is kept as a retired lane's is, and the replacement is
+            // dropped unstarted.
+            if stopped.halted && !rearm.contains(&spec.lane) {
+                tracing::warn!(
+                    "reload: [{label}] tripped as this reload was swapping it; left halted \
+                     until it is re-armed"
+                );
+                if let Some((was, venues, guard_kinds, key_env)) = facts {
+                    self.kept_trips.insert(
+                        spec.lane,
+                        KeptTrip {
+                            key_env,
+                            trip: stopped.trip.clone(),
+                            paging: None,
+                        },
+                    );
+                    self.publish_states();
+                    self.quiesce(&was, &venues, &guard_kinds, &stopped.trip_sources);
+                }
+                applied.left_tripped.push(label);
+                drop(built);
+                continue;
+            }
             starting.push((spec, was_running, label, built, stopped));
         }
         for (spec, was_running, label, built, stopped) in starting {
             let lane = spec.lane;
+            // The reference market's mid the new run starts from, read before it moves into
+            // `spawn`: for a re-armed lane, the price it now trusts in place of the one its
+            // breaker tripped on, which its answer names.
+            let trusted = built
+                .live
+                .values
+                .market_rx()
+                .and_then(|rx| *rx.borrow())
+                .map(|sample| feed::format_scaled(sample.mid, self.price_decimals));
             // What the generation just stopped leaves on series the new one does not write
             // for itself. Before `spawn`, so the new generation's seed and latch write
             // over these and never the other way round: a re-armed lane that trips again
             // at once on the same source reads 1 there, not this 0.
             retire_stopped(&built.live, &stopped);
+            // A re-arm of a lane whose trip outlived it (a halt, a removal): the trip it
+            // clears, for its line, once the new run is actually starting.
+            let kept = if rearm.contains(&lane) {
+                self.kept_trips.remove(&lane)
+            } else {
+                None
+            };
+            // The new run writes its own `breaker_tripped`; a kept trip paging under
+            // another label (the pair was renamed since) is retired here.
+            if let Some(was) = kept.as_ref().and_then(|kept| kept.paging.as_ref())
+                && *was != label
+            {
+                self.metrics.for_pair(was).breaker_tripped.set(f64::NAN);
+            }
             self.spawn(built, spec, done.clone());
             // The sources it tripped on, carried into the new generation for its removal
             // to retire, halted or not: a trip can land while a lane is being stopped.
@@ -1005,15 +1220,18 @@ impl Service {
                 tracing::info!("reload: [{label}] added");
                 applied.added.push(label.clone());
             }
-            if stopped.halted {
-                // Never silent. A reload run for an unrelated edit also re-arms any halted
-                // lane, which is the price of one verb — so the line says which guard it
-                // cleared and what tripped it, rather than letting a latch a human was meant
-                // to look at disappear into a summary count.
-                tracing::info!(
-                    "reload: [{label}] re-armed{}",
-                    rearm_detail(stopped.trip.as_ref())
-                );
+            if stopped.halted || kept.is_some() {
+                // Only a re-arm reaches here (audit F-17): a reload starts no lane its
+                // breaker halted unless asked to by name. Said in full, with the price the
+                // lane now trusts beside what tripped it, so whoever asked reads the price
+                // they accepted rather than a count.
+                let cleared = stopped
+                    .trip
+                    .as_ref()
+                    .or_else(|| kept.as_ref().and_then(|kept| kept.trip.as_ref()));
+                let line = rearmed_line(&label, trusted.as_deref(), cleared);
+                tracing::info!("reload: {line}");
+                applied.rearmed.push(line);
                 self.observers.emit(crate::observe::Event::Rearmed {
                     pair: label.clone(),
                 });
@@ -1023,31 +1241,30 @@ impl Service {
                 self.running[&lane].metrics.breaker_rearms.inc();
             }
         }
+        self.page_kept_trips(&wanted);
         Ok(applied)
     }
 }
 
-/// Why a reload did not leave every lane on the file, as the service answers a request
-/// for one. Two kinds, because the one who wrote the file has to do opposite things.
+/// Why a reload did not leave every lane on the config it was handed, as the service
+/// answers a request for one. [`Self::Rejected`] and [`Self::Partial`] are the service's own
+/// verdicts, apart because the one who asked has to do opposite things with the change it
+/// was converging. [`Self::Fault`] is not a verdict on the config at all.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ReloadFailure {
     /// Refused whole: nothing changed and every pair is still quoting its previous config,
-    /// so a file written for this reload is put back.
+    /// so the change is dropped and the file written for it put back.
     Rejected(String),
     /// Applied to every lane it reached, but at least one kept its previous config (or was
-    /// not started) because its feed would not come up. The file stays: the change is live
-    /// on the lanes it reached, a halt among them, and a put-back file would describe
-    /// neither what runs nor what was asked for, and have the next reload undo the rest.
+    /// not started) because its feed would not come up. The change is kept: it is live on
+    /// the lanes it reached, a halt among them, and dropping it would describe neither what
+    /// runs nor what was asked for, and have the next reload undo the rest.
     Partial(String),
-}
-
-impl ReloadFailure {
-    /// The line the service gave, whichever kind it is.
-    pub(crate) fn line(&self) -> &str {
-        match self {
-            ReloadFailure::Rejected(line) | ReloadFailure::Partial(line) => line,
-        }
-    }
+    /// Not done, through no fault of the config asked for: the pusher is stopping, or
+    /// `state.rs` could not write the config file or put it back. Nothing running changed.
+    /// Apart from [`Self::Rejected`] so whoever asked can tell "fix the change" from
+    /// "something is wrong on this side"; the line says whether the file is as it was.
+    Fault(String),
 }
 
 /// Writes what a stopped generation leaves on series its replacement does not write for
@@ -1069,114 +1286,6 @@ fn retire_stopped(live: &crate::pair::Live, stopped: &Stopped) {
     for kind in &stopped.guard_kinds {
         if !live.guard_kinds.contains(kind) {
             m.guard(kind).set(f64::NAN);
-        }
-    }
-}
-
-/// Reads the config file, hands it to `change`, writes it back and asks the service to
-/// reload, restoring the previous file if the reload is refused. The one path a change to
-/// the running config takes, whether the backoffice or an `UpdaterHandle` asks, so neither
-/// can forget the revert; `by` names the asker in the journal. The caller serializes
-/// changes (the `edits` lock the backoffice and the handle share): two at once would each
-/// read the file and write it back, and the second would drop the first's change.
-///
-/// `Ok` is a change that is live everywhere. [`ReloadFailure::Partial`] is one that is in
-/// the file and applied to every lane the reload reached, kept rather than reverted;
-/// [`ReloadFailure::Rejected`] means the file is as it was (or, if it could not be put
-/// back, says so).
-pub(crate) async fn change_config(
-    path: &std::path::Path,
-    reloads: &tokio::sync::mpsc::Sender<crate::backoffice::ReloadRequest>,
-    by: &str,
-    what: &str,
-    change: impl FnOnce(&mut config::RawConfig) -> Result<()>,
-) -> std::result::Result<String, ReloadFailure> {
-    // Refused before the write: the file is untouched.
-    let refused = ReloadFailure::Rejected;
-    let before = std::fs::read_to_string(path)
-        .map_err(|err| refused(format!("could not read {}: {err}", path.display())))?;
-    let mut raw = config::load_raw(path).map_err(|err| refused(format!("{err:#}")))?;
-    change(&mut raw).map_err(|err| refused(format!("{err:#}")))?;
-    config::write_raw_atomically(path, &raw).map_err(|err| refused(format!("{err:#}")))?;
-
-    match request_reload(reloads).await {
-        Ok(summary) => {
-            tracing::info!("{by} {what}; {summary}");
-            Ok(format!("{what}. {summary}"))
-        }
-        // Not put back: the reload stopped, started and restarted what it could, so the
-        // file already describes those lanes, and reverting it would have the next reload
-        // undo them (a halt, say, lifted by an unrelated edit).
-        Err(ReloadFailure::Partial(summary)) => {
-            tracing::warn!("{by} {what}; applied in part, the change is kept: {summary}");
-            Err(ReloadFailure::Partial(format!(
-                "{what}, but the reload applied in part: {summary}. The config file keeps the \
-                 change, which is live on every pair the reload reached; the next reload \
-                 retries the rest."
-            )))
-        }
-        Err(ReloadFailure::Rejected(err)) => {
-            // Put back before the rejection is reported, so by the time it is read the file
-            // already matches what is running again.
-            let restored = std::fs::write(path, &before);
-            tracing::warn!("{by} {what} REJECTED, reverted: {err}");
-            Err(ReloadFailure::Rejected(match restored {
-                Ok(()) => format!(
-                    "{what} was rejected and nothing changed: {err}. The config file has \
-                     been put back as it was."
-                ),
-                Err(write_err) => format!(
-                    "{what} was rejected ({err}) AND the config file could not be put back \
-                     ({write_err}). The file on disk no longer matches what is running: fix \
-                     it by hand before the next reload."
-                ),
-            }))
-        }
-    }
-}
-
-/// Asks the service to reload and waits for its verdict. A service that is gone, or went
-/// before it answered, counts as a rejection: nothing says it applied anything.
-pub(crate) async fn request_reload(
-    reloads: &tokio::sync::mpsc::Sender<crate::backoffice::ReloadRequest>,
-) -> std::result::Result<String, ReloadFailure> {
-    let (reply, answer) = tokio::sync::oneshot::channel();
-    reloads
-        .send(crate::backoffice::ReloadRequest { reply })
-        .await
-        .map_err(|_| {
-            ReloadFailure::Rejected("the pusher is shutting down and is not reloading".to_owned())
-        })?;
-    answer.await.map_err(|_| {
-        ReloadFailure::Rejected("the pusher stopped before it answered the reload".to_owned())
-    })?
-}
-
-/// Opens the SIGHUP stream, whatever mode this process is about to run in.
-///
-/// Above the mode branch, and held for the life of the run, because *not* installing a
-/// handler is not the same as ignoring the signal: SIGHUP's default disposition is to
-/// terminate. The shipped unit declares `ExecReload=/bin/kill -HUP $MAINPID` and takes its
-/// mode from the environment file, so a pusher an operator has put in `--mode node` and then
-/// reloads would be killed by the reload rather than reloading — and a `--once` run would
-/// die mid-flight on a stray one.
-///
-/// Only builder mode has a pair set to converge, so only builder mode reads the stream. The
-/// other modes still hold it, and holding it is the whole point: an installed handler nobody
-/// polls coalesces the signal and drops it, which is exactly the no-op wanted.
-pub(crate) fn install_hangup(config: &std::path::Path) -> Option<tokio::signal::unix::Signal> {
-    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
-        Ok(stream) => Some(stream),
-        // Said out loud rather than left to be discovered by an operator whose reload
-        // silently does nothing at 3am. The default disposition is still in place here, so a
-        // reload will end the process — which is exactly what the message warns of.
-        Err(err) => {
-            tracing::warn!(
-                "could not listen for SIGHUP ({err}); config reloads are unavailable and a \
-                 reload will terminate this process, so changing {} needs a restart",
-                config.display()
-            );
-            None
         }
     }
 }
@@ -1278,69 +1387,22 @@ pub(crate) async fn finish_recording(recording: Option<tokio::task::JoinHandle<(
     }
 }
 
-/// Hands the recorder the configuration the pusher now runs from, as the file says it:
-/// redacted for the row (`record::redacted_config`), and whole, in memory only, to judge
-/// whether it changed. A file that does not read is not a row: the caller has already
-/// loaded and validated it, so this is a race with an editor, and the next reload records.
+/// Hands the recorder the configuration the pusher now runs from: redacted for the row
+/// (`record::redacted_config`), and whole, in memory only, to judge whether it changed.
 pub(crate) fn record_config(
     recorder: Option<&record::Recorder>,
-    path: &std::path::Path,
+    raw: &config::RawConfig,
     source: &str,
 ) {
     let Some(recorder) = recorder else { return };
-    match config::load_raw(path) {
-        Ok(raw) => recorder.config(record::ConfigSnapshot::new(
-            SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0),
-            source,
-            &raw,
-        )),
-        Err(err) => tracing::warn!(
-            "[record] could not read {} to record it: {err:#}",
-            path.display()
-        ),
-    }
-}
-
-/// Refuses a reload whose file names a different PropAMM than the process is running.
-///
-/// The target is not a per-pair setting a reload can converge: every lane's `QuoteIdentity`
-/// is built from it and it is baked into `SendOpts`, so a process that adopted a new one
-/// would be a different service wearing the same pid. Refused whole rather than ignored,
-/// because the operator who edited that line believes it took effect.
-///
-/// Separate and pure so its message has a test: this is one of the few errors whose only
-/// job is to send someone to the right remedy.
-fn refuse_target_change(desired: Address, running: Address, path: &std::path::Path) -> Result<()> {
-    ensure!(
-        desired == running,
-        "target is {desired:#x} in {} but this process is running {running:#x}; changing the \
-         target needs a restart, not a reload",
-        path.display(),
-    );
-    Ok(())
-}
-
-/// Every setting is consumed once, at startup, so applying one here would change the file
-/// without changing the process. Refused, with the key named.
-fn refuse_settings_change(
-    desired: &config::FileSettings,
-    running: &config::FileSettings,
-    path: &std::path::Path,
-) -> Result<()> {
-    let changed = running.changed_keys(desired);
-    ensure!(
-        changed.is_empty(),
-        "[settings] {} changed in {} since this process started; these are read once, at \
-         startup, so applying them needs a restart rather than a reload{}. Nothing was \
-         changed.",
-        changed.join(", "),
-        path.display(),
-        crate::hints::restart_note(),
-    );
-    Ok(())
+    recorder.config(record::ConfigSnapshot::new(
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
+        source,
+        raw,
+    ));
 }
 
 /// Refuses a reload whose file names an updater key this process cannot see.
@@ -1413,6 +1475,20 @@ fn rearm_detail(cleared: Option<&crate::guard::Trip>) -> String {
         format_elapsed(trip.at.elapsed()),
         trip.reason.rearm,
     )
+}
+
+/// What a re-arm answers for one lane: the reference market's mid it now trusts, when it
+/// has a market, beside the trip it cleared, which for the deviation breaker names the
+/// price before the trip and the one it tripped on.
+fn rearmed_line(
+    label: &str,
+    trusted: Option<&str>,
+    cleared: Option<&crate::guard::Trip>,
+) -> String {
+    let trusting = trusted
+        .map(|mid| format!(", trusting mid {mid}"))
+        .unwrap_or_default();
+    format!("[{label}] re-armed{trusting}{}", rearm_detail(cleared))
 }
 
 /// A coarse "how long ago", for an operator line rather than a measurement: a halted pusher
@@ -1497,29 +1573,6 @@ mod tests {
     use super::*;
     use url::Url;
 
-    /// Every setting is consumed once, at startup, so a reload that quietly ignored a
-    /// changed one would leave the file saying something the process is not doing.
-    #[test]
-    fn a_reload_refuses_a_changed_setting_and_names_it() {
-        let path = std::path::Path::new("config.toml");
-        let running = config::FileSettings {
-            requote_ms: Some(50),
-            ..Default::default()
-        };
-        refuse_settings_change(&running, &running, path).expect("an unchanged table reloads");
-
-        let desired = config::FileSettings {
-            requote_ms: Some(25),
-            ..Default::default()
-        };
-        let err = format!(
-            "{:#}",
-            refuse_settings_change(&desired, &running, path).unwrap_err()
-        );
-        assert!(err.contains("requote_ms"), "{err}");
-        assert!(err.contains("restart"), "{err}");
-    }
-
     /// Ctrl-c has to reach a quoting lane even while the run loop is stuck inside a reload,
     /// which is where it cannot poll its own shutdown arm. Before per-lane stops the pairs
     /// held the global signal directly; the forwarder is what gives that back.
@@ -1590,11 +1643,10 @@ mod tests {
             },
             builders: Arc::new(config::BuildersConfig { builders }),
             builders_path: "config.toml".to_owned(),
-            // The reload path these tests drive never re-reads the file, so the two flags
-            // that only matter to `candidate` are at their defaults.
+            // The reload path these tests drive is handed its config, so the two flags that
+            // only matter to `candidate` are at their defaults.
             builders_from_config: true,
             backoffice_bound: false,
-            file_settings: config::FileSettings::default(),
             head: tokio::sync::watch::channel(head::Head::default()).1,
             metrics: Arc::clone(&metrics),
             health: Arc::new(supervisor::Health::new(0)),
@@ -1605,7 +1657,6 @@ mod tests {
             endpoints: venue::Endpoints::single(venue::VenueId::Binance, "ws://unused".to_owned()),
             observers: Default::default(),
             price_decimals: 18,
-            config_path: PathBuf::from("config.toml"),
             registry: Address::zero(),
             global,
             running: std::collections::BTreeMap::new(),
@@ -1615,6 +1666,8 @@ mod tests {
             pair_states: backoffice::PairStates::default(),
             key_lookup: Arc::new(config::env_lookup),
             kinds: Arc::new(crate::kinds::Kinds::shipped()),
+            halt_flags: Arc::default(),
+            kept_trips: Default::default(),
         }
     }
 
@@ -1792,7 +1845,7 @@ mod tests {
     }
 
     /// A halted lane is the one ending that must survive being reaped: it is exactly what a
-    /// reload has to find in order to re-arm it.
+    /// re-arm has to find in order to restart it.
     #[tokio::test]
     async fn a_halted_pair_stays_in_the_running_set_for_a_reload_to_find() {
         let mut service = test_service(Vec::new());
@@ -1806,6 +1859,59 @@ mod tests {
         assert_eq!(
             service.halted_lanes(),
             std::collections::BTreeSet::from([U256::from(1)])
+        );
+    }
+
+    /// Shutting down a lane the kill switch silenced touches that lane alone: another lane
+    /// halted on its breaker stays halted, neither restarted nor re-armed (audit F-17 is a
+    /// reload's, and a halt is not one), and the generation moves for the config change.
+    #[tokio::test]
+    async fn retiring_a_halted_lane_leaves_a_tripped_one_tripped() {
+        let mut service = test_service(Vec::new());
+        let silenced = register_fake_pair(&mut service, U256::from(1), "A/B");
+        let tripped = register_fake_pair(&mut service, U256::from(2), "C/D");
+        tripped
+            .halted
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let generation = service.reload_metrics.generation.get();
+        service.halt_flags.set(&[U256::from(1)]);
+        drop(silenced.release);
+
+        service
+            .retire_halted(crate::state::Halted {
+                lanes: vec![U256::from(1)],
+                config: Arc::new(crate::state::tests::a_config()),
+            })
+            .await;
+
+        assert!(!service.running.contains_key(&U256::from(1)), "retired");
+        assert_eq!(
+            service.halted_lanes(),
+            std::collections::BTreeSet::from([U256::from(2)]),
+            "the tripped lane is still there, still halted"
+        );
+        assert_eq!(service.reload_metrics.generation.get(), generation + 1.0);
+    }
+
+    /// A halt notice read late, after a resume lifted the pair's kill switch, stops nothing:
+    /// the lane is quoting again, and the config says so.
+    #[tokio::test]
+    async fn a_halt_notice_for_a_pair_since_resumed_stops_nothing() {
+        let mut service = test_service(Vec::new());
+        let _resumed = register_fake_pair(&mut service, U256::from(1), "A/B");
+        service.halt_flags.set(&[U256::from(1)]);
+        service.halt_flags.clear(&[U256::from(1)]);
+
+        service
+            .retire_halted(crate::state::Halted {
+                lanes: vec![U256::from(1)],
+                config: Arc::new(crate::state::tests::a_config()),
+            })
+            .await;
+
+        assert!(
+            service.running.contains_key(&U256::from(1)),
+            "still running"
         );
     }
 
@@ -2051,23 +2157,6 @@ mod tests {
         );
     }
 
-    /// A reload's refusals exist to send an operator to the right remedy, so the remedy is
-    /// what these assert. Both of these are reached with the pairs still quoting on the old
-    /// config, which is the fact the message has to leave them believing.
-    #[test]
-    fn a_reload_that_changes_the_target_is_refused_and_says_to_restart() {
-        let path = std::path::Path::new("pairs.toml");
-        let running = Address::from_low_u64_be(1);
-
-        refuse_target_change(running, running, path).expect("an unchanged target is fine");
-
-        let err = refuse_target_change(Address::from_low_u64_be(2), running, path)
-            .expect_err("a changed target must not be adopted by a running process")
-            .to_string();
-        assert!(err.contains("restart"), "must name the remedy: {err}");
-        assert!(err.contains("pairs.toml"), "and the file it read: {err}");
-    }
-
     /// The diagnostic the deferred `.env` re-read makes necessary: without it this surfaces
     /// as a bare "not set in the environment" to someone who has just set it, in the file
     /// they set it in.
@@ -2109,8 +2198,8 @@ pricing = { kind = "feed" }
     }
 
     /// Clearing a latch has to be at least as loud as the trip was, and carry the same
-    /// numbers — it is the whole mitigation for a reload re-arming a lane the operator was
-    /// not thinking about when they ran it.
+    /// numbers, so whoever re-armed the lane reads exactly what they cleared, beside the
+    /// price they accepted in its place.
     #[test]
     fn the_rearm_line_repeats_the_trip_it_cleared() {
         let at = std::time::Instant::now() - Duration::from_secs(14 * 60);
@@ -2177,6 +2266,36 @@ pricing = { kind = "feed" }
         }
     }
 
+    /// A re-arm answers with the price the lane now trusts, beside the trip it cleared, so
+    /// whoever re-armed it reads what they accepted (audit F-17); and the summary carries it.
+    #[test]
+    fn a_rearm_line_names_the_mid_it_trusts() {
+        let trip = trip_at(
+            "on a 4.10% move from previous 1.00 to 1.04 (limit 2.00%)",
+            std::time::Instant::now(),
+        );
+        let line = rearmed_line("WETH/USDC", Some("1.041"), Some(&trip));
+        assert!(
+            line.starts_with("[WETH/USDC] re-armed, trusting mid 1.041, clearing the halt"),
+            "{line}"
+        );
+        assert!(
+            line.ends_with("from previous 1.00 to 1.04 (limit 2.00%)"),
+            "{line}"
+        );
+        assert_eq!(
+            rearmed_line("A/B", None, Some(&trip)),
+            format!("[A/B] re-armed{}", rearm_detail(Some(&trip))),
+            "no market, no mid"
+        );
+        let applied = Applied {
+            restarted: vec!["WETH/USDC".to_owned()],
+            rearmed: vec![line.clone()],
+            ..Applied::default()
+        };
+        assert_eq!(applied.summary(), format!("reload: 1 restarted; {line}"));
+    }
+
     #[test]
     fn a_reload_summary_names_every_kind_that_happened_and_no_others() {
         assert_eq!(Applied::default().summary(), "reload: no change");
@@ -2186,6 +2305,8 @@ pricing = { kind = "feed" }
             restarted: vec!["C/D".to_owned(), "E/F".to_owned()],
             removed: Vec::new(),
             halted: vec!["I/J".to_owned()],
+            rearmed: Vec::new(),
+            left_tripped: Vec::new(),
             failed: vec!["G/H".to_owned()],
         };
         assert_eq!(
@@ -2229,7 +2350,7 @@ pricing = { kind = "feed" }
         assert_eq!(health.census(), (1, 0, 2));
         assert!(
             halted.load(Ordering::SeqCst),
-            "the lane's own flag rises with the count, so a reload knows which one to re-arm"
+            "the lane's own flag rises with the count, so a re-arm knows which one to restart"
         );
         assert_eq!(
             health.trips(),
@@ -2344,6 +2465,9 @@ pricing = { kind = "feed" }
             /// trips before the service adopts it.
             #[serde(default)]
             trips: bool,
+            /// Takes a while to build, as a feed waiting for its first price does.
+            #[serde(default)]
+            slow: bool,
         }
 
         #[derive(Clone, serde::Deserialize)]
@@ -2408,6 +2532,9 @@ pricing = { kind = "feed" }
                 Box::pin(async move {
                     assert!(!cfg.panics_building, "build blew up");
                     eyre::ensure!(!cfg.broken, "broken is set");
+                    if cfg.slow {
+                        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                    }
                     if cfg.trips {
                         ctx.latch().trip(
                             "a",
@@ -2483,7 +2610,6 @@ api_key = "k"
             );
             let mut service = test_service(vec![]);
             service.client = EthClient::new(Url::parse(&rpc.url).unwrap()).unwrap();
-            service.config_path = path.clone();
             service.opts.target = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
                 .parse()
                 .unwrap();
@@ -2498,6 +2624,11 @@ api_key = "k"
                 _ => None,
             });
             (service, rpc, builder, path)
+        }
+
+        /// The config a test wrote, as the shared config would hand it to a reload.
+        fn read(path: &std::path::Path) -> config::RawConfig {
+            config::load_raw(path).unwrap()
         }
 
         /// [`file`] without the first pair: lane A removed.
@@ -2547,7 +2678,7 @@ api_key = "k"
 
             std::fs::write(&path, file("", &builder.url)).unwrap();
             let first = service
-                .reload(&done)
+                .reload(&done, &read(&path), &[])
                 .await
                 .expect("the first reload adds both lanes");
             assert_eq!(first.added.len(), 2, "{first:?}");
@@ -2555,7 +2686,7 @@ api_key = "k"
 
             std::fs::write(&path, file("broken = true", &builder.url)).unwrap();
             let second = service
-                .reload(&done)
+                .reload(&done, &read(&path), &[])
                 .await
                 .expect("one failed lane does not fail the file");
             assert_eq!(second.failed.len(), 1, "A's build failed: {second:?}");
@@ -2573,13 +2704,19 @@ api_key = "k"
 
             std::fs::write(&path, file("", &builder.url)).unwrap();
             service
-                .reload(&done)
+                .reload(&done, &read(&path), &[])
                 .await
                 .expect("the first reload adds both lanes");
             let before = specs(&service);
 
             std::fs::write(&path, file("invalid = true", &builder.url)).unwrap();
-            let err = format!("{:#}", service.reload(&done).await.expect_err("rejected"));
+            let err = format!(
+                "{:#}",
+                service
+                    .reload(&done, &read(&path), &[])
+                    .await
+                    .expect_err("rejected")
+            );
             assert!(err.contains("invalid is set"), "{err}");
             assert_eq!(specs(&service), before, "nothing changed");
         }
@@ -2594,14 +2731,14 @@ api_key = "k"
 
             std::fs::write(&path, file("", &builder.url)).unwrap();
             service
-                .reload(&done)
+                .reload(&done, &read(&path), &[])
                 .await
                 .expect("the first reload adds both lanes");
             let before = specs(&service);
 
             std::fs::write(&path, file("panics_building = true", &builder.url)).unwrap();
             let second = service
-                .reload(&done)
+                .reload(&done, &read(&path), &[])
                 .await
                 .expect("a panicking build fails its lane, not the reload");
             assert_eq!(second.failed.len(), 1, "{second:?}");
@@ -2617,7 +2754,7 @@ api_key = "k"
 
             std::fs::write(&path, file("", &builder.url)).unwrap();
             service
-                .reload(&done)
+                .reload(&done, &read(&path), &[])
                 .await
                 .expect("the first reload adds both lanes");
             let before = specs(&service);
@@ -2627,12 +2764,185 @@ api_key = "k"
                 file("\n[[pairs.guards]]\nkind = \"m\"", &builder.url),
             )
             .unwrap();
-            let err = format!("{:#}", service.reload(&done).await.expect_err("rejected"));
+            let err = format!(
+                "{:#}",
+                service
+                    .reload(&done, &read(&path), &[])
+                    .await
+                    .expect_err("rejected")
+            );
             assert!(
                 err.contains("pair 1") && err.contains("`m` is a market guard"),
                 "{err}"
             );
             assert_eq!(specs(&service), before, "nothing changed");
+        }
+
+        /// Audit F-17, the side doors: a tripped pair halted and resumed, or removed and
+        /// added back, is not started on the way back. Its trip outlived its lane, reads
+        /// as tripped to the backoffice, and only its re-arm starts it, naming that trip.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_trip_outlives_a_halt_or_a_removal_until_the_re_arm() {
+            let (mut service, _rpc, builder, path) = setup("reload-kept-trip").await;
+            let (done, _done_rx) = tokio::sync::mpsc::unbounded_channel();
+            std::fs::write(&path, file("", &builder.url)).unwrap();
+            let config = read(&path);
+            service
+                .reload(&done, &config, &[])
+                .await
+                .expect("the first reload adds both lanes");
+            let (lane, label) = lane_a(&service);
+            halt_on_a(&service, lane);
+            let tripped = |service: &Service| {
+                service
+                    .pair_states
+                    .lock()
+                    .unwrap()
+                    .get("KEY_A")
+                    .map(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+            };
+
+            // Halted (the kill switch's flag and its notice), then resumed (the flag lifted,
+            // and the config as it was).
+            service.halt_flags.set(&[lane]);
+            service
+                .retire_halted(crate::state::Halted {
+                    lanes: vec![lane],
+                    config: Arc::new(config.clone()),
+                })
+                .await;
+            service.halt_flags.clear(&[lane]);
+            assert!(!service.running.contains_key(&lane));
+            let applied = service.reload(&done, &config, &[]).await.expect("applied");
+            assert!(applied.added.is_empty(), "{applied:?}");
+            assert_eq!(applied.left_tripped, vec![label.clone()]);
+            assert!(
+                !service.running.contains_key(&lane),
+                "not started by the resume"
+            );
+            assert_eq!(tripped(&service), Some(true), "and reads as tripped");
+            let paging = |service: &Service| service.metrics.for_pair(&label).breaker_tripped.get();
+            assert_eq!(
+                paging(&service),
+                1.0,
+                "the config asks for the pair and it is not quoting: the alert holds"
+            );
+
+            // Removed, then added back.
+            std::fs::write(&path, file_without_a(&builder.url)).unwrap();
+            service
+                .reload(&done, &read(&path), &[])
+                .await
+                .expect("the removal applies");
+            assert!(
+                paging(&service).is_nan(),
+                "a pair the config no longer has pages nobody"
+            );
+            let applied = service.reload(&done, &config, &[]).await.expect("applied");
+            assert_eq!(applied.left_tripped, vec![label.clone()], "{applied:?}");
+            assert_eq!(paging(&service), 1.0, "added back, and paging again");
+            assert!(
+                !service.running.contains_key(&lane),
+                "not started by the add"
+            );
+
+            let applied = service
+                .reload(&done, &config, &[lane])
+                .await
+                .expect("its re-arm applies");
+            assert_eq!(applied.added, vec![label.clone()], "{applied:?}");
+            assert_eq!(applied.rearmed.len(), 1, "{applied:?}");
+            assert!(
+                applied.rearmed[0].contains("clearing the halt")
+                    && applied.rearmed[0].contains("first"),
+                "the re-arm names the trip it clears: {:?}",
+                applied.rearmed
+            );
+            assert!(service.running.contains_key(&lane));
+            assert_eq!(tripped(&service), Some(false));
+            assert!(service.kept_trips.is_empty());
+            assert_eq!(paging(&service), 0.0, "re-armed: the new run's own reading");
+        }
+
+        /// A trip that lands as the reload is stopping the lane to swap it, after the check
+        /// made before the stop, is not re-armed by the swap either: the replacement is
+        /// dropped, the trip is kept, and only the pair's re-arm starts it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_lane_that_trips_as_it_is_swapped_is_not_started() {
+            let (mut service, _rpc, builder, path) = setup("reload-trip-in-swap").await;
+            let (done, _done_rx) = tokio::sync::mpsc::unbounded_channel();
+            std::fs::write(&path, file("", &builder.url)).unwrap();
+            service
+                .reload(&done, &read(&path), &[])
+                .await
+                .expect("the first reload adds both lanes");
+            let (lane, label) = lane_a(&service);
+            let tripped = Arc::clone(&service.running[&lane].halted);
+            let mut stop = service.running[&lane].stop.subscribe();
+
+            std::fs::write(&path, file("slow = true", &builder.url)).unwrap();
+            let edited = read(&path);
+            let (applied, ()) = tokio::join!(service.reload(&done, &edited, &[]), async {
+                // Past the build and the check: the lane has just been asked to stop.
+                stop.changed().await.unwrap();
+                tripped.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            let applied = applied.expect("the reload applies");
+            assert!(applied.restarted.is_empty(), "{applied:?}");
+            assert_eq!(applied.left_tripped, vec![label.clone()], "{applied:?}");
+            assert!(
+                applied.rearmed.is_empty(),
+                "nobody re-armed it: {applied:?}"
+            );
+            assert!(!service.running.contains_key(&lane), "not started");
+            assert!(service.kept_trips.contains_key(&lane), "its trip is kept");
+            assert_eq!(service.metrics.for_pair(&label).breaker_tripped.get(), 1.0);
+
+            let applied = service
+                .reload(&done, &edited, &[lane])
+                .await
+                .expect("its re-arm applies");
+            assert_eq!(applied.added, vec![label], "{applied:?}");
+            assert!(service.running.contains_key(&lane));
+        }
+
+        /// Audit F-17, the back door: a lane that trips while a reload is rebuilding it (a
+        /// build that waits, as a feed's first price does) is not swapped for the rebuilt
+        /// run, which would re-arm it unasked. It stays halted on its trip, and its own
+        /// re-arm then brings it back on the stanza as it is.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_lane_that_trips_while_it_is_rebuilt_stays_halted() {
+            let (mut service, _rpc, builder, path) = setup("reload-trip-in-build").await;
+            let (done, _done_rx) = tokio::sync::mpsc::unbounded_channel();
+            std::fs::write(&path, file("", &builder.url)).unwrap();
+            service
+                .reload(&done, &read(&path), &[])
+                .await
+                .expect("the first reload adds both lanes");
+            let (lane, label) = lane_a(&service);
+            let tripped = Arc::clone(&service.running[&lane].halted);
+            let run = service.running[&lane].id;
+
+            std::fs::write(&path, file("slow = true", &builder.url)).unwrap();
+            let edited = read(&path);
+            let (applied, ()) = tokio::join!(service.reload(&done, &edited, &[]), async {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                tripped.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            let applied = applied.expect("the reload applies");
+            assert!(applied.restarted.is_empty(), "{applied:?}");
+            assert_eq!(
+                service.running[&lane].id, run,
+                "the tripped run is still the one"
+            );
+            assert!(service.halted_lanes().contains(&lane));
+
+            let applied = service
+                .reload(&done, &edited, &[lane])
+                .await
+                .expect("its re-arm applies");
+            assert_eq!(applied.restarted, vec![label], "{applied:?}");
+            assert!(!service.halted_lanes().contains(&lane));
         }
 
         /// A re-armed lane that trips again at once, on the same source, before or as the
@@ -2646,15 +2956,19 @@ api_key = "k"
 
             std::fs::write(&path, file("", &builder.url)).unwrap();
             service
-                .reload(&done)
+                .reload(&done, &read(&path), &[])
                 .await
                 .expect("the first reload adds both lanes");
             let (lane, label) = lane_a(&service);
             halt_on_a(&service, lane);
 
-            // A changed stanza whose build trips the new latch on the same source and cause.
+            // Its re-arm, onto a changed stanza whose build trips the new latch on the same
+            // source and cause.
             std::fs::write(&path, file("trips = true", &builder.url)).unwrap();
-            let applied = service.reload(&done).await.expect("applied");
+            let applied = service
+                .reload(&done, &read(&path), &[lane])
+                .await
+                .expect("applied");
             assert_eq!(applied.restarted, vec![label.clone()], "{applied:?}");
             assert!(service.running[&lane].latch.tripped().is_some());
             assert_eq!(
@@ -2676,7 +2990,7 @@ api_key = "k"
 
             std::fs::write(&path, file("", &builder.url)).unwrap();
             service
-                .reload(&done)
+                .reload(&done, &read(&path), &[])
                 .await
                 .expect("the first reload adds both lanes");
             let (lane, label) = lane_a(&service);
@@ -2693,7 +3007,10 @@ api_key = "k"
             );
 
             std::fs::write(&path, file("broken = false", &builder.url)).unwrap();
-            let applied = service.reload(&done).await.expect("applied");
+            let applied = service
+                .reload(&done, &read(&path), &[])
+                .await
+                .expect("applied");
             assert_eq!(applied.restarted, vec![label.clone()], "{applied:?}");
             assert_eq!(
                 service.metrics.trip_source(&label, "a", "external").get(),
@@ -2703,7 +3020,10 @@ api_key = "k"
             assert_eq!(service.metrics.for_pair(&label).breaker_tripped.get(), 0.0);
 
             std::fs::write(&path, file_without_a(&builder.url)).unwrap();
-            let applied = service.reload(&done).await.expect("applied");
+            let applied = service
+                .reload(&done, &read(&path), &[])
+                .await
+                .expect("applied");
             assert_eq!(applied.removed, vec![label.clone()], "{applied:?}");
             assert!(
                 service
@@ -2729,14 +3049,17 @@ api_key = "k"
             )
             .unwrap();
             service
-                .reload(&done)
+                .reload(&done, &read(&path), &[])
                 .await
                 .expect("the first reload adds both lanes");
             let (_, label) = lane_a(&service);
             assert_eq!(service.metrics.for_pair(&label).guard("q").get(), 1.0);
 
             std::fs::write(&path, file("", &builder.url)).unwrap();
-            let applied = service.reload(&done).await.expect("applied");
+            let applied = service
+                .reload(&done, &read(&path), &[])
+                .await
+                .expect("applied");
             assert_eq!(applied.restarted, vec![label.clone()], "{applied:?}");
             assert!(
                 service.metrics.for_pair(&label).guard("q").get().is_nan(),
@@ -2752,13 +3075,19 @@ api_key = "k"
 
             std::fs::write(&path, file("", &builder.url)).unwrap();
             service
-                .reload(&done)
+                .reload(&done, &read(&path), &[])
                 .await
                 .expect("the first reload adds both lanes");
             let before = specs(&service);
 
             std::fs::write(&path, file("panics_validating = true", &builder.url)).unwrap();
-            let err = format!("{:#}", service.reload(&done).await.expect_err("rejected"));
+            let err = format!(
+                "{:#}",
+                service
+                    .reload(&done, &read(&path), &[])
+                    .await
+                    .expect_err("rejected")
+            );
             assert!(
                 err.contains("panicked") && err.contains("validate blew up"),
                 "{err}"

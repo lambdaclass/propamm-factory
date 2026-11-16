@@ -66,7 +66,7 @@ pub enum Event {
     },
     /// A block passed for the lane, with what it quoted for it or why it did not, and the
     /// pricer's declared diagnostics as of its last tick. Once per block, and none for the
-    /// block a halt broke out of, which has not passed: the generation a reload re-arms
+    /// block a halt broke out of, which has not passed: the generation a re-arm starts
     /// says it passed, if it does.
     #[non_exhaustive]
     Block {
@@ -108,7 +108,8 @@ pub enum Event {
         /// What the read-back found.
         outcome: LandingOutcome,
     },
-    /// A reload was asked for (SIGHUP, the backoffice, a handle) and answered.
+    /// A reload was asked for (a change through the backoffice API or a handle, or a plain
+    /// reload) and answered.
     #[non_exhaustive]
     Reload {
         /// How it went.

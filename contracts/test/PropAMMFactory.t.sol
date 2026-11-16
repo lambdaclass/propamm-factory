@@ -3,9 +3,10 @@ pragma solidity ^0.8.35;
 
 import {Test} from "forge-std/Test.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-import {PropAMM} from "../src/PropAMM.sol";
+import {PropAMM, InvalidOracle, NotAToken, UpdaterAlreadyAuthorized} from "../src/PropAMM.sol";
 import {CreationIsDisabled, PropAMMFactory} from "../src/PropAMMFactory.sol";
 import {IPropAMM} from "../src/interfaces/IPropAMM.sol";
+import {MockERC20} from "./mocks/MockERC20.sol";
 
 /// Recording stand-in for the registry: creating an instance calls addUpdater on the registry
 /// address it is created against, which holds no code in the test environment, so setUp etches this
@@ -47,10 +48,16 @@ contract PropAMMFactoryTest is Test {
     /// The updater set every test creates with, more than one so the plural path is the default.
     address[] updaters;
     PropAMM.PairConfig[] pairs;
+    /// MockERC20's runtime, etched wherever a test lists a token: `_addPair` refuses a token
+    /// address without code, and the mainnet addresses below have none on a bare test chain.
+    bytes tokenCode;
 
     function setUp() public {
         vm.etch(PUR_ADDR, address(new RegistryStub()).code);
         vm.etch(OTHER_PUR_ADDR, address(new RegistryStub()).code);
+        tokenCode = address(new MockERC20()).code;
+        vm.etch(USDC, tokenCode);
+        vm.etch(USDT, tokenCode);
         factory = new PropAMMFactory(factoryOwner);
         updaters.push(updater);
         updaters.push(secondUpdater);
@@ -130,10 +137,38 @@ contract PropAMMFactoryTest is Test {
         assertFalse(RegistryStub(PUR_ADDR).isUpdater(propAmm, updater));
     }
 
-    /// Two events per creation, in this order: the instance's own PairAdded (emitted inside
-    /// initialize, so from the predicted address, before the proxy constructor returns), then the
-    /// factory's PropAMMCreated. The creation event names neither pairs nor vaults; PairAdded is
-    /// where indexers read them.
+    /// The documented creation flow passes no updaters, so nothing at creation would call the
+    /// oracle: the factory path has to refuse an address without code too. Audit F-12.
+    function test_createPropAMM_refusesAnOracleWithoutCode() public {
+        address eoa = makeAddr("eoa-oracle");
+        vm.expectRevert(abi.encodeWithSelector(InvalidOracle.selector, eoa));
+        factory.createPropAMM(owner, eoa, new address[](0), pairs);
+    }
+
+    /// Pairs listed at creation go through the same `_addPair` check as `addPair`. Audit F-13.
+    function test_createPropAMM_refusesATokenWithoutCode() public {
+        address ghost = makeAddr("ghost");
+        PropAMM.PairConfig[] memory p = new PropAMM.PairConfig[](1);
+        p[0] = PropAMM.PairConfig({token0: ghost, token1: USDC, vault: vault});
+        vm.expectRevert(abi.encodeWithSelector(NotAToken.selector, ghost));
+        factory.createPropAMM(owner, PUR_ADDR, updaters, p);
+    }
+
+    /// `initialize` adds updaters the way `addUpdater` does, so a key listed twice is refused
+    /// rather than logged twice. Audit F-16.
+    function test_createPropAMM_refusesADuplicateUpdater() public {
+        address[] memory twice = new address[](2);
+        twice[0] = updater;
+        twice[1] = updater;
+        vm.expectRevert(abi.encodeWithSelector(UpdaterAlreadyAuthorized.selector, PUR_ADDR, updater));
+        factory.createPropAMM(owner, PUR_ADDR, twice, pairs);
+    }
+
+    /// The instance's own events come first, from the predicted address, before the proxy
+    /// constructor returns: one UpdaterAuthorized per updater, then one PairAdded per pair. The
+    /// factory's PropAMMCreated comes last. The creation event names neither pairs nor vaults;
+    /// PairAdded is where indexers read them. (This test pins the PairAdded → PropAMMCreated order;
+    /// the UpdaterAuthorized events are pinned in PropAMM.t.sol.)
     function test_createPropAMM_emitsPairAddedThenCreated() public {
         address predicted = factory.computeAddress(address(this), owner, PUR_ADDR, updaters, pairs);
         vm.expectEmit(true, true, true, true, predicted);
@@ -186,7 +221,7 @@ contract PropAMMFactoryTest is Test {
         assertEq(first.getPairs().length, 1);
 
         vm.prank(address(this));
-        first.addPair(makeAddr("token-a"), makeAddr("token-b"), vault);
+        first.addPair(_token("token-a"), _token("token-b"), vault);
         assertEq(first.getPairs().length, 2);
         assertEq(second.getPairs().length, 1);
     }
@@ -195,8 +230,8 @@ contract PropAMMFactoryTest is Test {
     /// another, and keeps no rights over what it deployed.
     function test_createPropAMM_ownerIsTheParamNotTheCreator() public {
         address theirOwner = makeAddr("their-owner");
-        address tokenA = makeAddr("token-a");
-        address tokenB = makeAddr("token-b");
+        address tokenA = _token("token-a");
+        address tokenB = _token("token-b");
         PropAMM propAmm = PropAMM(factory.createPropAMM(theirOwner, PUR_ADDR, updaters, pairs));
 
         assertEq(propAmm.owner(), theirOwner);
@@ -244,6 +279,8 @@ contract PropAMMFactoryTest is Test {
         address wbtc = 0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599;
         address weth = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
         address vaultB = makeAddr("vault-b");
+        vm.etch(wbtc, tokenCode);
+        vm.etch(weth, tokenCode);
         PropAMM.PairConfig[] memory three = new PropAMM.PairConfig[](3);
         three[0] = PropAMM.PairConfig({token0: USDC, token1: USDT, vault: vault});
         three[1] = PropAMM.PairConfig({token0: weth, token1: USDC, vault: vaultB});
@@ -267,8 +304,8 @@ contract PropAMMFactoryTest is Test {
 
     function test_ownerCanManagePairs() public {
         PropAMM propAmm = PropAMM(factory.createPropAMM(owner, PUR_ADDR, updaters, pairs));
-        address tokenA = makeAddr("token-a");
-        address tokenB = makeAddr("token-b");
+        address tokenA = _token("token-a");
+        address tokenB = _token("token-b");
         propAmm.addPair(tokenA, tokenB, vault);
         assertEq(propAmm.getPairs().length, 2);
         propAmm.removePair(USDC, USDT);
@@ -304,7 +341,9 @@ contract PropAMMFactoryTest is Test {
         vm.expectRevert();
         propAmm.removeUpdater(updater);
         vm.expectRevert();
-        propAmm.addPair(makeAddr("token-a"), makeAddr("token-b"), vault);
+        propAmm.removeUpdaterFrom(PUR_ADDR, updater);
+        vm.expectRevert();
+        propAmm.addPair(_token("token-a"), _token("token-b"), vault);
         vm.expectRevert();
         propAmm.removePair(USDC, USDT);
         vm.expectRevert();
@@ -331,7 +370,9 @@ contract PropAMMFactoryTest is Test {
     function test_nobodyCanReinitializeAFactoryInstance() public {
         PropAMM propAmm = PropAMM(factory.createPropAMM(owner, PUR_ADDR, updaters, pairs));
         address rando = makeAddr("rando");
-        address evilOracle = makeAddr("evil-oracle");
+        // A real contract: `initialize` refuses an oracle without code, which would make the call
+        // below revert whether or not the instance can be initialized again.
+        address evilOracle = address(new RegistryStub());
 
         vm.startPrank(rando);
         vm.expectRevert();
@@ -360,7 +401,7 @@ contract PropAMMFactoryTest is Test {
         PropAMM propAmm = PropAMM(factory.createPropAMM(owner, PUR_ADDR, updaters, pairs));
         vm.prank(factoryOwner);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, factoryOwner));
-        propAmm.addPair(makeAddr("token-a"), makeAddr("token-b"), vault);
+        propAmm.addPair(_token("token-a"), _token("token-b"), vault);
     }
 
     function test_disableCreation_emitsAndStopsCreation() public {
@@ -428,7 +469,7 @@ contract PropAMMFactoryTest is Test {
         assertEq(factory.propAMMsOf(address(this))[0], address(propAmm));
         assertEq(factory.computeAddress(address(this), owner, PUR_ADDR, updaters, pairs), address(propAmm));
 
-        propAmm.addPair(makeAddr("token-a"), makeAddr("token-b"), vault);
+        propAmm.addPair(_token("token-a"), _token("token-b"), vault);
         assertEq(propAmm.getPairs().length, 2);
         propAmm.upgradeToAndCall(newImplementation, "");
         assertEq(propAmm.owner(), owner);
@@ -472,5 +513,12 @@ contract PropAMMFactoryTest is Test {
         assertFalse(factory.creationDisabled());
         factory.createPropAMM(owner, PUR_ADDR, updaters, pairs);
         assertEq(factory.allPropAMMsLength(), 1);
+    }
+
+    /// A labelled address with token code, so `_addPair` accepts it. Etches only (no CREATE), so
+    /// it is safe between a cheatcode expectation and the call it guards.
+    function _token(string memory label) internal returns (address t) {
+        t = makeAddr(label);
+        vm.etch(t, tokenCode);
     }
 }

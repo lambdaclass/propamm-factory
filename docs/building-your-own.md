@@ -18,7 +18,7 @@ A pricing model is a `Pricer`: built once per lane configuration, asked for a pr
 tick, and handed the pair's market in the orientation a person says it (USDC per WETH,
 however the lane carries it). `examples/custom_pricer.rs` is a complete binary
 in 30 lines of code, compiled by CI: a `skewed` kind that publishes the market mid moved by a
-fixed fraction at a fixed half-spread. Its `main` is the whole assembly:
+fixed fraction at a fixed half-spread, and by no more than that half-spread. Its `main` is the whole assembly:
 
 ```rust
 fn main() -> std::process::ExitCode {
@@ -43,7 +43,7 @@ key_env = "UPDATER_KEY_WETH_USDC"
 [pairs.pricing]
 kind        = "skewed"
 half_spread = 0.0005
-skew        = 0.001
+skew        = 0.0002
 ```
 
 What to know:
@@ -64,6 +64,22 @@ What to know:
   kind alike. On a pair with a market it judges the market's mid as well as yours, so the
   pair stops when the market leaves the band even if your mid does not; a kind with a bound
   of its own checks it in `validate` or refuses the tick.
+- **Do not quote through the market.** The core does not compare your quote with the
+  market: the band is an absolute range, which it holds your mid and the market's to
+  separately, not a distance between the two. A pricer publishes one mid and one
+  half-spread, so it buys at `mid·(1 − delta)` and sells at `mid/(1 − delta)`. Move the
+  mid off the market's by more than the half-spread and one of
+  those crosses it: you sell below the market's price, or buy above it, and a taker fills
+  that and unwinds on the market at the vault's cost. It is worst when the move follows the
+  vault's inventory, because then a taker can cause it: unbalance the vault, wait for the
+  next vault reading (every 12s), take the quote that went through the market, and repeat.
+  So a pricer that moves its mid caps the move at its half-spread,
+  `skew.clamp(-half_spread, half_spread)` before `market.shift(skew)`, which leaves the
+  market's mid between the two prices. Clamp only a half-spread already checked
+  (`market.scaled_fraction` or `validate`): `f64::clamp` panics on a negative or NaN
+  bound. The `volatile` kind caps its tilt this way, and so do `examples/custom_pricer.rs`,
+  `examples/tilted.rs` and `example/`'s `inventory_skew`. A model that widens one side
+  instead of moving both (the `volatile` kind's inventory charge) cannot cross it at all.
 - **Builds do not block.** A `pricer_fn` closure runs synchronously inside the lane's build,
   so a fetch there stalls startup or the reload, and the 30s build limit cannot interrupt
   it. A pricer that must fetch before it can price, or whose stanza needs checking against
@@ -127,16 +143,20 @@ What to know:
 - **A trip is not a halt.** Every lane has a latch: a guard's `Trip`/`Halt`, a panic
   anywhere in a component's code (its `price`, `check`, `assess`, or a task it spawned), or
   a component's own `ctx.latch().trip(..)` trips it, the lane withdraws and stops, and only
-  a reload re-arms it, which is the circuit breaker's contract extended to everything. The
-  alarm and the re-arm line name what tripped (`quote_updater_trip_source{pair,source,cause}`
-  beside `breaker_tripped`, which stays the page: 1 while the lane is halted on that
-  source, 0 once a reload rebuilds the lane, re-armed or not, and gone with the lane), and
+  the pair's own re-arm brings it back (`POST /api/pairs/{key_env}/rearm`, or the handle's
+  `rearm`; no reload does), which is the circuit breaker's contract extended to everything.
+  The alarm and the re-arm line name what tripped
+  (`quote_updater_trip_source{pair,source,cause}` beside `breaker_tripped`, which stays the
+  page: 1 while the lane is halted on that source, 0 once the lane is rebuilt, which for a
+  lane halted on it means its re-arm, and gone with the lane), and
   the watchdog's notice
   names it too.
-  A kill switch is therefore never a trip: "stop until I say so" is `halted = true` in the
-  file, which a reload does not undo, and `UpdaterHandle::halt` is how a binary writes it
-  (with a `halt_reason` the backoffice shows and the reload logs). A panic on the price path
-  now trips the lane instead of restarting the loop: buggy code gets a human, not a retry.
+  A kill switch is therefore never a trip: "stop until I say so" is `halted = true` with a
+  `halt_reason` beside it in the file, which a reload does not undo (the backoffice's
+  `POST /api/reload` resumes only pairs halted without a reason), and `UpdaterHandle::halt`
+  is how a binary writes it (with the `halt_reason` the backoffice API shows and the reload
+  logs). A panic on the price path now trips the lane instead of restarting the loop: buggy
+  code gets a human, not a retry.
 - **What the run watches.** `quote_updater_guards{pair,kind}` is 1 per registered guard a
   pair runs, and NaN once it no longer does (its stanza removed, or the lane);
   `quote_updater_extension_duration_seconds{pair,kind}` times every call into a
@@ -187,16 +207,28 @@ What to know:
   `Updater::builder().run(args).await`, which returns an `Outcome` instead of exiting, and use
   `shutdown_on(future)` to stop it your way. A binary with other work to do meanwhile calls
   `start(args)` instead: it spawns the run on the current runtime and hands back an
-  `UpdaterHandle` whose `reload()` re-reads the file and answers with the reload's summary
-  or its rejection (exactly what SIGHUP and the backoffice get), whose `shutdown()` stops
-  it the graceful way, and whose `wait()` returns the `Outcome`. Ctrl-c is the caller's to
-  wire to `shutdown()` on that path, as it is with `shutdown_on`. The handle's
-  `halt(tokens, reason)` and `resume(tokens)` are a kill switch: a halt is written to the
-  config file as `halted = true` with `halt_reason` beside it and applied by a reload, so
-  no later reload undoes it and it survives a restart (a `Latch` trip is re-armed by the
-  next reload, so a kill switch is never built on one); the file is rewritten in full in
-  the backoffice's canonical form, so comments in it are not kept. Both are serialized with the
-  backoffice's edits of the same file, and both are refused in `--mode node`. `--help` and a usage error come
+  `UpdaterHandle` whose `reload()` converges the running pairs onto the run's config as it
+  is (the one read from the file at start, with every change made since through the
+  backoffice or the handle; the file is not read again) and answers with the reload's
+  summary or its rejection (exactly what the backoffice's `POST /api/reload` gets), whose
+  `shutdown()` stops it the graceful way, and whose `wait()` returns the `Outcome`. Ctrl-c
+  is the caller's to wire to `shutdown()` on that path, as it is with `shutdown_on`. The handle's
+  `halt(tokens, reason)` and `resume(tokens)` are a kill switch. A halt is immediate: the
+  pair's lane withdraws its quote at every builder on its next tick, with no reload, no RPC
+  call and no other pair's check in the way, and no wait for a change in flight. It is then
+  written to the config file as `halted = true` with `halt_reason` beside it, so no later
+  reload undoes it and it survives a restart (a `Latch` trip is cleared by the pair's re-arm
+  and by any restart, so a kill switch is never built on one). A resume is a checked change
+  like any other. The file is rewritten in full in the backoffice's canonical form, so
+  comments in it are not kept, and both are refused in `--mode node`. The handle's
+  `rearm(tokens)` is how a binary brings back a pair its circuit breaker (or any trip)
+  halted, as `POST /api/pairs/{key_env}/rearm` does on the backoffice; `reload()` leaves
+  such a pair halted. The lane is restarted from its stanza as the run's config has it then
+  and trusts the price it finds, which the answer names beside the trip it clears. It is
+  checked like any change that starts a pair, so it can be refused, and it changes nothing
+  in the file. It is refused for a pair halted rather than tripped (that is `resume`'s) and
+  in `--mode node`, and leaves a pair that is not tripped as it is.
+  `--help` and a usage error come
   back from `from_env` as a `clap::Error` to `print()` and exit with its code (0 for help),
   not to propagate with `?`: the doc example on `UpdaterBuilder::run` is the whole pattern.
   A binary with flags of its own puts `#[command(flatten)] updater: Args` in its clap
@@ -204,8 +236,6 @@ What to know:
   hands `cli.updater` to `run`: precedence and the blank-variable rule hold on that path
   too, because `Args` records what was given inside clap's own parse. `Args::config_path()`
   is the one setting read back, for a file of the binary's own beside the updater's.
-  `systemd_unit("name")` puts your unit into the operator hints (how to reload after a
-  halt, how to restart after a settings change); without it they say `SIGHUP`.
   Logs are `tracing` events: `run_from_env()` installs `quote_updater::output::layer_for(..)`
   for this crate's lines and the targets named with `log_target`; a binary with a
   subscriber of its own adds `output::layer()` (or `layer_for`) to a registry-based
