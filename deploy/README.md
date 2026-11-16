@@ -53,10 +53,11 @@ once per distinct error while polling carries the head.
 | alertmanager | `127.0.0.1:9093` | routes pages and tickets to `#propamm-alerts` |
 | postgres | compose network only | the `feed` schema the recorder writes (quotes, mids, vault balances, config history) |
 
-Neither the backoffice nor Grafana has a login worth the name (Grafana's admin password is
-in `.env`; the backoffice has none), so publish them on this host's tailnet address and
-nothing else: `BACKOFFICE_BIND` and `GRAFANA_BIND` in `.env`. Left at `127.0.0.1` they are
-reachable from the host only, or through an ssh tunnel.
+The backoffice has no login at all. Grafana has one, a single `admin` account whose
+password is `GRAFANA_ADMIN_PASSWORD` in `.env`, and that is all that stands in front of the
+dashboards and the recorder's database behind them. Publish both on this host's tailnet
+address and nothing else: `BACKOFFICE_BIND` and `GRAFANA_BIND` in `.env`. Left at
+`127.0.0.1` they are reachable from the host only, or through an ssh tunnel.
 
 ## HTTPS for the backoffice
 
@@ -127,7 +128,7 @@ secret. [docs/manual.md](../docs/manual.md), "The backoffice", has the rest.
 docker compose logs -f updater                 # the run
 docker compose run --rm updater --check        # after editing config/config.toml by hand
 docker compose restart updater                 # then this: the file is read only at start
-curl -X POST -H 'Content-Type: application/json' http://<BACKOFFICE_BIND>:8088/api/reload   # re-arm pairs halted by their breaker (https://<name>:8088 with HTTPS)
+curl -X POST -H 'Content-Type: application/json' http://<BACKOFFICE_BIND>:8088/api/pairs/<key_env>/rearm   # re-arm a pair halted by its breaker, once its feed is trusted (https://<name>:8088 with HTTPS)
 docker compose up -d updater                   # after editing .env (keys, RPC_WS_URL); restart would not
 docker compose pull && docker compose up -d    # newer Prometheus, Alertmanager, Grafana, Postgres
 docker compose build updater && docker compose up -d updater   # a new build of the updater

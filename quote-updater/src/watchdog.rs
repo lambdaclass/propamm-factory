@@ -88,7 +88,7 @@ pub(crate) fn halt_notice(
     (halted, waiting, total): (usize, usize, usize),
     backoffice: Option<&str>,
     sources: &[(&'static str, Cause)],
-    reload_hint: &str,
+    rearm_hint: &str,
 ) -> String {
     let named = describe_sources(sources);
     // Not a breaker story, and telling it as one sends the operator to look at feeds they
@@ -111,14 +111,14 @@ pub(crate) fn halt_notice(
             None => format!(
                 "nothing is quoting: {halted}/{total} pair(s) halted on their circuit \
                  breaker, {waiting} waiting to restart. NOT exiting, because a restart would \
-                 clear the breakers; check those feeds and reload once you trust them \
-                 ({reload_hint})"
+                 clear the breakers; check those feeds and re-arm each pair once you trust \
+                 it ({rearm_hint})"
             ),
             Some(named) => format!(
                 "nothing is quoting: {halted}/{total} pair(s) halted: {named}, {waiting} \
                  waiting to restart. NOT exiting, because a restart would clear the latches; \
-                 check those lanes and reload once you trust them \
-                 ({reload_hint})"
+                 check those lanes and re-arm each pair once you trust it \
+                 ({rearm_hint})"
             ),
         };
     }
@@ -131,13 +131,13 @@ pub(crate) fn halt_notice(
     match &named {
         None => format!(
             "{halted}/{total} pair(s) halted on their circuit breaker, {quoting} still \
-             quoting{waiting}. Check that feed and reload once you trust it \
-             ({reload_hint})"
+             quoting{waiting}. Check that feed and re-arm the pair once you trust it \
+             ({rearm_hint})"
         ),
         Some(named) => format!(
             "{halted}/{total} pair(s) halted: {named}; {quoting} still quoting{waiting}. \
-             Check those lanes and reload once you trust them \
-             ({reload_hint})"
+             Check those lanes and re-arm each pair once you trust it \
+             ({rearm_hint})"
         ),
     }
 }
@@ -186,7 +186,7 @@ mod tests {
             counts,
             backoffice,
             sources,
-            "POST http://100.64.1.2:8088/api/reload",
+            "POST http://100.64.1.2:8088/api/pairs/<key_env>/rearm",
         )
     }
 
@@ -198,17 +198,18 @@ mod tests {
         assert_eq!(
             old,
             "1/2 pair(s) halted on their circuit breaker, 1 still quoting. Check that feed \
-             and reload once you trust it (POST http://100.64.1.2:8088/api/reload)"
+             and re-arm the pair once you trust it (POST \
+             http://100.64.1.2:8088/api/pairs/<key_env>/rearm)"
         );
-        // A run with no backoffice is told whatever its caller can reload it with, in the
+        // A run with no backoffice is told whatever its caller can re-arm it with, in the
         // same place.
         let handle = halt_notice(
             (1, 0, 2),
             None,
             &[("deviation", Cause::Guard)],
-            "UpdaterHandle::reload",
+            "UpdaterHandle::rearm",
         );
-        assert!(handle.ends_with("(UpdaterHandle::reload)"), "{handle}");
+        assert!(handle.ends_with("(UpdaterHandle::rearm)"), "{handle}");
         let new = notice(
             (2, 0, 3),
             None,
@@ -217,15 +218,16 @@ mod tests {
         assert_eq!(
             new,
             "2/3 pair(s) halted: 1 on `deviation`, 1 on a panic in `funding`; 1 still \
-             quoting. Check those lanes and reload once you trust them (POST \
-             http://100.64.1.2:8088/api/reload)"
+             quoting. Check those lanes and re-arm each pair once you trust it (POST \
+             http://100.64.1.2:8088/api/pairs/<key_env>/rearm)"
         );
         let external = notice((1, 0, 1), None, &[("kill", Cause::External)]);
         assert_eq!(
             external,
             "nothing is quoting: 1/1 pair(s) halted: 1 on `kill` (external), 0 waiting to \
              restart. NOT exiting, because a restart would clear the latches; check those \
-             lanes and reload once you trust them (POST http://100.64.1.2:8088/api/reload)"
+             lanes and re-arm each pair once you trust it (POST \
+             http://100.64.1.2:8088/api/pairs/<key_env>/rearm)"
         );
     }
 
@@ -366,9 +368,9 @@ mod tests {
             );
         }
         let partial = notice((1, 0, 3), None, &[("deviation", Cause::Guard)]);
-        // Names the remedy, and specifically the reload rather than the restart it replaced:
-        // restarting to recover one lane clears every other lane's breaker on the way.
-        for expected in ["1/3", "2 still quoting", "reload"] {
+        // Names the remedy, and specifically the pair's re-arm rather than a restart, which
+        // to recover one lane clears every other lane's breaker on the way.
+        for expected in ["1/3", "2 still quoting", "re-arm"] {
             assert!(
                 partial.contains(expected),
                 "missing {expected:?}: {partial}"

@@ -6,9 +6,10 @@ pragma solidity ^0.8.35;
 /// nowhere and quote/swap revert. Serves one lane's worth of state, set with `setState`, and
 /// enforces no freshness window. `make local` runs the real registry instead.
 contract MockPUR {
-    /// Records what `initialize` registered. The real registry gates who may push updates on
-    /// this; the mock only remembers, so the calls have somewhere to land and can be asserted on.
-    mapping(address => bool) public isUpdater;
+    /// Records what each instance registered, per target (the calling instance), like the real
+    /// registry: PropAMM reads it back to refuse no-op `addUpdater`/`removeUpdater` calls. The
+    /// real registry also gates who may push updates on this; the mock only remembers.
+    mapping(address target => mapping(address updater => bool)) public isUpdater;
 
     /// The two slots PropAMM reads: the fractional spread and the mid price. Storage rather than
     /// immutables, so a mock installed with vm.etch can still be configured.
@@ -36,10 +37,10 @@ contract MockPUR {
     }
 
     function addUpdater(address updater) external {
-        isUpdater[updater] = true;
+        isUpdater[msg.sender][updater] = true;
     }
 
     function removeUpdater(address updater) external {
-        isUpdater[updater] = false;
+        isUpdater[msg.sender][updater] = false;
     }
 }

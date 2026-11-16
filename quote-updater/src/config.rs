@@ -134,6 +134,12 @@ pub fn write_raw_atomically(path: &Path, config: &RawConfig) -> Result<()> {
     // now, expensive at the next reload.
     parse_file_settings(&rendered).wrap_err("the rendered config does not parse back")?;
 
+    write_bytes_atomically(path, rendered.as_bytes())
+}
+
+/// [`write_raw_atomically`] for bytes already rendered: how a rejected change puts back the
+/// file it replaced, exactly as it was.
+pub(crate) fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let tmp = dir.join(format!(
         ".{}.tmp",
@@ -154,7 +160,7 @@ pub fn write_raw_atomically(path: &Path, config: &RawConfig) -> Result<()> {
         let mut file = options
             .open(&tmp)
             .wrap_err_with(|| format!("failed to open {}", tmp.display()))?;
-        file.write_all(rendered.as_bytes())
+        file.write_all(bytes)
             .wrap_err_with(|| format!("failed to write {}", tmp.display()))?;
         // Before the rename: otherwise a crash could leave an empty file at the real path.
         file.sync_all()
@@ -669,7 +675,7 @@ fn parse_threshold(fraction: &str, price_decimals: u32, key: &str, at: &str) -> 
         "{at}: {key} {fraction} is zero at {price_decimals} decimals, so the second \
          price would trip it and halt the pair"
     );
-    // Digits beyond `--price-decimals` are dropped by `parse_decimal_scaled`, which
+    // Digits beyond the price's decimals are dropped by `parse_decimal_scaled`, which
     // quietly tightens the guard: 0.0000015 at 6 decimals reads as 0.000001. A threshold
     // that is not what the config says is the misconfiguration the zero and upper-bound
     // checks exist to prevent, so it is refused the same way. Trailing zeros are not
@@ -679,9 +685,9 @@ fn parse_threshold(fraction: &str, price_decimals: u32, key: &str, at: &str) -> 
         .map_or(0, |(_, digits)| digits.trim_end_matches('0').len());
     ensure!(
         fraction_digits <= price_decimals as usize,
-        "{at}: {key} {fraction} has more decimal digits than the {price_decimals} \
-         decimals of --price-decimals can hold, so it would be read as {read}; use at most \
-         {price_decimals} decimals, or raise --price-decimals",
+        "{at}: {key} {fraction} has more decimal digits than the {price_decimals} a \
+         published price is scaled by, so it would be read as {read}; use at most \
+         {price_decimals} decimals",
         read = format_scaled(threshold_scaled, price_decimals)
     );
     // Bounded above as well as below, and for the same reason. Every line of prose about
@@ -2098,6 +2104,7 @@ disable_cross_region = false
         let actions = crate::reload::plan(
             &running,
             &desired.pairs,
+            &std::collections::BTreeSet::new(),
             &std::collections::BTreeSet::new(),
             false,
         );

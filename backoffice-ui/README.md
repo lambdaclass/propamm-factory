@@ -82,11 +82,22 @@ must be listed with `--backoffice-host`:
 
 ```
 pusher.your-tailnet.ts.net {
+	header Content-Security-Policy "frame-ancestors 'none'"
+	header X-Frame-Options DENY
 	reverse_proxy /api/* 100.64.1.2:8088
 	root * /srv/backoffice-ui/dist
 	file_server
 }
 ```
+
+**Never in another site's frame.** Whatever serves `dist/` should send
+`Content-Security-Policy: frame-ancestors 'none'` (and `X-Frame-Options: DENY` for older
+browsers), as above, so no other site can show the page invisibly inside its own and have an
+operator's click land on one of its buttons. The page's own `<meta>` policy cannot say this:
+browsers take it only from a response header. The page also refuses to run when it finds
+itself in a frame, and every action that changes something asks first, which a browser does
+not show for a framed page; the header is what stops it being loaded there at all. `pnpm
+dev` and `pnpm preview` send it.
 
 **From another origin**, with any static file server, and that origin listed with
 `--backoffice-cors-origin` (`BACKOFFICE_CORS_ORIGINS`) exactly as the browser's address bar

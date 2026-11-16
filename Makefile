@@ -12,11 +12,21 @@ endif
 
 ifneq ($(NIX),)
 
+# `make` here, not $(MAKE): $(MAKE) is the path of the make that read this file, the
+# host's, and inside the shell it is the shell's own that has to run (flake.nix lists
+# gnumake). On macOS the host's is the Command Line Tools' wrapper, which looks for
+# gnumake under DEVELOPER_DIR; the shell points that at its own SDK, which has none, so
+# every target died with `execv(.../usr/bin/gnumake): No such file or directory`.
+# Variables given on the command line still reach the inner make, through MAKEFLAGS.
+#
+# The `+` says what naming $(MAKE) said by itself, that the line is a make: it is run
+# under `make -n` too, where the inner make then lists the target's commands and runs
+# none.
 default:
-	@$(NIX) develop --command $(MAKE) --no-print-directory
+	+@$(NIX) develop --command make --no-print-directory
 
 $(filter-out install-nix shell,$(MAKECMDGOALS)):
-	@$(NIX) develop --command $(MAKE) --no-print-directory $@
+	+@$(NIX) develop --command make --no-print-directory $@
 
 shell:
 	$(NIX) develop
@@ -174,6 +184,14 @@ local: local-down build .local/priority-update-registry
 		| awk '/Deployed to:/ {print $$3}'); \
 	cast rpc anvil_setCode $(PUR_ADDR) "$$(cast code $$PUR_TMP --rpc-url $(RPC_URL))" \
 		--rpc-url $(RPC_URL)
+	@# Token code next, also before any PropAMM: `_addPair` refuses a pair token without
+	@# code, so the mintable mock ERC20 has to be at both mainnet token addresses before
+	@# Deploy.s.sol lists USDC/USDT. anvil_setCode is not a transaction, so the deployer's
+	@# nonce, and with it LOCAL_FACTORY, stays where it was.
+	cast rpc anvil_setCode $(USDC) \
+		$$(cd contracts && forge inspect MockERC20 deployedBytecode) --rpc-url $(RPC_URL)
+	cast rpc anvil_setCode $(USDT) \
+		$$(cd contracts && forge inspect MockERC20 deployedBytecode) --rpc-url $(RPC_URL)
 	@# Deploy the factory and create the first PropAMM through it: vault, anvil account 0 as
 	@# the price updater, USDC/USDT as the pair.
 	cd contracts && VAULT_ADDRESS=$(VAULT_ADDRESS) UPDATER_ADDRESS=$(ANVIL_ADDR) \
@@ -184,16 +202,14 @@ local: local-down build .local/priority-update-registry
 	@test "$$(cast code $(LOCAL_FACTORY) --rpc-url $(RPC_URL))" != "0x" || { \
 		echo "No code at $(LOCAL_FACTORY): anvil was probably not fresh. Re-run 'make local'."; \
 		exit 1; }
-	@# Swaps move real tokens, so put a mintable mock ERC20 at both mainnet token addresses,
-	@# give the trader (account 0) USDC and the vault USDT, and set the one approval swap's
+	@# Swaps move real tokens (the mock ERC20s set up before Deploy): give the trader
+	@# (account 0) USDC and the vault USDT, and set the one approval swap's
 	@# transferFrom needs: the vault lets PropAMM push USDT to the recipient. The input side
 	@# needs no approval: swaps are push-payment (the trader transfers tokenIn to PropAMM
 	@# before calling swap, which forwards it to the vault) — see `make swap`.
-	cast rpc anvil_setCode $(USDC) \
-		$$(cd contracts && forge inspect MockERC20 deployedBytecode) --rpc-url $(RPC_URL)
-	cast rpc anvil_setCode $(USDT) \
-		$$(cd contracts && forge inspect MockERC20 deployedBytecode) --rpc-url $(RPC_URL)
-	@# setCode copies no storage, so the tokens' names come separately.
+	@# setCode copies no storage, so the tokens' names come separately. These are transactions
+	@# from the deployer, so they stay after Deploy.s.sol: before it they would move the
+	@# factory off LOCAL_FACTORY.
 	cast send $(USDC) 'setMeta(string,string,uint8)' "USD Coin" USDC 18 \
 		--private-key $(ANVIL_KEY) --rpc-url $(RPC_URL) >/dev/null
 	cast send $(USDT) 'setMeta(string,string,uint8)' "Tether USD" USDT 18 \

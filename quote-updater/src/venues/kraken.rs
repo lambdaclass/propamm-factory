@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::venue::{Connection, Keepalive, Quote};
-use crate::venues::{rfc3339_utc, unwrap_alias};
+use crate::venues::{book_stamp, unwrap_alias};
 
 pub const DEFAULT_ENDPOINT: &str = "wss://ws.kraken.com/v2";
 
@@ -77,13 +77,10 @@ pub fn parse_stamped(text: &str) -> Result<Option<(Quote, Option<SystemTime>)>> 
             let ticker = data
                 .pop()
                 .ok_or_else(|| eyre!("ticker frame without data"))?;
-            Ok(Some((
-                Quote::Book {
-                    bid: ticker.bid.get().trim_matches('"').to_owned(),
-                    ask: ticker.ask.get().trim_matches('"').to_owned(),
-                },
-                ticker.timestamp.as_deref().and_then(rfc3339_utc),
-            )))
+            let bid = ticker.bid.get().trim_matches('"').to_owned();
+            let ask = ticker.ask.get().trim_matches('"').to_owned();
+            let stamp = book_stamp(&bid, &ask, ticker.timestamp.as_deref());
+            Ok(Some((Quote::Book { bid, ask }, stamp)))
         }
         // heartbeat, status, and method replies (subscribe ack, pong).
         _ => Ok(None),
@@ -97,6 +94,7 @@ pub fn expected_symbol(base: &str, quote: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::venues::rfc3339_utc;
 
     #[test]
     fn subscribes_with_a_json_ping() {

@@ -275,7 +275,13 @@ async function overview(root) {
           "Resumes the pairs halted from here and starts any pair that is not running. It re-arms " +
           "no tripped breaker: that is each pair's own Re-arm. A pair halted with a " +
           "reason (a binary's kill switch) resumes only from its own row.",
-        onclick: (e) => act(e.currentTarget, null, api.reload, refreshAll),
+        onclick: (e) =>
+          act(
+            e.currentTarget,
+            "Restart halted pairs? Every pair halted from here starts quoting again at every builder.",
+            api.reload,
+            refreshAll,
+          ),
       }, "Restart halted pairs"),
       refreshed,
     ),
@@ -537,11 +543,21 @@ async function showConnection() {
   }
 }
 
-await configure();
-await auth.start(api.auth);
-showConnection();
-const show = () => render().then(showWho);
-onRerender(show);
-window.addEventListener("hashchange", show);
-booted = true;
-render().then(showWho);
+// Never inside another site's frame: a page that loads this one invisibly can put its own
+// button over one of these and borrow an operator's click. The server should refuse to be
+// framed too (README.md, "Deploying"); this holds where it does not.
+if (window.top !== window.self) {
+  clear(view).append(
+    h("p", { class: "banner banner-err", role: "alert" },
+      "The backoffice does not run inside another page's frame. Open it in its own tab."),
+  );
+} else {
+  await configure();
+  await auth.start(api.auth);
+  showConnection();
+  const show = () => render().then(showWho);
+  onRerender(show);
+  window.addEventListener("hashchange", show);
+  booted = true;
+  render().then(showWho);
+}

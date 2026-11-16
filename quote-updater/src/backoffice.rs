@@ -31,10 +31,11 @@
 //! | `GET /api/pairs/{key_env}`        | one pair                                         |
 //! | `PUT /api/pairs/{key_env}`        | replaces a pair's stanza                         |
 //! | `DELETE /api/pairs/{key_env}`     | removes a pair                                   |
-//! | `POST /api/pairs/{key_env}/halt`  | stops a pair quoting, keeping it                 |
+//! | `POST /api/pairs/{key_env}/halt`  | stops a pair quoting at once, keeping it         |
 //! | `POST /api/pairs/{key_env}/resume`| clears a halt                                    |
+//! | `POST /api/pairs/{key_env}/rearm` | brings back a pair its circuit breaker halted    |
 //! | `POST /api/halt`                  | halts every pair                                 |
-//! | `POST /api/reload`                | restarts the pairs halted here, re-arms the rest |
+//! | `POST /api/reload`                | restarts the pairs halted here, retries the rest |
 //! | `GET /api/builders`               | every builder, without its API key               |
 //! | `POST /api/builders`              | adds a builder                                   |
 //! | `DELETE /api/builders/{name}`     | removes a builder                                |
@@ -45,9 +46,11 @@
 //! | `GET /api/preview`                | a websocket of live venue mids; saves nothing    |
 //!
 //! A change answers `{"status": "applied" | "partial", "message": ...}` with a 2xx; a
-//! `partial` one is kept, though some pair kept its previous config (see
+//! `partial` one is kept, though some pair kept its previous config or was stopped (see
 //! [`ReloadFailure::Partial`]). Anything refused answers `{"error": ...}` with a 4xx, and
-//! changed nothing.
+//! changed nothing. A fault on this side answers `{"error": ...}` with a 5xx: 500 for a
+//! change that could not be made (see [`ReloadFailure::Fault`]), 502 for a lookup that
+//! could not ask the chain or the venues.
 
 use std::{
     net::SocketAddr,
@@ -301,6 +304,7 @@ async fn bind_with(
         )
         .route("/api/pairs/{key_env}/halt", post(halt_pair))
         .route("/api/pairs/{key_env}/resume", post(resume_pair))
+        .route("/api/pairs/{key_env}/rearm", post(rearm_pair))
         .route("/api/halt", post(halt_all))
         .route("/api/reload", post(reload))
         .route("/api/builders", get(list_builders).post(add_builder))
@@ -514,6 +518,16 @@ impl ApiError {
     fn invalid(message: impl Into<String>) -> Self {
         Self::new(StatusCode::UNPROCESSABLE_ENTITY, message)
     }
+
+    /// Nothing wrong with the request: this side could not do it.
+    fn fault(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, message)
+    }
+
+    /// Something this API asks on the caller's behalf (the chain, a venue) did not answer.
+    fn upstream(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_GATEWAY, message)
+    }
 }
 
 /// A body that is not JSON, or not the shape the route takes, says so in serde's words.
@@ -535,7 +549,10 @@ impl IntoResponse for ApiError {
 
 /// What a change answers. A partial apply is a 2xx, because the change is kept (a retry
 /// would find it already made), and says `partial` rather than `applied`, because a pair
-/// still runs its previous config. A rejection is a 422: nothing changed.
+/// still runs its previous config, or was not started or stopped. A rejection is a 422:
+/// nothing changed. A fault on this side (the config file could not be written or put
+/// back, the pusher is stopping) is a 500, so a client can tell it from a change it should
+/// fix.
 fn respond(result: std::result::Result<String, Refused<ApiError>>, created: bool) -> Response {
     let kept = if created {
         StatusCode::CREATED
@@ -552,6 +569,9 @@ fn respond(result: std::result::Result<String, Refused<ApiError>>, created: bool
         }
         Err(Refused::Reload(ReloadFailure::Rejected(message))) => {
             ApiError::invalid(message).into_response()
+        }
+        Err(Refused::Reload(ReloadFailure::Fault(message))) => {
+            ApiError::fault(message).into_response()
         }
         Err(Refused::Change(err)) => err.into_response(),
     }
@@ -581,7 +601,8 @@ enum PairStatus {
     Live,
     /// Halted in the config: kept, not quoting.
     Halted,
-    /// Running, but its circuit breaker tripped: not quoting until a reload re-arms it.
+    /// Running, but its circuit breaker tripped: not quoting until its own re-arm brings it
+    /// back (`POST /api/pairs/{key_env}/rearm`).
     BreakerTripped,
     /// In the config, with no task: its feed never came up, say. A reload tries again.
     NotRunning,
@@ -771,18 +792,36 @@ async fn remove_pair(
     .await
 }
 
-/// Stops a pair quoting and keeps it, with every setting, in the config. The reload treats
-/// it as gone, so its quote is withdrawn at every builder exactly as a removal would.
+/// Stops a pair quoting and keeps it, with every setting, in the config: the kill switch
+/// (audit F-06, `SharedConfig::halt`). Its lane withdraws its quote at every builder on its
+/// next tick, with no reload, no RPC call and no other pair's check in the way, so it is
+/// never refused for another pair's sake and never waits on the chain; then the halt is
+/// recorded, in the config and the file.
 async fn halt_pair(
     State(state): State<Backoffice>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(key_env): Path<String>,
 ) -> Response {
-    apply(&state, peer, false, move |config| {
-        set_halted(config, Some(&key_env), true)?;
-        Ok(format!("halted pair {key_env}"))
-    })
-    .await
+    let by = format!("backoffice: {peer}");
+    let halted = state
+        .config
+        .halt(
+            &by,
+            move |config| {
+                let pair = config
+                    .pairs
+                    .iter()
+                    .find(|pair| pair.key_env == key_env)
+                    .ok_or_else(|| no_pair(&key_env))?;
+                if pair.halted {
+                    return Err(ApiError::conflict("already halted"));
+                }
+                Ok((vec![key_env.clone()], format!("halted pair {key_env}")))
+            },
+            None,
+        )
+        .await;
+    respond(halted, false)
 }
 
 async fn resume_pair(
@@ -797,15 +836,95 @@ async fn resume_pair(
     .await
 }
 
+/// Brings back a pair its circuit breaker halted (audit F-17): its lane is restarted from
+/// its stanza as it is and trusts the price it finds, which the answer names beside the trip
+/// it clears. Nothing else re-arms a breaker, a reload included, so this is someone deciding
+/// about this one pair, with that price in front of them. Checked like any change starting a
+/// pair, so it can be refused.
+async fn rearm_pair(
+    State(state): State<Backoffice>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(key_env): Path<String>,
+) -> Response {
+    let tripped = running(&state.states);
+    let rearmed = state
+        .config
+        .rearm(|config| {
+            let pair = config
+                .pairs
+                .iter()
+                .find(|pair| pair.key_env == key_env)
+                .ok_or_else(|| no_pair(&key_env))?;
+            if pair.halted {
+                return Err(ApiError::conflict(format!(
+                    "pair {key_env} is halted, not tripped; resume it with POST \
+                     /api/pairs/{key_env}/resume"
+                )));
+            }
+            if tripped.get(&key_env) != Some(&true) {
+                return Err(ApiError::conflict(format!(
+                    "pair {key_env} is not halted on its circuit breaker; there is nothing to \
+                     re-arm"
+                )));
+            }
+            Ok((vec![key_env.clone()], format!("re-armed pair {key_env}")))
+        })
+        .await;
+    if let Ok(line) = &rearmed {
+        tracing::info!("backoffice: {peer} {line}");
+    }
+    respond(rearmed, false)
+}
+
+/// The tail of a reload's answer naming the pairs left halted on their circuit breaker,
+/// which a reload no longer brings back (audit F-17); empty when there are none.
+fn tripped_note(states: &PairStates, config: &RawConfig) -> String {
+    let running = running(states);
+    let tripped: Vec<&str> = config
+        .pairs
+        .iter()
+        .filter(|pair| !pair.halted && running.get(&pair.key_env) == Some(&true))
+        .map(|pair| pair.key_env.as_str())
+        .collect();
+    if tripped.is_empty() {
+        return String::new();
+    }
+    format!(
+        ". Left halted on their circuit breaker, each to be re-armed with POST \
+         /api/pairs/{{key_env}}/rearm once its feed is trusted: {}",
+        tripped.join(", ")
+    )
+}
+
+/// [`halt_pair`], for every pair not halted already.
 async fn halt_all(
     State(state): State<Backoffice>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
 ) -> Response {
-    apply(&state, peer, false, |config| {
-        set_halted(config, None, true)?;
-        Ok("halted every pair".to_owned())
-    })
-    .await
+    let by = format!("backoffice: {peer}");
+    let halted = state
+        .config
+        .halt(
+            &by,
+            |config| {
+                if config.pairs.is_empty() {
+                    return Err(ApiError::conflict("there are no pairs to halt"));
+                }
+                let keys: Vec<String> = config
+                    .pairs
+                    .iter()
+                    .filter(|pair| !pair.halted)
+                    .map(|pair| pair.key_env.clone())
+                    .collect();
+                if keys.is_empty() {
+                    return Err(ApiError::conflict("already halted"));
+                }
+                Ok((keys, "halted every pair".to_owned()))
+            },
+            None,
+        )
+        .await;
+    respond(halted, false)
 }
 
 /// A reload with no edit behind it: covers the ways the running pairs drift from the
@@ -828,7 +947,11 @@ async fn reload(
         .pairs
         .iter()
         .any(|pair| pair.halted && !is_explained(pair));
-    let kept = explained_halts(&current);
+    let kept = format!(
+        "{}{}",
+        explained_halts(&current),
+        tripped_note(&state.states, &current)
+    );
     if any_flagged {
         let mut result = editing
             .change(&by, |config| {
@@ -864,6 +987,9 @@ async fn reload(
         Err(ReloadFailure::Rejected(err)) => Err(Refused::Reload(ReloadFailure::Rejected(
             format!("the reload was rejected: {err}"),
         ))),
+        Err(ReloadFailure::Fault(err)) => Err(Refused::Reload(ReloadFailure::Fault(format!(
+            "the reload was not made: {err}"
+        )))),
     };
     respond(result, false)
 }
@@ -1027,10 +1153,7 @@ async fn lookup_pair(State(state): State<Backoffice>, Query(tokens): Query<Token
         config::parse_address(tokens.token0.trim()),
         config::parse_address(tokens.token1.trim()),
     ) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "token addresses are not valid"})),
-        )
+        return ApiError::new(StatusCode::BAD_REQUEST, "token addresses are not valid")
             .into_response();
     };
     let (base_symbol, quote_symbol) = tokio::join!(
@@ -1052,12 +1175,11 @@ async fn lookup_pair(State(state): State<Backoffice>, Query(tokens): Query<Token
             "could not read symbol() from both tokens on chain, so their names are unknown"
         )),
     };
-    let (found, error) = match found {
-        Ok(found) => (found, None),
-        Err(err) => (
-            crate::discover::Discovery::default(),
-            Some(format!("{err:#}")),
-        ),
+    // A lookup that could not be made is an error like any other here, and not a 200 a
+    // client has to open to find out: what it asks (the chain, the venues) did not answer.
+    let found = match found {
+        Ok(found) => found,
+        Err(err) => return ApiError::upstream(format!("{err:#}")).into_response(),
     };
     let venues: Vec<serde_json::Value> = VenueId::ALL
         .iter()
@@ -1080,9 +1202,11 @@ async fn lookup_pair(State(state): State<Backoffice>, Query(tokens): Query<Token
             })
         })
         .collect();
+    // `ok` and `error` are what a failed lookup used to answer with a 200; kept, constant,
+    // for a client written against that.
     Json(serde_json::json!({
-        "ok": error.is_none(),
-        "error": error,
+        "ok": true,
+        "error": null,
         "swapped": found.swapped,
         "base": found.base_symbol,
         "quote": found.quote_symbol,
@@ -1548,7 +1672,9 @@ mod tests {
         edit(&mut config);
         config::write_raw_atomically(&path, &config).unwrap();
         let (tx, rx) = tokio::sync::mpsc::channel(1);
-        (Arc::new(SharedConfig::new(path, config, tx)), rx)
+        // No service here to retire a halted lane: the notice goes nowhere.
+        let (halts, _) = tokio::sync::mpsc::unbounded_channel();
+        (Arc::new(SharedConfig::new(path, config, tx, halts)), rx)
     }
 
     /// The service, answering every reload it is asked for with `verdict`. It keeps
@@ -1846,15 +1972,14 @@ mod tests {
         .await;
         let before = std::fs::read_to_string(config.path()).unwrap();
 
-        let (status, body) =
-            call(local, "POST", &format!("/api/pairs/{WETH_USDC}/halt"), None).await;
+        let (status, body) = call(local, "DELETE", &format!("/api/pairs/{WETH_USDC}"), None).await;
 
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
         let error = body["error"].as_str().unwrap();
         assert!(error.contains("preflight failed"), "{error}");
         assert!(error.contains("nothing changed"), "{error}");
         assert_eq!(std::fs::read_to_string(config.path()).unwrap(), before);
-        assert!(!config.snapshot().pairs[0].halted);
+        assert_eq!(config.snapshot().pairs.len(), 1);
     }
 
     /// One the service applied in part is kept, and says `partial` rather than `applied`.
@@ -1869,8 +1994,7 @@ mod tests {
         )
         .await;
 
-        let (status, body) =
-            call(local, "POST", &format!("/api/pairs/{WETH_USDC}/halt"), None).await;
+        let (status, body) = call(local, "DELETE", &format!("/api/pairs/{WETH_USDC}"), None).await;
 
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["status"], "partial", "{body}");
@@ -1878,8 +2002,85 @@ mod tests {
             body["message"].as_str().unwrap().contains("is kept"),
             "{body}"
         );
+        assert!(config.snapshot().pairs.is_empty());
+        assert!(config::load_raw(config.path()).unwrap().pairs.is_empty());
+    }
+
+    /// A halt is the kill switch, not a converged change (audit F-06): a service that would
+    /// reject every change, as one with a pair failing its checks does, is not asked, and
+    /// the halt is recorded in the config and the file all the same.
+    #[tokio::test]
+    async fn a_halt_is_not_refused_by_a_service_that_refuses_every_change() {
+        let (local, config) = serve(
+            "halt-not-refused",
+            |_| {},
+            Err(ReloadFailure::Rejected(
+                "preflight failed: another pair is not authorized".to_owned(),
+            )),
+        )
+        .await;
+
+        let (status, body) =
+            call(local, "POST", &format!("/api/pairs/{WETH_USDC}/halt"), None).await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "applied", "{body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("withdrawn at every builder"),
+            "{body}"
+        );
         assert!(config.snapshot().pairs[0].halted);
         assert!(config::load_raw(config.path()).unwrap().pairs[0].halted);
+        let (status, _) = call(local, "POST", &format!("/api/pairs/{WETH_USDC}/halt"), None).await;
+        assert_eq!(status, StatusCode::CONFLICT, "already halted");
+    }
+
+    /// A change that could not be made through no fault of its own (here, a pusher that is
+    /// stopping) is a 500, apart from the 422 of a change to fix, and leaves everything as
+    /// it was.
+    #[tokio::test]
+    async fn a_fault_on_this_side_is_a_500_and_not_the_changes_mistake() {
+        let (local, config) = serve(
+            "fault",
+            |_| {},
+            Err(ReloadFailure::Fault("the pusher is stopping".to_owned())),
+        )
+        .await;
+        let before = std::fs::read_to_string(config.path()).unwrap();
+
+        let (status, body) = call(local, "DELETE", &format!("/api/pairs/{WETH_USDC}"), None).await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        let error = body["error"].as_str().unwrap();
+        assert!(error.contains("the pusher is stopping"), "{error}");
+        assert_eq!(std::fs::read_to_string(config.path()).unwrap(), before);
+        assert_eq!(config.snapshot().pairs.len(), 1);
+    }
+
+    /// A lookup that could not be made (here, no node to read the tokens' names from)
+    /// answers an error status and `{"error"}`, like everything else this API refuses, and
+    /// not a 200 to be opened.
+    #[tokio::test]
+    async fn a_lookup_that_cannot_be_made_is_an_error_and_not_a_200() {
+        let (local, _config) = serve("lookup-fails", |_| {}, accepted()).await;
+
+        let (status, body) = call(
+            local,
+            "GET",
+            &format!("/api/lookup?token0={USDC}&token1={USDT}"),
+            None,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("symbol()"),
+            "{body}"
+        );
+        assert!(body.get("ok").is_none(), "{body}");
     }
 
     /// The guard: a change only as JSON, and never from another site's page, whatever its
@@ -2274,6 +2475,94 @@ mod tests {
         // And an IP address, which needs no listing.
         let (status, body) = call(local, "GET", "/api/pairs", None).await;
         assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// Audit F-17: a pair halted on its breaker comes back only through its own re-arm, which
+    /// the service is asked for by lane, with the config as it is. A pair that is not
+    /// tripped, one halted rather than tripped, and one that is not there are refused
+    /// before anything is asked; and `POST /api/reload` names the tripped pairs it leaves.
+    #[tokio::test]
+    async fn a_tripped_pair_is_re_armed_by_its_own_route_alone() {
+        let (config, mut requests) = shared("rearm", |config| {
+            let mut halted = config.pairs[0].clone();
+            halted.tokens = vec![USDC.to_owned(), USDT.to_owned()];
+            halted.key_env = "UPDATER_KEY_USDC_USDT".to_owned();
+            halted.halted = true;
+            config.pairs.push(halted);
+        });
+        let states = PairStates::default();
+        let tripped = Arc::new(AtomicBool::new(false));
+        states
+            .lock()
+            .unwrap()
+            .insert(WETH_USDC.to_owned(), Arc::clone(&tripped));
+        let (local, _task) = bind(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::clone(&config),
+            test_client(),
+            states,
+            test_kinds(),
+            Access::default(),
+        )
+        .await
+        .unwrap();
+        let rearm = format!("/api/pairs/{WETH_USDC}/rearm");
+
+        let (status, body) = call(local, "POST", &rearm, None).await;
+        assert_eq!(status, StatusCode::CONFLICT, "not tripped: {body}");
+        let (status, body) = call(
+            local,
+            "POST",
+            "/api/pairs/UPDATER_KEY_USDC_USDT/rearm",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "halted, not tripped: {body}");
+        assert!(body["error"].as_str().unwrap().contains("resume"), "{body}");
+        let (status, _) = call(local, "POST", "/api/pairs/NO_SUCH_KEY/rearm", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            requests.try_recv().is_err(),
+            "nothing was asked of the service"
+        );
+
+        tripped.store(true, Ordering::SeqCst);
+        // A reload leaves it, and says so.
+        let service = tokio::spawn(async move {
+            let reload = requests.recv().await.unwrap();
+            assert!(reload.rearm.is_empty(), "a reload re-arms nothing");
+            let _ = reload.reply.send(Ok(
+                "reload: the config matches what is running; nothing to do".to_owned(),
+            ));
+            let rearm = requests.recv().await.unwrap();
+            let _ = rearm.reply.send(Ok(
+                "reload: 1 restarted; [WETH/USDC] re-armed, trusting mid 2500".to_owned(),
+            ));
+            rearm.rearm
+        });
+        let (status, body) = call(local, "POST", "/api/reload", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let message = body["message"].as_str().unwrap();
+        assert!(
+            message.contains("Left halted on their circuit breaker") && message.contains(WETH_USDC),
+            "{message}"
+        );
+
+        let (status, body) = call(local, "POST", &rearm, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("trusting mid 2500"),
+            "{body}"
+        );
+        let lanes = service.await.unwrap();
+        let weth: crate::Address = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+            .parse()
+            .unwrap();
+        let usdc: crate::Address = USDC.parse().unwrap();
+        assert_eq!(lanes, [config::lane_of(weth.min(usdc), weth.max(usdc))]);
     }
 
     /// An edit replaces the stanza and nothing that makes the pair what it is: not its key,

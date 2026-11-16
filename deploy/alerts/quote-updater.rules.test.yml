@@ -4,8 +4,8 @@
 # ../compose.yaml globs `/etc/prometheus/rules/*.rules.yml`, and it must never load a file
 # of fixtures as live rules.
 #
-# Scoped to PusherSignerNearlyDry and its level check PusherSignerDry, and PusherVenueLate
-# (at the end). The first is a `predict_linear`, which is the only
+# Scoped to PusherSignerNearlyDry and its level check PusherSignerDry, PusherVenueLate, and
+# the loss-path rules (at the end). The first is a `predict_linear`, which is the only
 # expression in the file whose *silence* is a designed behaviour rather than a side effect of
 # a comparison coming out false: one NaN sample anywhere in the range suppresses it entirely,
 # and that is what stops a failed eth_getBalance paging an operator about a key that is fine.
@@ -164,3 +164,250 @@ tests:
             exp_annotations:
               summary: "ETH/USDT: okx has been delivering prices late for 5 minutes"
               description: "This venue's prices have been arriving later behind the exchange's own timestamps than max_source_lag_ms allows for five minutes, so it is out of the pair's average. quote_updater_venue_source_lag_ms says how far behind; a steady quote_updater_venue_future_stamps_total, or every stamped venue late by about the same amount, points at this host's clock instead."
+
+  # PusherForeignLaneWrite: one read-back that found a price the pair did not sign
+  # pages, on the first one. Landings and misses, however many, do not.
+  - interval: 1m
+    name: a lane holding a price its pair did not sign pages on the first one
+    input_series:
+      - series: 'quote_updater_landings_total{pair="WBTC/USDC",result="foreign"}'
+        values: "0x5 1x40"
+      - series: 'quote_updater_landings_total{pair="WETH/USDC",result="foreign"}'
+        values: "0x45"
+      - series: 'quote_updater_landings_total{pair="WETH/USDC",result="landed"}'
+        values: "0+1x45"
+      - series: 'quote_updater_landings_total{pair="WETH/USDC",result="missed"}'
+        values: "0+3x45"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: PusherForeignLaneWrite
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: PusherForeignLaneWrite
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              pair: WBTC/USDC
+              result: foreign
+            exp_annotations:
+              summary: "WBTC/USDC: another key wrote this lane"
+              description: "The updater read this lane back after a block and found a price stamped for that block that it did not sign, in a block where this pair's own key landed nothing. Another updater key of the same PropAMM wrote the lane: the registry authorizes a key for every lane of its target, not for one pair. A fill at that price came out of this pair's vault. The updater's log names the block. Read the lane there, find the key in the registry's UpdaterAdded log for the target, revoke it with removeUpdater, and check the vault's balances."
+      # Thirty minutes on, the one occurrence has left the window.
+      - eval_time: 40m
+        alertname: PusherForeignLaneWrite
+        exp_alerts: []
+
+  # The loss-path rules (audit F-07): PusherVaultLosingValue and PusherVaultDraining,
+  # PusherVaultUnpriced, PusherVaultOneSided and PusherQuoteThroughMarket. The first two are
+  # the reason these fixtures run over two hours: the measure is a balance against itself an
+  # hour ago, so there is nothing to compare for the first hour and the loss leaves the
+  # window an hour after it happened.
+  #
+  # Vault 0xa gives away 10000 USDC at minute 71: (590000 − 600000) × 1 over a vault worth
+  # 990000 is −1.01%, past the ticket's 0.5% and short of the page's 2%. Vault 0xb's WBTC
+  # falls 10% at the same minute and its balances do not move, which is the case the measure
+  # exists to leave alone: its value drops by 5% and it reads zero.
+  - interval: 1m
+    name: a vault that gave value away raises a ticket, and a falling market does not
+    input_series:
+      - series: 'quote_updater_vault_balance{token="WETH",vault="0xa"}'
+        values: "100x161"
+      - series: 'quote_updater_vault_balance{token="USDC",vault="0xa"}'
+        values: "600000x70 590000x90"
+      - series: 'quote_updater_vault_value_usd{token="WETH",vault="0xa"}'
+        values: "400000x161"
+      - series: 'quote_updater_vault_value_usd{token="USDC",vault="0xa"}'
+        values: "600000x70 590000x90"
+      - series: 'quote_updater_vault_balance{token="WBTC",vault="0xb"}'
+        values: "10x161"
+      - series: 'quote_updater_vault_balance{token="USDT",vault="0xb"}'
+        values: "1000000x161"
+      - series: 'quote_updater_vault_value_usd{token="WBTC",vault="0xb"}'
+        values: "1000000x70 900000x90"
+      - series: 'quote_updater_vault_value_usd{token="USDT",vault="0xb"}'
+        values: "1000000x161"
+      - series: 'quote_updater_token_price_usd{token="WETH"}'
+        values: "4000x161"
+      - series: 'quote_updater_token_price_usd{token="USDC"}'
+        values: "1x161"
+      - series: 'quote_updater_token_price_usd{token="WBTC"}'
+        values: "100000x70 90000x90"
+      - series: 'quote_updater_token_price_usd{token="USDT"}'
+        values: "1x161"
+    alert_rule_test:
+      # Inside `for: 10m`: the loss is four minutes old.
+      - eval_time: 75m
+        alertname: PusherVaultLosingValue
+        exp_alerts: []
+      - eval_time: 85m
+        alertname: PusherVaultLosingValue
+        exp_alerts:
+          - exp_labels:
+              severity: "ticket"
+              vault: "0xa"
+            exp_annotations:
+              summary: "Vault 0xa gave away -1.01% of its value in the last hour"
+              description: "Priced at today's prices, the vault holds over 0.5% less than it did an hour ago. A vault trading at fair prices ends an hour about level, so this is either trades landing at a wrong price or a withdrawal. Check the pair's published mid against the market and its spread against how far the market moves in a block."
+      # Under the page's 2%.
+      - eval_time: 85m
+        alertname: PusherVaultDraining
+        exp_alerts: []
+      # An hour after the loss the balance an hour ago is the balance now.
+      - eval_time: 140m
+        alertname: PusherVaultLosingValue
+        exp_alerts: []
+
+  # Vault 0xd gives away 30000 USDC at minute 71: −30000 over a vault worth 970000 is
+  # −3.093%, past the page's 2%.
+  - interval: 1m
+    name: a vault that gave away over 2 percent in an hour pages
+    input_series:
+      - series: 'quote_updater_vault_balance{token="WETH",vault="0xd"}'
+        values: "100x161"
+      - series: 'quote_updater_vault_balance{token="USDC",vault="0xd"}'
+        values: "600000x70 570000x90"
+      - series: 'quote_updater_vault_value_usd{token="WETH",vault="0xd"}'
+        values: "400000x161"
+      - series: 'quote_updater_vault_value_usd{token="USDC",vault="0xd"}'
+        values: "600000x70 570000x90"
+      - series: 'quote_updater_token_price_usd{token="WETH"}'
+        values: "4000x161"
+      - series: 'quote_updater_token_price_usd{token="USDC"}'
+        values: "1x161"
+    alert_rule_test:
+      - eval_time: 74m
+        alertname: PusherVaultDraining
+        exp_alerts: []
+      - eval_time: 80m
+        alertname: PusherVaultDraining
+        exp_alerts:
+          - exp_labels:
+              severity: "page"
+              vault: "0xd"
+            exp_annotations:
+              summary: "Vault 0xd gave away -3.093% of its value in the last hour"
+              description: "Priced at today's prices, the vault holds over 2% less than it did an hour ago, so it is paying out more than it takes in. If nobody withdrew from it, it is being traded against at a wrong price: halt its pairs first, then check each pair's published mid against the market and what its venues are reporting. A withdrawal by the operator reads the same way and clears within the hour."
+
+  # Vault 0xc holds ALIGN, which has no USD price, and loses half its USDT at minute 41.
+  # With one token unpriced the sum would cover USDT alone and read −50%, so the value
+  # rules are silent for this vault, and PusherVaultUnpriced is what says so.
+  - interval: 1m
+    name: a vault with an unpriced token is named, and the value rules stay silent for it
+    input_series:
+      - series: 'quote_updater_vault_balance{token="ALIGN",vault="0xc"}'
+        values: "1000000x100"
+      - series: 'quote_updater_vault_balance{token="USDT",vault="0xc"}'
+        values: "500000x40 250000x59"
+      - series: 'quote_updater_vault_value_usd{token="USDT",vault="0xc"}'
+        values: "500000x40 250000x59"
+      - series: 'quote_updater_token_price_usd{token="USDT"}'
+        values: "1x100"
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: PusherVaultLosingValue
+        exp_alerts: []
+      - eval_time: 90m
+        alertname: PusherVaultDraining
+        exp_alerts: []
+      - eval_time: 90m
+        alertname: PusherVaultOneSided
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: PusherVaultUnpriced
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: PusherVaultUnpriced
+        exp_alerts:
+          - exp_labels:
+              severity: "ticket"
+              vault: "0xc"
+              token: "ALIGN"
+            exp_annotations:
+              summary: "Vault 0xc: no USD price for ALIGN"
+              description: "The vault holds this token and the updater has had no USD price for it for half an hour, so the vault's value is unknown and PusherVaultLosingValue, PusherVaultDraining and PusherVaultOneSided are silent for it. Check the CoinGecko key and whether CoinGecko lists the token by its contract address."
+
+  # Vault 0xe is 95% WETH by value; vault 0xf is half and half.
+  - interval: 1m
+    name: a vault over 90 percent in one token raises a ticket whatever prices its pair
+    input_series:
+      - series: 'quote_updater_vault_balance{token="WETH",vault="0xe"}'
+        values: "237.5x30"
+      - series: 'quote_updater_vault_balance{token="USDC",vault="0xe"}'
+        values: "50000x30"
+      - series: 'quote_updater_vault_value_usd{token="WETH",vault="0xe"}'
+        values: "950000x30"
+      - series: 'quote_updater_vault_value_usd{token="USDC",vault="0xe"}'
+        values: "50000x30"
+      - series: 'quote_updater_vault_balance{token="WETH",vault="0xf"}'
+        values: "125x30"
+      - series: 'quote_updater_vault_balance{token="USDC",vault="0xf"}'
+        values: "500000x30"
+      - series: 'quote_updater_vault_value_usd{token="WETH",vault="0xf"}'
+        values: "500000x30"
+      - series: 'quote_updater_vault_value_usd{token="USDC",vault="0xf"}'
+        values: "500000x30"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: PusherVaultOneSided
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: PusherVaultOneSided
+        exp_alerts:
+          - exp_labels:
+              severity: "ticket"
+              vault: "0xe"
+            exp_annotations:
+              summary: "Vault 0xe: 95% of its value is in one token"
+              description: "The vault has been over 90% in one token for fifteen minutes, so it can fill trades in one direction only and whatever moved it there is still in the position. Check which way it went and at what prices, then rebalance the vault or halt the pair."
+
+  # Three pairs with the market at 4000 and a 5 bp half-spread. THROUGH published 3960, 1%
+  # under the market, and is quoting: the market is outside its quote. WITHDRAWN published
+  # the same and has sent nothing since, so nobody can fill it. ATCAP published 3998, its
+  # mid moved by exactly its half-spread, which is where the volatile kind's tilt stops:
+  # the market is on the edge of its quote, not outside it.
+  - interval: 1m
+    name: a quoting pair whose market is outside its published quote raises a ticket
+    input_series:
+      - series: 'quote_updater_feed_mid{pair="THROUGH/USDC"}'
+        values: "4000x20"
+      - series: 'quote_updater_published_mid{pair="THROUGH/USDC"}'
+        values: "3960x20"
+      - series: 'quote_updater_published_delta{pair="THROUGH/USDC"}'
+        values: "0.0005x20"
+      - series: 'quote_updater_feed_up{pair="THROUGH/USDC"}'
+        values: "1x20"
+      - series: 'quote_updater_publish_decisions_total{pair="THROUGH/USDC",action="publish"}'
+        values: "0+5x20"
+      - series: 'quote_updater_feed_mid{pair="WITHDRAWN/USDC"}'
+        values: "4000x20"
+      - series: 'quote_updater_published_mid{pair="WITHDRAWN/USDC"}'
+        values: "3960x20"
+      - series: 'quote_updater_published_delta{pair="WITHDRAWN/USDC"}'
+        values: "0.0005x20"
+      - series: 'quote_updater_feed_up{pair="WITHDRAWN/USDC"}'
+        values: "1x20"
+      - series: 'quote_updater_publish_decisions_total{pair="WITHDRAWN/USDC",action="publish"}'
+        values: "100x20"
+      - series: 'quote_updater_feed_mid{pair="ATCAP/USDC"}'
+        values: "4000x20"
+      - series: 'quote_updater_published_mid{pair="ATCAP/USDC"}'
+        values: "3998x20"
+      - series: 'quote_updater_published_delta{pair="ATCAP/USDC"}'
+        values: "0.0005x20"
+      - series: 'quote_updater_feed_up{pair="ATCAP/USDC"}'
+        values: "1x20"
+      - series: 'quote_updater_publish_decisions_total{pair="ATCAP/USDC",action="publish"}'
+        values: "0+5x20"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: PusherQuoteThroughMarket
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: PusherQuoteThroughMarket
+        exp_alerts:
+          - exp_labels:
+              severity: "ticket"
+              pair: "THROUGH/USDC"
+            exp_annotations:
+              summary: "THROUGH/USDC: the market is outside the published quote"
+              description: "For five minutes the market's mid has been further from the published mid than the published half-spread, so one of the pair's two prices is on the wrong side of the market and a taker can fill it and unwind at a profit. Halt the pair, then look at its pricing: a mid moved further than its spread, or a fixed price the market has left."

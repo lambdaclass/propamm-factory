@@ -201,6 +201,10 @@ pub(crate) struct Live {
     /// reload reads what tripped it. Cloned with `Live` for a restart, so a trip that
     /// happened while no loop was running is waiting when one returns.
     pub(crate) latch: crate::guard::Latch,
+    /// The pair's kill switch (`halts.rs`): set, the quote loop withdraws at every builder
+    /// and sends nothing more. The service hands each run its lane's flag as it starts it;
+    /// built unset.
+    pub(crate) halt: crate::halts::HaltSignal,
     /// Whether the pair configured a deviation guard, for `breaker_armed`.
     pub(crate) armed: bool,
     /// The registered guard kinds this pair runs (market and quote), for `guards{pair,kind}`.
@@ -591,6 +595,7 @@ pub(crate) async fn build_live(
     let values = values.with_guards(latch.clone(), quote_guards);
     Ok(Built {
         live: Live {
+            halt: Default::default(),
             pair: resolved.pair,
             values,
             latch,
@@ -1046,6 +1051,7 @@ mod tests {
             wall,
         }));
         let live = Live {
+            halt: Default::default(),
             pair: Pair {
                 tokens: (Address::zero(), Address::zero()),
                 lane: U256::from(3),
@@ -1117,6 +1123,7 @@ mod tests {
             }
         };
         let live = |okx: bool| Live {
+            halt: Default::default(),
             pair: Pair {
                 tokens: (Address::zero(), Address::zero()),
                 lane: U256::from(4),
@@ -1206,6 +1213,7 @@ mod tests {
             wall: std::time::SystemTime::now(),
         }));
         let live = Live {
+            halt: Default::default(),
             pair: Pair {
                 tokens: (Address::zero(), Address::zero()),
                 lane: U256::from(9),
@@ -1276,6 +1284,7 @@ mod tests {
             wall: std::time::SystemTime::now(),
         }));
         let live = Live {
+            halt: Default::default(),
             pair: Pair {
                 tokens: (Address::zero(), Address::zero()),
                 lane: U256::from(9),
@@ -1644,7 +1653,7 @@ mod tests {
 
         /// A component trips its own lane through the latch its build got: a model that
         /// sees its own inputs go bad stops the lane itself, with `cause = external`. (A
-        /// kill switch is a halt in the file, never this: a reload re-arms a latch.) A task
+        /// kill switch is a halt in the file, never this: a re-arm clears a latch.) A task
         /// that then returns is counted, since it fed nothing after.
         #[tokio::test]
         async fn a_component_can_trip_its_own_lane() {

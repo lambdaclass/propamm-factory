@@ -24,7 +24,7 @@ test the wiring.
 
 **`feed`**: publishes the exchange mid as it is. Settings: `delta`, optional. With it, the
 spread you set; without it, the exchange's own spread (only allowed when the pair follows a
-single exchange).
+single exchange), and never less than `min_delta`, which is 1 bp unless you set it.
 
 **`volatile`**: for pairs that move, like WETH/USDC. The spread is computed every block from
 how much the price has been moving (sigma, measured over the last `volatility_window_secs`)
@@ -46,8 +46,9 @@ a target split, and widens one side when the vault is too far off target. Settin
 The formula itself, term by term, is in [manual.md](manual.md), "Volatile pairs".
 
 **`inventory_skew`** is not in the library but in [`example/`](../example/src/main.rs): a fixed
-half-spread with the mid pushed away from the token the vault holds too much of. Settings:
-`half_spread`, `strength` (how far a fully lopsided vault pushes the mid),
+half-spread with the mid pushed away from the token the vault holds too much of, and never
+further than the half-spread, so it does not sell below the market price or buy above it.
+Settings: `half_spread`, `strength` (how far the mid moves per unit of imbalance),
 `max_inventory_age_secs`. It is the one to read to see how a model that looks at the vault is
 written, start to finish, with comments.
 
@@ -67,10 +68,12 @@ struct SkewedPricer { cfg: Skewed }
 impl Pricer for SkewedPricer {
     fn price(&mut self, tick: &TickCtx, _: &mut Diagnostics) -> Result<PricerOutput, Refusal> {
         let market = tick.market()?;                         // the exchange price, as a person reads it
-        Ok(PricerOutput::new(
-            market.scaled_fraction(self.cfg.half_spread)?,   // 0.0005 = 5 bp
-            market.shift(self.cfg.skew)?,                    // +0.01 = a mid 1% below market
-        ))
+        let half_spread = self.cfg.half_spread;
+        let delta = market.scaled_fraction(half_spread)?;    // 0.0005 = 5 bp; refuses < 0 or NaN
+        // Never move the mid further than the half-spread: past it you sell below the
+        // market price (or buy above it), and a taker pockets the difference.
+        let skew = self.cfg.skew.clamp(-half_spread, half_spread);
+        Ok(PricerOutput::new(delta, market.shift(skew)?))    // +0.0002 = a mid 2 bp below market
     }
 }
 ```
@@ -99,7 +102,7 @@ Inside `price`, from the tick:
 - `tick.market()`: the pair's current market price. `market.mid_f64()` is the price as a
   number; `market.scaled_fraction(x)` turns a fraction into a half-spread the contract
   understands; `market.shift(x)` moves the mid by a fraction (positive shifts it below the
-  market).
+  market), which you keep within the half-spread, as above.
 - `Refusal::new(handle, "why")`: do not quote this block. The reason is counted in the
   metrics under the name you declared.
 

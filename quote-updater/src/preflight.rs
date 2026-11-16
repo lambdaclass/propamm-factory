@@ -33,6 +33,8 @@ pub enum SymbolCheck {
 /// never turn `Unreadable` into anything else. `allow_symbol_mismatch` means "I know this
 /// stream differs from the tokens"; it is not a claim that the check itself may be
 /// skipped, so a missing symbol always surfaces as `Unreadable` regardless of the flag.
+/// What the flag does for a pair whose symbols cannot be read is [`unreadable_symbols`]'s
+/// to say, and it is never nothing.
 pub fn check_symbol(
     venue: crate::venue::VenueId,
     stream: &str,
@@ -68,6 +70,51 @@ pub fn check_symbol(
         SymbolCheck::MismatchAllowed { expected }
     } else {
         SymbolCheck::Mismatch { expected }
+    }
+}
+
+/// What a pair gets on its row when its tokens' symbols could not be read, so the
+/// stream/token cross-check did not run: `Err` is a failure, `Ok` a warning.
+///
+/// A failure unless the pair opted out. The cross-check is the one guard against
+/// publishing one asset's price on another's lane, or a pair's price the wrong way up, and
+/// it used to be skipped with a warning for exactly the tokens it cannot vouch for (a
+/// `symbol()` that reverts or does not decode). `allow_symbol_mismatch = true` is the pair
+/// saying its stream was checked against its tokens by hand, which is the only check left
+/// for it; the row still says the cross-check did not run.
+///
+/// `rpc_failed` is whether a token was never asked: the call itself failed, as opposed to
+/// the token answering with something that is not a symbol. The two must not share a
+/// message, for the reason `authorization_failure`'s two do not: the remedy for a token
+/// with no symbol is the opt-out, and giving that remedy for a read that timed out turns
+/// the check off for a pair it would have passed, for good. Both are failures, since a
+/// run must not start on a check nobody could make.
+pub fn unreadable_symbols(rpc_failed: bool, allow_mismatch: bool) -> Result<String, String> {
+    match (rpc_failed, allow_mismatch) {
+        (false, true) => Ok(
+            "could not read symbol() from both tokens, so the stream/token cross-check did \
+             not run for this pair; allow_symbol_mismatch is what vouches for its stream"
+                .to_owned(),
+        ),
+        (true, true) => Ok(
+            "could not ask both tokens for their symbol() (the call failed), so the \
+             stream/token cross-check did not run for this pair; allow_symbol_mismatch is \
+             what vouches for its stream"
+                .to_owned(),
+        ),
+        (false, false) => Err(
+            "could not read symbol() from both tokens, so nothing checked that this pair's \
+             stream prices these two tokens, and in this order; check it by hand, then set \
+             allow_symbol_mismatch = true"
+                .to_owned(),
+        ),
+        (true, false) => Err(
+            "could not ask both tokens for their symbol(): the call failed, twice, so \
+             nothing checked that this pair's stream prices these two tokens. This is the \
+             RPC endpoint, not the pair: run the check again, and leave \
+             allow_symbol_mismatch as it is"
+                .to_owned(),
+        ),
     }
 }
 
@@ -658,6 +705,7 @@ use crate::{
     UPDATE_GAS_LIMIT, call_view,
     config::{Config, resolve_keys},
     decode_return_data,
+    rpc::{CallOutcome, call_view_outcome},
 };
 use ethrex_l2_common::calldata::Value;
 use ethrex_l2_sdk::calldata::encode_calldata;
@@ -672,8 +720,57 @@ const PAIR_VAULTS_SIG: &str = "pairVaults(uint256)";
 const ERC20_SYMBOL_SIG: &str = "symbol()";
 const BALANCE_OF_SIG: &str = "balanceOf(address)";
 
-/// Reads an ERC-20 `symbol()`, or `None` when the token does not implement it in a form
-/// we can decode.
+/// What asking a token for its `symbol()` came to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SymbolRead {
+    Read(String),
+    /// The token answered, and not with a symbol: the call reverted, or what came back
+    /// does not decode as one, or is empty.
+    Unreadable,
+    /// Nothing answered: the call failed, both times it was made. Says nothing of the token.
+    Failed,
+}
+
+impl SymbolRead {
+    pub(crate) fn symbol(&self) -> Option<&str> {
+        match self {
+            SymbolRead::Read(symbol) => Some(symbol),
+            SymbolRead::Unreadable | SymbolRead::Failed => None,
+        }
+    }
+}
+
+/// Asks a token for its `symbol()`, telling a token that has none we can read from a call
+/// that never got an answer. Made a second time when the first fails: one read that timed
+/// out should not fail a pair's check, or refuse a reload.
+pub(crate) async fn read_symbol(client: &EthClient, token: Address) -> SymbolRead {
+    let Ok(calldata) = encode_calldata(ERC20_SYMBOL_SIG, &[]) else {
+        return SymbolRead::Unreadable;
+    };
+    let mut answer = call_view_outcome(client, token, calldata.clone()).await;
+    if answer.is_err() {
+        answer = call_view_outcome(client, token, calldata).await;
+    }
+    match answer {
+        Ok(CallOutcome::Returned(ret)) => {
+            symbol_from(&ret).map_or(SymbolRead::Unreadable, SymbolRead::Read)
+        }
+        Ok(CallOutcome::Reverted(_)) => SymbolRead::Unreadable,
+        Err(_) => SymbolRead::Failed,
+    }
+}
+
+/// Reads an ERC-20 `symbol()`, or `None` when there is none to show: for a caller that
+/// only wants a name to print. See [`read_symbol`] for one that has to know why.
+pub(crate) async fn token_symbol(client: &EthClient, token: Address) -> Option<String> {
+    match read_symbol(client, token).await {
+        SymbolRead::Read(symbol) => Some(symbol),
+        SymbolRead::Unreadable | SymbolRead::Failed => None,
+    }
+}
+
+/// The symbol in a `symbol()` answer, or `None` when the token does not implement it in a
+/// form we can decode.
 ///
 /// Decoded as `bytes`, not `string`: ethrex's `decode_calldata` has no `string` type —
 /// `DataType::parse` accepts address/bool/bytes/bytesN/uint*/int*/arrays/tuples and errors
@@ -681,13 +778,11 @@ const BALANCE_OF_SIG: &str = "balanceOf(address)";
 /// identical ABI encoding, so decoding as `bytes` and converting is exact, not a hack.
 /// A few pre-ERC-20-standard tokens return a fixed `bytes32` symbol instead, hence the
 /// second attempt.
-pub(crate) async fn token_symbol(client: &EthClient, token: Address) -> Option<String> {
-    let calldata = encode_calldata(ERC20_SYMBOL_SIG, &[]).ok()?;
-    let ret = call_view(client, token, calldata, None, None).await.ok()?;
-    let bytes = match decode_return_data("r(bytes)", &ret).ok().as_deref() {
+fn symbol_from(ret: &[u8]) -> Option<String> {
+    let bytes = match decode_return_data("r(bytes)", ret).ok().as_deref() {
         Some([Value::Bytes(bytes)]) => bytes.to_vec(),
         // Legacy tokens (e.g. MKR-era) return bytes32, zero-padded on the right.
-        _ => match decode_return_data("r(bytes32)", &ret).ok().as_deref() {
+        _ => match decode_return_data("r(bytes32)", ret).ok().as_deref() {
             Some([Value::FixedBytes(bytes)]) => bytes.to_vec(),
             _ => return None,
         },
@@ -717,12 +812,15 @@ pub async fn build_report(
     // A failed read must not default to a reassuring value: a zero base fee reads as
     // unlimited runway, so an RPC failure here must surface as "unknown", never as
     // "every key is infinitely funded".
-    let base_fee = client
-        .get_block_by_number(BlockIdentifier::Tag(BlockTag::Latest), false)
-        .await
-        .ok()
-        .and_then(|block| block.header.base_fee_per_gas)
-        .map(U256::from);
+    // Every read here is bounded by `RPC_TIMEOUT`, as `call_view`'s are: a reload runs this,
+    // and an RPC that accepts and never answers would otherwise hold it, and the config
+    // lock it holds, for ever (audit F-06).
+    let base_fee =
+        crate::bounded(client.get_block_by_number(BlockIdentifier::Tag(BlockTag::Latest), false))
+            .await
+            .ok()
+            .and_then(|block| block.header.base_fee_per_gas)
+            .map(U256::from);
     if base_fee.is_none() {
         warnings.push(
             "could not read the latest block's base fee, so funding runway is unknown for \
@@ -738,18 +836,18 @@ pub async fn build_report(
     // EIP-7702 case, where the target has code and still is not a contract. That last one is
     // what a run on a mainnet fork with an anvil account as its target actually hits; see
     // `target_warning`.
-    let target_code = client
-        .get_code(config.target, BlockIdentifier::Tag(BlockTag::Latest))
-        .await;
+    let target_code =
+        crate::bounded(client.get_code(config.target, BlockIdentifier::Tag(BlockTag::Latest)))
+            .await;
     let target_kind = classify_target(target_code.as_deref().ok());
     warnings.extend(target_warning(config.target, target_kind));
     let target_has_code = target_kind == TargetKind::Contract;
 
     // `symbol()` is read per pair, and pairs share tokens — all three in the example config
     // quote against USDC, so an uncached read fetches the same answer three times. Memoised
-    // across the whole report, including the `None` of a token that has no readable symbol,
-    // so a missing one is not retried per pair either.
-    let mut symbols: HashMap<Address, Option<String>> = HashMap::new();
+    // across the whole report, including a token that has no readable symbol or could not
+    // be asked, so a missing one is not retried per pair either.
+    let mut symbols: HashMap<Address, SymbolRead> = HashMap::new();
 
     let mut rows = Vec::with_capacity(config.pairs.len());
     for (spec, signer) in config.pairs.iter().zip(signers) {
@@ -758,11 +856,13 @@ pub async fn build_report(
             // Entry API rather than contains_key-then-insert: one lookup, and it keeps the
             // await inside the vacant branch so a cached token costs no work at all.
             if let std::collections::hash_map::Entry::Vacant(slot) = symbols.entry(token) {
-                slot.insert(token_symbol(client, token).await);
+                slot.insert(read_symbol(client, token).await);
             }
         }
-        let base_symbol = symbols[&base].clone();
-        let quote_symbol = symbols[&quote].clone();
+        let base_symbol = symbols[&base].symbol().map(str::to_owned);
+        let quote_symbol = symbols[&quote].symbol().map(str::to_owned);
+        let symbol_read_failed =
+            symbols[&base] == SymbolRead::Failed || symbols[&quote] == SymbolRead::Failed;
         let label = match (&base_symbol, &quote_symbol) {
             (Some(b), Some(q)) => format!("{b}/{q}"),
             _ => crate::config::lane_label(spec.lane),
@@ -813,7 +913,9 @@ pub async fn build_report(
                 // from a confirmed "no" — see `authorization_failure`.
                 let (answer, balance) = tokio::join!(
                     call_view(client, registry, calldata, None, None),
-                    client.get_balance(updater, BlockIdentifier::Tag(BlockTag::Latest)),
+                    crate::bounded(
+                        client.get_balance(updater, BlockIdentifier::Tag(BlockTag::Latest))
+                    ),
                 );
                 row.authorized = decode_one("r(bool)", answer.ok().as_deref())
                     .map(|value| value == Value::Bool(true));
@@ -872,14 +974,14 @@ pub async fn build_report(
                 }
             }
             // The cross-check is the guard against publishing one asset's price on
-            // another's lane, so losing it must be visible rather than silent. Once per
-            // pair, not per source: the symbols are the pair's.
+            // another's lane, so a pair it could not run for does not pass on a warning:
+            // it fails unless the pair opted out. Once per pair, not per source: the
+            // symbols are the pair's.
             if unreadable {
-                row.warnings.push(
-                    "could not read symbol() from both tokens, so the stream/token cross-check \
-                     did not run for this pair"
-                        .to_owned(),
-                );
+                match unreadable_symbols(symbol_read_failed, spec.allow_symbol_mismatch) {
+                    Ok(warning) => row.warnings.push(warning),
+                    Err(failure) => row.failures.push(failure),
+                }
             }
         }
 
@@ -982,9 +1084,9 @@ mod tests {
     use super::*;
 
     /// A pair with no `min_mid`/`max_mid` says so when something could push its mid
-    /// anywhere: a feed, or a custom pricer with no market, which nothing but `delta < 1`
-    /// and a nonzero mid bounds (the core's mid-shift check needs a market to compare
-    /// against). A static mid, or any pair with a band, does not.
+    /// anywhere: a feed, or a custom pricer, which nothing but `delta < 1` and a nonzero
+    /// mid bounds (the core never compares a mid with the market, even when there is one).
+    /// A static mid, or any pair with a band, does not.
     #[test]
     fn a_pair_nothing_bounds_is_warned_about() {
         let spec = |text: &str| {
@@ -1306,6 +1408,68 @@ mod tests {
                 expected: "ETHUSDC".to_owned()
             }
         );
+    }
+
+    /// A pair whose symbols cannot be read used to pass with a warning, which left the
+    /// tokens the cross-check cannot vouch for as the ones nothing checked at all.
+    #[test]
+    fn unreadable_symbols_fail_the_pair_unless_it_opted_out() {
+        let failure = unreadable_symbols(false, false).expect_err("no opt-out: a failure");
+        assert!(
+            failure.contains("allow_symbol_mismatch = true"),
+            "the failure names the way out: {failure}"
+        );
+        let warning = unreadable_symbols(false, true).expect("opted out: a warning");
+        assert!(
+            warning.contains("did not run"),
+            "opted out, the row still says the check did not run: {warning}"
+        );
+    }
+
+    /// A read that never got an answer fails the pair too, and must not send the operator
+    /// to the opt-out: set for a timeout, it turns the check off for a pair that would
+    /// have passed it, and nothing turns it back on.
+    #[test]
+    fn a_symbol_read_the_rpc_failed_is_not_blamed_on_the_pair() {
+        let failure = unreadable_symbols(true, false).expect_err("still a failure");
+        assert!(failure.contains("RPC endpoint"), "{failure}");
+        assert!(
+            !failure.contains("= true"),
+            "must not tell the operator to opt out: {failure}"
+        );
+        let warning = unreadable_symbols(true, true).expect("opted out: a warning");
+        assert!(warning.contains("the call failed"), "{warning}");
+    }
+
+    /// The three things asking a token for its symbol can come to, against a node: a
+    /// symbol, a token that has none (it reverts), and a node that does not answer.
+    #[tokio::test]
+    async fn a_token_with_no_symbol_is_told_apart_from_a_call_that_failed() {
+        use crate::rpc_mock::MockRpc;
+        let rpc = MockRpc::spawn(100).await;
+        let client = EthClient::new(url::Url::parse(&rpc.url).unwrap()).unwrap();
+        let (named, nameless) = (
+            Address::from_slice(&[0xa0; 20]),
+            Address::from_slice(&[0xb0; 20]),
+        );
+
+        rpc.set_symbol(named, "USDC");
+        assert_eq!(
+            read_symbol(&client, named).await,
+            SymbolRead::Read("USDC".to_owned())
+        );
+        assert_eq!(token_symbol(&client, named).await.as_deref(), Some("USDC"));
+
+        rpc.set_revert("symbol()", Vec::new());
+        assert_eq!(read_symbol(&client, nameless).await, SymbolRead::Unreadable);
+
+        // Asked twice before it is called a failure, and then it is the RPC's, not the
+        // token's.
+        let before = rpc.calls("eth_call").len();
+        rpc.set_failing("eth_call", true);
+        assert_eq!(read_symbol(&client, named).await, SymbolRead::Failed);
+        assert_eq!(rpc.calls("eth_call").len() - before, 2);
+        assert_eq!(token_symbol(&client, named).await, None);
     }
 
     #[test]

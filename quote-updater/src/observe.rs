@@ -66,7 +66,7 @@ pub enum Event {
     },
     /// A block passed for the lane, with what it quoted for it or why it did not, and the
     /// pricer's declared diagnostics as of its last tick. Once per block, and none for the
-    /// block a halt broke out of, which has not passed: the generation a reload re-arms
+    /// block a halt broke out of, which has not passed: the generation a re-arm starts
     /// says it passed, if it does.
     #[non_exhaustive]
     Block {
@@ -145,7 +145,8 @@ pub enum ReloadOutcome {
     Applied,
     /// The file was refused: nothing changed.
     Rejected,
-    /// Applied, but some lane kept its previous config.
+    /// Applied, but some lane kept its previous config, was not started, or was stopped
+    /// because the change took out a builder it quoted to.
     Partial,
 }
 
