@@ -22,3 +22,7 @@
 
 # direnv's cache of the flake shell.
 /.direnv/
+
+# The backoffice front end's dependencies and build (backoffice-ui/README.md).
+/backoffice-ui/node_modules/
+/backoffice-ui/dist/

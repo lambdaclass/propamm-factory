@@ -631,6 +631,9 @@ breaker halted, and reload. It serves no pages
 (`GET /` answers 404 with an `{"error": ...}`), so whatever front end an operator uses, or
 `curl`, talks to it. Every change goes through the shared config described in
 [Reloading the config](#reloading-the-config): written to `config.toml`, then converged onto.
+[`backoffice-ui/`](../backoffice-ui/README.md) is a front end for it: a pnpm project that
+builds to static files, served beside the API by a reverse proxy or from an origin listed
+with `--backoffice-cors-origin` (below).
 
 ```toml
 [settings]
