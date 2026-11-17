@@ -430,6 +430,11 @@ contract PropAMM is
     ///
     /// The registry keeps timestamps in 32 bits, hence the casts. They wrap on 7 February 2106,
     /// and this implementation is not meant to quote past that date.
+    ///
+    /// Both tokens' `decimals()` are read on every call and stored nowhere. A token whose answer
+    /// changes after listing is not supported: with nothing else changed, every quote on its
+    /// pairs moves by the matching power of ten, with no event and no update from the oracle.
+    /// The owner lists only tokens whose decimals are fixed (see `addPair`).
     function _pricing(address tokenIn, address tokenOut) internal view returns (Pricing memory p) {
         uint256 pairKey;
         (p.vault, pairKey) = _vaultFor(tokenIn, tokenOut);
@@ -558,6 +563,10 @@ contract PropAMM is
     /// @dev Reverts `NotAToken` if either token has no code, and `UnsupportedDecimals` if either
     /// reports more than `MAX_TOKEN_DECIMALS`; a token whose `decimals()` reverts is refused too.
     /// The vault may be an EOA.
+    ///
+    /// List only tokens whose `decimals()` never changes. It is checked here and not stored:
+    /// every quote reads it again (see `_pricing`), so a token whose answer changes after
+    /// listing, an upgradeable one for instance, is not supported (audit F-10 (i)).
     /// @param tokenX The first token in the pair.
     /// @param tokenY The second token in the pair.
     /// @param vault The account that holds this pair's inventory and has approved this instance.

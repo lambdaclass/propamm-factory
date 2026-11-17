@@ -39,6 +39,11 @@ cast send $FACTORY "createPropAMM(address,address,address[],(address,address,add
   Two pairs look like `"[(TOKEN0,TOKEN1,VAULT),(TOKEN0,TOKEN1,VAULT)]"`. Both token addresses
   must be deployed contracts on this chain with at most 36 decimals: creation reverts with
   `NotAToken` for an address without code, and with `UnsupportedDecimals` above 36.
+  List only tokens you trust and whose `decimals()` never changes. The PropAMM reads it on
+  every quote rather than storing it, so a token whose answer changes after listing (an
+  upgradeable token whose owner changes it, say) is not supported: its pairs would be
+  repriced by the matching power of ten, with no event. The same goes for a pair added
+  later with `addPair`.
 
 The vault must hold the tokens and have approved the PropAMM to spend both of them. The
 PropAMM address does not exist until the call, so either approve it right after creating,
