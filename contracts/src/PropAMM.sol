@@ -566,7 +566,7 @@ contract PropAMM is
     ///
     /// List only tokens whose `decimals()` never changes. It is checked here and not stored:
     /// every quote reads it again (see `_pricing`), so a token whose answer changes after
-    /// listing, an upgradeable one for instance, is not supported (audit F-10 (i)).
+    /// listing, an upgradeable one for instance, is not supported.
     /// @param tokenX The first token in the pair.
     /// @param tokenY The second token in the pair.
     /// @param vault The account that holds this pair's inventory and has approved this instance.
