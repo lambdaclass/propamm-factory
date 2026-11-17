@@ -191,11 +191,12 @@ contract PropAMM is
     /// timestamp whose `delta` and `mid` pass `_pricing`'s checks, and the vault holds some
     /// `tokenOut`. So it is per direction: a vault holding one side only is active one way.
     ///
-    /// Never reverts (audit F-14). The router probes this before it pays for a quote, and a
-    /// revert would take its probe down, so the registry and the token are asked with low-level
-    /// calls and their answers read only once they are long enough: a registry without code, one
-    /// that reverts and one whose answer is malformed all read as inactive. A registry or token
-    /// answering megabytes can still exhaust the gas.
+    /// Never reverts (audit F-14). `IPropAMM` offers this as the probe a router can make before
+    /// it pays for a quote, and an off-chain caller may ask it of several instances in one
+    /// batch; a revert would take the probe down, and the batch with it. So the registry and the
+    /// token are asked with low-level calls and their answers read only once they are long
+    /// enough: a registry without code, one that reverts and one whose answer is malformed all
+    /// read as inactive. A registry or token answering megabytes can still exhaust the gas.
     ///
     /// It is not told the swap's size and sizes nothing: a vault holding a wei reads as active,
     /// and the allowance is not read. `quote` and `quoteFillable` answer for an amount. Two

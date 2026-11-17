@@ -77,6 +77,21 @@ contract TruncatedArrayOracle {
     }
 }
 
+/// Every call reverts, and the revert data is a whole answer: this block's timestamp, then two
+/// slots holding a usable `delta` and `mid`, laid out as a registry would return them.
+contract RevertsWithAnAnswerOracle {
+    fallback() external payable {
+        assembly {
+            mstore(0, timestamp())
+            mstore(0x20, 0x40)
+            mstore(0x40, 2)
+            mstore(0x60, 500000000000000)
+            mstore(0x80, 1600000000000000000000)
+            revert(0, 0xa0)
+        }
+    }
+}
+
 /// Answers every call it has no function for with the bytes it was last given: answers no
 /// registry built with Solidity would encode.
 contract RawAnswerOracle {
@@ -743,8 +758,9 @@ contract PropAMMPricingTest is Test {
         assertEq(MockToken(WETH).balanceOf(vault), 1e18);
     }
 
-    /// The router probes `isActive` to skip propAMMs before paying for a quote, so a pause has
-    /// to surface there as `false`. Reverting instead would take the router's probe down with it.
+    /// `isActive` is the probe a caller can make to skip a propAMM before paying for a quote, so
+    /// a pause has to surface there as `false`. Reverting instead would take the probe down
+    /// with it.
     function test_pause_isActiveTurnsFalseWithoutReverting() public {
         _setPrice(1600e18, 5e14);
         _fundVault(USDT, 1_600_000e6);
@@ -817,6 +833,34 @@ contract PropAMMPricingTest is Test {
             vm.expectRevert();
             propAmm.quote(WETH, USDT, 1e18);
         }
+    }
+
+    /// A registry that reverts has not answered, whatever its revert data holds. Here the data is
+    /// the well-formed answer of the test above, byte for byte, which `isActive` would price
+    /// from had the call succeeded; `quote` reverts on the call itself.
+    function test_isActive_falseForARegistryThatRevertsWithAnAnswer() public {
+        _fundVault(USDT, 1_600_000e6);
+        _etchOracle(address(new RevertsWithAnAnswerOracle()));
+
+        assertFalse(propAmm.isActive(WETH, USDT));
+        vm.expectRevert();
+        propAmm.quote(WETH, USDT, 1e18);
+    }
+
+    /// The stamp is compared whole, not by its low 32 bits. This one is this block's timestamp
+    /// with a bit set above them, in an answer that is otherwise well formed: the decoder
+    /// refuses it as no uint32, so `quote` reverts, and `isActive` must not read it as fresh.
+    /// (`HighBitsOracle` is turned away for its length, before its stamp is looked at.)
+    function test_isActive_falseForAStampThatMatchesOnlyInItsLow32Bits() public {
+        _fundVault(USDT, 1_600_000e6);
+        _etchOracle(address(new RawAnswerOracle()));
+        uint256 stamp = vm.getBlockTimestamp() | (1 << 32);
+        RawAnswerOracle(payable(ORACLE))
+            .setAnswer(abi.encode(stamp, uint256(64), uint256(2), uint256(5e14), uint256(1600e18)));
+
+        assertFalse(propAmm.isActive(WETH, USDT));
+        vm.expectRevert();
+        propAmm.quote(WETH, USDT, 1e18);
     }
 
     /// The one place the two readings differ, and it errs toward skipping the pair: an answer

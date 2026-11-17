@@ -118,10 +118,11 @@ contract PropAMMGasTest is Test {
         assertLt(capped - quoted, FILLABLE_OVERHEAD_BUDGET, "capped overhead over quote");
     }
 
-    /// The router probes `isActive` before it pays for a quote. The probe answers what `quote`
-    /// would, so on a live pair it costs about what a quote does, and the quote that follows in
-    /// the same transaction finds the registry, the tokens and the vault warm. Probing first must
-    /// cost little more than quoting alone, or the fast path would not be one.
+    /// `IPropAMM` offers `isActive` as a fast path: a router can probe it before it pays for a
+    /// quote. The probe answers what `quote` would, so on a live pair it costs about what a quote
+    /// does, and the quote that follows in the same transaction finds the registry, the tokens
+    /// and the vault warm. Probing first must cost little more than quoting alone, or the fast
+    /// path would not be one.
     function test_gas_isActiveThenQuoteCostsLittleMoreThanAQuote() public {
         uint256 cold = vm.snapshotState();
         propAmm.quote(WETH, USDT, 500e18);

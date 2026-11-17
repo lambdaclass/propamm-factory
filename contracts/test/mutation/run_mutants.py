@@ -173,6 +173,11 @@ MUTANTS = [
         ("if (!ok || !_canPriceFrom(ret)) return false;", "if (!ok) return false;"),
     ),
     (
+        "isActive: reads the answer of a registry that reverted",
+        PROPAMM,
+        ("if (!ok || !_canPriceFrom(ret)) return false;", "if (!_canPriceFrom(ret)) return false;"),
+    ),
+    (
         "isActive: an empty vault is active",
         PROPAMM,
         ("return ok && ret.length >= 32 && abi.decode(ret, (uint256)) != 0;", "return ok && ret.length >= 32;"),
@@ -209,6 +214,14 @@ MUTANTS = [
         "isActive: ignores the stamp",
         PROPAMM,
         ("return wellFormed && stamp == uint32(block.timestamp) &&", "return wellFormed &&"),
+    ),
+    (
+        "isActive: compares the stamp's low 32 bits only",
+        PROPAMM,
+        (
+            "return wellFormed && stamp == uint32(block.timestamp) &&",
+            "return wellFormed && uint32(stamp) == uint32(block.timestamp) &&",
+        ),
     ),
     (
         "isActive: takes a delta of one or more",
