@@ -501,6 +501,7 @@ impl Kinds {
                     sources: spec.feeds.as_ref().map_or(0, |f| f.sources.len()),
                     min_mid: spec.band.min,
                     max_mid: spec.band.max,
+                    max_source_divergence: None,
                 };
                 guarded(kind, "validating", || factory.validate(table, &shape))
                     .wrap_err_with(|| format!("{at} (halted): [pairs.pricing] `{kind}`"))?;

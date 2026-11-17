@@ -1675,6 +1675,8 @@ fn preview_snapshot(
         crate::composite::weighted_average(&fresh).map(|(delta, mid)| crate::feed::PriceSample {
             delta,
             mid,
+            // The preview shows the average and each venue's own mid, not their gap.
+            divergence: ethrex_common::U256::zero(),
             at: now,
             wall,
         });

@@ -105,6 +105,7 @@ pub(crate) fn adopt_metrics(live: &Live, price_decimals: u32, metrics: &crate::m
             m.feed_sample_current.set(f64::NAN);
             m.feed_sources_fresh.set(f64::NAN);
             m.feed_sources_min.set(f64::NAN);
+            m.feed_divergence.set(f64::NAN);
         }
         // The sample `build_live` waited for, written through as this pair's first reading.
         //
@@ -238,6 +239,10 @@ pub(crate) fn shape_of(resolved: &ResolvedPair, price_decimals: u32, target: Add
         sources: resolved.feeds.as_ref().map_or(0, |f| f.sources.len()),
         min_mid: resolved.pair.band.min,
         max_mid: resolved.pair.band.max,
+        max_source_divergence: resolved
+            .feeds
+            .as_ref()
+            .and_then(|feeds| feeds.checks.max_divergence),
     }
 }
 
@@ -699,9 +704,10 @@ pub(crate) fn all_or_none<T>(results: Vec<(String, Result<T>)>) -> Result<Vec<T>
 /// `diagnostics` is how many its build declared, so the buffer has the slots the run's has
 /// and a pricer reading back what it set sees the same here.
 ///
-/// The preview goes through the core's backstop and then the pair's band, on the published
-/// mid and on the market's, with the same market and shape the run's every tick does, so a
-/// row cannot pass what the run would withdraw.
+/// The preview goes through the core's backstop, then the pair's band, on the published
+/// mid and on the market's, and then the check that the pair's venues agree, with the same
+/// market and shape the run's every tick does, so a row cannot pass what the run would
+/// withdraw.
 pub(crate) fn preview_row(
     pricer: &mut dyn Pricer,
     sample: Option<&feed::PriceSample>,
@@ -723,9 +729,11 @@ pub(crate) fn preview_row(
         Ok(preview) => preview
             .map_err(|refusal| refusal.to_string())
             .and_then(|priced| {
+                let divergence = sample.map_or_else(U256::zero, |sample| sample.divergence);
                 crate::pricing::backstop(priced, market.as_ref(), shape)
                     .and_then(|()| band.check(priced.mid))
                     .and_then(|()| market.as_ref().map_or(Ok(()), |m| band.check_market(m.mid)))
+                    .and_then(|()| crate::pricing::agreement(priced, divergence, shape))
                     .map(|()| (priced.delta, priced.mid))
                     .map_err(|unusable| unusable.to_string())
             }),
@@ -812,6 +820,10 @@ pub(crate) async fn collect_prices(
                 sources: spec.feeds.as_ref().map_or(0, |f| f.sources.len()),
                 min_mid: spec.band.min,
                 max_mid: spec.band.max,
+                max_source_divergence: spec
+                    .feeds
+                    .as_ref()
+                    .and_then(|feeds| feeds.checks.max_divergence),
             };
             let mut venues = Vec::new();
             // The diagnostics the pair's pricer declared in its build, for its quote guards
@@ -834,10 +846,19 @@ pub(crate) async fn collect_prices(
                 (Err(err), _) => Err(format!("{err:#}")),
                 (Ok(()), Some(feeds)) => match composite::connect(feeds, params()).await {
                     Ok(spawned) => {
+                        // The first sample is often one venue's, which has nothing to
+                        // disagree with: the gap the row is held to is the one between
+                        // every venue that delivers, as the run's is a moment later.
+                        let gap = spawned
+                            .settled_divergence(&feeds.sources, price_decimals)
+                            .await;
                         venues = venue_lines(&spawned);
                         let sample = *spawned.rx.borrow();
                         sample
-                            .map(Some)
+                            .map(|mut sample| {
+                                sample.divergence = sample.divergence.max(gap);
+                                Some(sample)
+                            })
                             .ok_or_else(|| "the feed reported a sample and then lost it".to_owned())
                     }
                     Err(err) => Err(format!("{err:#}")),
@@ -1056,6 +1077,7 @@ mod tests {
             mid: U256::from(2u64) * U256::exp10(18),
             at: std::time::Instant::now(),
             wall,
+            divergence: U256::zero(),
         }));
         let live = Live {
             halt: Default::default(),
@@ -1218,6 +1240,7 @@ mod tests {
             mid: U256::from(110u64) * U256::exp10(18),
             at: std::time::Instant::now(),
             wall: std::time::SystemTime::now(),
+            divergence: U256::zero(),
         }));
         let live = Live {
             halt: Default::default(),
@@ -1289,6 +1312,7 @@ mod tests {
             mid: U256::exp10(18),
             at: std::time::Instant::now(),
             wall: std::time::SystemTime::now(),
+            divergence: U256::zero(),
         }));
         let live = Live {
             halt: Default::default(),
@@ -1483,12 +1507,14 @@ mod tests {
             sources: 1,
             min_mid: None,
             max_mid: None,
+            max_source_divergence: None,
         };
         let sample = feed::PriceSample {
             mid: U256::from(4000u64) * U256::exp10(18),
             delta: U256::exp10(14),
             at: std::time::Instant::now(),
             wall: std::time::SystemTime::now(),
+            divergence: U256::zero(),
         };
         let (row, _) = preview_row(&mut WholeUnit, Some(&sample), &shape, 0);
         let refused = row.unwrap_err();
@@ -1510,10 +1536,12 @@ mod tests {
             sources: 1,
             min_mid: Some(U256::from(995_000_000_000_000_000u64)),
             max_mid: Some(U256::from(1_005_000_000_000_000_000u64)),
+            max_source_divergence: None,
         };
         let market = |mid: U256| feed::PriceSample {
             mid,
             delta: U256::zero(),
+            divergence: U256::zero(),
             at: std::time::Instant::now(),
             wall: std::time::SystemTime::now(),
         };
@@ -1563,6 +1591,7 @@ mod tests {
                 sources: 1,
                 min_mid: None,
                 max_mid: None,
+                max_source_divergence: None,
                 label: "CUSTOM/TEST".into(),
                 tokens: (Address::repeat_byte(1), Address::repeat_byte(2)),
                 lane: U256::from(9),

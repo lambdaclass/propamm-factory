@@ -269,6 +269,7 @@ pub const RESERVED_REASONS: &[&str] = &[
     "out_of_band",
     "delta_overflow",
     "panic",
+    "source_divergence",
 ];
 
 /// What a pricer publishes: the half-spread and the mid, exact, in lane orientation and at
@@ -386,6 +387,10 @@ pub struct PairShape {
     pub min_mid: Option<U256>,
     /// The pair's `max_mid`, likewise.
     pub max_mid: Option<U256>,
+    /// The pair's `max_source_divergence`, a fraction scaled by `10^price_decimals`: how far
+    /// its venues may disagree before the core withdraws the quote. `None` is the default
+    /// limit, which follows the spread the pair publishes; see `agreement`.
+    pub max_source_divergence: Option<U256>,
 }
 
 /// The pair's reference market this tick: the composite of its `symbol`/`sources`, fresh.
@@ -699,6 +704,84 @@ pub(crate) fn backstop(
     }
     let _ = market;
     Ok(())
+}
+
+/// How many of its own half-spreads a pair lets its venues disagree by, when it sets no
+/// `max_source_divergence`.
+///
+/// The limit follows the spread because the spread is what the disagreement costs: a
+/// quote is safe to stand behind while the market is somewhere inside it, and venues that
+/// disagree by many spreads are saying nobody knows where the market is to that accuracy.
+/// It is a multiple rather than one spread because venues never agree exactly. A deep book
+/// and a thin one on the same market sit a few spreads apart for a moment on every move,
+/// and a limit that withdrew on each of those would stop a healthy pair many times an hour.
+/// Twenty leaves that alone and still catches what the check is for: a primary venue that
+/// froze or is delivering a backlog while the market moved on, and a venue pushed far off
+/// the others. An operator who knows a pair's venues sets `max_source_divergence` tighter.
+pub const DIVERGENCE_SPREADS: u64 = 20;
+
+/// The least the default limit is, as a fraction of the mid in parts per ten thousand:
+/// 5 bp. A pair quoting a very thin spread (a stable pair's fraction of a basis point)
+/// would otherwise get a limit inside the ordinary noise between two venues.
+pub const DIVERGENCE_FLOOR_BP: u64 = 5;
+
+/// Whether the venues behind the pair's market agree closely enough to publish `out`.
+///
+/// `divergence` is the composite's reading of how far they disagree (`PriceSample`'s:
+/// the primary venue against each other fresh one). It is held to the pair's
+/// `max_source_divergence` when it sets one, and otherwise to [`DIVERGENCE_SPREADS`] times
+/// the half-spread being published, and no less than [`DIVERGENCE_FLOOR_BP`]. Past the
+/// limit the tick is withdrawn under `source_divergence`; nothing latches, so the first
+/// tick on which the venues agree again quotes.
+///
+/// It is the check on what the average cannot show. One venue frozen while the market
+/// moves, one delivering a backlog, one whose thin book was pushed: each leaves an average
+/// that looks like a price. The venues disagreeing is the only sign there is, so that is
+/// what withdraws the quote. A pair with one fresh venue has nothing to compare, reads
+/// zero, and always passes.
+pub(crate) fn agreement(
+    out: PricerOutput,
+    divergence: U256,
+    pair: &PairShape,
+) -> Result<(), Unusable> {
+    let (limit, source) = match pair.max_source_divergence {
+        Some(limit) => (limit, "max_source_divergence".to_owned()),
+        None => {
+            let floor = crate::config::spread_scale(pair.price_decimals)
+                .saturating_mul(U256::from(DIVERGENCE_FLOOR_BP))
+                / U256::from(10_000u64);
+            let spreads = out.delta.saturating_mul(U256::from(DIVERGENCE_SPREADS));
+            if spreads >= floor {
+                (
+                    spreads,
+                    format!("{DIVERGENCE_SPREADS} times the half-spread it would publish"),
+                )
+            } else {
+                (
+                    floor,
+                    format!("the default floor, {DIVERGENCE_FLOOR_BP} bp"),
+                )
+            }
+        }
+    };
+    if divergence <= limit {
+        return Ok(());
+    }
+    let percent = |value: U256| {
+        format!(
+            "{:.4}%",
+            crate::feed::scaled_to_f64(value, pair.price_decimals) * 100.0
+        )
+    };
+    Err(Unusable::new(
+        UnusableKind::SourceDivergence,
+        format!(
+            "the pair's venues disagree by {}, over the limit of {} ({source}); refusing to \
+             quote a price they do not agree on",
+            percent(divergence),
+            percent(limit),
+        ),
+    ))
 }
 
 /// A secret a `[pairs.pricing]` stanza names rather than holds: written `{ env = "NAME" }`,
@@ -1164,6 +1247,7 @@ mod tests {
             sources: 1,
             min_mid: None,
             max_mid: None,
+            max_source_divergence: None,
             label: "WETH/USDC".into(),
             tokens: (Address::repeat_byte(1), Address::repeat_byte(2)),
             lane: U256::from(7),
@@ -1179,6 +1263,7 @@ mod tests {
             delta: crate::feed::parse_decimal_scaled(delta, decimals).unwrap(),
             at: Instant::now(),
             wall: std::time::SystemTime::now(),
+            divergence: U256::zero(),
         }
     }
 
@@ -1259,6 +1344,45 @@ mod tests {
             "{}",
             refusal.message()
         );
+    }
+
+    /// The limit `agreement` holds the venues to: 20 half-spreads of what is being
+    /// published, no less than 5 bp, or the pair's own `max_source_divergence`.
+    #[test]
+    fn the_venues_may_disagree_by_a_multiple_of_the_spread_or_the_pairs_own_limit() {
+        let mut p = pair(false, 18);
+        let bp = U256::exp10(14);
+        let quote = |delta: U256| PricerOutput::new(delta, U256::from(4000u64) * U256::exp10(18));
+        let refused = |out: PricerOutput, divergence: U256, p: &PairShape| {
+            let err = agreement(out, divergence, p).unwrap_err();
+            assert_eq!(err.kind(), Some(UnusableKind::SourceDivergence));
+            err.to_string()
+        };
+
+        // A 0.5 bp half-spread: 20 of them are 10 bp.
+        let half_bp = bp / 2;
+        assert!(agreement(quote(half_bp), bp * 10, &p).is_ok());
+        let said = refused(quote(half_bp), bp * 10 + 1, &p);
+        assert!(said.contains("20 times the half-spread"), "{said}");
+
+        // A 0.1 bp half-spread: 20 of them are 2 bp, under the floor, so the floor is it.
+        let tenth_bp = bp / 10;
+        assert!(agreement(quote(tenth_bp), bp * 5, &p).is_ok());
+        let said = refused(quote(tenth_bp), bp * 5 + 1, &p);
+        assert!(said.contains("the default floor, 5 bp"), "{said}");
+
+        // The pair's own limit replaces both, tighter or looser.
+        p.max_source_divergence = Some(bp);
+        assert!(agreement(quote(half_bp), bp, &p).is_ok());
+        let said = refused(quote(half_bp), bp + 1, &p);
+        assert!(said.contains("max_source_divergence"), "{said}");
+        p.max_source_divergence = Some(bp * 100);
+        assert!(agreement(quote(tenth_bp), bp * 100, &p).is_ok());
+
+        // Nothing to compare (one fresh venue, or no market) reads zero and always passes,
+        // whatever is published.
+        p.max_source_divergence = None;
+        assert!(agreement(quote(U256::zero()), U256::zero(), &p).is_ok());
     }
 
     #[test]

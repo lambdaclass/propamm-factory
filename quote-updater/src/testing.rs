@@ -68,6 +68,7 @@ pub fn pair_for(
         sources: 1,
         min_mid: None,
         max_mid: None,
+        max_source_divergence: None,
     }
 }
 
@@ -87,6 +88,7 @@ pub fn pair_with(inverted: bool, price_decimals: u32) -> PairShape {
         sources: 1,
         min_mid: None,
         max_mid: None,
+        max_source_divergence: None,
     }
 }
 
@@ -128,6 +130,7 @@ pub fn market_at(
             at: sampled_at,
             // The wall-clock stamp is the recorder's; nothing a pricer sees reads it.
             wall: std::time::SystemTime::now(),
+            divergence: ethrex_common::U256::zero(),
         },
         pair,
     )

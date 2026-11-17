@@ -265,6 +265,7 @@ pub struct Metrics {
     feed_delta: GaugeVec,
     feed_sources_fresh: GaugeVec,
     feed_sources_min: GaugeVec,
+    feed_divergence: GaugeVec,
     venue_feed_up: GaugeVec,
     venue_feed_ticks: IntCounterVec,
     venue_feed_rejected: IntCounterVec,
@@ -333,6 +334,7 @@ pub struct PairMetrics {
     pub feed_delta: Gauge,
     pub feed_sources_fresh: Gauge,
     pub feed_sources_min: Gauge,
+    pub feed_divergence: Gauge,
     price_unusable: [IntCounter; UnusableKind::ALL.len()],
     publish_decisions: [IntCounter; 4],
     pub published_mid: Gauge,
@@ -569,6 +571,14 @@ impl Metrics {
                 &r,
                 "quote_updater_feed_sources_min",
                 "Venues that must be fresh for the pair to publish (min_sources).",
+                pair,
+            )?,
+            feed_divergence: gauge(
+                &r,
+                "quote_updater_feed_divergence",
+                "Largest gap between the pair's primary venue and any other fresh one, as a \
+                 fraction of the other's mid, at the last composite tick. 0 with one fresh \
+                 venue.",
                 pair,
             )?,
             venue_feed_up: gauge(
@@ -1036,6 +1046,7 @@ impl Metrics {
             feed_delta: self.feed_delta.with_label_values(p),
             feed_sources_fresh: self.feed_sources_fresh.with_label_values(p),
             feed_sources_min: self.feed_sources_min.with_label_values(p),
+            feed_divergence: self.feed_divergence.with_label_values(p),
             price_unusable: UnusableKind::ALL
                 .map(|k| self.price_unusable.with_label_values(&[pair, k.as_str()])),
             publish_decisions: PublishAction::ALL.map(|a| {
@@ -1360,6 +1371,7 @@ impl PairMetrics {
             &self.feed_delta,
             &self.feed_sources_fresh,
             &self.feed_sources_min,
+            &self.feed_divergence,
             &self.published_mid,
             &self.published_delta,
             &self.breaker_armed,
@@ -1635,6 +1647,7 @@ mod tests {
             (UnusableKind::OutOfBand, 3),
             (UnusableKind::DeltaOverflow, 4),
             (UnusableKind::Panic, 5),
+            (UnusableKind::SourceDivergence, 6),
         ];
         assert_eq!(kinds.len(), UnusableKind::ALL.len());
         for (kind, n) in kinds {

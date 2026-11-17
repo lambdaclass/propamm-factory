@@ -106,7 +106,7 @@ disable_cross_region = false
 # [settings], because it is a sub-table.
 # [settings.endpoints]
 # binance = "wss://stream.binance.com:9443/ws"
-# coinbase = "wss://ws-feed.exchange.coinbase.com"
+# coinbase = "wss://advanced-trade-ws.coinbase.com"
 # kucoin = "https://api.kucoin.com"        # the REST host its socket URL is fetched from
 # mexc = "https://api.mexc.com"            # polled
 # coingecko = "https://api.coingecko.com/api/v3"  # not a venue: where vault USD prices come from
@@ -354,6 +354,18 @@ max_deviation = "0.002"
 # those are never left out for it. 1500 is a sensible value on any pair.
 # See "Late venues" in docs/manual.md.
 # max_source_lag_ms = "1500"
+
+# How far this pair's venues may disagree before its quote is withdrawn, as a fraction of
+# the mid (0.0005 = 0.05%). The check is on for every pair with two or more venues: the
+# gap between the primary venue (the one with the most weight) and any other fresh one is
+# held to this limit, and the pair quotes again on the first tick they agree. It is what
+# catches a venue whose price froze behind a live socket, one delivering a backlog, and
+# one whose thin book was pushed, none of which the average shows. Left unset, the limit
+# is 20 times the half-spread the pair publishes, and at least 0.05%. Set it to tighten
+# that for venues you know (read quote_updater_feed_divergence for what they ordinarily
+# do), or to loosen it. Needs two or more venues.
+# See "Venues that disagree" in docs/manual.md.
+# max_source_divergence = "0.0005"
 
 # A pair priced by a pricing kind a binary registered (docs/building-your-own.md),
 # the same way `feed`, `fixed` and `volatile` are. A stanza naming a kind its

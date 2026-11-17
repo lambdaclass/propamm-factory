@@ -2335,6 +2335,7 @@ mod tests {
             mid,
             at: std::time::Instant::now(),
             wall: std::time::SystemTime::now(),
+            divergence: U256::zero(),
         }
     }
 
@@ -3771,6 +3772,7 @@ mod tests {
             mid: scaled(mid).1,
             at: std::time::Instant::now(),
             wall: std::time::SystemTime::now(),
+            divergence: U256::zero(),
         }
     }
 

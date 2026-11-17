@@ -34,6 +34,13 @@ const SOURCE_FIELDS = [
       "behind the exchange's own timestamp; needs a venue that sends one (not binance, not mexc). " +
       "Blank is off",
   ],
+  [
+    "max_source_divergence",
+    "0.001",
+    "withdraw while the venue with the most weight and any other differ by more than this " +
+      "fraction of the price; needs two venues or more. Blank is the default: 20 times the " +
+      "half-spread being published, and no less than 0.0005",
+  ],
 ];
 
 const MIN_SOURCES_HINT =

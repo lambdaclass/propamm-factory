@@ -379,6 +379,11 @@ pub struct PriceSample {
     pub mid: U256,
     pub at: Instant,
     pub wall: SystemTime,
+    /// How far the pair's venues disagree, on a composite's sample: the largest gap between
+    /// the primary venue's mid and any other fresh venue's, as a fraction of the other's,
+    /// scaled by 10^decimals (see `composite::divergence`). Zero on one venue's own sample
+    /// and on a composite with a single fresh venue, where there is nothing to compare.
+    pub divergence: U256,
 }
 
 impl PriceSample {
@@ -484,7 +489,7 @@ pub fn spawn_feed(
                             url,
                             subscribe,
                             keepalive,
-                        }) => feed.read_stream(&url, subscribe.as_deref(), &keepalive).await,
+                        }) => feed.read_stream(&url, &subscribe, &keepalive).await,
                         Ok(Connection::Poll { url, headers, every }) => {
                             feed.poll(&url, &headers, every).await
                         }
@@ -551,7 +556,7 @@ impl Feed {
     async fn read_stream(
         &self,
         url: &str,
-        subscribe: Option<&str>,
+        subscribe: &[String],
         keepalive: &Keepalive,
     ) -> Result<()> {
         let Feed {
@@ -562,8 +567,8 @@ impl Feed {
         // cadence into long dead periods.
         let mut ws = ws::connect(url).await?;
         tracing::info!("[{symbol}] {venue} stream connected: {url}");
-        if let Some(subscribe) = subscribe {
-            ws.send(Message::text(subscribe))
+        for subscribe in subscribe {
+            ws.send(Message::text(subscribe.as_str()))
                 .await
                 .wrap_err("subscribe failed")?;
         }
@@ -731,6 +736,7 @@ impl Feed {
                     mid,
                     at,
                     wall,
+                    divergence: U256::zero(),
                 }));
             }
             Err(err) => {

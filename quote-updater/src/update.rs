@@ -154,17 +154,21 @@ pub enum UnusableKind {
     /// tripped, so it is counted at most once per lane. Appended last: `ALL`'s order is
     /// the metric array's.
     Panic,
+    /// The pair's venues disagree by more than the pair allows (`pricing::agreement`).
+    /// Appended after `Panic` for the same reason `Panic` was appended.
+    SourceDivergence,
 }
 
 impl UnusableKind {
     /// Declaration order is load-bearing: `metrics::PairMetrics` indexes its pre-bound
     /// children by `kind as usize`.
-    pub const ALL: [UnusableKind; 5] = [
+    pub const ALL: [UnusableKind; 6] = [
         UnusableKind::NoSample,
         UnusableKind::Stale,
         UnusableKind::OutOfBand,
         UnusableKind::DeltaOverflow,
         UnusableKind::Panic,
+        UnusableKind::SourceDivergence,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -174,6 +178,7 @@ impl UnusableKind {
             UnusableKind::OutOfBand => "out_of_band",
             UnusableKind::DeltaOverflow => "delta_overflow",
             UnusableKind::Panic => "panic",
+            UnusableKind::SourceDivergence => "source_divergence",
         }
     }
 }
@@ -585,9 +590,14 @@ impl ValueSource {
     /// included.
     pub fn current_detailed(&self, band: &MidBand) -> Result<Priced, Unusable> {
         let now = Instant::now();
+        // How far the venues behind the market disagree; zero for a pair with no market.
+        let mut divergence = U256::zero();
         let market = match &self.market {
             Some(rx) => match fresh_sample(rx) {
-                Ok(sample) => Some(Market::from_sample(&sample, &self.pair)),
+                Ok(sample) => {
+                    divergence = sample.divergence;
+                    Some(Market::from_sample(&sample, &self.pair))
+                }
                 // Refused before the pricer runs, and still judged by the quote guards: a
                 // feed gone quiet is the commonest way a lane is withdrawn, so a guard that
                 // halts after so long withdrawn has to count these ticks. No market and no
@@ -627,14 +637,16 @@ impl ValueSource {
         // is still worth seeing, as the volatile model's gauges always were.
         self.bound.publish(&out);
         // The core's own judgement of what the pricer published (the backstop, then the
-        // band, on the published mid and then on the market's), folded in with the pricer's
-        // refusal into the one answer the quote guards see: an `Ok` here is a quote the core
-        // would publish. The market's turn is what stops a kind whose mid does not follow
-        // the market, a `fixed` price, once the market leaves the band (audit F-04).
+        // band, on the published mid and then on the market's, then whether the venues
+        // behind the market agree), folded in with the pricer's refusal into the one answer
+        // the quote guards see: an `Ok` here is a quote the core would publish. The market's
+        // turn at the band is what stops a kind whose mid does not follow the market, a
+        // `fixed` price, once the market leaves the band (audit F-04).
         let judged = match priced {
             Ok(priced) => match crate::pricing::backstop(priced, market.as_ref(), &self.pair)
                 .and_then(|()| band.check(priced.mid))
                 .and_then(|()| market.as_ref().map_or(Ok(()), |m| band.check_market(m.mid)))
+                .and_then(|()| crate::pricing::agreement(priced, divergence, &self.pair))
             {
                 Ok(()) => Ok(priced),
                 Err(unusable) => Err(unusable.as_refusal()),
@@ -759,6 +771,7 @@ fn test_shape(inverted: bool, price_decimals: u32) -> PairShape {
         sources: 1,
         min_mid: None,
         max_mid: None,
+        max_source_divergence: None,
     }
 }
 
@@ -1044,6 +1057,7 @@ mod tests {
                 mid: U256::exp10(18),
                 at: Instant::now(),
                 wall: std::time::SystemTime::now() - std::time::Duration::from_secs(60),
+                divergence: U256::zero(),
             }));
             let err = source.current_detailed(&band).unwrap_err();
             assert_eq!(
@@ -1261,10 +1275,41 @@ mod tests {
             mid,
             at: std::time::Instant::now(),
             wall: SystemTime::now(),
+            divergence: U256::zero(),
         };
         // The sender is returned so the channel outlives the source.
         let (tx, rx) = tokio::sync::watch::channel(Some(sample));
         (tx, ValueSource::feed_for_tests(rx, None, false, 18))
+    }
+
+    /// Audit F-05. The average of a pair's venues looks like a price whether or not the
+    /// venues agree, so the composite says how far they disagree and the core withdraws
+    /// the quote past the pair's limit: here the default, 20 half-spreads of the 0.5 bp
+    /// this lane publishes, 10 bp. Nothing latches: the venues agreeing again is the tick
+    /// that quotes.
+    #[test]
+    fn a_market_whose_venues_disagree_is_withdrawn_until_they_agree() {
+        let mid = U256::from(4_000u64) * U256::exp10(18);
+        let (tx, source) = feed_of(mid);
+        let with = |divergence: u64| {
+            let mut sample = (*tx.borrow()).unwrap();
+            sample.divergence = U256::from(divergence);
+            tx.send_replace(Some(sample));
+            source.current_detailed(&MidBand::default())
+        };
+        let ten_bp = 1_000_000_000_000_000u64;
+
+        assert!(with(0).is_ok(), "one venue, or venues that agree");
+        assert!(with(ten_bp).is_ok(), "at the limit is inside it");
+
+        let err = with(ten_bp + 1).unwrap_err();
+        assert_eq!(err.kind(), Some(UnusableKind::SourceDivergence));
+        assert!(
+            err.to_string().contains("venues disagree by 0.1000%"),
+            "{err}"
+        );
+
+        assert!(with(ten_bp / 2).is_ok(), "they agree again, and it quotes");
     }
 
     fn feed_of_empty() -> (tokio::sync::watch::Sender<Option<PriceSample>>, ValueSource) {
@@ -1307,6 +1352,7 @@ mod tests {
         let sample = PriceSample {
             delta: U256::zero(),
             mid: market_mid,
+            divergence: U256::zero(),
             at,
             wall: SystemTime::now(),
         };
@@ -1395,6 +1441,7 @@ mod tests {
             let sample = PriceSample {
                 delta: U256::zero(),
                 mid: market_mid,
+                divergence: U256::zero(),
                 at: std::time::Instant::now(),
                 wall: SystemTime::now(),
             };
@@ -1443,6 +1490,7 @@ mod tests {
             mid: U256::exp10(18),
             at: std::time::Instant::now(),
             wall: SystemTime::now(),
+            divergence: U256::zero(),
         }))
         .unwrap();
         tokio::time::timeout(Duration::from_secs(1), source.changed())
@@ -1479,6 +1527,7 @@ mod tests {
             mid: U256::exp10(18),
             at: std::time::Instant::now() - Duration::from_secs(60),
             wall: SystemTime::now() - Duration::from_secs(60),
+            divergence: U256::zero(),
         };
         let (_tx, rx) = tokio::sync::watch::channel(Some(sample));
         let source = ValueSource::feed_for_tests(rx, None, false, 18);
@@ -1541,6 +1590,7 @@ mod tests {
                 "out_of_band",
                 "delta_overflow",
                 "panic",
+                "source_divergence",
             ]
         );
         // A pricer may not declare a reason that is the core's: the list it is checked
