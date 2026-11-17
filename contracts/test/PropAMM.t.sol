@@ -10,6 +10,7 @@ import {
     InvalidOracle,
     NoVault,
     NotAToken,
+    OracleUnchanged,
     PairAlreadyExists,
     UnsupportedDecimals,
     UnsupportedPair,
@@ -440,6 +441,14 @@ contract PropAMMTest is Test {
         vm.expectRevert(abi.encodeWithSelector(InvalidOracle.selector, eoa));
         propAmm.setOracle(eoa);
         assertEq(address(propAmm.oracle()), ORACLE);
+    }
+
+    /// Naming the registry the instance already reads changes nothing, so it is refused, like
+    /// `setPairVault` to the vault a pair already has: `OracleChanged` reports a move.
+    function test_setOracle_refusesTheOracleItAlreadyHas() public {
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(OracleUnchanged.selector, ORACLE));
+        propAmm.setOracle(ORACLE);
     }
 
     function test_setOracle_refusesTheZeroAddress() public {

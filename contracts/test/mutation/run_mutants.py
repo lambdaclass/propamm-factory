@@ -6,11 +6,13 @@
     python3 contracts/test/mutation/run_mutants.py --list     their names
 
 Each mutant below is one edit to a source file: a guard removed, a modifier dropped, an order
-swapped. Where one bug takes two edits (a check made in two places), the mutant lists both. A mutant is killed when `forge test` reports a failed test with it applied, and
-survives when every test still passes, which means nothing in the suite depends on the line
-it broke. A `forge test` that ends any other way (killed for memory on a small runner, a
-crash) is an error, not a kill: it says nothing about the tests. The run exits 0 only if
-every mutant is killed.
+swapped. Where one bug takes two edits (a check made in two places), the mutant lists both.
+
+A mutant is killed when `forge test` reports a failed test with it applied, and survives when
+every test still passes, which means nothing in the suite depends on the line it broke. A
+`forge test` that ends any other way (killed for memory on a small runner, a crash) is an
+error, not a kill: it says nothing about the tests. The run exits 0 only if every mutant is
+killed.
 
 The sources are never edited in place. The run works on copies of `src/`, `test/` and
 `foundry.toml` in a temporary directory, with `lib/` linked in, so an interrupted run leaves
@@ -98,12 +100,20 @@ MUTANTS = [
     (
         "swap: pays the zero address",
         PROPAMM,
-        ("require(recipient != address(0) && recipient != address(this),", "require(recipient != address(this),"),
+        drop(f"{I8}require(recipient != address(0), InvalidRecipient(recipient));\n"),
     ),
     (
-        "swap: pays the instance itself",
+        "swap: pays the pair's own vault",
         PROPAMM,
-        ("require(recipient != address(0) && recipient != address(this),", "require(recipient != address(0),"),
+        drop(f"{I8}require(recipient != vault, InvalidRecipient(recipient));\n"),
+    ),
+    (
+        "swap: refuses the instance as recipient",
+        PROPAMM,
+        (
+            f"{I8}require(recipient != address(0), InvalidRecipient(recipient));\n",
+            f"{I8}require(recipient != address(0) && recipient != address(this), InvalidRecipient(recipient));\n",
+        ),
     ),
     ("swap: runs while paused", PROPAMM, ("override nonReentrant whenNotPaused returns", "override nonReentrant returns")),
     ("swap: can be re-entered", PROPAMM, ("override nonReentrant whenNotPaused returns", "override whenNotPaused returns")),
@@ -155,6 +165,57 @@ MUTANTS = [
         ),
     ),
     ("pause: isActive stays true", PROPAMM, drop(f"{I8}if (paused()) return false;\n")),
+    # isActive, which makes quote's checks by hand so that it never reverts.
+    ("isActive: answers for an unlisted pair", PROPAMM, drop(f"{I8}if (vault == address(0)) return false;\n")),
+    (
+        "isActive: does not read the registry's answer",
+        PROPAMM,
+        ("if (!ok || !_canPriceFrom(ret)) return false;", "if (!ok) return false;"),
+    ),
+    (
+        "isActive: an empty vault is active",
+        PROPAMM,
+        ("return ok && ret.length >= 32 && abi.decode(ret, (uint256)) != 0;", "return ok && ret.length >= 32;"),
+    ),
+    (
+        "isActive: decodes a balance that is not there",
+        PROPAMM,
+        (
+            "return ok && ret.length >= 32 && abi.decode(ret, (uint256)) != 0;",
+            "return ok && abi.decode(ret, (uint256)) != 0;",
+        ),
+    ),
+    (
+        "isActive: decodes an answer too short for two slots",
+        PROPAMM,
+        drop(f"{I8}if (answer.length < 160) return false;\n"),
+    ),
+    (
+        "isActive: takes the slots from any offset",
+        PROPAMM,
+        ("bool wellFormed = offset == 64 && count >= 2 &&", "bool wellFormed = count >= 2 &&"),
+    ),
+    (
+        "isActive: takes fewer than two slots",
+        PROPAMM,
+        ("bool wellFormed = offset == 64 && count >= 2 &&", "bool wellFormed = offset == 64 &&"),
+    ),
+    (
+        "isActive: takes slots the answer does not hold",
+        PROPAMM,
+        (" && count <= (answer.length - 96) / 32;", ";"),
+    ),
+    (
+        "isActive: ignores the stamp",
+        PROPAMM,
+        ("return wellFormed && stamp == uint32(block.timestamp) &&", "return wellFormed &&"),
+    ),
+    (
+        "isActive: takes a delta of one or more",
+        PROPAMM,
+        (" && delta < SPREAD_SCALE && mid != 0;", " && mid != 0;"),
+    ),
+    ("isActive: takes a zero mid", PROPAMM, (" && delta < SPREAD_SCALE && mid != 0;", " && delta < SPREAD_SCALE;")),
     # What a price has to be before it is quoted from.
     (
         "price: any past update is read",
@@ -168,21 +229,6 @@ MUTANTS = [
         "price: the stamp is not checked",
         PROPAMM,
         drop(f"{I8}require(updatedAt == uint32(block.timestamp), StaleOracleData(pairKey, updatedAt));\n"),
-    ),
-    (
-        "price: isActive ignores the stamp",
-        PROPAMM,
-        (f"{I8}return abi.decode(ret, (uint256)) == uint32(block.timestamp);", f"{I8}return true;"),
-    ),
-    (
-        "price: isActive decodes an answer too short to hold a stamp",
-        PROPAMM,
-        (f"{I8}if (!ok || ret.length < 32) return false;", f"{I8}if (!ok) return false;"),
-    ),
-    (
-        "price: isActive answers for an unlisted pair",
-        PROPAMM,
-        drop(f"{I8}if (pairVaults[pairKey] == address(0)) return false;\n"),
     ),
     (
         "price: too few slots",
@@ -289,6 +335,11 @@ MUTANTS = [
         "oracle: setOracle takes an address without code",
         PROPAMM,
         drop(f"{I8}require(newOracle.code.length > 0, InvalidOracle(newOracle));\n"),
+    ),
+    (
+        "oracle: setOracle to the registry it already has",
+        PROPAMM,
+        drop(f"{I8}require(newOracle != address(oracle), OracleUnchanged(newOracle));\n"),
     ),
     (
         "updaters: a key the registry has is added again",

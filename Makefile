@@ -234,10 +234,11 @@ local: local-down build .local/priority-update-registry
 	$(MAKE) update-price
 	@# Sanity checks through the real registry: isActive and quote both require the stored
 	@# timestamp to equal block.timestamp exactly, which the update above was stamped for.
+	@# isActive also requires the vault to hold USDT, as minted above.
 	@set -e; PROP=$(PROPAMM_LOOKUP); \
 	test "$$(cast call $$PROP 'isActive(address,address)(bool)' \
 		$(USDC) $(USDT) --rpc-url $(RPC_URL))" = "true" || { \
-		echo "isActive() is false: the pushed update's timestamp does not match chain time."; \
+		echo "isActive() is false: the pushed update's timestamp does not match chain time, or the vault holds no USDT."; \
 		exit 1; }; \
 	test "$$(cast call $$PROP 'quote(address,address,uint256)(uint256)' \
 		$(USDC) $(USDT) 100 --rpc-url $(RPC_URL))" = "100" || { \

@@ -54,8 +54,12 @@ error ZeroAmountIn();
 /// A swap whose input is worth less than one wei of `tokenOut`: the taker would pay for nothing.
 error ZeroAmountOut();
 /// A swap to the zero address, which some tokens (USDT) accept and burn the output on, or to the
-/// instance itself, where the output would sit as a balance the next caller can swap away.
+/// pair's own vault, where the output leg is a transfer from the vault to itself and delivers
+/// nothing.
 error InvalidRecipient(address recipient);
+/// `setOracle` naming the registry the instance already reads: nothing would change, and the
+/// event would report a move that did not happen.
+error OracleUnchanged(address oracle);
 
 /// @notice Push payment (see `IPropAMM`) is atomic only inside the caller's transaction: tokens
 /// left on an instance between transactions can be swapped by anyone, and `withdrawERC20`
@@ -182,23 +186,56 @@ contract PropAMM is
     }
 
     /// @inheritdoc IPropAMM
-    /// @dev True when the pair is listed and the registry holds an update for its lane stamped
-    /// with this block's timestamp. It reads the stamp and nothing else of the answer; `quote`
-    /// reads the rest.
+    /// @dev True when `quote` has what it needs to price the pair: the instance is not paused, the
+    /// pair is listed, the registry holds an update for its lane stamped with this block's
+    /// timestamp whose `delta` and `mid` pass `_pricing`'s checks, and the vault holds some
+    /// `tokenOut`. So it is per direction: a vault holding one side only is active one way.
+    ///
+    /// Never reverts (audit F-14). The router probes this before it pays for a quote, and a
+    /// revert would take its probe down, so the registry and the token are asked with low-level
+    /// calls and their answers read only once they are long enough: a registry without code, one
+    /// that reverts and one whose answer is malformed all read as inactive. A registry or token
+    /// answering megabytes can still exhaust the gas.
+    ///
+    /// It is not told the swap's size and sizes nothing: a vault holding a wei reads as active,
+    /// and the allowance is not read. `quote` and `quoteFillable` answer for an amount. Two
+    /// things `quote` reverts on are left to it as well: a token whose `decimals()` has stopped
+    /// answering since it was listed, and a `mid` too large to scale by a token's decimals.
     function isActive(address tokenIn, address tokenOut) external view override returns (bool active) {
         if (paused()) return false;
         uint256 pairKey = _pairKey(tokenIn, tokenOut);
-        // A removed pair's lane can still hold a fresh update (audit F-09).
-        if (pairVaults[pairKey] == address(0)) return false;
+        address vault = pairVaults[pairKey];
+        // A removed pair's lane can still hold a fresh update (audit F-09), and the zero address
+        // holds a balance of most tokens, so the checks below would not turn it away.
+        if (vault == address(0)) return false;
 
         bytes memory getState =
             abi.encodeCall(IPrioUpdateRegistry.getState, (pairKey, uint32(block.timestamp), uint32(block.timestamp)));
         (bool ok, bytes memory ret) = address(oracle).staticcall(getState);
-        // An address without code answers with no data; a registry always answers with some.
-        if (!ok || ret.length < 32) return false;
-        // The answer's first word is the update's stamp, and the only part read: `_pricing`
-        // requires this block's, so an update `quote` would refuse as stale is not active.
-        return abi.decode(ret, (uint256)) == uint32(block.timestamp);
+        if (!ok || !_canPriceFrom(ret)) return false;
+
+        // An empty vault fills nothing. Any balance will do: sizing is `quoteFillable`'s job.
+        (ok, ret) = tokenOut.staticcall(abi.encodeCall(IERC20.balanceOf, (vault)));
+        return ok && ret.length >= 32 && abi.decode(ret, (uint256)) != 0;
+    }
+
+    /// @notice Whether a registry's answer to `getState` is one `_pricing` would price from:
+    /// stamped with this block's timestamp, with a `delta` below one and a `mid` that is not zero.
+    /// @dev For `isActive`, so it must not revert, which the ABI decoder does on an answer it
+    /// cannot follow. `(uint32, uint256[])` carrying the two slots `_pricing` needs is five words
+    /// or more: the stamp, the array's offset, its length, `delta`, `mid`. Decoding five words
+    /// out of 160 bytes or more cannot revert.
+    ///
+    /// The offset has to be 64, where every Solidity registry puts the array. The decoder would
+    /// follow any offset; an answer laid out another way reads as not priceable here, which errs
+    /// toward the router skipping the pair.
+    function _canPriceFrom(bytes memory answer) internal view returns (bool) {
+        if (answer.length < 160) return false;
+        (uint256 stamp, uint256 offset, uint256 count, uint256 delta, uint256 mid) =
+            abi.decode(answer, (uint256, uint256, uint256, uint256, uint256));
+        // The decoder wants every slot the length announces to be present, not only the two read.
+        bool wellFormed = offset == 64 && count >= 2 && count <= (answer.length - 96) / 32;
+        return wellFormed && stamp == uint32(block.timestamp) && delta < SPREAD_SCALE && mid != 0;
     }
 
     /// @inheritdoc IPropAMM
@@ -229,10 +266,14 @@ contract PropAMM is
     ///
     /// Reverts `ZeroAmountIn` for a swap of nothing and `ZeroAmountOut` for one whose quote
     /// rounds to nothing, so a `Swapped` is never logged for a trade priced at zero, and
-    /// `InvalidRecipient` for the zero address or the instance itself. Not reentrant: `Swapped`
-    /// is emitted after delivery, as `IPropAMM` specifies, and a token that called back into
-    /// `swap` from one of the transfers would otherwise log its nested swap ahead of the one
-    /// that contains it.
+    /// `InvalidRecipient` for the zero address or the pair's own vault. The instance itself is a
+    /// valid recipient: a router taking two hops on one instance names it for the first, which
+    /// leaves the output where push payment wants the second hop's input, inside the same
+    /// transaction (see the contract-level note).
+    ///
+    /// Not reentrant: `Swapped` is emitted after delivery, as `IPropAMM` specifies, and a token
+    /// that called back into `swap` from one of the transfers would otherwise log its nested
+    /// swap ahead of the one that contains it. Two swaps one after the other are not nested.
     function swap(
         address tokenIn,
         address tokenOut,
@@ -243,7 +284,7 @@ contract PropAMM is
     ) external override nonReentrant whenNotPaused returns (uint256 amountOut) {
         require(deadline >= block.timestamp, Expired());
         require(amountIn != 0, ZeroAmountIn());
-        require(recipient != address(0) && recipient != address(this), InvalidRecipient(recipient));
+        require(recipient != address(0), InvalidRecipient(recipient));
 
         uint256 realAmountOut = _quote(tokenIn, tokenOut, amountIn);
         require(realAmountOut != 0, ZeroAmountOut());
@@ -253,6 +294,8 @@ contract PropAMM is
         // legs move through. `_quote` already proved it is set; this re-read of the same slot is
         // warm, and cheaper than threading the address out of the pricing function.
         address vault = pairVaults[_pairKey(tokenIn, tokenOut)];
+        // Paid to the vault it comes out of, the output would move nothing.
+        require(recipient != vault, InvalidRecipient(recipient));
 
         // What `recipient` holds before, so the output is measured, not assumed: a token that
         // charges a fee on transfer delivers less than `realAmountOut`.
@@ -581,9 +624,10 @@ contract PropAMM is
     /// updater)` log lists them. Authorize the keys the new registry needs with `addUpdater`
     /// after this call.
     /// @param newOracle The new oracle address. Reverts with `InvalidOracle` for an address with
-    /// no code.
+    /// no code, and with `OracleUnchanged` for the registry the instance already reads.
     function setOracle(address newOracle) external onlyOwner {
         require(newOracle.code.length > 0, InvalidOracle(newOracle));
+        require(newOracle != address(oracle), OracleUnchanged(newOracle));
         oracle = IPrioUpdateRegistry(newOracle);
         emit OracleChanged(newOracle);
     }

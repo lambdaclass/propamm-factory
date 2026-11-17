@@ -36,7 +36,7 @@ contract EmptyReturnOracle {
     fallback() external payable {}
 }
 
-/// Every call returns one word: this block's timestamp, which is all `isActive` reads.
+/// Every call returns one word: this block's timestamp, a fresh stamp with no slots behind it.
 contract OneWordOracle {
     fallback() external payable {
         assembly {
@@ -73,6 +73,23 @@ contract TruncatedArrayOracle {
             mstore(0x20, 0x40)
             mstore(0x40, 2)
             return(0, 0x60)
+        }
+    }
+}
+
+/// Answers every call it has no function for with the bytes it was last given: answers no
+/// registry built with Solidity would encode.
+contract RawAnswerOracle {
+    bytes public answer;
+
+    function setAnswer(bytes calldata answer_) external {
+        answer = answer_;
+    }
+
+    fallback() external payable {
+        bytes memory a = answer;
+        assembly {
+            return(add(a, 0x20), mload(a))
         }
     }
 }
@@ -508,17 +525,41 @@ contract PropAMMPricingTest is Test {
     }
 
     /// The output has to go to someone. A token that accepts transfers to the zero address
-    /// (USDT does) would burn it there, and sent to the instance itself it becomes a balance the
-    /// next caller can swap away. Both are refused.
-    function test_swap_refusesTheZeroAddressAndItselfAsRecipient() public {
+    /// (USDT does) would burn it there, and paid to the vault it comes out of it would not move
+    /// at all: the taker's input gone, nothing received. Both are refused.
+    function test_swap_refusesTheZeroAddressAndThePairsVaultAsRecipient() public {
         _readyToSwapOneWeth();
 
         vm.startPrank(trader);
         vm.expectRevert(abi.encodeWithSelector(InvalidRecipient.selector, address(0)));
         propAmm.swap(WETH, USDT, 1e18, 0, address(0), block.timestamp);
-        vm.expectRevert(abi.encodeWithSelector(InvalidRecipient.selector, address(propAmm)));
-        propAmm.swap(WETH, USDT, 1e18, 0, address(propAmm), block.timestamp);
+        vm.expectRevert(abi.encodeWithSelector(InvalidRecipient.selector, vault));
+        propAmm.swap(WETH, USDT, 1e18, 0, vault, block.timestamp);
         vm.stopPrank();
+    }
+
+    /// Two hops on one instance, the way a push-payment router chains them: the first swap names
+    /// the instance as recipient, so its output is already where the second swap takes its input
+    /// from. Nothing is left on the instance, and the taker ends with what the second hop quoted
+    /// for the first hop's output.
+    function test_swap_twoHopsOnOneInstance() public {
+        // WETH -> USDT -> USDC. The mock serves one price for every lane, so a USDC is priced at
+        // 1600 USDT here; what matters is that each hop pays what it quotes.
+        uint256 firstOut = _readyToSwapOneWeth();
+        _fundVault(USDC, 1_000_000e6);
+        uint256 secondOut = propAmm.quote(USDT, USDC, firstOut);
+        assertGt(secondOut, 0);
+
+        assertEq(this.swapWethToUsdcThroughUsdt(firstOut, secondOut), secondOut);
+        assertEq(MockToken(USDC).balanceOf(trader), secondOut);
+        assertEq(MockToken(USDT).balanceOf(address(propAmm)), 0, "the first hop's output was left behind");
+        assertEq(MockToken(WETH).balanceOf(address(propAmm)), 0);
+    }
+
+    /// Both hops inside one external call, as a router makes them: one transaction.
+    function swapWethToUsdcThroughUsdt(uint256 minUsdt, uint256 minUsdc) external returns (uint256) {
+        uint256 usdt = propAmm.swap(WETH, USDT, 1e18, minUsdt, address(propAmm), block.timestamp);
+        return propAmm.swap(USDT, USDC, usdt, minUsdc, trader, block.timestamp);
     }
 
     /// `Swapped` is the last thing a swap logs, after both transfers, as `IPropAMM` documents:
@@ -739,60 +780,153 @@ contract PropAMMPricingTest is Test {
         assertFalse(propAmm.isActive(WETH, USDT));
     }
 
-    /// A malformed answer used to revert `isActive` in its decoder. It reads the first word and
-    /// no more: an answer stamped with this block's timestamp reads as active however broken the
-    /// rest is, and `quote` rejects it. A first word that is anything else, a stamp that does
-    /// not fit a uint32 included, reads as inactive (audit F-10).
-    function test_isActive_leavesAMalformedAnswerToQuote() public {
-        address[2] memory shapes = [address(new OneWordOracle()), address(new TruncatedArrayOracle())];
-        string[2] memory names = ["one word", "truncated array"];
+    /// A malformed answer used to revert `isActive` in its decoder. It reads as inactive, like
+    /// anything else `quote` cannot price from: a fresh stamp with nothing behind it, a stamp
+    /// that does not fit a uint32, a slot array cut short.
+    function test_isActive_falseForAMalformedAnswer() public {
+        _fundVault(USDT, 1_600_000e6);
+        address[3] memory shapes =
+            [address(new OneWordOracle()), address(new HighBitsOracle()), address(new TruncatedArrayOracle())];
+        string[3] memory names = ["one word", "timestamp above uint32", "truncated array"];
         for (uint256 i = 0; i < shapes.length; i++) {
             _etchOracle(shapes[i]);
-            assertTrue(propAmm.isActive(WETH, USDT), names[i]);
+            assertFalse(propAmm.isActive(WETH, USDT), names[i]);
             vm.expectRevert();
             propAmm.quote(WETH, USDT, 1e18);
         }
-
-        _etchOracle(address(new HighBitsOracle()));
-        assertFalse(propAmm.isActive(WETH, USDT), "timestamp above uint32");
-        vm.expectRevert();
-        propAmm.quote(WETH, USDT, 1e18);
     }
 
-    /// A fresh lane reads as active whatever its slots hold; `quote` rejects the unusable ones.
-    function test_isActive_doesNotReadTheSlots() public {
-        uint256 pairKey = uint256(keccak256(abi.encodePacked(WETH, USDT)));
+    /// `isActive` reads five words of the registry's answer by hand where `quote` uses the ABI
+    /// decoder. Each answer here carries a fresh stamp and a usable `delta` and `mid` in the
+    /// places `isActive` looks, and is one the decoder refuses or `quote` cannot price from.
+    function test_isActive_falseForAnAnswerQuoteWouldRefuse() public {
+        _fundVault(USDT, 1_600_000e6);
+        _etchOracle(address(new RawAnswerOracle()));
+        RawAnswerOracle raw = RawAnswerOracle(payable(ORACLE));
 
-        MockPUR(ORACLE).setState(5e14, 0);
-        assertTrue(propAmm.isActive(WETH, USDT), "mid == 0");
+        // Stamp, the array's offset, its length, then the two slots: what a registry encodes.
+        raw.setAnswer(_answer(64, 2));
+        assertTrue(propAmm.isActive(WETH, USDT), "the well-formed answer");
+        propAmm.quote(WETH, USDT, 1e18);
+
+        uint256[2][3] memory malformed = [[uint256(64), 3], [uint256(64), 1], [uint256(96), 2]];
+        string[3] memory names = ["three slots announced, two there", "one slot announced", "array at another offset"];
+        for (uint256 i = 0; i < malformed.length; i++) {
+            raw.setAnswer(_answer(malformed[i][0], malformed[i][1]));
+            assertFalse(propAmm.isActive(WETH, USDT), names[i]);
+            vm.expectRevert();
+            propAmm.quote(WETH, USDT, 1e18);
+        }
+    }
+
+    /// The one place the two readings differ, and it errs toward skipping the pair: an answer
+    /// with its array somewhere other than straight after the head is valid ABI, so `quote`
+    /// prices from it, while `isActive` expects the layout every Solidity registry produces.
+    function test_isActive_expectsTheCanonicalLayout() public {
+        _fundVault(USDT, 1_600_000e6);
+        _etchOracle(address(new RawAnswerOracle()));
+        // The array's offset is 96, and a spare word sits between the head and the array.
+        RawAnswerOracle(payable(ORACLE))
+            .setAnswer(abi.encode(vm.getBlockTimestamp(), uint256(96), uint256(0), uint256(2), 5e14, 1600e18));
+
+        assertGt(propAmm.quote(WETH, USDT, 1e18), 0);
+        assertFalse(propAmm.isActive(WETH, USDT));
+    }
+
+    /// The vault's balance is asked for with a low-level call, like the registry: a token that
+    /// reverts, answers with nothing or has no code reads as an empty vault, not as a revert.
+    /// (The shapes are the registry ones; all a shape does is answer every call the same way.)
+    function test_isActive_falseForATokenThatDoesNotAnswer() public {
+        _setPrice(1600e18, 5e14);
+        _fundVault(USDT, 1_600_000e6);
+        assertTrue(propAmm.isActive(WETH, USDT));
+
+        vm.etch(USDT, address(new RevertingOracle()).code);
+        assertFalse(propAmm.isActive(WETH, USDT), "a token that reverts");
+        vm.etch(USDT, address(new EmptyReturnOracle()).code);
+        assertFalse(propAmm.isActive(WETH, USDT), "a token that answers with nothing");
+        vm.etch(USDT, "");
+        assertFalse(propAmm.isActive(WETH, USDT), "a token without code");
+    }
+
+    /// `isActive` makes `_pricing`'s checks by hand, so the two could drift apart. Whatever the
+    /// lane holds, however old, and whatever the instance and its vault are doing, it answers
+    /// true exactly when `quote` answers for the pair. `fault` picks what, if anything, is wrong.
+    function testFuzz_isActive_agreesWithQuote(uint256 fault, uint256 mid, uint256 delta, uint256 slots) public {
+        fault = bound(fault, 0, 8);
+        // Up to 1e36: past about 1e41, scaling `mid` by a token's decimals overflows, which
+        // `isActive` leaves to `quote`.
+        mid = fault == 1 ? 0 : bound(mid, 1, 1e36);
+        delta = fault == 2 ? bound(delta, SPREAD_SCALE, type(uint256).max) : bound(delta, 0, SPREAD_SCALE - 1);
+        MockPUR(ORACLE).setState(delta, mid);
+        // Two slots, or more: the mock pads with zeros, and extra slots are not `_pricing`'s concern.
+        MockPUR(ORACLE).setSlotCount(fault == 3 ? 1 : uint64(bound(slots, 2, 4)));
+        if (fault == 4 || fault == 5) skip(12); // an old update, which the registry refuses...
+        if (fault == 5) MockPUR(ORACLE).setLenient(true); // ...or hands back under its true stamp
+        if (fault != 6) _fundVault(USDT, 1_600_000e6);
+        vm.startPrank(owner);
+        if (fault == 7) propAmm.pause();
+        if (fault == 8) propAmm.removePair(WETH, USDT);
+        vm.stopPrank();
+
+        bool quotes;
+        try propAmm.quote(WETH, USDT, 0) {
+            quotes = true;
+        } catch {}
+        assertEq(quotes, fault == 0, "the fault did not decide whether quote answers");
+        assertEq(propAmm.isActive(WETH, USDT), quotes);
+    }
+
+    /// A fresh lane is not enough: `isActive` answers what `quote` would, so slots `quote`
+    /// rejects read as inactive, each for the reason `quote` names.
+    function test_isActive_falseWhenTheSlotsCannotBePricedFrom() public {
+        uint256 pairKey = uint256(keccak256(abi.encodePacked(WETH, USDT)));
+        _fundVault(USDT, 1_600_000e6);
+        _setPrice(1600e18, 5e14);
+        assertTrue(propAmm.isActive(WETH, USDT), "a price quote accepts");
+
+        _setPrice(0, 5e14);
+        assertFalse(propAmm.isActive(WETH, USDT), "mid == 0");
         vm.expectRevert(abi.encodeWithSelector(InvalidMid.selector, pairKey));
         propAmm.quote(WETH, USDT, 1e18);
 
-        MockPUR(ORACLE).setState(5e14, 1e18);
+        _setPrice(1600e18, SPREAD_SCALE);
+        assertFalse(propAmm.isActive(WETH, USDT), "delta of one");
+        vm.expectRevert(abi.encodeWithSelector(SpreadTooWide.selector, SPREAD_SCALE));
+        propAmm.quote(WETH, USDT, 1e18);
+
+        _setPrice(1600e18, 5e14);
         MockPUR(ORACLE).setSlotCount(1);
-        assertTrue(propAmm.isActive(WETH, USDT), "one slot");
+        assertFalse(propAmm.isActive(WETH, USDT), "one slot");
         vm.expectRevert(abi.encodeWithSelector(InsufficientOracleData.selector, pairKey, uint256(1)));
         propAmm.quote(WETH, USDT, 1e18);
     }
 
     /// Removing a pair leaves its lane in the registry, still holding a fresh update: only the
-    /// listing check turns `isActive` false. Audit F-09.
+    /// listing turns `isActive` false. The balance check would not: an unlisted pair's vault
+    /// reads as the zero address, where most real tokens have a balance, burnt. Audit F-09.
     function test_isActive_falseForARemovedPair() public {
         _setPrice(1600e18, 5e14);
+        _fundVault(USDT, 1_600_000e6);
+        deal(USDT, address(0), 1e6);
         assertTrue(propAmm.isActive(WETH, USDT));
         vm.prank(owner);
         propAmm.removePair(WETH, USDT);
         assertFalse(propAmm.isActive(WETH, USDT), "the lane still has a fresh price");
     }
 
-    /// `isActive` is not told the swap's size, so a vault read could only tell an empty vault from
-    /// one holding a wei. It reads none: a vault that holds nothing and has approved nothing still
-    /// reads as active, and `quote` is what rejects it. Audit F-09 (review).
-    function test_isActive_doesNotReadTheVault() public {
+    /// A vault holding none of `tokenOut` cannot fill anything, and `quote` says so. `isActive`
+    /// is per direction for that reason: the same pair is active the other way round as long as
+    /// the vault holds that side. It is still not told a size, so a wei in the vault is enough.
+    function test_isActive_falseForAnEmptyVault() public {
         _setPrice(1600e18, 5e14);
-        assertTrue(propAmm.isActive(WETH, USDT));
+        assertFalse(propAmm.isActive(WETH, USDT), "no USDT to pay out");
         vm.expectRevert(abi.encodeWithSelector(EmptyVault.selector, USDT));
         propAmm.quote(WETH, USDT, 1e18);
+
+        MockToken(USDT).mint(vault, 1);
+        assertTrue(propAmm.isActive(WETH, USDT), "a wei of USDT");
+        assertFalse(propAmm.isActive(USDT, WETH), "still no WETH");
     }
 
     function test_pause_onlyOwnerCanFlipIt() public {
@@ -817,6 +951,12 @@ contract PropAMMPricingTest is Test {
     function _deployToken(address where, uint8 decimals) internal {
         vm.etch(where, address(new MockToken()).code);
         MockToken(where).setDecimals(decimals);
+    }
+
+    /// A `getState` answer stamped now, with `delta` and `mid` as its fourth and fifth words, and
+    /// the array's offset and length as given.
+    function _answer(uint256 offset, uint256 count) internal view returns (bytes memory) {
+        return abi.encode(vm.getBlockTimestamp(), offset, count, uint256(5e14), uint256(1600e18));
     }
 
     function _setPrice(uint256 mid, uint256 delta) internal {
