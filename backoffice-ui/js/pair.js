@@ -236,9 +236,12 @@ export async function pairView(root, { key }) {
       lastLookup = `${b}-${a}`.toLowerCase();
     }
     const keepSaved = first && editing;
+    // Only markets in the pair's own quote are ticked. One in another dollar (`stand_in`) is
+    // filled in but left to the operator, with its note saying why: averaged as if at par, it
+    // fails the startup check unless the pair opts in (audit F-04).
     const top = new Set(
       data.venues
-        .filter((v) => v.listed)
+        .filter((v) => v.listed && !v.stand_in)
         .sort((x, y) => (y.volume_usd || 0) - (x.volume_usd || 0))
         .slice(0, TICK_TOP)
         .map((v) => v.venue),
@@ -284,7 +287,10 @@ export async function pairView(root, { key }) {
       `${data.base}/${data.quote}` +
       (swapped && !editing ? ` (swapped: venues price ${data.base} in ${data.quote}, not the other way round)` : "") +
       (swapped && editing ? ` (venues price ${data.base} in ${data.quote}, the other way round from this pair's tokens)` : "") +
-      (listed === 0 ? " (no venue lists this pair; fill the table by hand)" : "");
+      (listed === 0 ? " (no venue lists this pair; fill the table by hand)" : "") +
+      (listed > 0 && top.size === 0 && !keepSaved
+        ? ` (venues list ${data.base} only against another dollar, so none is ticked; see each venue's note)`
+        : "");
     append(clear(lookupNotes), (data.notes || []).map((n) => h("li", {}, n)));
     lookupNotes.hidden = !(data.notes || []).length;
     visibility();
