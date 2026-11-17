@@ -12,11 +12,11 @@
 //! manages it.
 //!
 //! No cookie, session, redirect or client secret: a browser never sends the token on its
-//! own, so a page on another site has nothing of the operator's to use (audit F-02).
+//! own, so a page on another site has nothing of the operator's to use.
 //!
 //! Google's keys are fetched at start and again as their `Cache-Control` says, by a task of
 //! their own. A request is never held up by that fetch while the keys it needs are known:
-//! in particular a halt (audit F-06) is checked against keys already in memory. A failed
+//! in particular a halt is checked against keys already in memory. A failed
 //! fetch keeps the keys already held. Only a token signed by a key not yet seen (Google
 //! rotates them) waits for a fetch, at most one at a time and one every [`REFETCH_EVERY`].
 
@@ -811,7 +811,7 @@ pub(crate) mod tests {
         assert_eq!(keys.fetches(), before + 1, "no fetch inside REFETCH_EVERY");
     }
 
-    /// The F-06 half: with Google's endpoint hanging, a token signed by a key already held is
+    /// With Google's endpoint hanging, a token signed by a key already held is
     /// checked at once, from memory.
     #[tokio::test]
     async fn a_known_key_is_checked_without_waiting_for_google() {

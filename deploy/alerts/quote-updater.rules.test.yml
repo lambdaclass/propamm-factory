@@ -197,7 +197,7 @@ tests:
         alertname: PusherForeignLaneWrite
         exp_alerts: []
 
-  # The loss-path rules (audit F-07): PusherVaultLosingValue and PusherVaultDraining,
+  # The loss-path rules: PusherVaultLosingValue and PusherVaultDraining,
   # PusherVaultUnpriced, PusherVaultOneSided and PusherQuoteThroughMarket. The first two are
   # the reason these fixtures run over two hours: the measure is a balance against itself an
   # hour ago, so there is nothing to compare for the first hour and the loss leaves the
@@ -412,7 +412,7 @@ tests:
               summary: "THROUGH/USDC: the market is outside the published quote"
               description: "For five minutes the market's mid has been further from the published mid than the published half-spread, so one of the pair's two prices is on the wrong side of the market and a taker can fill it and unwind at a profit. Halt the pair, then look at its pricing: a mid moved further than its spread, or a fixed price the market has left."
 
-  # PusherSourcesDisagree (audit F-05): a pair withdrawn in every one of five minutes raises
+  # PusherSourcesDisagree: a pair withdrawn in every one of five minutes raises
   # a ticket; one withdrawn for a tick twice, three minutes apart, does not. Scrape-rate
   # fixtures: the rate is over one minute.
   - interval: 15s

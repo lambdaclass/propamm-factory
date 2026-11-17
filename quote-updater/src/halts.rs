@@ -1,4 +1,4 @@
-//! The kill switch (audit F-06): one flag per pair, shared between whoever halts it and the
+//! The kill switch: one flag per pair, shared between whoever halts it and the
 //! lane that quotes it.
 //!
 //! A halt used to be a config change like any other: a full reload, which checks every pair

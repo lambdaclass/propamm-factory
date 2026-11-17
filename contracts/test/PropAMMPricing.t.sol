@@ -29,7 +29,7 @@ import {MockToken} from "./mocks/MockToken.sol";
 import {FeeOnTransferToken} from "./mocks/FeeOnTransferToken.sol";
 import {ReentrantToken} from "./mocks/ReentrantToken.sol";
 
-// Oracle shapes etched over `ORACLE` by the `isActive` tests (audit F-14).
+// Oracle shapes etched over `ORACLE` by the `isActive` tests.
 
 /// Every call returns no data.
 contract EmptyReturnOracle {
@@ -776,7 +776,7 @@ contract PropAMMPricingTest is Test {
     }
 
     /// Replaces the code at `ORACLE`: whatever sits there, `isActive` answers instead of
-    /// reverting (audit F-14).
+    /// reverting.
     function _etchOracle(address shape) internal {
         vm.etch(ORACLE, shape.code);
     }
@@ -948,7 +948,7 @@ contract PropAMMPricingTest is Test {
 
     /// Removing a pair leaves its lane in the registry, still holding a fresh update: only the
     /// listing turns `isActive` false. The balance check would not: an unlisted pair's vault
-    /// reads as the zero address, where most real tokens have a balance, burnt. Audit F-09.
+    /// reads as the zero address, where most real tokens have a balance, burnt.
     function test_isActive_falseForARemovedPair() public {
         _setPrice(1600e18, 5e14);
         _fundVault(USDT, 1_600_000e6);
@@ -1008,7 +1008,7 @@ contract PropAMMPricingTest is Test {
     }
 
     /// A fee-on-transfer tokenOut (USDT with its fee switch on): the recipient gets less than
-    /// computed, so `minAmountOut` must be checked against what it received. Audit F-09.
+    /// computed, so `minAmountOut` must be checked against what it received.
     function test_swap_revertsWhenTheRecipientWouldReceiveLessThanMinAmountOut() public {
         (PropAMM amm, FeeOnTransferToken fot) = _feeOnTransferOutputPair();
         uint256 quoted = amm.quote(WETH, address(fot), 1_000e18);
@@ -1019,7 +1019,7 @@ contract PropAMMPricingTest is Test {
     }
 
     /// `Swapped.amountOut` is documented as a balance delta, and the router-facing return value
-    /// should agree with it. Audit F-09.
+    /// should agree with it.
     function test_swap_returnsAndEmitsWhatTheRecipientReceived() public {
         (PropAMM amm, FeeOnTransferToken fot) = _feeOnTransferOutputPair();
         uint256 quoted = amm.quote(WETH, address(fot), 1_000e18);
@@ -1033,7 +1033,7 @@ contract PropAMMPricingTest is Test {
     }
 
     /// Push payment cannot tell a payment from a stray transfer: tokens left on the instance can be
-    /// swapped by anyone. The vault is still paid in full; the loss is the sender's. Audit F-09.
+    /// swapped by anyone. The vault is still paid in full; the loss is the sender's.
     function test_swap_aStrayBalanceIsSwappableByAnyone() public {
         _setPrice(1600e18, 5e14);
         _fundVault(USDT, 1_600_000e6);
@@ -1047,7 +1047,7 @@ contract PropAMMPricingTest is Test {
     }
 
     /// A fee-on-transfer tokenIn (USDT with its fee switch on) is not supported: with nothing else on
-    /// the instance, it holds less than amountIn and the swap reverts. Audit F-09.
+    /// the instance, it holds less than amountIn and the swap reverts.
     function test_swap_feeOnTransferTokenInReverts() public {
         (PropAMM amm, FeeOnTransferToken fot) = _feeOnTransferInputPair();
         fot.mint(address(this), 100e18);
@@ -1061,7 +1061,7 @@ contract PropAMMPricingTest is Test {
 
     /// ...but it does not fail closed: when the instance already holds the shortfall (a caller that
     /// sends more than amountIn, or a stray), the swap fills, and the vault receives amountIn less
-    /// the token's fee, selling below its price. Documented, not prevented. Audit F-09 (review).
+    /// the token's fee, selling below its price. Documented, not prevented.
     function test_swap_feeOnTransferTokenInFillsWhenTheShortfallIsHeld() public {
         (PropAMM amm, FeeOnTransferToken fot) = _feeOnTransferInputPair();
         fot.mint(address(this), 102e18);

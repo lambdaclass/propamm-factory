@@ -7,7 +7,7 @@
 //! accepts: so the shared config always says what is running, and the file always holds
 //! it for the next boot.
 //!
-//! A halt is the other exception (audit F-06). [`SharedConfig::halt`] sets the pair's kill
+//! A halt is the other exception. [`SharedConfig::halt`] sets the pair's kill
 //! switch first (`halts.rs`), a flag its lane reads on every tick, so its quote is withdrawn
 //! at once whatever change is in flight; then it records the halt here without a converge,
 //! so nothing on the chain or in another pair can refuse or hold it up.
@@ -43,7 +43,7 @@ use crate::{
 pub(crate) struct ReloadRequest {
     pub(crate) config: Arc<RawConfig>,
     /// The lanes halted on their breaker to bring back: restarted from `config`, trusting
-    /// the price they find. No other converge restarts a tripped lane (audit F-17).
+    /// the price they find. No other converge restarts a tripped lane.
     pub(crate) rearm: Vec<U256>,
     pub(crate) reply: oneshot::Sender<Result<String, ReloadFailure>>,
 }
@@ -151,7 +151,7 @@ impl SharedConfig {
         self.edit().await.reload().await
     }
 
-    /// Re-arms the pairs `pick` chooses (audit F-17): each one halted on its circuit breaker
+    /// Re-arms the pairs `pick` chooses: each one halted on its circuit breaker
     /// is restarted from its stanza as it is, and trusts the price it finds, which its line
     /// in the answer names beside the trip it clears. The one way a tripped lane comes
     /// back. A converge of the config as it is, checked like any other, so it can be
@@ -184,7 +184,7 @@ impl SharedConfig {
         }
     }
 
-    /// The kill switch (audit F-06). `pick` chooses the pairs to halt from a config, by
+    /// The kill switch. `pick` chooses the pairs to halt from a config, by
     /// `key_env`, and says what that is for the line, or refuses (a pair that is not there,
     /// one already halted). It is asked twice, as below.
     ///
@@ -694,7 +694,7 @@ api_key = "k"
             .await
     }
 
-    /// The kill switch (audit F-06): the lane's flag is set before anything else, while a
+    /// The kill switch: the lane's flag is set before anything else, while a
     /// change in flight holds the edit lock and the service sits on its converge, as one
     /// stuck on a hung RPC would; the halt is recorded once that change is done, and never
     /// asks the service for a converge of its own.

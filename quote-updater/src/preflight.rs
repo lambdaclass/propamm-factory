@@ -814,7 +814,7 @@ pub async fn build_report(
     // "every key is infinitely funded".
     // Every read here is bounded by `RPC_TIMEOUT`, as `call_view`'s are: a reload runs this,
     // and an RPC that accepts and never answers would otherwise hold it, and the config
-    // lock it holds, for ever (audit F-06).
+    // lock it holds, for ever.
     let base_fee =
         crate::bounded(client.get_block_by_number(BlockIdentifier::Tag(BlockTag::Latest), false))
             .await
@@ -1038,7 +1038,7 @@ pub(crate) fn symbol_verdicts(
                 spec.allow_symbol_mismatch,
             ) {
                 SymbolCheck::Match | SymbolCheck::MismatchAllowed { .. } => {}
-                // Refused unless the pair opted in, and then still said (audit F-04).
+                // Refused unless the pair opted in, and then still said.
                 SymbolCheck::StandIn { quoted_in } => match stand_in_failure(
                     source.venue,
                     &source.symbol,
@@ -1084,8 +1084,8 @@ pub(crate) fn symbol_verdicts(
 
 /// Why a source quoted in another dollar cannot run, if it cannot. The composite averages
 /// sources without converting them, so a USD or USDT market on a USDC pair is averaged as if
-/// the two were at par, and through a depeg of either the pair publishes the wrong price
-/// (audit F-04). `allow_symbol_mismatch` is the pair's way to say it averages them at par
+/// the two were at par, and through a depeg of either the pair publishes the wrong price.
+/// `allow_symbol_mismatch` is the pair's way to say it averages them at par
 /// knowingly; `build_report` then keeps the at-par warning.
 pub(crate) fn stand_in_failure(
     venue: crate::venue::VenueId,
@@ -1110,7 +1110,7 @@ pub(crate) fn stand_in_failure(
 /// them is the default and would otherwise be invisible. A pair with a market earns it, and
 /// so does a kind with no market, which is bounded by less: only `delta < 1` and a nonzero
 /// mid stand between its output and the chain. So does a `fixed` mid with no market, banded
-/// or not, which only an `unguarded` stanza can run (audit F-04): nothing compares it with
+/// or not, which only an `unguarded` stanza can run: nothing compares it with
 /// a market, and the band can only compare the constant with itself.
 fn band_warning(spec: &crate::config::PairSpec) -> Option<String> {
     if spec.feeds.is_none() && spec.pricing.kind == "fixed" {
@@ -1146,8 +1146,7 @@ mod tests {
     /// anywhere: a feed, or a custom pricer, which nothing but `delta < 1` and a nonzero
     /// mid bounds (the core never compares a mid with the market, even when there is one).
     /// A pair with a band does not, unless its mid is `fixed` and it streams nothing: a band
-    /// around a constant bounds nothing, and nothing compares that constant with a market
-    /// (audit F-04).
+    /// around a constant bounds nothing, and nothing compares that constant with a market.
     #[test]
     fn a_pair_nothing_bounds_is_warned_about() {
         let spec = |text: &str| {
@@ -1214,7 +1213,7 @@ mod tests {
     }
 
     /// A pair that opts in to averaging a market in another dollar passes, and is still told
-    /// that it is averaged at par; one that does not fails. Audit F-04 (review).
+    /// that it is averaged at par; one that does not fails.
     #[test]
     fn a_stand_in_the_pair_allows_is_still_reported_as_averaged_at_par() {
         let (failures, _) =
@@ -1262,7 +1261,7 @@ mod tests {
     }
 
     /// The template every compose deployment starts from passes preflight's pair verdicts:
-    /// its stable pair streams USDCUSDT inside a [0.995, 1.005] band. Audit F-04.
+    /// its stable pair streams USDCUSDT inside a [0.995, 1.005] band.
     #[test]
     fn the_deploy_example_passes_preflights_pair_verdicts() {
         let template = include_str!("../../deploy/config.example.toml").replace(
@@ -1525,7 +1524,7 @@ mod tests {
         );
     }
 
-    /// Audit F-04, path 2: a market in another dollar is averaged as if at par, so through a
+    /// A market in another dollar is averaged as if at par, so through a
     /// depeg of either the pair publishes the wrong price. It fails preflight unless the pair
     /// opts in with `allow_symbol_mismatch`; then `build_report` keeps the at-par warning.
     #[test]

@@ -4,7 +4,7 @@
 //! A fixed price does not follow its market, so it is only safe while the market sits
 //! inside its own quote, `mid · (1 − delta)` to `mid · (1 + delta)`. Outside it a taker
 //! trades the vault at a stale price: a stablecoin depeg drains the sound side at par, one
-//! small step at a time (audit F-04). So the pair needs a market (`symbol` or `sources`),
+//! small step at a time. So the pair needs a market (`symbol` or `sources`),
 //! and the pricer refuses every tick on which the market is outside its quote, whatever
 //! the pair's band. A smoke test with no market says so with `unguarded = true`.
 //!
@@ -67,7 +67,7 @@ impl Fixed {
     /// market orientation, inverted for an inverted lane (byte for byte the rule a feed
     /// follows), the delta as a fraction below one unit, both inside the pair's band.
     fn resolve(cfg: &FixedConfig, pair: &PairShape) -> eyre::Result<(U256, U256)> {
-        // With no market nothing could stop a fixed price through a depeg (audit F-04).
+        // With no market nothing could stop a fixed price through a depeg.
         eyre::ensure!(
             pair.sources > 0 || cfg.unguarded,
             "pricing `fixed` publishes the same mid whatever the market does, and this pair \
@@ -219,7 +219,7 @@ impl FixedPricer {
 impl Pricer for FixedPricer {
     fn price(&mut self, tick: &TickCtx, _out: &mut Diagnostics) -> Result<PricerOutput, Refusal> {
         // A pair with a market quotes only while the market sits inside this price's own bid
-        // and ask; outside them a taker trades the vault at a stale price (audit F-04). The
+        // and ask; outside them a taker trades the vault at a stale price. The
         // core has already refused a stale market, so a tick with none is an unguarded pair.
         if let Ok(market) = tick.market() {
             let quote = self.quote(tick.pair().price_decimals);
@@ -340,7 +340,7 @@ mod tests {
         );
     }
 
-    /// Audit F-04: a fixed price does not follow its market, so it is only safe while the
+    /// A fixed price does not follow its market, so it is only safe while the
     /// market sits inside its own quote. Outside it a taker trades the vault at a stale
     /// price: at the PoC's 0.9997 USDT per USDC the vault's bid, 1.0001 · (1 − 0.0002) ≈
     /// 0.99990, is already above the market, and a USDT depeg (1.0005) is past its ask. The
@@ -388,7 +388,7 @@ mod tests {
 
     /// With no market, nothing could stop a fixed price through a depeg, so the stanza
     /// needs a market (`symbol` or `sources`) or says it is a smoke test with `unguarded`.
-    /// A pair form sends `"true"` as a string, so that reads as the flag too. Audit F-04.
+    /// A pair form sends `"true"` as a string, so that reads as the flag too.
     #[test]
     fn a_fixed_price_needs_a_market_unless_it_says_it_is_unguarded() {
         let mut pair = testing::pair();

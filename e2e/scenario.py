@@ -93,7 +93,7 @@ binance_ws = "ws://127.0.0.1:{ports['binance']}/ws"
 [settings.endpoints]
 coingecko = "http://127.0.0.1:{ports['rpc']}"
 
-# A fixed price needs a market to compare its price with (audit F-04): it quotes only while
+# A fixed price needs a market to compare its price with: it quotes only while
 # USDCUSDT's mid sits inside its own bid and ask, and the Binance mock holds it at par.
 [[pairs]]
 tokens  = ["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", "0xdAC17F958D2ee523a2206206994597C13D831ec7"]

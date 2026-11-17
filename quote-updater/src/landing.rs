@@ -52,7 +52,7 @@ pub(crate) enum Landing {
     /// The lane holds an update stamped for the block, its price is none of the ones this
     /// process signed for it, and this pair's key landed nothing in the block: another key
     /// wrote the lane. The registry authorizes an updater for every lane of its target, so
-    /// any other pair's key can (audit F-08).
+    /// any other pair's key can.
     Foreign,
     /// The read-back itself failed, so inclusion is unknown. Never counted as landed: an
     /// unverifiable state must not render as a healthy one.

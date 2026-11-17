@@ -74,8 +74,8 @@ fn ignore_hangup(tasks: &mut Tasks, config: &std::path::Path) {
 }
 
 /// How the halt notice tells an operator to re-arm a pair its breaker halted: the one
-/// thing that brings it back without restarting the others, one pair at a time (audit
-/// F-17). `backoffice` is its base URL, scheme included.
+/// thing that brings it back without restarting the others, one pair at a time.
+/// `backoffice` is its base URL, scheme included.
 fn rearm_hint(backoffice: Option<&str>, handle: bool) -> String {
     match (backoffice, handle) {
         (Some(url), _) => format!("POST {url}/api/pairs/<key_env>/rearm"),
@@ -1000,7 +1000,7 @@ mod tests {
     /// What every in-process run test starts from: a mock RPC serving one USDC/USDT pair
     /// with a vault, an acking mock builder, and a config file naming both. The pair is
     /// `fixed` and `unguarded`: these runs stream nothing, and a fixed price otherwise needs
-    /// a market to compare its price with (audit F-04).
+    /// a market to compare its price with.
     struct Fixture {
         rpc: crate::rpc_mock::MockRpc,
         /// Shared, so a `shutdown_on` future can wait on it.
@@ -1682,7 +1682,7 @@ api_key = "k"
 
     /// A halt is an intent, in the file: a reload leaves it alone and only `resume` clears
     /// it. A trip is a judgement, on the latch: a reload leaves it too, and only the pair's
-    /// re-arm clears it (audit F-17).
+    /// re-arm clears it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_halt_survives_a_reload_and_a_trip_does_not() {
         use std::{
@@ -1736,8 +1736,8 @@ api_key = "k"
             .expect_err("nothing to resume");
         assert!(err.contains("not halted"), "{err}");
 
-        // The trip: the guard halts the lane on the next block. A reload leaves it halted
-        // (audit F-17); only its own re-arm brings it back, naming the mid it now trusts.
+        // The trip: the guard halts the lane on the next block. A reload leaves it halted;
+        // only its own re-arm brings it back, naming the mid it now trusts.
         killed.store(true, Ordering::SeqCst);
         fx.rpc.set_head(101);
         assert!(
@@ -2023,7 +2023,7 @@ api_key = "k"
         assert_eq!(fx.builder.count(), 0, "nothing quotes yet");
 
         // `unguarded`, as the fixture's own pair is: the pair streams nothing, and a fixed
-        // price with no market is otherwise refused (audit F-04).
+        // price with no market is otherwise refused.
         let added = client
             .post(format!("http://127.0.0.1:{port}/api/pairs"))
             .header("content-type", "application/json")
@@ -2066,7 +2066,7 @@ api_key = "k"
             .expect("runs and stops cleanly");
     }
 
-    /// Audit F-06, its first half: a halt is not refused while a pair fails its checks. With
+    /// A halt is not refused while a pair fails its checks. With
     /// the chain answering no `eth_call`, preflight cannot confirm any updater, so a reload
     /// is refused, as every halt used to be; the halt goes through all the same, the quote
     /// is withdrawn and the file keeps it.
@@ -2100,7 +2100,7 @@ api_key = "k"
             .expect("runs and stops cleanly");
     }
 
-    /// Audit F-06, its second half: a halt does not wait on the chain. With the RPC slow to
+    /// A halt does not wait on the chain. With the RPC slow to
     /// answer a read every reload makes, a reload is in flight for seconds, holding the
     /// config's edit lock and the service; a halt made meanwhile has the quote withdrawn at
     /// once, long before that reload is done, and is recorded after it.
@@ -2156,7 +2156,7 @@ api_key = "k"
     }
 
     /// A halt beside a lane that fails every reload, because it never builds: the halt is
-    /// not a reload (audit F-06), so that lane has no say in it. It applies, cleanly, the
+    /// not a reload, so that lane has no say in it. It applies, cleanly, the
     /// file keeps it, the quote is withdrawn, and the next reload, which fails that lane
     /// again, leaves the halted pair stopped.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

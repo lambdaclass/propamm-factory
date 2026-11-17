@@ -72,7 +72,7 @@ address. The settings page can point one browser at another backoffice; that is 
 browser only, and "blank" there goes back to `config.json`'s.
 
 The backoffice refuses a change from a page on an origin it does not know, and a browser
-lets a page read the API's answers only if the API approves its origin (audit F-02). So
+lets a page read the API's answers only if the API approves its origin. So
 serve `dist/` one of two ways:
 
 **Under the backoffice's own address**, from a reverse proxy that serves `dist/` and passes

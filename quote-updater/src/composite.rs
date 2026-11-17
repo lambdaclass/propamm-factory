@@ -259,7 +259,7 @@ impl Spawned {
     ///
     /// Read from the venues rather than from the composite's sample, which says only how
     /// far the venues it was averaged from disagreed: the first one is usually one venue's,
-    /// and reads zero whatever the others go on to say (audit F-05).
+    /// and reads zero whatever the others go on to say.
     pub async fn settled_divergence(&self, sources: &[Source], decimals: u32) -> U256 {
         let every_venue = async {
             for venue in &self.venues {
@@ -629,7 +629,7 @@ mod tests {
         }
     }
 
-    /// Audit F-05: what the composite reports about its venues agreeing. The primary is
+    /// What the composite reports about its venues agreeing. The primary is
     /// the venue the average mostly is, and the gap is its distance from the furthest of
     /// the others, so a venue listed at a thousandth of the weight still counts in full as
     /// a second reading of the market.
@@ -1087,7 +1087,7 @@ mod tests {
         assert!((ratio - 0.5).abs() < 1e-9, "got {ratio}");
     }
 
-    /// Audit F-05: `--check` holds a pair to its venues agreeing, and the first composite
+    /// `--check` holds a pair to its venues agreeing, and the first composite
     /// sample cannot say whether they do when it was one venue's. The gap is read once
     /// every venue has delivered.
     #[tokio::test]

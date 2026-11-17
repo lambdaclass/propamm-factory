@@ -429,7 +429,7 @@ impl MidBand {
     /// the published mid's scale. Judged after [`Self::check`] for a pair that streams, so a
     /// kind whose mid does not follow the market (a `fixed` price) still stops when the
     /// market leaves the band. Without it a fixed stable pair's band judged only the fixed
-    /// number, and the pair sold at par through a depeg (audit F-04).
+    /// number, and the pair sold at par through a depeg.
     pub fn check_market(&self, market_mid: U256) -> Result<(), crate::update::Unusable> {
         use crate::update::{Unusable, UnusableKind};
         if let Some(min) = self.min
@@ -483,7 +483,7 @@ impl PricingSpec {
         }
     }
 
-    /// A `fixed` stanza for a test pair that streams nothing, so `unguarded` (audit F-04: a
+    /// A `fixed` stanza for a test pair that streams nothing, so `unguarded` (a
     /// fixed price otherwise needs a market to compare its price with).
     pub(crate) fn fixed_for_tests(mid: &str, delta: &str) -> Self {
         Self::for_tests(
@@ -1787,7 +1787,7 @@ sources = [{ venue = "binance", symbol = "ETHUSDT" }]
         assert!(err.contains("not both"), "{err}");
     }
 
-    /// Audit F-05. The limit on how far a pair's venues may disagree is the default one
+    /// The limit on how far a pair's venues may disagree is the default one
     /// unless the stanza sets it, and then it is a fraction held to what every threshold
     /// is, on a pair that has two venues to compare.
     #[test]
