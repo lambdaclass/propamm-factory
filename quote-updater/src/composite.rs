@@ -247,6 +247,38 @@ pub async fn connect(feeds: &Feeds, params: Params<'_>) -> Result<Spawned> {
     }
 }
 
+/// How long `--check` gives the rest of a pair's venues to deliver after the first composite
+/// sample. The first sample needs only `min_sources` venues, often one, and one venue has
+/// nothing to disagree with.
+pub const EVERY_VENUE_WAIT: Duration = Duration::from_secs(5);
+
+impl Spawned {
+    /// For `--check`: how far the pair's venues disagree once every one of them has
+    /// delivered, or after [`EVERY_VENUE_WAIT`] over those that have. `sources` are the
+    /// pair's, in the order the venues were dialed.
+    ///
+    /// Read from the venues rather than from the composite's sample, which says only how
+    /// far the venues it was averaged from disagreed: the first one is usually one venue's,
+    /// and reads zero whatever the others go on to say (audit F-05).
+    pub async fn settled_divergence(&self, sources: &[Source], decimals: u32) -> U256 {
+        let every_venue = async {
+            for venue in &self.venues {
+                let mut rx = venue.rx.clone();
+                if rx.wait_for(|sample| sample.is_some()).await.is_err() {
+                    return;
+                }
+            }
+        };
+        let _ = tokio::time::timeout(EVERY_VENUE_WAIT, every_venue).await;
+        let delivered: Vec<(&Source, PriceSample)> = sources
+            .iter()
+            .zip(&self.venues)
+            .filter_map(|(source, venue)| (*venue.rx.borrow()).map(|sample| (source, sample)))
+            .collect();
+        divergence(&delivered, decimals)
+    }
+}
+
 /// The averaging state: the latest sample from each source and where the result goes.
 struct Composite {
     sources: Vec<Source>,
@@ -1053,6 +1085,48 @@ mod tests {
             .breaker_window_deviation_ratio
             .get();
         assert!((ratio - 0.5).abs() < 1e-9, "got {ratio}");
+    }
+
+    /// Audit F-05: `--check` holds a pair to its venues agreeing, and the first composite
+    /// sample cannot say whether they do when it was one venue's. The gap is read once
+    /// every venue has delivered.
+    #[tokio::test]
+    async fn the_check_reads_the_gap_once_every_venue_has_delivered() {
+        let fast = mock_venue(vec![ticker("3000.00000000")], Duration::ZERO).await;
+        // The other venue's price comes later: its first frame is one the feed reads as
+        // no price.
+        let slow = mock_venue(
+            vec![
+                r#"{"result":null,"id":1}"#.to_owned(),
+                ticker("3300.00000000"),
+            ],
+            Duration::from_millis(400),
+        )
+        .await;
+        let router = route(vec![("fast", fast), ("slow", slow)]).await;
+        let endpoints = Endpoints::single(VenueId::Binance, router);
+        let metrics = Metrics::new().unwrap();
+        let feeds = Feeds {
+            sources: vec![
+                source(VenueId::Binance, "fast", "2"),
+                source(VenueId::Binance, "slow", "1"),
+            ],
+            min_sources: 1,
+            checks: Default::default(),
+        };
+        let spawned = connect(
+            &feeds,
+            params(&endpoints, &metrics, Latch::new(), None, Vec::new()),
+        )
+        .await
+        .unwrap();
+        let first = spawned.rx.borrow().unwrap();
+        assert_eq!(first.divergence, U256::zero(), "one venue's sample");
+        // |3000 − 3300| / 3300 at 8 decimals.
+        assert_eq!(
+            spawned.settled_divergence(&feeds.sources, 8).await,
+            U256::from(9_090_909u64)
+        );
     }
 
     /// Two venues at different prices average by weight, and a venue that never delivers

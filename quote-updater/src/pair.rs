@@ -846,10 +846,19 @@ pub(crate) async fn collect_prices(
                 (Err(err), _) => Err(format!("{err:#}")),
                 (Ok(()), Some(feeds)) => match composite::connect(feeds, params()).await {
                     Ok(spawned) => {
+                        // The first sample is often one venue's, which has nothing to
+                        // disagree with: the gap the row is held to is the one between
+                        // every venue that delivers, as the run's is a moment later.
+                        let gap = spawned
+                            .settled_divergence(&feeds.sources, price_decimals)
+                            .await;
                         venues = venue_lines(&spawned);
                         let sample = *spawned.rx.borrow();
                         sample
-                            .map(Some)
+                            .map(|mut sample| {
+                                sample.divergence = sample.divergence.max(gap);
+                                Some(sample)
+                            })
                             .ok_or_else(|| "the feed reported a sample and then lost it".to_owned())
                     }
                     Err(err) => Err(format!("{err:#}")),

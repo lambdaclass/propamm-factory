@@ -347,7 +347,7 @@ A withdrawn tick is counted under
 `quote_updater_price_unusable_total{reason="source_divergence"}`, and
 `PusherSourcesDisagree` raises a ticket when that goes on for five minutes. Nothing
 latches, so there is nothing to re-arm. `--check` applies the same limit to the row it
-prints. The backoffice's pair form has the field; blank is the default limit. Rolling back
+prints, once every venue has delivered a price (it waits up to five seconds for them). The backoffice's pair form has the field; blank is the default limit. Rolling back
 to a version without this key: remove `max_source_divergence` from every pair first, as
 for `max_source_lag_ms`.
 
