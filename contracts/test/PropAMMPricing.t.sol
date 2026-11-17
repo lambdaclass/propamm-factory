@@ -2,25 +2,32 @@
 pragma solidity ^0.8.35;
 
 import "forge-std/console.sol";
-import {Test} from "forge-std/Test.sol";
+import {Test, Vm} from "forge-std/Test.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
+import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import {
     PropAMM,
     EmptyVault,
+    Expired,
     InsufficientOracleData,
     InsufficientOutput,
     InsufficientVaultBalance,
     InvalidMid,
+    InvalidRecipient,
     SpreadTooWide,
-    UnsupportedPair
+    StaleOracleData,
+    UnsupportedPair,
+    ZeroAmountIn,
+    ZeroAmountOut
 } from "../src/PropAMM.sol";
 import {IPropAMM} from "../src/interfaces/IPropAMM.sol";
 import {MockPUR} from "./mocks/MockPUR.sol";
 import {MockToken} from "./mocks/MockToken.sol";
 import {FeeOnTransferToken} from "./mocks/FeeOnTransferToken.sol";
+import {ReentrantToken} from "./mocks/ReentrantToken.sol";
 
 // Oracle shapes etched over `ORACLE` by the `isActive` tests (audit F-14).
 
@@ -29,11 +36,11 @@ contract EmptyReturnOracle {
     fallback() external payable {}
 }
 
-/// Every call returns one word.
+/// Every call returns one word: this block's timestamp, which is all `isActive` reads.
 contract OneWordOracle {
     fallback() external payable {
         assembly {
-            mstore(0, 1)
+            mstore(0, timestamp())
             return(0, 32)
         }
     }
@@ -58,11 +65,11 @@ contract HighBitsOracle {
     }
 }
 
-/// Claims two slots but returns only the head.
+/// Claims two slots under this block's timestamp, but returns only the head.
 contract TruncatedArrayOracle {
     fallback() external payable {
         assembly {
-            mstore(0, 1)
+            mstore(0, timestamp())
             mstore(0x20, 0x40)
             mstore(0x40, 2)
             return(0, 0x60)
@@ -330,6 +337,81 @@ contract PropAMMPricingTest is Test {
         propAmm.quote(WETH, USDT, 1000e18);
     }
 
+    /// A `delta` of one or more is refused as it is read, with the `delta` itself: before, the
+    /// largest word overflowed the sum with the impact and `quote` panicked where `quoteFillable`
+    /// named the reason. `swap` prices through the same read.
+    function test_quote_andSwapRefuseADeltaOfOneOrMore() public {
+        _fundVault(USDT, 1_600_000e6);
+        MockToken(WETH).mint(address(propAmm), 1e18);
+
+        uint256[3] memory deltas = [SPREAD_SCALE, SPREAD_SCALE + 1, type(uint256).max];
+        for (uint256 i = 0; i < deltas.length; i++) {
+            _setPrice(1600e18, deltas[i]);
+
+            vm.expectRevert(abi.encodeWithSelector(SpreadTooWide.selector, deltas[i]));
+            propAmm.quote(WETH, USDT, 1e18);
+            vm.expectRevert(abi.encodeWithSelector(SpreadTooWide.selector, deltas[i]));
+            propAmm.swap(WETH, USDT, 1e18, 0, trader, block.timestamp);
+        }
+    }
+
+    //------------------------------
+    // Freshness
+    //------------------------------
+
+    /// A price is good for the block it was stamped for. A block later the registry has no
+    /// update for the window it is asked about, so quotes revert and `isActive` says so.
+    function test_quote_revertsOnceThePriceIsABlockOld() public {
+        _setPrice(1600e18, 5e14);
+        _fundVault(USDT, 1_600_000e6);
+        assertGt(propAmm.quote(WETH, USDT, 1e18), 0);
+        assertTrue(propAmm.isActive(WETH, USDT));
+
+        skip(12);
+
+        vm.expectRevert(MockPUR.StaleUpdate.selector);
+        propAmm.quote(WETH, USDT, 1e18);
+        vm.expectRevert(MockPUR.StaleUpdate.selector);
+        propAmm.quoteFillable(WETH, USDT, 1e18);
+        assertFalse(propAmm.isActive(WETH, USDT));
+
+        // A new update for the new block, and the pair quotes again.
+        _setPrice(1600e18, 5e14);
+        assertGt(propAmm.quote(WETH, USDT, 1e18), 0);
+        assertTrue(propAmm.isActive(WETH, USDT));
+    }
+
+    /// Freshness is not only the registry's promise. One that keeps no window hands back its
+    /// last update however old; the instance reads the stamp on the answer and refuses any that
+    /// is not this block's, on every path that prices.
+    function test_quote_refusesAnOldUpdateFromARegistryThatKeepsNoWindow() public {
+        _setPrice(1600e18, 5e14);
+        _fundVault(USDT, 1_600_000e6);
+        vm.prank(vault);
+        MockToken(USDT).approve(address(propAmm), type(uint256).max);
+        MockPUR(ORACLE).setLenient(true);
+        uint32 stamped = uint32(vm.getBlockTimestamp());
+        uint256 fresh = propAmm.quote(WETH, USDT, 1e18);
+
+        skip(12);
+
+        bytes memory stale =
+            abi.encodeWithSelector(StaleOracleData.selector, uint256(keccak256(abi.encodePacked(WETH, USDT))), stamped);
+        vm.expectRevert(stale);
+        propAmm.quote(WETH, USDT, 1e18);
+        vm.expectRevert(stale);
+        propAmm.quoteFillable(WETH, USDT, 1e18);
+        MockToken(WETH).mint(address(propAmm), 1e18);
+        vm.expectRevert(stale);
+        propAmm.swap(WETH, USDT, 1e18, 0, trader, vm.getBlockTimestamp());
+        assertFalse(propAmm.isActive(WETH, USDT));
+
+        // The same registry with an update for this block is priced from as before.
+        _setPrice(1600e18, 5e14);
+        assertEq(propAmm.quote(WETH, USDT, 1e18), fresh);
+        assertTrue(propAmm.isActive(WETH, USDT));
+    }
+
     //------------------------------
     // swap
     //------------------------------
@@ -375,6 +457,116 @@ contract PropAMMPricingTest is Test {
         assertEq(amountOut, expected);
         assertApproxEqRel(amountOut, 1e18 - 5e14, 1e13); // ~1 WETH less the 5bps spread
         assertEq(MockToken(WETH).balanceOf(trader), expected);
+    }
+
+    /// The deadline is the last timestamp the swap may execute at: this block's is still in time,
+    /// one second earlier is not.
+    function test_swap_revertsPastItsDeadline() public {
+        skip(1 hours);
+        uint256 expected = _readyToSwapOneWeth();
+
+        vm.startPrank(trader);
+        vm.expectRevert(Expired.selector);
+        propAmm.swap(WETH, USDT, 1e18, 0, trader, vm.getBlockTimestamp() - 1);
+
+        assertEq(propAmm.swap(WETH, USDT, 1e18, 0, trader, vm.getBlockTimestamp()), expected);
+        vm.stopPrank();
+    }
+
+    /// `minAmountOut` is a floor on what the swap pays: a wei above the quote reverts, naming
+    /// both figures. The quote itself clears it.
+    function test_swap_revertsBelowMinAmountOut() public {
+        uint256 expected = _readyToSwapOneWeth();
+
+        vm.startPrank(trader);
+        vm.expectRevert(abi.encodeWithSelector(InsufficientOutput.selector, expected + 1, expected));
+        propAmm.swap(WETH, USDT, 1e18, expected + 1, trader, block.timestamp);
+
+        assertEq(propAmm.swap(WETH, USDT, 1e18, expected, trader, block.timestamp), expected);
+        vm.stopPrank();
+    }
+
+    /// A swap of nothing moved nothing and still logged a `Swapped`, which anyone could pad the
+    /// event stream with. It reverts instead.
+    function test_swap_refusesAZeroAmountIn() public {
+        _readyToSwapOneWeth();
+
+        vm.prank(trader);
+        vm.expectRevert(ZeroAmountIn.selector);
+        propAmm.swap(WETH, USDT, 0, 0, trader, block.timestamp);
+    }
+
+    /// A wei of WETH at 1600 is worth a billionth of a USDT wei, so the swap would take it and
+    /// pay nothing. It reverts instead.
+    function test_swap_refusesAFillThatPaysNothing() public {
+        _readyToSwapOneWeth();
+        assertEq(propAmm.quote(WETH, USDT, 1), 0);
+
+        vm.prank(trader);
+        vm.expectRevert(ZeroAmountOut.selector);
+        propAmm.swap(WETH, USDT, 1, 0, trader, block.timestamp);
+    }
+
+    /// The output has to go to someone. A token that accepts transfers to the zero address
+    /// (USDT does) would burn it there, and sent to the instance itself it becomes a balance the
+    /// next caller can swap away. Both are refused.
+    function test_swap_refusesTheZeroAddressAndItselfAsRecipient() public {
+        _readyToSwapOneWeth();
+
+        vm.startPrank(trader);
+        vm.expectRevert(abi.encodeWithSelector(InvalidRecipient.selector, address(0)));
+        propAmm.swap(WETH, USDT, 1e18, 0, address(0), block.timestamp);
+        vm.expectRevert(abi.encodeWithSelector(InvalidRecipient.selector, address(propAmm)));
+        propAmm.swap(WETH, USDT, 1e18, 0, address(propAmm), block.timestamp);
+        vm.stopPrank();
+    }
+
+    /// `Swapped` is the last thing a swap logs, after both transfers, as `IPropAMM` documents:
+    /// the output is delivered by the time it is reported.
+    function test_swap_logsSwappedAfterBothTransfers() public {
+        _readyToSwapOneWeth();
+
+        vm.recordLogs();
+        vm.prank(trader);
+        propAmm.swap(WETH, USDT, 1e18, 0, trader, block.timestamp);
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        assertEq(logs.length, 3);
+        assertEq(logs[0].emitter, WETH);
+        assertEq(logs[1].emitter, USDT);
+        assertEq(logs[2].emitter, address(propAmm));
+        assertEq(logs[2].topics[0], IPropAMM.Swapped.selector);
+    }
+
+    /// A token that calls out while it moves cannot nest a second swap inside the first. Left
+    /// open, the inner swap would settle and log before the outer one that contains it, and
+    /// indexers would read two swaps in the wrong order. The guard is per call, not per
+    /// transaction: the swaps the router makes one after another on an instance still go through.
+    function test_swap_cannotBeReenteredFromATokenTransfer() public {
+        // WETH becomes a token with a transfer hook. Its balances and decimals stay: the etch
+        // replaces code, not storage.
+        vm.etch(WETH, address(new ReentrantToken()).code);
+        _readyToSwapOneWeth();
+        MockToken(WETH).mint(address(propAmm), 1e18); // a second WETH for the nested swap to spend
+
+        ReentrantToken(WETH)
+            .arm(address(propAmm), abi.encodeCall(IPropAMM.swap, (WETH, USDT, 1e18, 0, trader, block.timestamp)));
+        vm.prank(trader);
+        vm.expectRevert(ReentrancyGuardTransient.ReentrancyGuardReentrantCall.selector);
+        propAmm.swap(WETH, USDT, 1e18, 0, trader, block.timestamp);
+
+        // The revert undid the hook's own reset along with everything else, so it is still armed.
+        // Disarmed, two swaps in one call both settle.
+        ReentrantToken(WETH).arm(address(0), "");
+        this.swapOneWethTwice();
+        assertEq(MockToken(WETH).balanceOf(vault), 2e18);
+        assertGt(MockToken(USDT).balanceOf(trader), 0);
+    }
+
+    /// Two swaps inside one external call, so they share a transaction however the tests are run.
+    function swapOneWethTwice() external {
+        propAmm.swap(WETH, USDT, 1e18, 0, trader, block.timestamp);
+        propAmm.swap(WETH, USDT, 1e18, 0, trader, block.timestamp);
     }
 
     /// Two pairs, two vaults: a swap on one moves both of its legs through that pair's vault and
@@ -547,18 +739,24 @@ contract PropAMMPricingTest is Test {
         assertFalse(propAmm.isActive(WETH, USDT));
     }
 
-    /// A malformed answer used to revert `isActive` in its decoder. Now the pair reads as active
-    /// and `quote` rejects it.
+    /// A malformed answer used to revert `isActive` in its decoder. It reads the first word and
+    /// no more: an answer stamped with this block's timestamp reads as active however broken the
+    /// rest is, and `quote` rejects it. A first word that is anything else, a stamp that does
+    /// not fit a uint32 included, reads as inactive (audit F-10).
     function test_isActive_leavesAMalformedAnswerToQuote() public {
-        address[3] memory shapes =
-            [address(new OneWordOracle()), address(new HighBitsOracle()), address(new TruncatedArrayOracle())];
-        string[3] memory names = ["one word", "timestamp above uint32", "truncated array"];
+        address[2] memory shapes = [address(new OneWordOracle()), address(new TruncatedArrayOracle())];
+        string[2] memory names = ["one word", "truncated array"];
         for (uint256 i = 0; i < shapes.length; i++) {
             _etchOracle(shapes[i]);
             assertTrue(propAmm.isActive(WETH, USDT), names[i]);
             vm.expectRevert();
             propAmm.quote(WETH, USDT, 1e18);
         }
+
+        _etchOracle(address(new HighBitsOracle()));
+        assertFalse(propAmm.isActive(WETH, USDT), "timestamp above uint32");
+        vm.expectRevert();
+        propAmm.quote(WETH, USDT, 1e18);
     }
 
     /// A fresh lane reads as active whatever its slots hold; `quote` rejects the unusable ones.
@@ -738,6 +936,17 @@ contract PropAMMPricingTest is Test {
         MockToken(token).mint(vault, amount);
         vm.prank(vault);
         MockToken(token).approve(address(propAmm), type(uint256).max);
+    }
+
+    /// WETH/USDT at 1600 and 5bps on a vault of 1000 WETH worth of USDT that has approved the
+    /// instance, with the trader's 1 WETH already pushed. Returns what that WETH quotes for.
+    function _readyToSwapOneWeth() internal returns (uint256 expected) {
+        _setPrice(1600e18, 5e14);
+        _fundVault(USDT, 1_600_000e6);
+        vm.prank(vault);
+        MockToken(USDT).approve(address(propAmm), type(uint256).max);
+        MockToken(WETH).mint(address(propAmm), 1e18);
+        return propAmm.quote(WETH, USDT, 1e18);
     }
 
     /// Asserts `amountOut` is `midAmountOut` less `delta`, allowing for the impact term on top.

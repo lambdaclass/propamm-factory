@@ -32,8 +32,8 @@ contract PropAMMGasTest is Test {
     /// router concludes the instance does not implement `IPropAMMFillable`, and falls back to its
     /// blind probe without any error to notice.
     uint256 constant ERC165_CHECKER_GAS = 30_000;
-    /// What `quoteFillable` may cost over a cold `quote` of the same order. Measured at 5,326
-    /// (5,520 when the vault binds): one cold `allowance` read plus the closed-form sizing. The
+    /// What `quoteFillable` may cost over a cold `quote` of the same order. Measured at 5,283
+    /// (5,488 when the vault binds): one cold `allowance` read plus the closed-form sizing. The
     /// headroom absorbs compiler drift; a second registry read or a search loop would not fit in it.
     uint256 constant FILLABLE_OVERHEAD_BUDGET = 7_000;
 

@@ -1,5 +1,5 @@
-.PHONY: deps build test local local-down update-price swap deploy-factory price-service quickstart \
-	backoffice-ui cargo-build cargo-test lint e2e mocks downstream install-nix shell default
+.PHONY: deps build test mutants local local-down update-price swap deploy-factory price-service \
+	quickstart backoffice-ui cargo-build cargo-test lint e2e mocks downstream install-nix shell default
 
 # Every target runs inside the shell flake.nix defines: foundry, the Rust version in
 # rust-toolchain.toml, python with the packages the mocks need. Outside that shell, with
@@ -157,6 +157,11 @@ build: deps
 
 test: build
 	cd contracts && forge test
+
+# One bug planted in the contracts at a time, and the tests have to fail for each: a mutant
+# that survives is a line no test depends on. Works on a copy, and takes a few minutes.
+mutants: deps
+	python3 contracts/test/mutation/run_mutants.py
 
 .local/priority-update-registry:
 	mkdir -p .local
