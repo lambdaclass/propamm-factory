@@ -1,5 +1,5 @@
-.PHONY: deps build test local local-down update-price swap deploy-factory price-service quickstart \
-	backoffice-ui cargo-build cargo-test lint e2e mocks downstream install-nix shell default
+.PHONY: deps build test mutants local local-down update-price swap deploy-factory price-service \
+	quickstart backoffice-ui cargo-build cargo-test lint e2e mocks downstream install-nix shell default
 
 # Every target runs inside the shell flake.nix defines: foundry, the Rust version in
 # rust-toolchain.toml, python with the packages the mocks need. Outside that shell, with
@@ -168,6 +168,11 @@ build: deps
 test: build
 	cd contracts && forge test
 
+# One bug planted in the contracts at a time, and the tests have to fail for each: a mutant
+# that survives is a line no test depends on. Works on a copy, and takes a few minutes.
+mutants: deps
+	python3 contracts/test/mutation/run_mutants.py
+
 .local/priority-update-registry:
 	mkdir -p .local
 	git clone --depth 1 --recurse-submodules --shallow-submodules $(PUR_REPO) $@
@@ -239,10 +244,11 @@ local: local-down build .local/priority-update-registry
 	$(MAKE) update-price
 	@# Sanity checks through the real registry: isActive and quote both require the stored
 	@# timestamp to equal block.timestamp exactly, which the update above was stamped for.
+	@# isActive also requires the vault to hold USDT, as minted above.
 	@set -e; PROP=$(PROPAMM_LOOKUP); \
 	test "$$(cast call $$PROP 'isActive(address,address)(bool)' \
 		$(USDC) $(USDT) --rpc-url $(RPC_URL))" = "true" || { \
-		echo "isActive() is false: the pushed update's timestamp does not match chain time."; \
+		echo "isActive() is false: the pushed update's timestamp does not match chain time, or the vault holds no USDT."; \
 		exit 1; }; \
 	test "$$(cast call $$PROP 'quote(address,address,uint256)(uint256)' \
 		$(USDC) $(USDT) 100 --rpc-url $(RPC_URL))" = "100" || { \

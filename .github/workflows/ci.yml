@@ -35,6 +35,21 @@ jobs:
       - run: forge fmt --check
       - run: forge test
 
+  mutation:
+    name: Contracts (mutation run)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Plants one bug at a time in PropAMM.sol and PropAMMFactory.sol (an owner check dropped,
+    # a swap guard removed, the freshness window opened) and fails if the tests pass with any
+    # of them: a suite can be green and still not notice a guard is gone. A change to the
+    # contracts that breaks a mutant's text fails here too; fix the mutant in the same PR.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: foundry-rs/foundry-toolchain@v1
+      - run: python3 contracts/test/mutation/run_mutants.py
+
   quote-updater:
     name: Quote updater (format / clippy / tests)
     runs-on: ubuntu-latest

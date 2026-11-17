@@ -23,6 +23,38 @@ add and remove updaters (`addUpdater`, `removeUpdater`, and `removeUpdaterFrom` 
 the instance has moved away from), point it at another registry (`setOracle`) and pause it. Traders call `swap`;
 anyone can call `quote` and `isActive` to see what a trade would get.
 
+A price is good for one block. The instance asks the registry for the update stamped with the
+current block's timestamp and checks the stamp on the answer, so a registry that keeps no such
+window and hands back an older update is refused rather than priced from. The check is only as
+good as the stamp: a registry that misreports its timestamps is believed, as the registry is for
+the price itself. One block means one timestamp: on a chain whose blocks can share a timestamp
+an update is good for all of them, and before deploying on one the updater should publish the
+block number in an extra slot for the instance to require. The registry keeps timestamps in 32
+bits, which run out on 7 February 2106; this implementation is not meant to quote past that date.
+
+`swap` reverts rather than settle a trade that moves nothing or loses its output: an `amountIn`
+of zero, an input worth less than one wei of the output token, and a `recipient` that is the zero
+address or the pair's own vault. The instance itself is a valid recipient: a router taking two
+hops on one instance names it for the first hop, and the output is then in place as the second
+hop's input. `swap` cannot be re-entered from a token's transfer; one swap after another in the
+same transaction is fine.
+
+`isActive` answers true when `quote` has what it needs to price the pair: the instance is not
+paused, the pair is listed, the registry holds this block's update for it with a `delta` below
+one and a `mid` that is not zero, and the vault holds some of the output token. It never reverts
+and is not told a size, so a quote for a real amount can still fail on the vault's balance, and a
+swap on its allowance.
+
+An instance logs the configuration it starts with: `initialize` emits `OracleChanged`, an
+`UpdaterAuthorized` per updater and a `PairAdded` per pair, the events later changes emit. The
+exception is an instance created by an earlier implementation and upgraded to this one, which
+never logged its oracle or its first updaters; for it the registry's own log is the record.
+`setOracle` moves no updaters, which is why each updater event names the registry it was made
+on. The factory's `PropAMMCreated` names the instance, its creator, its owner, the oracle and the
+updaters. `setPairVault` to the vault a pair already has reverts, and so does `setOracle` to
+the registry the instance already reads, like `removePair` of a pair that is not listed: no event
+reports a change that did not happen.
+
 Instances also implement `IPropAMMFillable`, advertised through ERC-165, which
 `PropAMMRouter`'s split routing (`swapSplitV1`) prices a venue with in one call:
 `quoteFillable(tokenIn, tokenOut, amountIn)` answers with how much of the order the pair's vault
@@ -32,7 +64,9 @@ reads every capacity before any leg fills, so two instances it lists must not fi
 output token from the same vault: when one instance replaces another, take the old one off the
 router's venue list first.
 
-Sources and tests are in [`contracts/`](../contracts/). `make test` runs the tests.
+Sources and tests are in [`contracts/`](../contracts/). `make test` runs the tests, and
+`make mutants` checks the tests themselves: it plants one bug at a time in the contracts and
+fails if any of them goes unnoticed.
 
 ## The quote updater
 

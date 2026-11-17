@@ -32,8 +32,6 @@ contract PropAMMFactoryTest is Test {
     address constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
     address constant USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
 
-    event PropAMMCreated(address indexed propAmm, address indexed creator, address oracle, address[] updaters);
-
     /// The owner every test creates with: the test contract itself, so it can call the instance's
     /// owner-only functions without pranking. Creating one for someone else, which is what the
     /// parameter is for, is covered by test_createPropAMM_ownerIsTheParamNotTheCreator.
@@ -164,18 +162,34 @@ contract PropAMMFactoryTest is Test {
         factory.createPropAMM(owner, PUR_ADDR, twice, pairs);
     }
 
-    /// The instance's own events come first, from the predicted address, before the proxy
-    /// constructor returns: one UpdaterAuthorized per updater, then one PairAdded per pair. The
-    /// factory's PropAMMCreated comes last. The creation event names neither pairs nor vaults;
-    /// PairAdded is where indexers read them. (This test pins the PairAdded → PropAMMCreated order;
-    /// the UpdaterAuthorized events are pinned in PropAMM.t.sol.)
-    function test_createPropAMM_emitsPairAddedThenCreated() public {
+    /// A creation's events, in this order: the instance's own configuration (its oracle, each
+    /// updater, each pair; emitted inside initialize, so from the predicted address, before the
+    /// proxy constructor returns), then the factory's PropAMMCreated. The creation event names
+    /// neither pairs nor vaults; PairAdded is where indexers read them. The oracle and updaters
+    /// are in both, so an indexer following only the instance has them too.
+    function test_createPropAMM_emitsTheInstancesConfigurationThenCreated() public {
         address predicted = factory.computeAddress(address(this), owner, PUR_ADDR, updaters, pairs);
         vm.expectEmit(true, true, true, true, predicted);
+        emit PropAMM.OracleChanged(PUR_ADDR);
+        vm.expectEmit(true, true, true, true, predicted);
+        emit PropAMM.UpdaterAuthorized(updater, PUR_ADDR);
+        vm.expectEmit(true, true, true, true, predicted);
+        emit PropAMM.UpdaterAuthorized(secondUpdater, PUR_ADDR);
+        vm.expectEmit(true, true, true, true, predicted);
         emit PropAMM.PairAdded(USDC, USDT, vault);
-        vm.expectEmit(true, true, false, true, address(factory));
-        emit PropAMMCreated(predicted, address(this), PUR_ADDR, updaters);
+        vm.expectEmit(true, true, true, true, address(factory));
+        emit PropAMMFactory.PropAMMCreated(predicted, address(this), owner, PUR_ADDR, updaters);
         factory.createPropAMM(owner, PUR_ADDR, updaters, pairs);
+    }
+
+    /// The event names the owner the creator chose, not the creator: an owner finds the instances
+    /// made for it by the event's third topic, whoever sent the transaction.
+    function test_createPropAMM_createdEventNamesTheOwner() public {
+        address theirOwner = makeAddr("their-owner");
+        address predicted = factory.computeAddress(address(this), theirOwner, PUR_ADDR, updaters, pairs);
+        vm.expectEmit(true, true, true, true, address(factory));
+        emit PropAMMFactory.PropAMMCreated(predicted, address(this), theirOwner, PUR_ADDR, updaters);
+        factory.createPropAMM(theirOwner, PUR_ADDR, updaters, pairs);
     }
 
     function test_createPropAMM_revertsOnDuplicate() public {
@@ -335,30 +349,41 @@ contract PropAMMFactoryTest is Test {
         // the expectation itself.
         address newImplementation = address(new PropAMM());
 
+        // A token the instance holds, so the withdrawal below has something to take: against a
+        // token with no code it would revert whoever called, and prove nothing about access.
+        MockERC20 held = new MockERC20();
+        held.mint(address(propAmm), 1e18);
+        // Real tokens: `addPair` refuses an address without code whoever calls.
+        address tokenA = _token("token-a");
+        address tokenB = _token("token-b");
+        // The reason is pinned on every call: a bare expectRevert passes on any failure, the
+        // owner check or not.
+        bytes memory notOwner = abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, rando);
+
         vm.startPrank(rando);
-        vm.expectRevert();
+        vm.expectRevert(notOwner);
         propAmm.addUpdater(rando);
-        vm.expectRevert();
+        vm.expectRevert(notOwner);
         propAmm.removeUpdater(updater);
-        vm.expectRevert();
+        vm.expectRevert(notOwner);
         propAmm.removeUpdaterFrom(PUR_ADDR, updater);
-        vm.expectRevert();
-        propAmm.addPair(_token("token-a"), _token("token-b"), vault);
-        vm.expectRevert();
+        vm.expectRevert(notOwner);
+        propAmm.addPair(tokenA, tokenB, vault);
+        vm.expectRevert(notOwner);
         propAmm.removePair(USDC, USDT);
-        vm.expectRevert();
+        vm.expectRevert(notOwner);
         propAmm.setPairVault(USDC, USDT, rando);
-        vm.expectRevert();
+        vm.expectRevert(notOwner);
         propAmm.upgradeToAndCall(newImplementation, "");
-        vm.expectRevert();
+        vm.expectRevert(notOwner);
         propAmm.setOracle(OTHER_PUR_ADDR);
-        vm.expectRevert();
+        vm.expectRevert(notOwner);
         propAmm.pause();
-        vm.expectRevert();
+        vm.expectRevert(notOwner);
         propAmm.unpause();
-        vm.expectRevert();
-        propAmm.withdrawERC20(USDC, rando, 1);
-        vm.expectRevert();
+        vm.expectRevert(notOwner);
+        propAmm.withdrawERC20(address(held), rando, 1);
+        vm.expectRevert(notOwner);
         propAmm.transferOwnership(rando);
         vm.stopPrank();
     }
