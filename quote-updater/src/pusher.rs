@@ -998,7 +998,9 @@ mod tests {
     const ANVIL_KEY_0: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
     /// What every in-process run test starts from: a mock RPC serving one USDC/USDT pair
-    /// with a vault, an acking mock builder, and a config file naming both.
+    /// with a vault, an acking mock builder, and a config file naming both. The pair is
+    /// `fixed` and `unguarded`: these runs stream nothing, and a fixed price otherwise needs
+    /// a market to compare its price with (audit F-04).
     struct Fixture {
         rpc: crate::rpc_mock::MockRpc,
         /// Shared, so a `shutdown_on` future can wait on it.
@@ -1047,7 +1049,7 @@ binance_ws = "ws://127.0.0.1:1/ws"
 [[pairs]]
 tokens  = ["{usdc:#x}", "{usdt:#x}"]
 key_env = "QU_TEST_KEY"
-pricing = {{ kind = "fixed", mid = "1.0001", delta = "0.0002" }}
+pricing = {{ kind = "fixed", mid = "1.0001", delta = "0.0002", unguarded = true }}
 {pair_tail}
 [[builder]]
 name = "mock"
@@ -2020,6 +2022,8 @@ api_key = "k"
         assert_eq!(pairs, serde_json::json!([]));
         assert_eq!(fx.builder.count(), 0, "nothing quotes yet");
 
+        // `unguarded`, as the fixture's own pair is: the pair streams nothing, and a fixed
+        // price with no market is otherwise refused (audit F-04).
         let added = client
             .post(format!("http://127.0.0.1:{port}/api/pairs"))
             .header("content-type", "application/json")
@@ -2027,7 +2031,12 @@ api_key = "k"
                 serde_json::json!({
                     "tokens": [format!("{:#x}", fx.tokens.0), format!("{:#x}", fx.tokens.1)],
                     "key_env": "QU_TEST_KEY",
-                    "pricing": {"kind": "fixed", "mid": "1.0001", "delta": "0.0002"},
+                    "pricing": {
+                        "kind": "fixed",
+                        "mid": "1.0001",
+                        "delta": "0.0002",
+                        "unguarded": true,
+                    },
                 })
                 .to_string(),
             )
@@ -2042,7 +2051,13 @@ api_key = "k"
             fx.builder.wait_for(1, Duration::from_secs(10)).await,
             "the added pair quotes"
         );
-        assert_eq!(fx.raw_pair().key_env, "QU_TEST_KEY", "and is in the file");
+        let written = fx.raw_pair();
+        assert_eq!(written.key_env, "QU_TEST_KEY", "and is in the file");
+        assert_eq!(
+            written.pricing.get("unguarded"),
+            Some(&toml::Value::Boolean(true)),
+            "with the flag it was sent with, so the file still passes its checks"
+        );
 
         handle.shutdown();
         tokio::time::timeout(Duration::from_secs(20), handle.wait())

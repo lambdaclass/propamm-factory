@@ -128,9 +128,16 @@ MINT_AMOUNT := 1000000000000000000000000
 # The key the quote updater reads for the USDC/USDT pair, as `make price-service` names it.
 PUSHER_KEY_ENV := UPDATER_KEY_USDC_USDT
 INTERVAL ?= 12
+# The spread `make price-service` quotes its fixed PRICE with. Not DELTA's 0: a fixed price
+# quotes only while its market sits inside its own spread (audit F-04), so with none it would
+# quote only on a market exactly at PRICE.
+SERVICE_DELTA ?= 0.0005
 
 # $(1) = target address, $(2) = output path: a config for the local pair, fixed price or a
-# Binance symbol (SYMBOL=USDCUSDT streams the live mid and spread instead).
+# Binance symbol (SYMBOL=USDCUSDT streams the live mid and spread instead). The fixed price
+# streams Binance's USDCUSDT too: a fixed price needs a market to compare its price with
+# (audit F-04), and quotes only while that market sits within SERVICE_DELTA of PRICE. So the
+# updater must reach Binance, and PRICE must sit inside the [0.995, 1.005] band.
 define write_updater_config
 mkdir -p .local; \
 { \
@@ -144,7 +151,10 @@ mkdir -p .local; \
     echo 'symbol  = "$(SYMBOL)"'; \
     echo 'pricing = { kind = "feed" }'; \
   else \
-    echo 'pricing = { kind = "fixed", mid = "$(PRICE)", delta = "$(DELTA)" }'; \
+    echo 'symbol  = "USDCUSDT"'; \
+    echo 'min_mid = "0.995"'; \
+    echo 'max_mid = "1.005"'; \
+    echo 'pricing = { kind = "fixed", mid = "$(PRICE)", delta = "$(SERVICE_DELTA)" }'; \
   fi; \
 } > $(2)
 endef
@@ -302,7 +312,8 @@ local-down:
 
 # Keep the local pair's price fresh with the library's built-in models (no code of yours):
 # one updateState transaction per INTERVAL seconds, mining a block each (`--mine`).
-#   make price-service                  push PRICE (default 1) for USDC/USDT every 12s
+#   make price-service                  push PRICE (default 1) for USDC/USDT every 12s, while
+#                                       Binance's USDCUSDT sits within SERVICE_DELTA of it
 #   make price-service SYMBOL=USDCUSDT  stream Binance's live mid and spread instead
 price-service:
 	@test -n "$$(cast code $(LOCAL_FACTORY) --rpc-url $(RPC_URL) 2>/dev/null | grep -v '^0x$$')" || { \

@@ -576,10 +576,29 @@ groups:
         for: 5m
         labels: { severity: ticket }
         annotations:
-          summary: "{{ $labels.pair }}: mids are falling outside min_mid/max_mid"
+          summary: "{{ $labels.pair }}: the mid, or the market's mid, is outside min_mid/max_mid"
           description: >-
             The band is the only thing between a corrupt book and an arbitrary on-chain
-            price the next fill is priced against. Either the book is wrong or the band is.
+            price the next fill is priced against. It judges the published mid and, on a
+            pair with a market, the market's own mid, so this also fires through a depeg:
+            on a stable pair, check the peg first. Otherwise either the book is wrong or
+            the band is.
+
+      # A `fixed` pair withdrawn because its market left its own quote (audit F-04). That is
+      # the guard working: outside its bid and ask a taker would trade the vault at a stale
+      # price. Sustained, it is a depeg or a fixed mid that no longer matches the market.
+      - alert: PusherFixedPriceOffMarket
+        expr: rate(quote_updater_price_unusable_total{reason="market_outside_quote"}[5m]) > 0
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.pair }}: the market is outside the fixed price's quote"
+          description: >-
+            A fixed price quotes only while its market sits inside its own bid and ask, so
+            this pair is withdrawn. Through a depeg that is what keeps the vault from being
+            drained at par; otherwise the fixed mid or its delta no longer matches the
+            market, and the pair stays quiet until the market comes back or the stanza
+            changes.
 
       # The vault drifting away from the share it is configured to hold. Nothing else in
       # this file reads the inventory series at all: they arrived with volatile pricing and

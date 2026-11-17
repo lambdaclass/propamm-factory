@@ -59,13 +59,16 @@ What to know:
 - **The core still decides.** A pricer can refuse (`Refusal::new`, counted under the reason
   it declared), and the core withdraws anything unpublishable whatever a pricer returns: a
   spread of a whole unit or more, a zero mid, or a mid the contract cannot store (over 216
-  bits), each counted under its own `reason`. The pair's `min_mid`/`max_mid` band bounds
-  every kind's mid alike, as an absolute range; a kind with a bound of its own checks it
-  in `validate` or refuses the tick.
+  bits), each counted under its own `reason`. Where a mid may be is the pair's
+  `min_mid`/`max_mid` band, an absolute range in lane orientation that applies to every
+  kind alike. On a pair with a market it judges the market's mid as well as yours, so the
+  pair stops when the market leaves the band even if your mid does not; a kind with a bound
+  of its own checks it in `validate` or refuses the tick.
 - **Do not quote through the market.** The core does not compare your quote with the
-  market: the band is an absolute range, not a distance from the market's mid. A pricer
-  publishes one mid and one half-spread, so it buys at `mid·(1 − delta)` and sells at
-  `mid/(1 − delta)`. Move the mid off the market's by more than the half-spread and one of
+  market: the band is an absolute range, which it holds your mid and the market's to
+  separately, not a distance between the two. A pricer publishes one mid and one
+  half-spread, so it buys at `mid·(1 − delta)` and sells at `mid/(1 − delta)`. Move the
+  mid off the market's by more than the half-spread and one of
   those crosses it: you sell below the market's price, or buy above it, and a taker fills
   that and unwinds on the market at the vault's cost. It is worst when the move follows the
   vault's inventory, because then a taker can cause it: unbalance the vault, wait for the
@@ -124,9 +127,9 @@ What to know:
   deviation guard (`max_deviation`, which keeps its own keys and cannot be named in a
   stanza), and answers `Pass` or `Trip`, whose reason the alarm line prefixes with
   ``guard `<kind>` tripped: `` (so a reason says only what was seen). A pair that streams
-  no price (a fixed `mid`, or a pricing kind with no `symbol` or `sources`) has no
-  composite, so a market guard stanza on it is refused at startup, on reload and under
-  `--check`, as `max_deviation` on a fixed mid is. A `QuoteGuard` judges our quote in the
+  no price (an `unguarded` fixed `mid`, or a pricing kind with no `symbol` or `sources`)
+  has no composite, so a market guard stanza on it is refused at startup, on reload and
+  under `--check`, as `max_deviation` on a pair with no stream is. A `QuoteGuard` judges our quote in the
   loop, after the pricer, the core's bounds and the band, on every tick: on the pricer's
   output *or a refusal*, the pricer's or the core's. That includes a feed with no sample yet
   or a stale one, which the core refuses before the pricer runs: on that tick the candidate

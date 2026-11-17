@@ -931,59 +931,14 @@ pub async fn build_report(
             }
         }
 
-        row.warnings.extend(band_warning(spec));
-
-        // A venue symbol is the one hand-written field that can be catastrophically wrong:
-        // publishing BTC's price on the WETH lane is arbitraged within a block. Every source
-        // is checked, since one wrong venue in an average is still a wrong price. The
-        // decision itself lives in `check_symbol`, tested independently of the chain.
-        if let Some(feeds) = &spec.feeds {
-            let mut unreadable = false;
-            for source in &feeds.sources {
-                match check_symbol(
-                    source.venue,
-                    &source.symbol,
-                    base_symbol.as_deref(),
-                    quote_symbol.as_deref(),
-                    spec.allow_symbol_mismatch,
-                ) {
-                    SymbolCheck::Match | SymbolCheck::MismatchAllowed { .. } => {}
-                    SymbolCheck::StandIn { quoted_in } => row.warnings.push(format!(
-                        "{} stream {:?} is quoted in {quoted_in}, not {}; averaged as if \
-                         they were at par",
-                        source.venue,
-                        source.symbol,
-                        quote_symbol.as_deref().unwrap_or("the quote token")
-                    )),
-                    SymbolCheck::Mismatch { expected } => {
-                        // `check_symbol` only returns `Mismatch` when both symbols were read.
-                        let b = base_symbol
-                            .as_deref()
-                            .expect("Mismatch implies both symbols were read");
-                        let q = quote_symbol
-                            .as_deref()
-                            .expect("Mismatch implies both symbols were read");
-                        row.failures.push(format!(
-                            "{} stream {:?} does not match the declared pair {b}/{q}, which \
-                             reads {expected:?} there; set allow_symbol_mismatch = true if \
-                             this is deliberate",
-                            source.venue, source.symbol
-                        ));
-                    }
-                    SymbolCheck::Unreadable => unreadable = true,
-                }
-            }
-            // The cross-check is the guard against publishing one asset's price on
-            // another's lane, so a pair it could not run for does not pass on a warning:
-            // it fails unless the pair opted out. Once per pair, not per source: the
-            // symbols are the pair's.
-            if unreadable {
-                match unreadable_symbols(symbol_read_failed, spec.allow_symbol_mismatch) {
-                    Ok(warning) => row.warnings.push(warning),
-                    Err(failure) => row.failures.push(failure),
-                }
-            }
-        }
+        let (failures, warnings) = symbol_verdicts(
+            spec,
+            base_symbol.as_deref(),
+            quote_symbol.as_deref(),
+            symbol_read_failed,
+        );
+        row.failures.extend(failures);
+        row.warnings.extend(warnings);
 
         // Both checks below can fail to run against a target that *is* a contract — an RPC
         // blip, a response that does not decode. A check that did not run is not a check
@@ -1053,19 +1008,123 @@ pub async fn build_report(
         rows,
     })
 }
+
+/// What a pair's on-chain symbols say about it, as `(failures, warnings)`: the band warning,
+/// and every source's stream/token cross-check. Separated from `build_report`, like
+/// `check_symbol`, so every branch is testable without a chain. `symbol_read_failed` is
+/// whether a symbol is missing because the call for it failed, rather than because the token
+/// has none to read: [`unreadable_symbols`] words the two apart.
+pub(crate) fn symbol_verdicts(
+    spec: &crate::config::PairSpec,
+    base_symbol: Option<&str>,
+    quote_symbol: Option<&str>,
+    symbol_read_failed: bool,
+) -> (Vec<String>, Vec<String>) {
+    let mut failures = Vec::new();
+    let mut warnings: Vec<String> = band_warning(spec).into_iter().collect();
+
+    // A venue symbol is the one hand-written field that can be catastrophically wrong:
+    // publishing BTC's price on the WETH lane is arbitraged within a block. Every source is
+    // checked, since one wrong venue in an average is still a wrong price. The decision
+    // itself lives in `check_symbol`, tested independently of the chain.
+    if let Some(feeds) = &spec.feeds {
+        let mut unreadable = false;
+        for source in &feeds.sources {
+            match check_symbol(
+                source.venue,
+                &source.symbol,
+                base_symbol,
+                quote_symbol,
+                spec.allow_symbol_mismatch,
+            ) {
+                SymbolCheck::Match | SymbolCheck::MismatchAllowed { .. } => {}
+                // Refused unless the pair opted in, and then still said (audit F-04).
+                SymbolCheck::StandIn { quoted_in } => match stand_in_failure(
+                    source.venue,
+                    &source.symbol,
+                    &quoted_in,
+                    quote_symbol,
+                    spec.allow_symbol_mismatch,
+                ) {
+                    Some(failure) => failures.push(failure),
+                    None => warnings.push(format!(
+                        "{} stream {:?} is quoted in {quoted_in}, not {}; averaged as if they \
+                         were at par",
+                        source.venue,
+                        source.symbol,
+                        quote_symbol.unwrap_or("the quote token")
+                    )),
+                },
+                SymbolCheck::Mismatch { expected } => {
+                    // `check_symbol` only returns `Mismatch` when both symbols were read.
+                    let b = base_symbol.expect("Mismatch implies both symbols were read");
+                    let q = quote_symbol.expect("Mismatch implies both symbols were read");
+                    failures.push(format!(
+                        "{} stream {:?} does not match the declared pair {b}/{q}, which reads \
+                         {expected:?} there; set allow_symbol_mismatch = true if this is \
+                         deliberate",
+                        source.venue, source.symbol
+                    ));
+                }
+                SymbolCheck::Unreadable => unreadable = true,
+            }
+        }
+        // The cross-check is the guard against publishing one asset's price on another's
+        // lane, so a pair it could not run for does not pass on a warning: it fails unless
+        // the pair opted out. Once per pair, not per source: the symbols are the pair's.
+        if unreadable {
+            match unreadable_symbols(symbol_read_failed, spec.allow_symbol_mismatch) {
+                Ok(warning) => warnings.push(warning),
+                Err(failure) => failures.push(failure),
+            }
+        }
+    }
+    (failures, warnings)
+}
+
+/// Why a source quoted in another dollar cannot run, if it cannot. The composite averages
+/// sources without converting them, so a USD or USDT market on a USDC pair is averaged as if
+/// the two were at par, and through a depeg of either the pair publishes the wrong price
+/// (audit F-04). `allow_symbol_mismatch` is the pair's way to say it averages them at par
+/// knowingly; `build_report` then keeps the at-par warning.
+pub(crate) fn stand_in_failure(
+    venue: crate::venue::VenueId,
+    stream: &str,
+    quoted_in: &str,
+    quote_symbol: Option<&str>,
+    allow_mismatch: bool,
+) -> Option<String> {
+    if allow_mismatch {
+        return None;
+    }
+    let quote = quote_symbol.unwrap_or("the quote token");
+    Some(format!(
+        "{venue} stream {stream:?} is quoted in {quoted_in}, not {quote}, and the average does \
+         not convert it: through a depeg of either it publishes the wrong price. Use a {quote} \
+         market, or set allow_symbol_mismatch = true to average it at par knowingly"
+    ))
+}
+
 /// The warning a pair with no `min_mid`/`max_mid` earns, if it earns one. Carried over from
 /// the single-pair CLI's --min-mid/--max-mid note: bounds are optional, so a pair without
-/// them is the default and would otherwise be invisible. A fixed mid gets none: it cannot
-/// drift, and its kind already proved it sits inside whatever band was declared. A pair
-/// with a market does, and so does a kind with no market, which is bounded by less: only
-/// `delta < 1` and a nonzero mid stand between its output and the chain.
+/// them is the default and would otherwise be invisible. A pair with a market earns it, and
+/// so does a kind with no market, which is bounded by less: only `delta < 1` and a nonzero
+/// mid stand between its output and the chain. So does a `fixed` mid with no market, banded
+/// or not, which only an `unguarded` stanza can run (audit F-04): nothing compares it with
+/// a market, and the band can only compare the constant with itself.
 fn band_warning(spec: &crate::config::PairSpec) -> Option<String> {
+    if spec.feeds.is_none() && spec.pricing.kind == "fixed" {
+        return Some(
+            "pricing `fixed` is unguarded: it publishes the same mid whatever the market does, \
+             and this pair streams no market, so nothing compares its price with one. For a real \
+             pair, give it a symbol: it then stops quoting whenever the market leaves its quote"
+                .to_owned(),
+        );
+    }
     if !spec.band.is_unset() {
         return None;
     }
     match (&spec.feeds, spec.pricing.kind.as_str()) {
-        // A fixed mid cannot drift, and its kind checked it against the band at parse time.
-        (None, "fixed") => None,
         (None, kind) => Some(format!(
             "no min_mid/max_mid set, and pricing `{kind}` has no market to be checked against, \
              so nothing bounds this pair's published mid but a nonzero value; whatever the \
@@ -1086,7 +1145,9 @@ mod tests {
     /// A pair with no `min_mid`/`max_mid` says so when something could push its mid
     /// anywhere: a feed, or a custom pricer, which nothing but `delta < 1` and a nonzero
     /// mid bounds (the core never compares a mid with the market, even when there is one).
-    /// A static mid, or any pair with a band, does not.
+    /// A pair with a band does not, unless its mid is `fixed` and it streams nothing: a band
+    /// around a constant bounds nothing, and nothing compares that constant with a market
+    /// (audit F-04).
     #[test]
     fn a_pair_nothing_bounds_is_warned_about() {
         let spec = |text: &str| {
@@ -1108,6 +1169,131 @@ mod tests {
             "{alone}"
         );
         assert_eq!(band_warning(&spec(&banded)), None);
+
+        let fixed = band_warning(&stable_pair(BAND, FIXED))
+            .expect("a fixed mid with no market, banded or not");
+        assert!(fixed.contains("no market"), "{fixed}");
+        let streamed = format!("{STREAM}{BAND}");
+        assert_eq!(band_warning(&stable_pair(&streamed, FIXED)), None);
+    }
+
+    /// One USDC/USDT pair priced by `pricing`, with `lines` added to its stanza.
+    fn stable_pair(lines: &str, pricing: &str) -> crate::config::PairSpec {
+        let text = format!(
+            "target = \"0x70997970C51812dc3A010C7d01b50e0d17dc79C8\"\n\
+             [[pairs]]\n\
+             tokens  = [\"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48\", \
+             \"0xdAC17F958D2ee523a2206206994597C13D831ec7\"]\n\
+             key_env = \"UPDATER_KEY_USDC_USDT\"\n\
+             {lines}\
+             pricing = {pricing}\n\
+             [[builder]]\nname = \"b\"\nendpoint = \"wss://b.example/ws\"\napi_key = \"k\"\n"
+        );
+        crate::config::parse_config(&text, 18)
+            .unwrap()
+            .pairs
+            .remove(0)
+    }
+
+    /// The old deploy template's stable pair: 1.0001, 2 bp.
+    const FIXED: &str = r#"{ kind = "fixed", mid = "1.0001", delta = "0.0002" }"#;
+    const STREAM: &str = "symbol = \"USDCUSDT\"\n";
+    const BAND: &str = "min_mid = \"0.995\"\nmax_mid = \"1.005\"\n";
+
+    /// A WETH/USDC pair streaming Coinbase's ETH-USD, a market in another dollar, with
+    /// `extra` added to its stanza.
+    fn weth_usdc_from_usd(extra: &str) -> crate::config::PairSpec {
+        let text = crate::config::tests_support::CUSTOM.replace(
+            "symbol  = \"ETHUSDC\"\n",
+            &format!("sources = [{{ venue = \"coinbase\", symbol = \"ETH-USD\" }}]\n{extra}"),
+        );
+        crate::config::parse_config(&text, 18)
+            .unwrap()
+            .pairs
+            .remove(0)
+    }
+
+    /// A pair that opts in to averaging a market in another dollar passes, and is still told
+    /// that it is averaged at par; one that does not fails. Audit F-04 (review).
+    #[test]
+    fn a_stand_in_the_pair_allows_is_still_reported_as_averaged_at_par() {
+        let (failures, _) =
+            symbol_verdicts(&weth_usdc_from_usd(""), Some("WETH"), Some("USDC"), false);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].contains("allow_symbol_mismatch"),
+            "{failures:?}"
+        );
+
+        let allowed = weth_usdc_from_usd("allow_symbol_mismatch = true\n");
+        let (failures, warnings) = symbol_verdicts(&allowed, Some("WETH"), Some("USDC"), false);
+        assert!(failures.is_empty(), "{failures:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("averaged as if they were at par")),
+            "{warnings:?}"
+        );
+    }
+
+    /// A check that did not run is not a check that passed: a pair whose symbols could not be
+    /// read fails, and one that opted out is still told its stream/token cross-check did not
+    /// run.
+    #[test]
+    fn an_unread_symbol_says_the_cross_check_did_not_run() {
+        let feed = r#"{ kind = "feed" }"#;
+        let streamed = stable_pair(STREAM, feed);
+        let (failures, _) = symbol_verdicts(&streamed, None, Some("USDT"), false);
+        assert!(
+            failures.iter().any(|f| f.contains("nothing checked")),
+            "{failures:?}"
+        );
+
+        let opted_out = format!("{STREAM}allow_symbol_mismatch = true\n");
+        let (failures, warnings) =
+            symbol_verdicts(&stable_pair(&opted_out, feed), None, Some("USDT"), false);
+        assert!(failures.is_empty(), "{failures:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("stream/token cross-check did not run")),
+            "{warnings:?}"
+        );
+    }
+
+    /// The template every compose deployment starts from passes preflight's pair verdicts:
+    /// its stable pair streams USDCUSDT inside a [0.995, 1.005] band. Audit F-04.
+    #[test]
+    fn the_deploy_example_passes_preflights_pair_verdicts() {
+        let template = include_str!("../../deploy/config.example.toml").replace(
+            "target = \"0x0000000000000000000000000000000000000000\"",
+            "target = \"0x70997970C51812dc3A010C7d01b50e0d17dc79C8\"",
+        );
+        let config = crate::config::parse_config(&template, 18).expect("the template parses");
+        let symbol = |token: Address| match format!("{token:#x}").as_str() {
+            "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2" => "WETH",
+            "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48" => "USDC",
+            "0xdac17f958d2ee523a2206206994597c13d831ec7" => "USDT",
+            other => panic!("unexpected token {other}"),
+        };
+        for spec in &config.pairs {
+            // `tokens` is address-sorted; the cross-check reads them as declared, base first.
+            let (a, b) = spec.tokens;
+            let (base, quote) = if spec.invert { (b, a) } else { (a, b) };
+            let (failures, _) =
+                symbol_verdicts(spec, Some(symbol(base)), Some(symbol(quote)), false);
+            assert!(failures.is_empty(), "{failures:?}");
+        }
+        let stable = config
+            .pairs
+            .iter()
+            .find(|spec| symbol(spec.tokens.1) == "USDT")
+            .expect("the template keeps a USDC/USDT pair");
+        let feeds = stable.feeds.as_ref().expect("it streams");
+        assert_eq!(feeds.sources[0].symbol, "USDCUSDT");
+        let at = |text: &str| crate::feed::parse_decimal_scaled(text, 18).unwrap();
+        assert_eq!(stable.band.min, Some(at("0.995")));
+        assert_eq!(stable.band.max, Some(at("1.005")));
     }
 
     /// Builds the cell the way `rows` does, from a threshold and a block count. Named
@@ -1339,9 +1525,37 @@ mod tests {
         );
     }
 
-    /// A USDC or USDT pair read from the base's USDC, USDT or USD market passes without the
-    /// opt-out, as a stand-in; a different base never does, nor a stand-in for any other
-    /// quote.
+    /// Audit F-04, path 2: a market in another dollar is averaged as if at par, so through a
+    /// depeg of either the pair publishes the wrong price. It fails preflight unless the pair
+    /// opts in with `allow_symbol_mismatch`; then `build_report` keeps the at-par warning.
+    #[test]
+    fn an_unconverted_dollar_stand_in_fails_unless_the_pair_opts_in() {
+        use crate::venue::VenueId;
+        let usd = stand_in_failure(VenueId::Coinbase, "ETH-USD", "USD", Some("USDC"), false)
+            .expect("USD averaged as USDC");
+        for needle in [
+            "coinbase",
+            "\"ETH-USD\"",
+            "USD,",
+            "USDC",
+            "allow_symbol_mismatch",
+        ] {
+            assert!(usd.contains(needle), "{needle}: {usd}");
+        }
+        assert!(
+            stand_in_failure(VenueId::Binance, "ETHUSDT", "USDT", Some("USDC"), false).is_some(),
+            "USDT averaged as USDC"
+        );
+        assert_eq!(
+            stand_in_failure(VenueId::Coinbase, "ETH-USD", "USD", Some("USDC"), true),
+            None,
+            "the pair opted in"
+        );
+    }
+
+    /// A USDC or USDT pair read from the base's USDC, USDT or USD market is classified as a
+    /// stand-in, not a mismatch; a different base never is, nor a stand-in for any other
+    /// quote. Whether a stand-in may run is `stand_in_failure`'s call.
     #[test]
     fn a_dollar_stand_in_passes_and_a_wrong_asset_does_not() {
         use crate::venue::VenueId;

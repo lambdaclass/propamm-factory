@@ -413,6 +413,38 @@ impl MidBand {
         }
         Ok(())
     }
+
+    /// The same bounds on the pair's market: the composite mid, in lane orientation and at
+    /// the published mid's scale. Judged after [`Self::check`] for a pair that streams, so a
+    /// kind whose mid does not follow the market (a `fixed` price) still stops when the
+    /// market leaves the band. Without it a fixed stable pair's band judged only the fixed
+    /// number, and the pair sold at par through a depeg (audit F-04).
+    pub fn check_market(&self, market_mid: U256) -> Result<(), crate::update::Unusable> {
+        use crate::update::{Unusable, UnusableKind};
+        if let Some(min) = self.min
+            && market_mid < min
+        {
+            return Err(Unusable::new(
+                UnusableKind::OutOfBand,
+                format!(
+                    "the market's mid {market_mid} is below this pair's min_mid {min}: the \
+                     market has left the band; refusing to publish"
+                ),
+            ));
+        }
+        if let Some(max) = self.max
+            && market_mid > max
+        {
+            return Err(Unusable::new(
+                UnusableKind::OutOfBand,
+                format!(
+                    "the market's mid {market_mid} is above this pair's max_mid {max}: the \
+                     market has left the band; refusing to publish"
+                ),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// One `[pairs.pricing]` stanza: the registered kind it names, and the stanza as written
@@ -440,8 +472,13 @@ impl PricingSpec {
         }
     }
 
+    /// A `fixed` stanza for a test pair that streams nothing, so `unguarded` (audit F-04: a
+    /// fixed price otherwise needs a market to compare its price with).
     pub(crate) fn fixed_for_tests(mid: &str, delta: &str) -> Self {
-        Self::for_tests("fixed", &[("mid", mid), ("delta", delta)])
+        Self::for_tests(
+            "fixed",
+            &[("mid", mid), ("delta", delta), ("unguarded", "true")],
+        )
     }
 
     pub(crate) fn feed_for_tests(delta: Option<&str>) -> Self {

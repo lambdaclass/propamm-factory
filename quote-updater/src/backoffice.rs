@@ -1343,6 +1343,10 @@ async fn lookup_pair(State(state): State<Backoffice>, Query(tokens): Query<Token
         .iter()
         .map(|venue| {
             let row = found.row(*venue);
+            // A market in another dollar is answered but not `selected`, so a front end shows
+            // it and leaves it to the operator: averaged at par it fails preflight unless the
+            // pair opts in (audit F-04).
+            let stand_in = row.is_some_and(|r| r.note.starts_with("quoted in"));
             serde_json::json!({
                 "venue": venue.as_str(),
                 "listed": row.is_some(),
@@ -1356,7 +1360,8 @@ async fn lookup_pair(State(state): State<Backoffice>, Query(tokens): Query<Token
                     VenueId::Mexc => "polled every second".to_owned(),
                     _ => String::new(),
                 }),
-                "stand_in": row.is_some_and(|r| r.note.starts_with("quoted in")),
+                "stand_in": stand_in,
+                "selected": row.is_some() && !stand_in,
             })
         })
         .collect();
@@ -3103,6 +3108,15 @@ mod tests {
         );
         assert_eq!(by("coinbase")["weight"], "10");
         assert_eq!(by("coinbase")["stand_in"], true);
+        // Answered, never selected for the operator: averaged at par it fails preflight unless
+        // the pair opts in (audit F-04), so only markets in the pair's own quote are selected.
+        assert_eq!(by("binance")["selected"], true);
+        assert_eq!(by("coinbase")["selected"], false);
+        let note = by("coinbase")["note"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(note.contains("not selected"), "{note}");
         assert_eq!(
             by("okx")["listed"],
             false,

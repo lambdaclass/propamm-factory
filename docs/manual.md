@@ -125,9 +125,9 @@ key_env = "UPDATER_KEY_WETH_USDC"
 pricing = { kind = "feed", delta = "0.0005" }
 min_sources = "2"
 sources = [
-  { venue = "binance",  symbol = "ETHUSDC", weight = "2" },
-  { venue = "coinbase", symbol = "ETH-USD", weight = "1" },
-  { venue = "kraken",   symbol = "ETH/USD" },                 # weight blank is 1
+  { venue = "binance", symbol = "ETHUSDC", weight = "2" },
+  { venue = "okx",     symbol = "ETH-USDC", weight = "1" },
+  { venue = "kraken",  symbol = "ETH/USDC" },                 # weight blank is 1
 ]
 ```
 
@@ -151,12 +151,13 @@ Three consequences of averaging worth choosing deliberately:
 
 - **Every source must price in the same quote currency.** The average does not convert:
   mixing Coinbase's `ETH-USD` with Binance's `ETHUSDC` averages dollars with USDC, which
-  is fine only while the two trade at par. The startup cross-check accepts a USDC or USDT
-  pair read from the base's USDC, USDT or USD market, with a warning; any other
-  difference (a different asset, or another quote) fails it unless the pair sets
-  `allow_symbol_mismatch`. So does a token whose `symbol()` cannot be read: the check has
-  nothing to compare the stream with, and the pair fails until `allow_symbol_mismatch` says
-  you compared them yourself.
+  is right only while the two trade at par, and through a depeg of either publishes the
+  wrong price. So the startup cross-check fails a USDC or USDT pair read from the base's
+  market in another of USDC, USDT or USD, and fails any other difference (a different
+  asset, or another quote), unless the pair sets `allow_symbol_mismatch`. With it, a market
+  in another dollar runs, still with a warning that it is averaged at par. A token whose
+  `symbol()` cannot be read fails the check too: it has nothing to compare the stream
+  with, and the pair fails until `allow_symbol_mismatch` says you compared them yourself.
 - **A venue dropping out steps the mid by the disagreement between venues.** The fresh set
   changes, so the average moves by however far the departing venue sat from the rest. The
   breaker judges that step like any other, so `max_deviation` has to be larger than the
@@ -192,13 +193,17 @@ its underlying, `WETH` as `ETH`), asks every exchange for its own list of market
 the tradable market whose base and quote are exactly those two names, with the name the
 exchange gives it. The one fallback: a pair quoted in USDC or USDT that an exchange does not
 list exactly takes whichever of that exchange's USDC, USDT and USD markets trades the most,
-with a note. Any other quote matches exactly or that venue has no suggestion.
-Weights are suggested from each market's 24h volume (largest 10). The preview
-(`GET /api/preview`, a websocket) then dials the venues you choose live, with the same feed
-code the updater runs, and streams each one's mid plus the weighted composite, so what would
-be published can be seen before the pair is added. Neither saves anything. A venue the
-lookup could not fill is filled by hand, and its live price in the preview shows whether
-the symbol typed works. [The backoffice](#the-backoffice) has the preview's details.
+with a note, but answers it as not to be chosen for the operator (`"stand_in": true`,
+`"selected": false`): averaged as if at par, it fails the startup cross-check unless the pair
+sets `allow_symbol_mismatch`. Any other quote matches exactly or that venue has no
+suggestion. A market in the pair's own quote is answered `"selected": true`, and those are
+the ones a front end starts from. Weights are suggested from each market's 24h volume
+(largest 10). The preview (`GET /api/preview`, a websocket) then dials the venues you choose
+live, with the same feed code the updater runs, and streams each one's mid plus the weighted
+composite, so what would be published can be seen before the pair is added. Neither saves
+anything. A venue the lookup could not fill is filled by hand, and its live price in the
+preview shows whether the symbol typed works. [The backoffice](#the-backoffice) has the
+preview's details.
 
 `--check` dials every source and prints one line per venue under a multi-source row, so a
 venue with a wrong symbol, or one disagreeing with the others, shows up before anything is
@@ -1047,10 +1052,12 @@ every price is off by a power of ten, and the updater refuses to start.
 anvil-only (node mode).
 
 What each pair *publishes* is not here — it is in the config, including `min_mid`/`max_mid`,
-the band a published mid must fall inside. That band is the only thing standing between a
-corrupt book and an arbitrary price on chain that the next fill is priced against: a mid
-outside it is refused, so the RPC service skips the push and builder mode withdraws the live
-quote at every builder. Startup warns for any feed-priced pair that sets neither. It is per
+the band a published mid, and on a pair with a market the market's mid too, must fall inside.
+That band is the only thing standing between a corrupt book and an arbitrary price on chain
+that the next fill is priced against: a mid outside it is refused, so the RPC service skips
+the push and builder mode withdraws the live quote at every builder. Startup warns for any
+feed-priced pair that sets neither. A `fixed` pair needs a market at all, unless its stanza
+says `unguarded = true`, and is warned about then. It is per
 pair rather than per process because the magnitudes are not comparable — one band covering
 both ETHUSDC (~4000) and USDCUSDT (~1) would have to be so wide it bounds nothing.
 
@@ -1140,6 +1147,20 @@ The trade is explicit: a move that arrives in sub-threshold steps never trips, h
 eventually travels. That is a real market move, and `min_mid`/`max_mid` is what bounds where
 it may end up. On trip, an empty-tx cancel goes out to every builder holding that pair's quote and
 the lane stops quoting.
+
+The band judges two numbers on a pair with a market: the mid the pair publishes, and the
+market's own mid, so a pair whose market leaves the band stops even when its own mid does
+not. That makes the band the depeg guard for a `feed` pair between two dollars: a depeg is
+usually a slide in small steps, which neither breaker check sees. Give such a pair a tight
+band with both bounds, for example `[0.995, 1.005]` for USDC/USDT.
+
+A `fixed` pair does not wait for the band. Its price does not follow the market, so it is
+only safe while the market sits inside its own bid and ask, `mid · (1 − delta)` to
+`mid · (1 + delta)`: outside them a taker trades the vault at a stale price, and a depeg
+drains the sound side at par long before the market reaches a band's edge. So a `fixed`
+pair needs a market (`symbol` or `sources`), and it stops quoting on every tick its market
+is outside its quote, counted as `market_outside_quote`. A smoke test with no market says
+`unguarded = true` in its stanza.
 
 One consequence worth knowing before it happens: the reference is the last print the feed
 *delivered*, however long ago. While the feed itself is away — a Binance reconnect, a
@@ -1568,7 +1589,7 @@ target = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
 [[pairs]]
 tokens  = ["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", "0xdAC17F958D2ee523a2206206994597C13D831ec7"]
 key_env = "UPDATER_KEY_USDC_USDT"
-pricing = { kind = "fixed", mid = "5", delta = "0" }
+pricing = { kind = "fixed", mid = "5", delta = "0", unguarded = true }
 
 [[builder]]
 name = "mock-a"

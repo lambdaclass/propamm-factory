@@ -34,8 +34,14 @@ max_mid = "0.001"
 max_deviation = "0.02"
 pricing = { kind = "feed", delta = "0.0005" }
 
-# USDC/USDT at a fixed price.
+# USDC/USDT from Binance's book, with a 2 bp half-spread. The band is the depeg guard: the
+# pair stops quoting once the market leaves [0.995, 1.005] USDT per USDC, or its stream goes
+# quiet. A `fixed` price needs the same `symbol`, and quotes only while the market sits
+# inside its own spread; `feed` follows the market inside the band.
 [[pairs]]
 tokens  = ["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", "0xdAC17F958D2ee523a2206206994597C13D831ec7"]
+symbol  = "USDCUSDT"
 key_env = "UPDATER_KEY_USDC_USDT"
-pricing = { kind = "fixed", mid = "1.0001", delta = "0.0002" }
+min_mid = "0.995"
+max_mid = "1.005"
+pricing = { kind = "feed", delta = "0.0002" }
