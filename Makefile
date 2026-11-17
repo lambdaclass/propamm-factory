@@ -1,5 +1,5 @@
 .PHONY: deps build test local local-down update-price swap deploy-factory price-service quickstart \
-	cargo-build cargo-test lint e2e mocks downstream install-nix shell default
+	backoffice-ui cargo-build cargo-test lint e2e mocks downstream install-nix shell default
 
 # Every target runs inside the shell flake.nix defines: foundry, the Rust version in
 # rust-toolchain.toml, python with the packages the mocks need. Outside that shell, with
@@ -350,8 +350,16 @@ quickstart: local
 	trap 'kill $$MOCKS $$PROM $$GRAF 2>/dev/null; rm -f $(CURDIR)/.local/mocks.pid' EXIT; \
 	until grep -q READY .local/mocks.log 2>/dev/null; do sleep 0.2; done; \
 	echo "backoffice API http://127.0.0.1:8088/api/   grafana http://127.0.0.1:3000   prometheus http://127.0.0.1:9090"; \
+	echo "backoffice front end: 'make backoffice-ui' in another terminal, then http://127.0.0.1:8090"; \
 	cd example && $(PUSHER_KEY_ENV)=$(ANVIL_KEY) ./target/debug/my-propamm --config .local.toml --registry $(PUR_ADDR) --check && \
 	$(PUSHER_KEY_ENV)=$(ANVIL_KEY) ./target/debug/my-propamm --config .local.toml --registry $(PUR_ADDR)
+
+# The backoffice's front end (backoffice-ui/) for the backoffice `make quickstart` runs:
+# Vite's dev server on http://127.0.0.1:8090, with /api proxied to http://127.0.0.1:8088 (or
+# BACKOFFICE_API), so the page and the API share an origin and the backoffice lists nothing
+# for it. pnpm fetches the Node version package.json pins.
+backoffice-ui:
+	cd backoffice-ui && pnpm install --frozen-lockfile && pnpm dev
 
 ## QUOTE UPDATER LIBRARY ##
 cargo-build:

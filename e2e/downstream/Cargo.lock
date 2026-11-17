@@ -3258,6 +3258,7 @@ dependencies = [
  "eyre",
  "futures-util",
  "hex",
+ "jsonwebtoken",
  "prometheus",
  "rand 0.8.8",
  "reqwest",

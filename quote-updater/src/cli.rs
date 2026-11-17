@@ -22,7 +22,7 @@ use crate::{PRICE_DECIMALS, config, venue};
 const MAINNET_REGISTRY: &str = "0xDa7AfEeD021EAFC1c1Af9C362dE477DaD0396B81";
 
 /// The backoffice's address when a flag or `[settings] backoffice_addr` names only its port:
-/// this host alone, which is never the wrong place to have bound an API with no login.
+/// this host alone, which is never the wrong place to have bound an API that writes.
 const DEFAULT_BACKOFFICE_IP: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
 /// The backoffice's port when a flag names only its address: the one every doc and the
@@ -184,8 +184,8 @@ pub(crate) struct Flags {
     /// Serve the backoffice API on this address: this host's tailnet address, say
     /// (100.64.1.2). The address half of [settings] backoffice_addr, which this overrides;
     /// with only --backoffice-port given, 127.0.0.1. Either flag alone turns the backoffice
-    /// on. An unspecified address (0.0.0.0, ::) is refused: the API has no login, and that
-    /// would bind every interface. Builder mode only
+    /// on. An unspecified address (0.0.0.0, ::) is refused: the API writes, and that would bind
+    /// every interface. Builder mode only
     #[arg(long, env = "BACKOFFICE_IP")]
     pub(crate) backoffice_ip: Option<IpAddr>,
 
@@ -211,8 +211,8 @@ pub(crate) struct Flags {
     /// Let a browser page served from this origin (scheme://host[:port], e.g.
     /// http://100.64.1.2:3000) call the backoffice API: it is answered with CORS headers
     /// and its changes are taken. Repeat the flag, or comma-separate the variable, for more
-    /// than one. `*` is refused: the API has no login, so any site an operator's browser
-    /// visits could then drive it. Without this only a page served under the API's own
+    /// than one. `*` is refused: without a sign-in, any site an operator's browser visits
+    /// could then drive it. Without this only a page served under the API's own
     /// address, or a client that is not a browser, can make a change
     #[arg(
         long = "backoffice-cors-origin",
@@ -232,6 +232,34 @@ pub(crate) struct Flags {
     /// (what `tailscale cert` writes as <name>.key) or PKCS#1
     #[arg(long, env = "BACKOFFICE_TLS_KEY")]
     pub(crate) backoffice_tls_key: Option<PathBuf>,
+
+    /// Require a Google sign-in on every backoffice request: the OAuth client ID the front
+    /// end signs in with (a "Web application" client, ending in .apps.googleusercontent.com;
+    /// no client secret). Every request then needs the ID token of an account
+    /// --backoffice-allow-domain or --backoffice-allow-email lets in, as Authorization:
+    /// Bearer <token>. Without it the backoffice takes no sign-in
+    #[arg(long, env = "BACKOFFICE_GOOGLE_CLIENT_ID")]
+    pub(crate) backoffice_google_client_id: Option<String>,
+
+    /// With --backoffice-google-client-id: a Google Workspace domain whose accounts may sign
+    /// in. Matched on the domain Google says manages the account, never on the address, so a
+    /// personal account under a work address is not let in. Repeat the flag, or
+    /// comma-separate the variable, for more than one
+    #[arg(
+        long = "backoffice-allow-domain",
+        env = "BACKOFFICE_ALLOW_DOMAINS",
+        value_delimiter = ','
+    )]
+    pub(crate) backoffice_allow_domains: Vec<String>,
+
+    /// With --backoffice-google-client-id: a Google account that may sign in, by its address.
+    /// Repeat the flag, or comma-separate the variable, for more than one
+    #[arg(
+        long = "backoffice-allow-email",
+        env = "BACKOFFICE_ALLOW_EMAILS",
+        value_delimiter = ','
+    )]
+    pub(crate) backoffice_allow_emails: Vec<String>,
 
     /// Keep builder quote updates in the region they were submitted to
     #[arg(long, env = "DISABLE_CROSS_REGION", value_parser = FalseyValueParser::new())]
@@ -903,6 +931,38 @@ mod tests {
             ["http://a.example", "http://b.example", "http://c.example"]
         );
         assert!(defaulted_args().flags.backoffice_cors_origins.is_empty());
+    }
+
+    /// Google sign-in's lists, repeated or comma-separated like the others, read into who
+    /// the backoffice lets in.
+    #[test]
+    fn google_sign_in_reads_its_client_id_and_who_is_let_in() {
+        let args = Args::try_parse_from([
+            "quote-updater",
+            "--config",
+            "config.toml",
+            "--backoffice-google-client-id",
+            "1234-abc.apps.googleusercontent.com",
+            "--backoffice-allow-domain",
+            "example.com,example.org",
+            "--backoffice-allow-email",
+            "Ops@Gmail.com",
+        ])
+        .unwrap();
+        let google = crate::auth::GoogleSignIn::from_flags(
+            args.flags.backoffice_google_client_id.as_deref(),
+            &args.flags.backoffice_allow_domains,
+            &args.flags.backoffice_allow_emails,
+        )
+        .unwrap()
+        .expect("on");
+        assert_eq!(google.client_id, "1234-abc.apps.googleusercontent.com");
+        assert_eq!(google.domains, ["example.com", "example.org"]);
+        assert_eq!(google.emails, ["ops@gmail.com"]);
+        let off = defaulted_args();
+        assert!(off.flags.backoffice_google_client_id.is_none());
+        assert!(off.flags.backoffice_allow_domains.is_empty());
+        assert!(off.flags.backoffice_allow_emails.is_empty());
     }
 
     /// The TLS files go together: both, or neither for plain HTTP.

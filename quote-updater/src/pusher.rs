@@ -258,6 +258,26 @@ async fn run_inner(
         }
         (None, _) => None,
     };
+    // Checked here too, so a half setup (a client ID with no one allowed in, say) is refused,
+    // by `--check` as well, before anything connects.
+    let backoffice_google = match (
+        crate::auth::GoogleSignIn::from_flags(
+            args.flags.backoffice_google_client_id.as_deref(),
+            &args.flags.backoffice_allow_domains,
+            &args.flags.backoffice_allow_emails,
+        )?,
+        backoffice_addr,
+    ) {
+        (Some(google), Some(_)) => Some(google),
+        (Some(_), None) => {
+            tracing::warn!(
+                "--backoffice-google-client-id is set, but this run serves no backoffice to \
+                 sign in to; it is ignored"
+            );
+            None
+        }
+        (None, _) => None,
+    };
     // How the backoffice is reached, for every line that tells an operator where to go: by
     // the first name it answers to when it has one (over HTTPS, the one its certificate
     // names), by its address otherwise.
@@ -742,6 +762,9 @@ async fn run_inner(
                 if !cors_origins.is_empty() {
                     answering.push(format!("CORS for {}", cors_origins.join(", ")));
                 }
+                if let Some(google) = &backoffice_google {
+                    answering.push(google.describe());
+                }
                 let (local, task) = backoffice::bind(
                     addr,
                     Arc::clone(&shared),
@@ -752,6 +775,7 @@ async fn run_inner(
                         hosts: backoffice_hosts,
                         origins: cors_origins,
                         tls: backoffice_tls,
+                        google: backoffice_google,
                     },
                 )
                 .await?;

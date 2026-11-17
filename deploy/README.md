@@ -122,6 +122,25 @@ the certificate's refuses the run, naming the file: `docker compose run --rm upd
 --check` reports it. `deploy/tls` is gitignored apart from its `.gitkeep`: the key is a
 secret. [docs/manual.md](../docs/manual.md), "The backoffice", has the rest.
 
+## Google sign-in for the backoffice
+
+Optional: on top of the tailnet, every request can be made to need a Google sign-in by an
+allowed account. Create an OAuth client ID of type "Web application", for this backoffice
+alone, in the Google Cloud console (APIs & Services, Credentials), with the front end's `https://` origin under
+"Authorized JavaScript origins" (Google takes no IP address there). Then, in `.env`:
+
+```bash
+BACKOFFICE_GOOGLE_CLIENT_ID=1234-abc.apps.googleusercontent.com
+BACKOFFICE_ALLOW_DOMAINS=example.com        # every account of this Workspace
+BACKOFFICE_ALLOW_EMAILS=ops@example.com     # and/or these accounts
+```
+
+The client ID only, never its secret. A client ID with no one allowed is refused at start.
+The updater fetches Google's signing keys from `www.googleapis.com`, so the container needs
+outbound HTTPS. A request without a good token gets a 401, an account not let in a 403, and
+`GET /api/auth` tells a front end which client ID to sign in with.
+[docs/manual.md](../docs/manual.md), "Google sign-in", has the details.
+
 ## Day to day
 
 ```bash
