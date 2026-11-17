@@ -16,7 +16,13 @@
 /deploy/.env
 /deploy/config/*
 !/deploy/config/.gitkeep
+/deploy/tls/*
+!/deploy/tls/.gitkeep
 /deploy/alertmanager/slack-webhook
 
 # direnv's cache of the flake shell.
 /.direnv/
+
+# The backoffice front end's dependencies and build (backoffice-ui/README.md).
+/backoffice-ui/node_modules/
+/backoffice-ui/dist/

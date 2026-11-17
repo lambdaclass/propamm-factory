@@ -82,21 +82,23 @@ pub(crate) fn watchdog_verdict(
 /// has ("halted on their circuit breaker", "check that feed"); once a registered guard, a
 /// panic or a kill switch can halt a lane, the notice names the sources instead, so a
 /// panic in a pricer never pages as a feed problem.
+///
+/// `backoffice` is the backoffice's base URL, scheme included, when the run serves one.
 pub(crate) fn halt_notice(
     (halted, waiting, total): (usize, usize, usize),
     backoffice: Option<&str>,
     sources: &[(&'static str, Cause)],
-    reload_hint: &str,
+    rearm_hint: &str,
 ) -> String {
     let named = describe_sources(sources);
     // Not a breaker story, and telling it as one sends the operator to look at feeds they
     // have no reason to doubt.
     if halted == 0 && waiting >= total && total > 0 {
         return match backoffice {
-            Some(addr) => format!(
+            Some(url) => format!(
                 "nothing is quoting: all {total} pair(s) are failing to start and none has \
                  halted, so this is the config rather than a feed. NOT exiting, so the \
-                 backoffice stays reachable: fix it at http://{addr}/"
+                 backoffice stays reachable: fix it through {url}/api/"
             ),
             None => format!(
                 "nothing is quoting: all {total} pair(s) are failing to start and none has \
@@ -109,14 +111,14 @@ pub(crate) fn halt_notice(
             None => format!(
                 "nothing is quoting: {halted}/{total} pair(s) halted on their circuit \
                  breaker, {waiting} waiting to restart. NOT exiting, because a restart would \
-                 clear the breakers; check those feeds and reload once you trust them \
-                 ({reload_hint})"
+                 clear the breakers; check those feeds and re-arm each pair once you trust \
+                 it ({rearm_hint})"
             ),
             Some(named) => format!(
                 "nothing is quoting: {halted}/{total} pair(s) halted: {named}, {waiting} \
                  waiting to restart. NOT exiting, because a restart would clear the latches; \
-                 check those lanes and reload once you trust them \
-                 ({reload_hint})"
+                 check those lanes and re-arm each pair once you trust it \
+                 ({rearm_hint})"
             ),
         };
     }
@@ -129,13 +131,13 @@ pub(crate) fn halt_notice(
     match &named {
         None => format!(
             "{halted}/{total} pair(s) halted on their circuit breaker, {quoting} still \
-             quoting{waiting}. Check that feed and reload once you trust it \
-             ({reload_hint})"
+             quoting{waiting}. Check that feed and re-arm the pair once you trust it \
+             ({rearm_hint})"
         ),
         Some(named) => format!(
             "{halted}/{total} pair(s) halted: {named}; {quoting} still quoting{waiting}. \
-             Check those lanes and reload once you trust them \
-             ({reload_hint})"
+             Check those lanes and re-arm each pair once you trust it \
+             ({rearm_hint})"
         ),
     }
 }
@@ -174,7 +176,7 @@ mod tests {
     use super::*;
     use crate::guard::Cause;
 
-    /// A binary run as a unit, so the expected lines read as they always have.
+    /// A run with a backoffice, which is told the call that reloads it.
     fn notice(
         counts: (usize, usize, usize),
         backoffice: Option<&str>,
@@ -184,7 +186,7 @@ mod tests {
             counts,
             backoffice,
             sources,
-            "systemctl --user reload example-quoter",
+            "POST http://100.64.1.2:8088/api/pairs/<key_env>/rearm",
         )
     }
 
@@ -196,11 +198,18 @@ mod tests {
         assert_eq!(
             old,
             "1/2 pair(s) halted on their circuit breaker, 1 still quoting. Check that feed \
-             and reload once you trust it (systemctl --user reload example-quoter)"
+             and re-arm the pair once you trust it (POST \
+             http://100.64.1.2:8088/api/pairs/<key_env>/rearm)"
         );
-        // A binary that names no unit is told the signal, in the same place.
-        let signal = halt_notice((1, 0, 2), None, &[("deviation", Cause::Guard)], "SIGHUP");
-        assert!(signal.ends_with("(SIGHUP)"), "{signal}");
+        // A run with no backoffice is told whatever its caller can re-arm it with, in the
+        // same place.
+        let handle = halt_notice(
+            (1, 0, 2),
+            None,
+            &[("deviation", Cause::Guard)],
+            "UpdaterHandle::rearm",
+        );
+        assert!(handle.ends_with("(UpdaterHandle::rearm)"), "{handle}");
         let new = notice(
             (2, 0, 3),
             None,
@@ -209,15 +218,16 @@ mod tests {
         assert_eq!(
             new,
             "2/3 pair(s) halted: 1 on `deviation`, 1 on a panic in `funding`; 1 still \
-             quoting. Check those lanes and reload once you trust them (systemctl --user \
-             reload example-quoter)"
+             quoting. Check those lanes and re-arm each pair once you trust it (POST \
+             http://100.64.1.2:8088/api/pairs/<key_env>/rearm)"
         );
         let external = notice((1, 0, 1), None, &[("kill", Cause::External)]);
         assert_eq!(
             external,
             "nothing is quoting: 1/1 pair(s) halted: 1 on `kill` (external), 0 waiting to \
              restart. NOT exiting, because a restart would clear the latches; check those \
-             lanes and reload once you trust them (systemctl --user reload example-quoter)"
+             lanes and re-arm each pair once you trust it (POST \
+             http://100.64.1.2:8088/api/pairs/<key_env>/rearm)"
         );
     }
 
@@ -324,12 +334,15 @@ mod tests {
     /// is the config: on a page-managed server, most often a pair added before any builder.
     #[test]
     fn a_config_outage_is_not_reported_as_a_halt() {
-        let with_page = notice((0, 1, 1), Some("100.64.1.2:8088"), &[]);
+        let with_page = notice((0, 1, 1), Some("https://100.64.1.2:8088"), &[]);
         assert!(
             with_page.contains("this is the config rather than a feed"),
             "{with_page}"
         );
-        assert!(with_page.contains("http://100.64.1.2:8088/"), "{with_page}");
+        assert!(
+            with_page.contains("fix it through https://100.64.1.2:8088/api/"),
+            "{with_page}"
+        );
         assert!(!with_page.contains("breaker"), "{with_page}");
 
         let without = notice((0, 2, 2), None, &[]);
@@ -355,9 +368,9 @@ mod tests {
             );
         }
         let partial = notice((1, 0, 3), None, &[("deviation", Cause::Guard)]);
-        // Names the remedy, and specifically the reload rather than the restart it replaced:
-        // restarting to recover one lane clears every other lane's breaker on the way.
-        for expected in ["1/3", "2 still quoting", "reload"] {
+        // Names the remedy, and specifically the pair's re-arm rather than a restart, which
+        // to recover one lane clears every other lane's breaker on the way.
+        for expected in ["1/3", "2 still quoting", "re-arm"] {
             assert!(
                 partial.contains(expected),
                 "missing {expected:?}: {partial}"

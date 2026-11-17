@@ -6,6 +6,11 @@
 //! and the pair's band. So a pricer only ever makes the updater more cautious: it can
 //! withdraw a quote, never publish one the core would refuse.
 //!
+//! What the core does not judge is where a pricer's quote sits against the market. A pricer
+//! that moves its mid off the market's (to rebalance a vault, say) must keep the market's
+//! mid between the two prices it publishes, which means moving the mid by no more than its
+//! half-spread: see [`Market::shift`].
+//!
 //! Everything a pricer sees is exact and in lane orientation, with helpers for the f64
 //! world: [`Market::mid_f64`] reads the market the way a person says it (USDC per WETH,
 //! whichever way the lane carries it), and [`Market::scaled_fraction`], [`Market::shift`]
@@ -31,7 +36,10 @@ pub use self::inputs::{
 };
 pub use self::{feed::Feed, fixed::Fixed, volatile::Volatile};
 #[cfg(test)]
-pub(crate) use self::{feed::FeedPricer, fixed::FixedPricer};
+pub(crate) use self::{
+    feed::{FeedPricer, Spread as FeedSpread},
+    fixed::FixedPricer,
+};
 
 use crate::{
     feed::{PriceSample, parse_decimal_scaled},
@@ -46,10 +54,11 @@ use crate::{
 /// guard reading a [`super::guard::SourceSample`]'s own `mid` and `delta`.
 pub use crate::feed::scaled_to_f64;
 
-/// One input of a pricing kind on the backoffice's pair form: the stanza key it writes, the
-/// placeholder the empty input shows, and the hint under it. A kind that declares its fields
-/// ([`Factory::fields`]) is editable from the page; one that declares none is edited in the
-/// config file, and the page says so.
+/// One input of a pricing kind on a pair form: the stanza key it writes, the placeholder the
+/// empty input shows, and the hint under it. The backoffice API lists every registered
+/// kind's fields (`GET /api/kinds`) for whatever front end draws that form. A kind that
+/// declares its fields ([`Factory::fields`]) can be edited from such a form; one that
+/// declares none has a stanza only written whole, as the config file holds it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FormField {
     /// The stanza key the input writes, e.g. `half_spread`.
@@ -59,7 +68,7 @@ pub struct FormField {
     /// One or two sentences under the input: what the key means and what blank means.
     pub hint: &'static str,
     /// Written into the stanza as a TOML number rather than a string, for a config type
-    /// with `f64`/`u64` fields; the page refuses a value that is not one.
+    /// with `f64`/`u64` fields: a form sends it as a JSON number.
     pub number: bool,
 }
 
@@ -159,21 +168,22 @@ pub trait Factory: Send + Sync + 'static {
         Ok(())
     }
 
-    /// The stanza's keys as inputs on the backoffice's pair form, in the order shown. The
-    /// page posts each as text and writes it into the stanza as a string, so a kind that
-    /// declares fields reads its config as strings (the kinds this crate ships do). Empty, the default,
-    /// means the stanza is edited in the file and the page says so.
+    /// The stanza's keys as inputs on a pair form, in the order shown, as the backoffice API
+    /// lists them (`GET /api/kinds`). A field is written into the stanza as a string unless
+    /// it is a [`FormField::number`], so a kind that declares fields reads its config as
+    /// strings (the kinds this crate ships do). Empty, the default, means the stanza is
+    /// only written whole.
     fn fields(&self) -> &'static [FormField] {
         &[]
     }
 
-    /// HTML the pair form shows above this kind's fields: what the model does and how to
-    /// tune it. Empty by default.
+    /// HTML a pair form shows above this kind's fields: what the model does and how to tune
+    /// it. Listed by `GET /api/kinds` as `help_html`. Empty by default.
     fn form_help(&self) -> &'static str {
         ""
     }
 
-    /// One line describing a stanza for the `--check` report and the backoffice's pair
+    /// One line describing a stanza for the `--check` report and the backoffice API's pair
     /// list, e.g. `mid 1.0001 delta 0.0002`. Empty by default, which shows the kind alone.
     fn summary(&self, _cfg: &Self::Config) -> String {
         String::new()
@@ -372,8 +382,8 @@ pub struct PairShape {
     /// market, which a kind that reads one refuses in its `validate`.
     pub sources: usize,
     /// The pair's `min_mid`, in lane orientation, which the core holds every published mid
-    /// to; a kind whose mid is a setting checks it here, so a mistake fails the file instead
-    /// of every tick.
+    /// to, and on a pair with a market the market's mid as well; a kind whose mid is a
+    /// setting checks it here, so a mistake fails the file instead of every tick.
     pub min_mid: Option<U256>,
     /// The pair's `max_mid`, likewise.
     pub max_mid: Option<U256>,
@@ -426,6 +436,15 @@ impl Market {
 
     /// The mid moved by `skew` in market orientation: `+0.01` publishes a mid 1% below the
     /// market's (the volatile model's tilt direction), returned in lane orientation.
+    ///
+    /// Keep `skew` within the half-spread published beside it, `±delta`. We buy at
+    /// `mid·(1 − skew)·(1 − delta)` and sell at `mid·(1 − skew)/(1 − delta)`, so at
+    /// `skew = delta` we sell at the market's mid, and past it below: the quote is through
+    /// the market, and a taker fills it and unwinds on the market at the vault's cost. A
+    /// skew that follows the vault's inventory makes that repeatable, since whoever
+    /// unbalances the vault moves the quote. Nothing in the core checks this (the band is an
+    /// absolute bound on the mid, not a distance from the market), so the pricer clamps:
+    /// `skew.clamp(-delta, delta)`, as the volatile model does with its tilt.
     pub fn shift(&self, skew: f64) -> Result<U256, Refusal> {
         shifted_mid(self.mid, skew, self.inverted, self.price_decimals)
             .map_err(|err| Refusal::core(UnusableKind::DeltaOverflow, format!("{err:#}")))
@@ -655,6 +674,10 @@ impl Diagnostics {
 /// the pair's band (`min_mid`/`max_mid`) is the operator's bound
 /// on the mid and is checked after it. Severity only goes up: this can withdraw a quote,
 /// never publish one.
+///
+/// It does not compare the mid with the market's: a pricer may price off something other
+/// than the pair's reference market, so keeping a quote from going through the market is
+/// the pricer's to do (see [`Market::shift`]).
 pub(crate) fn backstop(
     out: PricerOutput,
     market: Option<&Market>,
@@ -973,7 +996,7 @@ impl BuildCtx {
 
     /// The lane's latch, for a component to trip its own lane from its code or a task of
     /// its own (`cause = external`): a model that sees its inputs go bad, an oracle that
-    /// disagrees for too long. Not a kill switch: a reload re-arms every latch, so
+    /// disagrees for too long. Not a kill switch: the pair's re-arm clears a latch, so
     /// "stop until I say so" is a halt in the config file, never a trip. Under a test build
     /// context this is a latch of the context's own, readable back through the same call.
     pub fn latch(&self) -> crate::guard::Latch {

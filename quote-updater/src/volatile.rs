@@ -345,9 +345,10 @@ const MAX_DELTA: f64 = 0.05;
 /// inside both. Both ends are reached: a vault far enough off its band, at a σ that clamps
 /// the tilt, sits on them.
 ///
-/// One definition for two readers: [`price`] clamps its skew to it, and the core's backstop
-/// (`pricing::backstop`) bounds every pricer's mid by the mids it gives, so the bound is the
-/// model's reach and cannot drift from it.
+/// [`price`] clamps its skew to it. It bounds this model only: the core's backstop
+/// (`pricing::backstop`) does not judge any pricer's mid against the market, so a pricer
+/// that moves its mid keeps it around the market itself, as the tilt's `±delta` clamp in
+/// [`price`] does here.
 pub fn skew_reach() -> (f64, f64) {
     let charge = (1.0 - MAX_DELTA).sqrt();
     (
@@ -454,8 +455,8 @@ pub fn price(params: &VolatileParams, sigma: f64, base_share: f64) -> Terms {
     };
     // Exactly, the solve lands inside `skew_reach`. Nothing proves f64 rounding cannot carry
     // it an ulp past an end (a million sampled spreads at both ends never did), so the clamp
-    // takes any such ulp back, and the backstop's bound, computed from the same two numbers,
-    // holds by construction rather than within a tolerance.
+    // takes any such ulp back, and the bound holds by construction rather than within a
+    // tolerance.
     let (lowest, highest) = skew_reach();
     let skew = skew.clamp(lowest, highest);
 

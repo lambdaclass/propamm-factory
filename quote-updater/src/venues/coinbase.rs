@@ -23,7 +23,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::venue::{Connection, Keepalive, Quote};
-use crate::venues::{rfc3339_utc, unwrap_alias};
+use crate::venues::{book_stamp, unwrap_alias};
 
 pub const DEFAULT_ENDPOINT: &str = "wss://advanced-trade-ws.coinbase.com";
 
@@ -99,7 +99,7 @@ pub fn parse_stamped(text: &str) -> Result<Option<(Quote, Option<SystemTime>)>> 
                         bid: bid.clone(),
                         ask: ask.clone(),
                     },
-                    frame.timestamp.as_deref().and_then(rfc3339_utc),
+                    book_stamp(bid, ask, frame.timestamp.as_deref()),
                 ))),
                 _ => Err(eyre!("ticker without best_bid/best_ask")),
             }

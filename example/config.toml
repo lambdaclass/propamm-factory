@@ -24,7 +24,7 @@ max_deviation = "0.02"          # the library's built-in deviation breaker, stil
 [pairs.pricing]
 kind        = "inventory_skew"  # registered in main.rs
 half_spread = 0.0005            # 5 bp
-strength    = 0.02              # a 100% base vault pushes the mid 1% down
+strength    = 0.02              # 2 bp of mid per point of base share past 50%, capped at half_spread
 max_inventory_age_secs = 60
 
 [[pairs.guards]]
@@ -42,7 +42,9 @@ tokens  = ["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",   # USDC
 symbol  = "USDCUSDT"
 key_env = "UPDATER_KEY_USDC_USDT"
 max_deviation = "0.002"
-pricing = { kind = "feed" }
+# The exchange's mid at the exchange's own spread, and never less than 2 bp: the book's
+# spread is priced for a quote that can be pulled in milliseconds, and ours stands a block.
+pricing = { kind = "feed", min_delta = "0.0002" }
 
 [[builder]]
 name = "titan-eu"

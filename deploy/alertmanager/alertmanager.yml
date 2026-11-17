@@ -35,6 +35,9 @@ inhibit_rules:
   - source_matchers: ['alertname="PusherPoolSeverelyImbalanced"']
     target_matchers: ['alertname="PusherPoolImbalanced"']
     equal: [pair]
+  - source_matchers: ['alertname="PusherVaultDraining"']
+    target_matchers: ['alertname="PusherVaultLosingValue"']
+    equal: [vault]
 
 receivers:
   - name: page

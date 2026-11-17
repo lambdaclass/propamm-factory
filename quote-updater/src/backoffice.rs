@@ -1,57 +1,98 @@
-//! A web UI for changing the pusher's configuration without a deploy.
+//! The backoffice: a JSON API for changing the pusher's pairs and builders without a
+//! deploy, and for looking up and previewing a pair's venues before adding it. It serves
+//! no pages; whatever front end an operator uses talks to it under `/api`.
 //!
-//! Server-rendered HTML with plain `<form>` posts. Each change writes `config.toml` and
-//! asks the service to reload it; if the reload is rejected the previous file is written
-//! back, so what is on disk always describes what is running.
+//! Every change goes through the shared config (`state.rs`), which applies it to a copy,
+//! writes `config.toml`, has the service converge the running pairs onto it, and keeps it
+//! only if the service accepts: so the config in memory and the file on disk both describe
+//! what is running. `[settings]` are read once, at start, and the API only shows them.
 //!
-//! No login: `backoffice_addr` is the host's tailnet address, so reaching this page means
-//! being past the tailnet ACL. Binding a routable address is refused, because unlike
-//! `/metrics` this page writes. Every change logs the peer that made it.
+//! The address it binds (`--backoffice-ip` and `--backoffice-port`, or `[settings]
+//! backoffice_addr`) is the host's tailnet address, so reaching this API means being past
+//! the tailnet ACL. Binding every interface is refused, because unlike `/metrics` this API
+//! writes. No login beyond that unless `--backoffice-google-client-id` is given: then every
+//! request also needs a Google sign-in by an allowed account (`auth.rs`, checked in
+//! [`guard`]). Every change logs the peer that made it, and who signed in.
+//!
+//! Plain HTTP unless `--backoffice-tls-cert` and `--backoffice-tls-key` are given; then
+//! HTTPS only, with the certificate read again whenever its files change (`tls.rs`).
+//!
+//! Being past the ACL is not the same as meaning to be here: a browser on the tailnet sends
+//! whatever another site's page tells it to (audit F-02). So [`guard`] answers only requests
+//! addressed to a name the API is served under, which stops a site that points its own
+//! domain at this host (DNS rebinding); takes a change only as JSON, which a page on another
+//! site cannot send here without CORS approval; and refuses one whose `Origin` names another
+//! site. The approval goes to the origins `--backoffice-cors-origin` lists, and only to
+//! those: a front end served from one of them can call the API, and every other site still
+//! cannot.
+//!
+//! | Route                             | What it does                                     |
+//! |-----------------------------------|--------------------------------------------------|
+//! | `GET /api/pairs`                  | every pair, with what the pusher is doing with it |
+//! | `POST /api/pairs`                 | adds a pair (its `[[pairs]]` stanza, as JSON)    |
+//! | `GET /api/pairs/{key_env}`        | one pair                                         |
+//! | `PUT /api/pairs/{key_env}`        | replaces a pair's stanza                         |
+//! | `DELETE /api/pairs/{key_env}`     | removes a pair                                   |
+//! | `POST /api/pairs/{key_env}/halt`  | stops a pair quoting at once, keeping it         |
+//! | `POST /api/pairs/{key_env}/resume`| clears a halt                                    |
+//! | `POST /api/pairs/{key_env}/rearm` | brings back a pair its circuit breaker halted    |
+//! | `POST /api/halt`                  | halts every pair                                 |
+//! | `POST /api/reload`                | restarts the pairs halted here, retries the rest |
+//! | `GET /api/builders`               | every builder, without its API key               |
+//! | `POST /api/builders`              | adds a builder                                   |
+//! | `DELETE /api/builders/{name}`     | removes a builder                                |
+//! | `GET /api/settings`               | `target` and `[settings]`, read-only             |
+//! | `GET /api/kinds`                  | the registered pricing kinds and their fields    |
+//! | `GET /api/venues`                 | the venues a pair can read                       |
+//! | `GET /api/lookup`                 | where a token pair trades; saves nothing         |
+//! | `GET /api/preview`                | a websocket of live venue mids; saves nothing    |
+//! | `GET /api/auth`                   | how a page signs in; needs no sign-in            |
+//!
+//! A change answers `{"status": "applied" | "partial", "message": ...}` with a 2xx; a
+//! `partial` one is kept, though some pair kept its previous config or was stopped (see
+//! [`ReloadFailure::Partial`]). Anything refused answers `{"error": ...}` with a 4xx, and
+//! changed nothing. A fault on this side answers `{"error": ...}` with a 5xx: 500 for a
+//! change that could not be made (see [`ReloadFailure::Fault`]), 502 for a lookup that
+//! could not ask the chain or the venues.
 
 use std::{
     net::SocketAddr,
-    path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
 
-use askama::Template;
 use axum::{
-    Form, Json, Router,
-    extract::{ConnectInfo, Query, State},
-    http::StatusCode,
-    response::{Html, IntoResponse, Redirect, Response},
-    routing::{get, post},
+    Json, Router,
+    extract::{ConnectInfo, Extension, Path, Query, State, rejection::JsonRejection},
+    http::{Method, StatusCode, header},
+    response::{IntoResponse, Response},
+    routing::{delete, get, post},
 };
-use eyre::{Result, WrapErr, bail, eyre};
-use serde::Deserialize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use eyre::{Result, WrapErr, eyre};
+use serde::{Deserialize, Serialize};
+use tokio::task::JoinHandle;
 
-use tokio::{sync::oneshot, task::JoinHandle};
-
-use crate::config::{self, BuilderConfig, RawConfig, RawPair, RawSource};
+use crate::config::{self, BuilderConfig, RawConfig, RawPair};
 use crate::service::ReloadFailure;
+use crate::state::{Refused, SharedConfig};
 use crate::venue::VenueId;
-
-/// A reload the backoffice, or an `UpdaterHandle`, is asking the service to perform.
-/// Unlike SIGHUP it waits for the verdict, because a rejection means putting the
-/// operator's file back.
-pub(crate) struct ReloadRequest {
-    pub(crate) reply: oneshot::Sender<std::result::Result<String, crate::service::ReloadFailure>>,
-}
 
 /// What the running pusher is doing with each pair, by `key_env`: for every pair that has
 /// a task, the flag its circuit breaker raises when it trips. The service keeps it current
-/// as pairs start and stop, so a row can say what is actually running rather than only what
-/// the file asks for.
+/// as pairs start and stop, so the API can say what is actually running rather than only
+/// what the config asks for.
 pub type PairStates = Arc<std::sync::Mutex<std::collections::BTreeMap<String, Arc<AtomicBool>>>>;
 
 #[derive(Clone)]
 struct Backoffice {
-    config_path: PathBuf,
+    /// What the API reads and changes; the service converges onto it.
+    config: Arc<SharedConfig>,
     states: PairStates,
-    /// The registered pricing kinds: what the pair form offers, with each kind's fields.
+    /// The registered pricing kinds: what `/api/kinds` lists, with each kind's fields.
     kinds: Arc<crate::kinds::Kinds>,
-    reloads: tokio::sync::mpsc::Sender<ReloadRequest>,
     /// For the venue lookup (`discover.rs`): the node that reads the tokens' `symbol()`, the
     /// client that asks the exchanges, and where each exchange's API is.
     client: ethrex_rpc::clients::eth::EthClient,
@@ -59,14 +100,32 @@ struct Backoffice {
     rest: Arc<crate::discover::Rest>,
     /// Market lists already fetched, kept for a while: Binance's alone is megabytes.
     lookups: Arc<crate::discover::Cache>,
-    /// Open preview pages, capped at PREVIEW_PAGES. Each page connects to each venue at
-    /// most once, so this bounds the venue connections previews can hold at once.
+    /// Open previews, capped at PREVIEW_PAGES. Each connects to each venue at most once,
+    /// so this bounds the venue connections previews can hold at once.
     preview_pages: Arc<tokio::sync::Semaphore>,
-    /// Serializes edits. Two at once would each read the file and write it back, and the
-    /// second would drop the first's change. Also covers the window where a rejected edit
-    /// is being reverted. Shared with the `UpdaterHandle` of a `start`ed run, whose halts
-    /// and resumes are edits of the same file.
-    edits: Arc<tokio::sync::Mutex<()>>,
+    /// The origins besides its own whose pages may change things here, as
+    /// [`parse_origins`] writes them: the same list the CORS layer answers to.
+    origins: Arc<[String]>,
+    /// The names besides an IP address and `localhost` that requests may be addressed to,
+    /// as [`parse_hosts`] writes them.
+    hosts: Arc<[String]>,
+    /// Google sign-in, when it is on: what checks every request's token (`auth.rs`).
+    sign_in: Option<crate::auth::Verifier>,
+}
+
+/// Who may reach the API, and how: the names it answers to, the browser origins besides its
+/// own it answers CORS for, and its certificate when it is HTTPS. The default is plain HTTP,
+/// answering to IP addresses and `localhost` alone, with no CORS.
+#[derive(Default)]
+pub(crate) struct Access {
+    /// `--backoffice-host` or `[settings] backoffice_hosts`; see [`parse_hosts`].
+    pub(crate) hosts: Vec<String>,
+    /// `--backoffice-cors-origin`; see [`parse_origins`].
+    pub(crate) origins: Vec<String>,
+    /// `--backoffice-tls-cert` and `--backoffice-tls-key`, read.
+    pub(crate) tls: Option<crate::tls::Tls>,
+    /// `--backoffice-google-client-id` and who it lets in; `None` takes no sign-in.
+    pub(crate) google: Option<crate::auth::GoogleSignIn>,
 }
 
 /// `0.0.0.0:8088` binds every interface, including whatever the host has facing the
@@ -75,49 +134,149 @@ pub(crate) fn is_unspecified_bind(addr: SocketAddr) -> bool {
     addr.ip().is_unspecified()
 }
 
-/// Binds `addr` and serves the page. Fatal on failure: an operator who believes this is up
-/// and whose changes are going nowhere is worse off than one whose service refused to
-/// start.
-pub async fn bind(
+/// Refuses [`is_unspecified_bind`]. Startup asks before it connects to anything, and
+/// [`bind`] again.
+pub(crate) fn refuse_unspecified_bind(addr: SocketAddr) -> Result<()> {
+    eyre::ensure!(
+        !is_unspecified_bind(addr),
+        "the backoffice address is {addr}, which binds every interface on this host. This \
+         API rewrites the pusher's config, and is not to face whatever this host faces even \
+         behind a sign-in; bind it to the host's tailnet address instead (--backoffice-ip, or [settings] \
+         backoffice_addr), where the tailnet ACL is the access control."
+    );
+    Ok(())
+}
+
+/// `--backoffice-cors-origin`, checked, and each written as a browser writes `Origin`
+/// (lowercase, no default port, no trailing slash), which is what both the CORS layer and
+/// [`guard`] compare a request's against, byte for byte. `*` and `null` are refused: unless
+/// Google sign-in is on the API has no login, so an origin that answers for any page would
+/// let any site an operator's browser visits drive it.
+pub(crate) fn parse_origins(origins: &[String]) -> Result<Vec<String>> {
+    origins
+        .iter()
+        .map(|origin| origin.trim())
+        .filter(|origin| !origin.is_empty())
+        .map(|origin| {
+            eyre::ensure!(
+                origin != "*",
+                "\"*\" would let a page on any site an operator's browser visits drive this \
+                 API; list the front end's own origin, such as http://100.64.1.2:3000"
+            );
+            let written = || {
+                eyre!(
+                    "{origin:?} is not an origin; write the scheme, host and port alone, such \
+                     as http://100.64.1.2:3000, with no path"
+                )
+            };
+            let url = url::Url::parse(origin).map_err(|_| written())?;
+            eyre::ensure!(
+                matches!(url.scheme(), "http" | "https")
+                    && url.has_host()
+                    && url.path() == "/"
+                    && url.query().is_none()
+                    && url.fragment().is_none()
+                    && url.username().is_empty()
+                    && url.password().is_none(),
+                written()
+            );
+            Ok(url.origin().ascii_serialization())
+        })
+        .collect()
+}
+
+/// `--backoffice-host` and `[settings] backoffice_hosts`, checked: each a bare hostname, as
+/// a `Host` header carries it without its port, lowercased and without a trailing dot. The
+/// names the API is reached by besides an IP address and `localhost`, which it always
+/// answers to: its tailnet name (the one its certificate names, over HTTPS), or the name a
+/// reverse proxy serves it under. Never a front end's: that is an origin, for
+/// `--backoffice-cors-origin`.
+pub(crate) fn parse_hosts(hosts: &[String]) -> Result<Vec<String>> {
+    hosts
+        .iter()
+        .map(|host| host.trim())
+        .filter(|host| !host.is_empty())
+        .map(|host| {
+            let name = host.strip_suffix('.').unwrap_or(host);
+            let labels_ok = name.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && label
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            });
+            eyre::ensure!(
+                labels_ok,
+                "{host:?} is not a hostname; write the name alone, such as \
+                 pusher.your-tailnet.ts.net, without a scheme, a port or a path"
+            );
+            Ok(name.to_ascii_lowercase())
+        })
+        .collect()
+}
+
+/// The CORS answers for `origins`, `None` when there are none to give: a preflight from
+/// one of them is answered for the methods and the one header this API takes, and every
+/// answer to one carries `Access-Control-Allow-Origin`. No credentials: the API has no
+/// cookie or login to send.
+fn cors(origins: &[String]) -> Option<tower_http::cors::CorsLayer> {
+    if origins.is_empty() {
+        return None;
+    }
+    let origins: Vec<axum::http::HeaderValue> = origins
+        .iter()
+        .map(|origin| origin.parse().expect("parse_origins writes ASCII"))
+        .collect();
+    Some(
+        tower_http::cors::CorsLayer::new()
+            .allow_origin(tower_http::cors::AllowOrigin::list(origins))
+            .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+            .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+            .max_age(Duration::from_secs(600)),
+    )
+}
+
+/// Binds `addr` and serves the API as `access` says: the names it answers to, its CORS
+/// answers, and HTTPS when it has a certificate. Fatal on failure: an operator who believes
+/// this is up and whose changes are going nowhere is worse off than one whose service
+/// refused to start.
+pub(crate) async fn bind(
     addr: SocketAddr,
-    config_path: PathBuf,
-    reloads: tokio::sync::mpsc::Sender<ReloadRequest>,
+    config: Arc<SharedConfig>,
     client: ethrex_rpc::clients::eth::EthClient,
     states: PairStates,
-    edits: Arc<tokio::sync::Mutex<()>>,
     kinds: Arc<crate::kinds::Kinds>,
+    access: Access,
 ) -> Result<(SocketAddr, JoinHandle<()>)> {
     bind_with(
         addr,
-        config_path,
-        reloads,
+        config,
         client,
         states,
-        edits,
         kinds,
+        access,
         crate::discover::Rest::default(),
     )
     .await
 }
 
 /// [`bind`], with the exchanges' APIs somewhere else: a test's mock.
-#[allow(clippy::too_many_arguments)] // two call sites (bind and a test), each naming them
 async fn bind_with(
     addr: SocketAddr,
-    config_path: PathBuf,
-    reloads: tokio::sync::mpsc::Sender<ReloadRequest>,
+    config: Arc<SharedConfig>,
     client: ethrex_rpc::clients::eth::EthClient,
     states: PairStates,
-    edits: Arc<tokio::sync::Mutex<()>>,
     kinds: Arc<crate::kinds::Kinds>,
+    access: Access,
     rest: crate::discover::Rest,
 ) -> Result<(SocketAddr, JoinHandle<()>)> {
-    eyre::ensure!(
-        !is_unspecified_bind(addr),
-        "backoffice_addr is {addr}, which binds every interface on this host. This page \
-         rewrites the pusher's config and has no authentication of its own; bind it to the \
-         host's tailnet address instead, where the tailnet ACL is the access control."
-    );
+    refuse_unspecified_bind(addr)?;
+    // Written as the headers are, whatever the caller did, so the guard and the CORS layer
+    // compare against the same strings.
+    let origins = parse_origins(&access.origins).wrap_err("--backoffice-cors-origin")?;
+    let hosts = parse_hosts(&access.hosts).wrap_err("--backoffice-host")?;
+    let tls = access.tls;
+    let sign_in = access.google.map(crate::auth::Verifier::new).transpose()?;
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -127,10 +286,9 @@ async fn bind_with(
         .wrap_err("bound backoffice listener has no local address")?;
 
     let state = Backoffice {
-        config_path,
+        config,
         states,
         kinds,
-        reloads,
         client,
         rest: Arc::new(rest),
         // A User-Agent, because CoinGecko and Coinbase answer 403 to a request without one.
@@ -141,465 +299,1002 @@ async fn bind_with(
             .wrap_err("http client")?,
         lookups: Arc::new(crate::discover::Cache::default()),
         preview_pages: Arc::new(tokio::sync::Semaphore::new(PREVIEW_PAGES)),
-        edits,
+        origins: origins.clone().into(),
+        hosts: hosts.into(),
+        sign_in: sign_in.clone(),
     };
 
     let app = Router::new()
-        // A list page, and a page per thing being added or edited. The plainest shape a
-        // CRUD can have, and the one a browser gives for free: Back leaves a form, a
-        // bookmark reaches one pair, and the list is a list rather than a stack of forms.
-        .route("/", get(index))
-        .route("/pairs/new", get(new_pair_page))
-        .route("/pairs/edit/{key_env}", get(edit_pair_page))
-        .route("/pairs/add", post(add_pair))
-        .route("/pairs/lookup", get(lookup_pair))
-        .route("/pairs/preview", get(preview_socket))
-        .route("/static/pair.js", get(pair_script))
-        .route("/pairs/edit", post(edit_pair))
-        .route("/pairs/remove", post(remove_pair))
-        .route("/pairs/halt", post(halt_pair))
-        .route("/pairs/resume", post(resume_pair))
-        .route("/pairs/halt-all", post(halt_all))
-        .route("/settings", get(settings_page))
-        .route("/settings/save", post(save_settings))
-        .route("/builders/new", get(new_builder_page))
-        .route("/builders/add", post(add_builder))
-        .route("/builders/remove", post(remove_builder))
-        .route("/reload", post(reload_only))
-        .with_state(state);
-
-    let task = tokio::spawn(async move {
-        // With connect info, so every mutation can be logged against its peer.
-        if let Err(err) = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
+        .route("/api/pairs", get(list_pairs).post(add_pair))
+        .route(
+            "/api/pairs/{key_env}",
+            get(get_pair).put(edit_pair).delete(remove_pair),
         )
-        .await
-        {
-            tracing::warn!("backoffice listener stopped: {err}");
+        .route("/api/pairs/{key_env}/halt", post(halt_pair))
+        .route("/api/pairs/{key_env}/resume", post(resume_pair))
+        .route("/api/pairs/{key_env}/rearm", post(rearm_pair))
+        .route("/api/halt", post(halt_all))
+        .route("/api/reload", post(reload))
+        .route("/api/builders", get(list_builders).post(add_builder))
+        .route("/api/builders/{name}", delete(remove_builder))
+        .route("/api/settings", get(settings))
+        .route("/api/kinds", get(list_kinds))
+        .route("/api/venues", get(list_venues))
+        .route("/api/lookup", get(lookup_pair))
+        .route("/api/preview", get(preview_socket))
+        .route("/api/auth", get(auth_info))
+        .fallback(|| async {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "no such route; the backoffice API is under /api",
+            )
+        })
+        // Around every route above, so one added later is guarded without saying so.
+        .layer(axum::middleware::from_fn_with_state(state.clone(), guard));
+    // Around the guard, so a preflight (an `OPTIONS` with no JSON and no route) is answered
+    // before it, and every answer to a listed origin, a refusal included, carries the
+    // header that lets its page read it.
+    let app = match cors(&origins) {
+        Some(cors) => app.layer(cors),
+        None => app,
+    }
+    .with_state(state);
+
+    // With connect info, so every change can be logged against its peer.
+    let app = app.into_make_service_with_connect_info::<SocketAddr>();
+    // Google's keys kept fresh for as long as the API is served, in the same task, so
+    // ending it ends both.
+    let keep_keys_fresh = async move {
+        match sign_in {
+            Some(verifier) => verifier.keep_keys_fresh().await,
+            None => std::future::pending().await,
         }
-    });
+    };
+    let task = match tls {
+        None => tokio::spawn(async move {
+            tokio::select! {
+                served = axum::serve(listener, app).into_future() => {
+                    if let Err(err) = served {
+                        tracing::warn!("backoffice listener stopped: {err}");
+                    }
+                }
+                () = keep_keys_fresh => {}
+            }
+        }),
+        Some(tls) => {
+            let (listener, accepting) = crate::tls::listener(listener, tls)
+                .wrap_err("bound backoffice listener has no local address")?;
+            // The accept loop and the server in one task, so ending it ends both. `tap_io`
+            // only so axum hands the peer's address to `ConnectInfo`, which it does for a
+            // wrapped listener of any kind and for its own `TcpListener` alone otherwise.
+            use axum::serve::ListenerExt;
+            tokio::spawn(async move {
+                let serving = axum::serve(listener.tap_io(|_| {}), app);
+                tokio::select! {
+                    served = serving.into_future() => {
+                        if let Err(err) = served {
+                            tracing::warn!("backoffice listener stopped: {err}");
+                        }
+                    }
+                    () = accepting => {}
+                    () = keep_keys_fresh => {}
+                }
+            })
+        }
+    };
 
     Ok((local, task))
 }
 
 // ---------------------------------------------------------------------------
-// Applying a change
+// Which requests are answered
 // ---------------------------------------------------------------------------
 
-/// Reads the config, hands it to `change`, writes it back and reloads, restoring the
-/// previous file if the reload is refused. The one place that is done, so no handler can
-/// forget the revert.
-async fn apply(
-    state: &Backoffice,
-    peer: SocketAddr,
-    what: &str,
-    change: impl FnOnce(&mut RawConfig) -> Result<()>,
-) -> Outcome {
-    let _guard = state.edits.lock().await;
-    apply_locked(state, peer, what, change).await
-}
-
-/// [`apply`] for a caller that already holds `state.edits`, so it can look at the file and
-/// decide what to change under the same lock the change is made under.
-async fn apply_locked(
-    state: &Backoffice,
-    peer: SocketAddr,
-    what: &str,
-    change: impl FnOnce(&mut RawConfig) -> Result<()>,
-) -> Outcome {
-    Outcome::from(change_locked(state, peer, what, change).await)
-}
-
-/// [`apply_locked`] before it becomes a banner, for a caller that has to tell a partial
-/// apply from a rejection.
-async fn change_locked(
-    state: &Backoffice,
-    peer: SocketAddr,
-    what: &str,
-    change: impl FnOnce(&mut RawConfig) -> Result<()>,
-) -> std::result::Result<String, ReloadFailure> {
-    // The write, reload and revert live in the service, shared with `UpdaterHandle`.
-    crate::service::change_config(
-        &state.config_path,
-        &state.reloads,
-        &format!("backoffice: {peer}"),
-        what,
-        change,
-    )
-    .await
-}
-
-/// Percent-encoding for the banner message in the redirect's query string.
-fn urlencode(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for byte in text.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char);
+/// Runs before every route. With Google sign-in on, a request first needs a token of an
+/// allowed account ([`signed_in`]); a browser never sends one on its own. Without it this API
+/// has no login, so what it must not do is act on a request that an operator's browser sent
+/// without the operator meaning it (audit F-02). Both ways, the checks below stand.
+/// A page on another site can make a browser send a plain form post anywhere, without
+/// asking and without the server's say; a `PUT`, a `DELETE`, or a post of JSON it cannot
+/// send without first asking this server, which says yes only to the origins
+/// `--backoffice-cors-origin` lists. And a site can point its own domain at this host's
+/// address once its page has loaded (DNS rebinding): to the browser that page and this API
+/// are then one origin, so it sends anything and reads every answer, `Origin` and `Host`
+/// both carrying the site's name. What gives it away is that name. So:
+///
+/// - every request, reads included, must be addressed (`Host`) to an IP address,
+///   `localhost`, or a name `--backoffice-host` lists ([`host_allowed`]);
+/// - a `POST` or `PUT` is taken only as `Content-Type: application/json`, a bodiless one
+///   (a halt, a reload) included;
+/// - a change whose `Origin` (which a browser sets and a page cannot) is neither this API's
+///   own address nor a listed origin is refused, whatever its method. A request with no
+///   `Origin` is not from a browser page, and goes on.
+async fn guard(
+    State(state): State<Backoffice>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let method = request.method();
+    let headers = request.headers();
+    let mut caller = Caller { peer, email: None };
+    let refusal = if !host_allowed(headers, request.uri(), &state.hosts) {
+        Some(Refusal::new(
+            StatusCode::FORBIDDEN,
+            "this request was addressed to a name the backoffice does not answer to. It \
+             answers to an IP address, to localhost, and to the names listed with \
+             --backoffice-host or [settings] backoffice_hosts; list this one there and \
+             restart if it is how you reach the backoffice",
+        ))
+    } else {
+        match signed_in(&state, method, request.uri().path(), headers).await {
+            Err(refusal) => Some(refusal),
+            Ok(email) => {
+                caller.email = email;
+                if method.is_safe() {
+                    None
+                } else if !origin_allowed(headers, &state.origins) {
+                    Some(Refusal::new(
+                        StatusCode::FORBIDDEN,
+                        "the backoffice only takes a change from a page served under its own \
+                         address or an origin --backoffice-cors-origin lists, or from a client \
+                         that is not a browser",
+                    ))
+                } else if (method == Method::POST || method == Method::PUT) && !is_json(headers) {
+                    Some(Refusal::new(
+                        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                        "send a change as JSON, with Content-Type: application/json, even one \
+                         with no body",
+                    ))
+                } else {
+                    None
+                }
             }
-            b' ' => out.push('+'),
-            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    };
+    match refusal {
+        Some(Refusal {
+            status,
+            why,
+            challenge,
+        }) => {
+            let header = |name| {
+                headers
+                    .get(name)
+                    .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned())
+            };
+            // Never the token: Host and Origin only.
+            tracing::warn!(
+                "backoffice: refused {method} {} from {caller} (Host {:?}, Origin {:?}): {why}",
+                request.uri().path(),
+                header(header::HOST),
+                header(header::ORIGIN),
+            );
+            let mut response = ApiError::new(status, why).into_response();
+            if let Some(challenge) = challenge {
+                response.headers_mut().insert(
+                    header::WWW_AUTHENTICATE,
+                    axum::http::HeaderValue::from_static(challenge),
+                );
+            }
+            response
+        }
+        None => {
+            request.extensions_mut().insert(caller);
+            next.run(request).await
         }
     }
-    out
 }
 
-/// What a handler tells the page to say after a change.
-struct Outcome {
-    ok: bool,
+/// Why [`guard`] turned a request away, and, for a missing or bad sign-in, the
+/// `WWW-Authenticate` challenge its 401 carries.
+struct Refusal {
+    status: StatusCode,
+    why: String,
+    challenge: Option<&'static str>,
+}
+
+impl Refusal {
+    fn new(status: StatusCode, why: impl Into<String>) -> Self {
+        Self {
+            status,
+            why: why.into(),
+            challenge: None,
+        }
+    }
+}
+
+/// Who made a request, for the line every change logs: the signed-in address when Google
+/// sign-in is on, and the peer's address always. Put on every request [`guard`] lets
+/// through, so a handler always finds it.
+#[derive(Clone, Debug)]
+struct Caller {
+    peer: SocketAddr,
+    email: Option<String>,
+}
+
+impl std::fmt::Display for Caller {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.email {
+            Some(email) => write!(f, "{email} ({})", self.peer),
+            None => write!(f, "{}", self.peer),
+        }
+    }
+}
+
+/// The subprotocol the preview websocket answers with, and the prefix of the one that
+/// carries the token: a browser cannot give a websocket an `Authorization` header, so a page
+/// opens it with `["backoffice", "bearer.<token>"]`. Kept out of the URL, which proxies and
+/// logs keep.
+const WS_PROTOCOL: &str = "backoffice";
+const WS_BEARER: &str = "bearer.";
+
+/// The ID token a request carries: `Authorization: Bearer <token>`, or a `bearer.<token>`
+/// websocket subprotocol ([`WS_BEARER`]).
+fn bearer(headers: &axum::http::HeaderMap) -> Option<&str> {
+    if let Some(value) = headers.get(header::AUTHORIZATION) {
+        let (scheme, token) = value.to_str().ok()?.split_once(' ')?;
+        return scheme
+            .eq_ignore_ascii_case("bearer")
+            .then(|| token.trim())
+            .filter(|token| !token.is_empty());
+    }
+    headers
+        .get_all(header::SEC_WEBSOCKET_PROTOCOL)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .find_map(|protocol| protocol.trim().strip_prefix(WS_BEARER))
+        .filter(|token| !token.is_empty())
+}
+
+/// With Google sign-in on, who signed in (see `auth.rs`), or why the request is turned away.
+/// `Ok(None)` when it is off, and for `GET /api/auth`, which tells a page how to sign in
+/// and so cannot ask it to have done so.
+async fn signed_in(
+    state: &Backoffice,
+    method: &Method,
+    path: &str,
+    headers: &axum::http::HeaderMap,
+) -> std::result::Result<Option<String>, Refusal> {
+    let Some(verifier) = &state.sign_in else {
+        return Ok(None);
+    };
+    if method == Method::GET && path == "/api/auth" {
+        return Ok(None);
+    }
+    let Some(token) = bearer(headers) else {
+        return Err(Refusal {
+            challenge: Some("Bearer"),
+            ..Refusal::new(
+                StatusCode::UNAUTHORIZED,
+                "sign in with Google: this backoffice answers only a request carrying the ID \
+                 token of an allowed account, as Authorization: Bearer <token>",
+            )
+        });
+    };
+    match verifier.verify(token).await {
+        Ok(email) => Ok(Some(email)),
+        Err(crate::auth::Denied::Unauthenticated(why)) => Err(Refusal {
+            challenge: Some("Bearer error=\"invalid_token\""),
+            ..Refusal::new(StatusCode::UNAUTHORIZED, why)
+        }),
+        Err(crate::auth::Denied::NotAllowed(why)) => Err(Refusal::new(StatusCode::FORBIDDEN, why)),
+        Err(crate::auth::Denied::NoKeys) => Err(Refusal::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the backoffice has not been able to fetch Google's signing keys yet, so it cannot \
+             check a sign-in; try again shortly",
+        )),
+    }
+}
+
+/// How a page signs in here: the Google OAuth client ID to sign in with, or `null` when
+/// this backoffice takes no sign-in. Answered to anyone the guard lets reach it, signed in
+/// or not, since a page asks before it can be.
+async fn auth_info(State(state): State<Backoffice>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "google_client_id": state.sign_in.as_ref().map(|verifier| verifier.client_id()),
+    }))
+}
+
+/// Whether the request is addressed to a name this API is served under: any IP address,
+/// `localhost`, or one of `hosts` ([`parse_hosts`]). The port is not part of the question.
+/// An IP address needs no listing because a rebound name is always a name; see [`guard`].
+/// `Host`, or the request line's own authority when a client sent one there instead.
+fn host_allowed(headers: &axum::http::HeaderMap, uri: &axum::http::Uri, hosts: &[String]) -> bool {
+    let authority = match headers.get(header::HOST) {
+        Some(host) => host
+            .to_str()
+            .ok()
+            .and_then(|host| host.parse::<axum::http::uri::Authority>().ok()),
+        None => uri.authority().cloned(),
+    };
+    let Some(authority) = authority else {
+        return false;
+    };
+    let name = authority.host();
+    let name = name.strip_suffix('.').unwrap_or(name);
+    // An IPv6 address is written in brackets in a `Host`.
+    let address = name
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(name);
+    address.parse::<std::net::IpAddr>().is_ok()
+        || name.eq_ignore_ascii_case("localhost")
+        || hosts.iter().any(|host| host.eq_ignore_ascii_case(name))
+}
+
+/// Whether the body is declared JSON, parameters such as `charset` aside.
+fn is_json(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+}
+
+/// No `Origin` (not a browser page), this API's own address ([`same_origin`]), or one of
+/// `origins`, matched as the CORS layer matches it.
+fn origin_allowed(headers: &axum::http::HeaderMap, origins: &[String]) -> bool {
+    match headers.get(header::ORIGIN) {
+        None => true,
+        Some(origin) => {
+            same_origin(headers)
+                || origin
+                    .to_str()
+                    .is_ok_and(|origin| origins.iter().any(|listed| listed == origin))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Answers
+// ---------------------------------------------------------------------------
+
+/// A request refused before anything changed: `{"error": ...}` with its status.
+#[derive(Debug)]
+struct ApiError {
+    status: StatusCode,
     message: String,
 }
 
-/// A partial apply is not shown as a success: the page would be saying a change is live
-/// while a pair still runs its previous config. Its message says the file kept the change.
-impl From<std::result::Result<String, ReloadFailure>> for Outcome {
-    fn from(result: std::result::Result<String, ReloadFailure>) -> Self {
-        match result {
-            Ok(message) => Outcome::ok(message),
-            Err(failure) => Outcome::failed(failure.line().to_owned()),
+impl ApiError {
+    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
         }
+    }
+
+    fn not_found(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::NOT_FOUND, message)
+    }
+
+    /// Clashes with what the config holds: a key or name taken, a halt already in place.
+    fn conflict(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, message)
+    }
+
+    /// Well-formed, and not a change the config can take.
+    fn invalid(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::UNPROCESSABLE_ENTITY, message)
+    }
+
+    /// Nothing wrong with the request: this side could not do it.
+    fn fault(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, message)
+    }
+
+    /// Something this API asks on the caller's behalf (the chain, a venue) did not answer.
+    fn upstream(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_GATEWAY, message)
     }
 }
 
-impl Outcome {
-    fn ok(message: String) -> Self {
-        Self { ok: true, message }
+/// A body that is not JSON, or not the shape the route takes, says so in serde's words.
+impl From<JsonRejection> for ApiError {
+    fn from(rejection: JsonRejection) -> Self {
+        Self::new(rejection.status(), rejection.body_text())
     }
-    fn failed(message: String) -> Self {
-        Self { ok: false, message }
-    }
+}
 
-    /// Post/redirect/get, so a refresh does not repeat the change.
-    fn redirect(self) -> Response {
-        let kind = if self.ok { "ok" } else { "err" };
-        Redirect::to(&format!("/?{kind}={}", urlencode(&self.message))).into_response()
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (
+            self.status,
+            Json(serde_json::json!({ "error": self.message })),
+        )
+            .into_response()
     }
+}
+
+/// What a change answers. A partial apply is a 2xx, because the change is kept (a retry
+/// would find it already made), and says `partial` rather than `applied`, because a pair
+/// still runs its previous config, or was not started or stopped. A rejection is a 422:
+/// nothing changed. A fault on this side (the config file could not be written or put
+/// back, the pusher is stopping) is a 500, so a client can tell it from a change it should
+/// fix.
+fn respond(result: std::result::Result<String, Refused<ApiError>>, created: bool) -> Response {
+    let kept = if created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    let body = |status: &str, message: String| {
+        Json(serde_json::json!({ "status": status, "message": message }))
+    };
+    match result {
+        Ok(message) => (kept, body("applied", message)).into_response(),
+        Err(Refused::Reload(ReloadFailure::Partial(message))) => {
+            (kept, body("partial", message)).into_response()
+        }
+        Err(Refused::Reload(ReloadFailure::Rejected(message))) => {
+            ApiError::invalid(message).into_response()
+        }
+        Err(Refused::Reload(ReloadFailure::Fault(message))) => {
+            ApiError::fault(message).into_response()
+        }
+        Err(Refused::Change(err)) => err.into_response(),
+    }
+}
+
+/// Makes `change` through the shared config and answers with how it went. The one place a
+/// handler changes anything, so none can skip the converge or the revert.
+async fn apply(
+    state: &Backoffice,
+    caller: &Caller,
+    created: bool,
+    change: impl FnOnce(&mut RawConfig) -> std::result::Result<String, ApiError>,
+) -> Response {
+    let by = format!("backoffice: {caller}");
+    respond(state.config.change(&by, change).await, created)
 }
 
 // ---------------------------------------------------------------------------
-// Handlers
+// Pairs
 // ---------------------------------------------------------------------------
 
-/// The venue table of the pair form: one symbol and one weight per venue the binary
-/// knows, named `symbol_<venue>` and `weight_<venue>`. A blank symbol is a venue the pair
-/// does not read. Named fields rather than a map because the form decoder does not do
-/// repeated keys; every field defaults so a form rendered before a venue was added still
-/// posts.
-#[derive(Deserialize, Default)]
-struct SourcesForm {
-    #[serde(default)]
-    symbol_binance: String,
-    #[serde(default)]
-    weight_binance: String,
-    #[serde(default)]
-    symbol_coinbase: String,
-    #[serde(default)]
-    weight_coinbase: String,
-    #[serde(default)]
-    symbol_kraken: String,
-    #[serde(default)]
-    weight_kraken: String,
-    #[serde(default)]
-    symbol_okx: String,
-    #[serde(default)]
-    weight_okx: String,
-    #[serde(default)]
-    symbol_bybit: String,
-    #[serde(default)]
-    weight_bybit: String,
-    #[serde(default)]
-    symbol_kucoin: String,
-    #[serde(default)]
-    weight_kucoin: String,
-    #[serde(default)]
-    symbol_bitget: String,
-    #[serde(default)]
-    weight_bitget: String,
-    #[serde(default)]
-    symbol_gate: String,
-    #[serde(default)]
-    weight_gate: String,
-    #[serde(default)]
-    symbol_mexc: String,
-    #[serde(default)]
-    weight_mexc: String,
-    #[serde(default)]
-    min_sources: String,
+/// What the running pusher is doing with a pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PairStatus {
+    /// Quoting.
+    Live,
+    /// Halted in the config: kept, not quoting.
+    Halted,
+    /// Running, but its circuit breaker tripped: not quoting until its own re-arm brings it
+    /// back (`POST /api/pairs/{key_env}/rearm`).
+    BreakerTripped,
+    /// In the config, with no task: its feed never came up, say. A reload tries again.
+    NotRunning,
 }
 
-impl SourcesForm {
-    /// The row for `venue`, so the list of venues is `VenueId::ALL` and not a second copy
-    /// of it here.
-    fn row(&self, venue: VenueId) -> (&str, &str) {
-        match venue {
-            VenueId::Binance => (&self.symbol_binance, &self.weight_binance),
-            VenueId::Coinbase => (&self.symbol_coinbase, &self.weight_coinbase),
-            VenueId::Kraken => (&self.symbol_kraken, &self.weight_kraken),
-            VenueId::Okx => (&self.symbol_okx, &self.weight_okx),
-            VenueId::Bybit => (&self.symbol_bybit, &self.weight_bybit),
-            VenueId::Kucoin => (&self.symbol_kucoin, &self.weight_kucoin),
-            VenueId::Bitget => (&self.symbol_bitget, &self.weight_bitget),
-            VenueId::Gate => (&self.symbol_gate, &self.weight_gate),
-            VenueId::Mexc => (&self.symbol_mexc, &self.weight_mexc),
-        }
-    }
-
-    /// The venues with a symbol filled in, in `VenueId::ALL` order.
-    fn sources(&self) -> Vec<RawSource> {
-        VenueId::ALL
-            .iter()
-            .filter_map(|venue| {
-                let (symbol, weight) = self.row(*venue);
-                optional(symbol).map(|symbol| RawSource {
-                    venue: venue.as_str().to_owned(),
-                    symbol,
-                    weight: optional(weight),
-                })
-            })
-            .collect()
+/// `running` is the pair's breaker flag if the pusher has a task for it, `None` if not.
+fn pair_status(pair: &RawPair, running: Option<bool>) -> PairStatus {
+    match (pair.halted, running) {
+        (true, _) => PairStatus::Halted,
+        (false, Some(true)) => PairStatus::BreakerTripped,
+        (false, Some(false)) => PairStatus::Live,
+        (false, None) => PairStatus::NotRunning,
     }
 }
 
-/// Writes the venue table into a pair the way the file spells it: one Binance market with
-/// no weight and no minimum is `symbol = "..."`, the form every existing file uses, so a
-/// pair saved from this page without touching the table reads back unchanged; anything
-/// else is `sources`. `legacy_symbol` is the old single `symbol` input, still posted by a
-/// form a browser held open from before the table existed.
-fn apply_sources(pair: &mut RawPair, sources: &SourcesForm, legacy_symbol: &str) -> Result<()> {
-    for venue in VenueId::ALL {
-        let (symbol, weight) = sources.row(*venue);
-        if optional(symbol).is_none() && optional(weight).is_some() {
-            return Err(eyre!(
-                "{venue} has a weight but no symbol; fill in the market to use it, or clear \
-                 the weight"
-            ));
-        }
-    }
-    let mut rows = sources.sources();
-    if rows.is_empty()
-        && let Some(symbol) = optional(legacy_symbol)
-    {
-        rows.push(RawSource {
-            venue: VenueId::Binance.as_str().to_owned(),
-            symbol,
-            weight: None,
-        });
-    }
-    let min_sources = optional(&sources.min_sources);
-    match rows.as_slice() {
-        [only]
-            if only.venue == VenueId::Binance.as_str()
-                && only.weight.is_none()
-                && min_sources.is_none() =>
-        {
-            pair.symbol = Some(only.symbol.clone());
-            pair.sources = Vec::new();
-            pair.min_sources = None;
-        }
-        _ => {
-            pair.symbol = None;
-            pair.sources = rows;
-            pair.min_sources = min_sources;
-        }
-    }
-    Ok(())
-}
-
-#[derive(Deserialize)]
-struct AddPair {
-    token0: String,
-    token1: String,
-    key_env: String,
-    /// The single Binance market, from a form rendered before the venue table existed.
-    #[serde(default)]
-    symbol: String,
-    #[serde(flatten)]
-    sources: SourcesForm,
-    min_mid: String,
-    max_mid: String,
-    max_deviation: String,
-    // Defaulted like every field added after this struct's first version: a form a
-    // browser is still holding open from before a pusher restart added this field does
-    // not post it at all, and that must still save rather than 422.
-    #[serde(default)]
-    max_deviation_window: String,
-    #[serde(default)]
-    max_deviation_window_blocks: String,
-    /// The late-venue key. `None` is a form rendered before the field existed, which
-    /// keeps whatever the file sets; a blank field clears the key.
-    #[serde(default)]
-    max_source_lag_ms: Option<String>,
-    /// The venues-disagree limit, with the same two meanings of absent and blank.
-    #[serde(default)]
-    max_source_divergence: Option<String>,
-    #[serde(default)]
-    allow_symbol_mismatch: Option<String>,
-    /// The pricing kind the operator chose. Every kind's section is posted whichever is
-    /// showing, so this decides which kind's fields are kept. Defaulted so a form rendered
-    /// before it existed still posts; blank keeps the pair's stanza.
-    #[serde(default)]
+/// A pair as the API shows it: its stanza as the config holds it, which is what a `PUT`
+/// takes back, beside what the running pusher is doing with it.
+#[derive(Serialize)]
+struct PairView {
+    pair: RawPair,
+    status: PairStatus,
+    /// The pricing kind's one-line summary of the stanza, as `--check` prints it.
     pricing: String,
-    /// Every other posted input: the chosen kind's fields, named `pricing_<kind>_<field>`
-    /// by the form, which [`pricing_stanza`] reads for the chosen kind alone.
-    #[serde(flatten)]
-    kind_fields: std::collections::HashMap<String, String>,
 }
 
-/// A blank field means the key is absent, not set to `""`, which every one of them rejects.
-fn optional(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+/// A snapshot of [`PairStates`], so every pair in an answer reads the same moment and the
+/// lock is not held while answering. A poisoned lock still holds a usable map.
+fn running(states: &PairStates) -> std::collections::BTreeMap<String, bool> {
+    states
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .map(|(key, tripped)| (key.clone(), tripped.load(Ordering::SeqCst)))
+        .collect()
 }
 
-/// A field a form may not post at all: absent keeps `key` as it is (a page rendered before
-/// the field existed), present sets it as [`optional`] reads it, blank clearing it.
-fn set_if_posted(key: &mut Option<String>, posted: Option<&str>) {
-    if let Some(value) = posted {
-        *key = optional(value);
-    }
-}
-
-/// The `[pairs.pricing]` stanza a form describes: the chosen kind, and the values it posted
-/// for that kind's declared fields, each written as the string it was typed as and left out
-/// when blank. Every kind's section is posted whichever is showing, so only the chosen kind's
-/// inputs are read. A kind with no declared fields keeps the pair's stanza when it already
-/// prices it (the page cannot edit one, and says so) and otherwise gets a stanza naming it
-/// alone, for the operator to fill in the file. A blank choice (a form from before the
-/// choice existed) keeps the stanza as it is.
-fn pricing_stanza(
+fn pair_view(
+    pair: &RawPair,
+    running: &std::collections::BTreeMap<String, bool>,
     kinds: &crate::kinds::Kinds,
-    kind: &str,
-    existing: Option<&toml::Table>,
-    posted: &std::collections::HashMap<String, String>,
-) -> Result<toml::Table> {
-    let kind = kind.trim();
-    if kind.is_empty() {
-        return existing
-            .cloned()
-            .ok_or_else(|| eyre!("choose a pricing kind"));
+) -> PairView {
+    PairView {
+        pair: pair.clone(),
+        status: pair_status(pair, running.get(&pair.key_env).copied()),
+        pricing: kinds.pricer_summary(&config::PricingSpec {
+            kind: pair
+                .pricing
+                .get("kind")
+                .and_then(|kind| kind.as_str())
+                .unwrap_or("")
+                .to_owned(),
+            config: pair.pricing.clone(),
+        }),
     }
-    let fields = kinds.pricer_fields(kind).ok_or_else(|| {
-        let registered = kinds.pricer_kinds();
-        if registered.is_empty() {
-            eyre!("unknown pricing kind {kind:?}; this binary registers none")
-        } else {
-            eyre!(
-                "unknown pricing kind {kind:?}; registered: {}",
-                registered.join(", ")
-            )
-        }
-    })?;
-    let existing_kind = existing
-        .and_then(|t| t.get("kind"))
-        .and_then(|k| k.as_str());
-    if fields.is_empty() && existing_kind == Some(kind) {
-        return Ok(existing.cloned().unwrap_or_default());
-    }
-    let mut table = toml::Table::new();
-    table.insert("kind".to_owned(), toml::Value::String(kind.to_owned()));
-    for field in fields {
-        let key = format!("pricing_{kind}_{}", field.name);
-        if let Some(value) = posted.get(&key).and_then(|v| optional(v)) {
-            let value = if field.number {
-                match (value.parse::<i64>(), value.parse::<f64>()) {
-                    (Ok(int), _) => toml::Value::Integer(int),
-                    (_, Ok(float)) if float.is_finite() => toml::Value::Float(float),
-                    _ => bail!("`{}` must be a number, got {value:?}", field.name),
-                }
-            } else {
-                toml::Value::String(value)
-            };
-            table.insert(field.name.to_owned(), value);
-        }
-    }
-    Ok(table)
 }
 
+async fn list_pairs(State(state): State<Backoffice>) -> Json<Vec<PairView>> {
+    let config = state.config.snapshot();
+    let running = running(&state.states);
+    Json(
+        config
+            .pairs
+            .iter()
+            .map(|pair| pair_view(pair, &running, &state.kinds))
+            .collect(),
+    )
+}
+
+async fn get_pair(
+    State(state): State<Backoffice>,
+    Path(key_env): Path<String>,
+) -> std::result::Result<Json<PairView>, ApiError> {
+    let config = state.config.snapshot();
+    let pair = config
+        .pairs
+        .iter()
+        .find(|pair| pair.key_env == key_env)
+        .ok_or_else(|| no_pair(&key_env))?;
+    Ok(Json(pair_view(pair, &running(&state.states), &state.kinds)))
+}
+
+fn no_pair(key_env: &str) -> ApiError {
+    ApiError::not_found(format!("no pair with key_env {key_env:?}"))
+}
+
+/// Adds a pair: its `[[pairs]]` stanza, as JSON, exactly as the config file would hold it.
+/// A pair is added quoting; one to be added halted is added and then halted.
 async fn add_pair(
     State(state): State<Backoffice>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Form(form): Form<AddPair>,
-) -> Response {
-    let what = format!("added pair {}/{}", form.token0, form.token1);
-    let kinds = Arc::clone(&state.kinds);
-    apply(&state, peer, &what, move |config| {
-        let pair = pair_from_form(&form, &kinds)?;
-        config::check_source_keys(&pair)?;
+    Extension(caller): Extension<Caller>,
+    body: std::result::Result<Json<RawPair>, JsonRejection>,
+) -> std::result::Result<Response, ApiError> {
+    let Json(pair) = body?;
+    if pair.halted || pair.halt_reason.is_some() {
+        return Err(ApiError::invalid(format!(
+            "a pair is added quoting; halt it after with POST /api/pairs/{}/halt",
+            pair.key_env
+        )));
+    }
+    config::check_source_keys(&pair).map_err(|err| ApiError::invalid(format!("{err:#}")))?;
+    Ok(apply(&state, &caller, true, move |config| {
         if config
             .pairs
             .iter()
             .any(|existing| existing.key_env == pair.key_env)
         {
-            return Err(eyre!(
+            return Err(ApiError::conflict(format!(
                 "a pair already uses key_env {:?}; every pair needs its own key, since two \
                  pairs on one address share a nonce and only one of them could land per \
                  block",
                 pair.key_env
+            )));
+        }
+        let what = format!("added pair {}", pair.key_env);
+        config.pairs.push(pair);
+        Ok(what)
+    })
+    .await)
+}
+
+/// Replaces a pair's stanza with the body, which is the `pair` of a `GET` of it with
+/// whatever changed. Its identity stays: `key_env` and `tokens` are what the lane and the
+/// signer are derived from, so a pair on other ones is a `DELETE` and a `POST`. Its halt
+/// stays too, changed only by the halt and resume routes, so an edit cannot lift a kill
+/// switch by leaving the flag out.
+async fn edit_pair(
+    State(state): State<Backoffice>,
+    Extension(caller): Extension<Caller>,
+    Path(key_env): Path<String>,
+    body: std::result::Result<Json<RawPair>, JsonRejection>,
+) -> std::result::Result<Response, ApiError> {
+    let Json(edited) = body?;
+    if edited.key_env != key_env {
+        return Err(ApiError::invalid(format!(
+            "the body's key_env is {:?} but the path names {key_env:?}; a pair's key_env and \
+             tokens are its identity, so a pair on another key is a DELETE and a POST",
+            edited.key_env
+        )));
+    }
+    config::check_source_keys(&edited).map_err(|err| ApiError::invalid(format!("{err:#}")))?;
+    Ok(apply(&state, &caller, false, move |config| {
+        let pair = config
+            .pairs
+            .iter_mut()
+            .find(|pair| pair.key_env == key_env)
+            .ok_or_else(|| no_pair(&key_env))?;
+        let same_tokens = pair.tokens.len() == edited.tokens.len()
+            && pair
+                .tokens
+                .iter()
+                .zip(&edited.tokens)
+                .all(|(was, is)| was.eq_ignore_ascii_case(is));
+        if !same_tokens {
+            return Err(ApiError::invalid(
+                "a pair's tokens cannot change: the lane and its orientation are derived from \
+                 them, so a pair on other tokens is a DELETE and a POST",
             ));
         }
-        config.pairs.push(pair);
-        Ok(())
+        if pair.halted != edited.halted || pair.halt_reason != edited.halt_reason {
+            return Err(ApiError::conflict(format!(
+                "an edit keeps the pair's halt as it is; send halted and halt_reason as a GET \
+                 shows them, and halt or resume it with POST /api/pairs/{key_env}/halt or \
+                 /resume"
+            )));
+        }
+        *pair = edited;
+        Ok(format!("edited pair {key_env}"))
+    })
+    .await)
+}
+
+async fn remove_pair(
+    State(state): State<Backoffice>,
+    Extension(caller): Extension<Caller>,
+    Path(key_env): Path<String>,
+) -> Response {
+    apply(&state, &caller, false, move |config| {
+        let before = config.pairs.len();
+        config.pairs.retain(|pair| pair.key_env != key_env);
+        if config.pairs.len() == before {
+            return Err(no_pair(&key_env));
+        }
+        // Removing the last pair is allowed: a process with a backoffice may run with none,
+        // which is the state a fresh host starts in, and this API is how it gets out of it.
+        Ok(format!("removed pair {key_env}"))
     })
     .await
-    .redirect()
 }
 
-/// The stanza an add form describes, every rule applied.
-fn pair_from_form(form: &AddPair, kinds: &crate::kinds::Kinds) -> Result<RawPair> {
-    let mut pair = RawPair {
-        tokens: vec![form.token0.trim().to_owned(), form.token1.trim().to_owned()],
-        key_env: form.key_env.trim().to_owned(),
-        symbol: None,
-        sources: Vec::new(),
-        min_sources: None,
-        max_source_lag_ms: form.max_source_lag_ms.as_deref().and_then(optional),
-        max_source_divergence: form.max_source_divergence.as_deref().and_then(optional),
-        min_mid: optional(&form.min_mid),
-        max_mid: optional(&form.max_mid),
-        max_deviation: optional(&form.max_deviation),
-        max_deviation_window: optional(&form.max_deviation_window),
-        max_deviation_window_blocks: optional(&form.max_deviation_window_blocks),
-        allow_symbol_mismatch: form.allow_symbol_mismatch.is_some(),
-        halted: false,
-        halt_reason: None,
-        pricing: pricing_stanza(kinds, &form.pricing, None, &form.kind_fields)?,
-        guards: Vec::new(),
-    };
-    apply_sources(&mut pair, &form.sources, &form.symbol)?;
-    Ok(pair)
+/// Stops a pair quoting and keeps it, with every setting, in the config: the kill switch
+/// (audit F-06, `SharedConfig::halt`). Its lane withdraws its quote at every builder on its
+/// next tick, with no reload, no RPC call and no other pair's check in the way, so it is
+/// never refused for another pair's sake and never waits on the chain; then the halt is
+/// recorded, in the config and the file.
+async fn halt_pair(
+    State(state): State<Backoffice>,
+    Extension(caller): Extension<Caller>,
+    Path(key_env): Path<String>,
+) -> Response {
+    let by = format!("backoffice: {caller}");
+    let halted = state
+        .config
+        .halt(
+            &by,
+            move |config| {
+                let pair = config
+                    .pairs
+                    .iter()
+                    .find(|pair| pair.key_env == key_env)
+                    .ok_or_else(|| no_pair(&key_env))?;
+                if pair.halted {
+                    return Err(ApiError::conflict("already halted"));
+                }
+                Ok((vec![key_env.clone()], format!("halted pair {key_env}")))
+            },
+            None,
+        )
+        .await;
+    respond(halted, false)
 }
 
-/// A hash of the pair form's script, put in the URL the page loads it from. Cloudflare,
-/// in front of the backoffice, keeps a `.js` file for hours whatever the server says, so
-/// under one fixed URL a deploy's new script did not reach the browser; a URL that changes
-/// with the script's content is fetched fresh the first time.
-fn pair_script_version() -> &'static str {
-    static VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        include_str!("../templates/pair.js").hash(&mut hasher);
-        format!("{:016x}", hasher.finish())
-    });
-    &VERSION
+async fn resume_pair(
+    State(state): State<Backoffice>,
+    Extension(caller): Extension<Caller>,
+    Path(key_env): Path<String>,
+) -> Response {
+    apply(&state, &caller, false, move |config| {
+        set_halted(config, Some(&key_env), false)?;
+        Ok(format!("resumed pair {key_env}"))
+    })
+    .await
 }
 
-/// The pair form's script, served from the binary like the templates are. `no-cache`
-/// because it changes with every deploy and its URL does not: without it a browser keeps
-/// running the previous deploy's script against the new server.
-async fn pair_script() -> Response {
-    (
-        [
-            (
-                axum::http::header::CONTENT_TYPE,
-                "application/javascript; charset=utf-8",
-            ),
-            (axum::http::header::CACHE_CONTROL, "no-cache"),
-        ],
-        include_str!("../templates/pair.js"),
+/// Brings back a pair its circuit breaker halted (audit F-17): its lane is restarted from
+/// its stanza as it is and trusts the price it finds, which the answer names beside the trip
+/// it clears. Nothing else re-arms a breaker, a reload included, so this is someone deciding
+/// about this one pair, with that price in front of them. Checked like any change starting a
+/// pair, so it can be refused.
+async fn rearm_pair(
+    State(state): State<Backoffice>,
+    Extension(caller): Extension<Caller>,
+    Path(key_env): Path<String>,
+) -> Response {
+    let tripped = running(&state.states);
+    let rearmed = state
+        .config
+        .rearm(|config| {
+            let pair = config
+                .pairs
+                .iter()
+                .find(|pair| pair.key_env == key_env)
+                .ok_or_else(|| no_pair(&key_env))?;
+            if pair.halted {
+                return Err(ApiError::conflict(format!(
+                    "pair {key_env} is halted, not tripped; resume it with POST \
+                     /api/pairs/{key_env}/resume"
+                )));
+            }
+            if tripped.get(&key_env) != Some(&true) {
+                return Err(ApiError::conflict(format!(
+                    "pair {key_env} is not halted on its circuit breaker; there is nothing to \
+                     re-arm"
+                )));
+            }
+            Ok((vec![key_env.clone()], format!("re-armed pair {key_env}")))
+        })
+        .await;
+    if let Ok(line) = &rearmed {
+        tracing::info!("backoffice: {caller} {line}");
+    }
+    respond(rearmed, false)
+}
+
+/// The tail of a reload's answer naming the pairs left halted on their circuit breaker,
+/// which a reload no longer brings back (audit F-17); empty when there are none.
+fn tripped_note(states: &PairStates, config: &RawConfig) -> String {
+    let running = running(states);
+    let tripped: Vec<&str> = config
+        .pairs
+        .iter()
+        .filter(|pair| !pair.halted && running.get(&pair.key_env) == Some(&true))
+        .map(|pair| pair.key_env.as_str())
+        .collect();
+    if tripped.is_empty() {
+        return String::new();
+    }
+    format!(
+        ". Left halted on their circuit breaker, each to be re-armed with POST \
+         /api/pairs/{{key_env}}/rearm once its feed is trusted: {}",
+        tripped.join(", ")
     )
-        .into_response()
 }
+
+/// [`halt_pair`], for every pair not halted already.
+async fn halt_all(
+    State(state): State<Backoffice>,
+    Extension(caller): Extension<Caller>,
+) -> Response {
+    let by = format!("backoffice: {caller}");
+    let halted = state
+        .config
+        .halt(
+            &by,
+            |config| {
+                if config.pairs.is_empty() {
+                    return Err(ApiError::conflict("there are no pairs to halt"));
+                }
+                let keys: Vec<String> = config
+                    .pairs
+                    .iter()
+                    .filter(|pair| !pair.halted)
+                    .map(|pair| pair.key_env.clone())
+                    .collect();
+                if keys.is_empty() {
+                    return Err(ApiError::conflict("already halted"));
+                }
+                Ok((keys, "halted every pair".to_owned()))
+            },
+            None,
+        )
+        .await;
+    respond(halted, false)
+}
+
+/// A reload with no edit behind it: covers the ways the running pairs drift from the
+/// config on their own, a pair its circuit breaker halted (much the commonest) or one whose
+/// feed never came up.
+///
+/// Pairs halted through this API are resumed too: their flag is cleared and the reload
+/// starts them, as a change, so a refused reload leaves the flags as they were. A halt with
+/// a reason is left as it is and named in the answer (see [`set_halted`]). Decided under
+/// the shared config's edit lock, so two at once cannot both see a flag the first is about
+/// to clear, which would have the second report an error for a restart that worked.
+async fn reload(State(state): State<Backoffice>, Extension(caller): Extension<Caller>) -> Response {
+    let by = format!("backoffice: {caller}");
+    let mut editing = state.config.edit().await;
+    let current = editing.config();
+    let any_flagged = current
+        .pairs
+        .iter()
+        .any(|pair| pair.halted && !is_explained(pair));
+    let kept = format!(
+        "{}{}",
+        explained_halts(&current),
+        tripped_note(&state.states, &current)
+    );
+    if any_flagged {
+        let mut result = editing
+            .change(&by, |config| {
+                set_halted(config, None, false)?;
+                Ok::<_, ApiError>("restarted halted pairs".to_owned())
+            })
+            .await;
+        // Not on a rejection: a refused restart changed nothing, so nothing was "left".
+        match &mut result {
+            Ok(message) | Err(Refused::Reload(ReloadFailure::Partial(message))) => {
+                message.push_str(&kept)
+            }
+            Err(_) => {}
+        }
+        return respond(result, false);
+    }
+    let result = match editing.reload().await {
+        Ok(summary) => {
+            tracing::info!("{by} reloaded; {summary}");
+            // The service's no-op line is not what someone asking for a reload wants to
+            // know.
+            Ok(match (summary.contains("nothing to do"), kept.is_empty()) {
+                (true, true) => {
+                    "nothing was halted; the running pairs already match the config".to_owned()
+                }
+                (true, false) => format!("nothing was restarted{kept}"),
+                (false, _) => format!("{summary}{kept}"),
+            })
+        }
+        Err(ReloadFailure::Partial(line)) => Err(Refused::Reload(ReloadFailure::Partial(format!(
+            "the reload applied in part: {line}{kept}"
+        )))),
+        Err(ReloadFailure::Rejected(err)) => Err(Refused::Reload(ReloadFailure::Rejected(
+            format!("the reload was rejected: {err}"),
+        ))),
+        Err(ReloadFailure::Fault(err)) => Err(Refused::Reload(ReloadFailure::Fault(format!(
+            "the reload was not made: {err}"
+        )))),
+    };
+    respond(result, false)
+}
+
+// ---------------------------------------------------------------------------
+// Builders, settings, kinds and venues
+// ---------------------------------------------------------------------------
+
+/// A builder as the API shows it: everything but its API key, which is a live credential
+/// and goes in, never out.
+#[derive(Serialize)]
+struct BuilderView {
+    name: String,
+    endpoint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disable_cross_region: Option<bool>,
+}
+
+async fn list_builders(State(state): State<Backoffice>) -> Json<Vec<BuilderView>> {
+    Json(
+        state
+            .config
+            .snapshot()
+            .builders
+            .iter()
+            .map(|builder| BuilderView {
+                name: builder.name.clone(),
+                endpoint: builder.endpoint.clone(),
+                disable_cross_region: builder.disable_cross_region,
+            })
+            .collect(),
+    )
+}
+
+/// Adds a builder: `{"name", "endpoint", "api_key", "disable_cross_region"?}`, as its
+/// `[[builder]]` table holds it. Every pair is restarted onto the new list, and the reload
+/// refuses a list none of whose builders would connect.
+async fn add_builder(
+    State(state): State<Backoffice>,
+    Extension(caller): Extension<Caller>,
+    body: std::result::Result<Json<BuilderConfig>, JsonRejection>,
+) -> std::result::Result<Response, ApiError> {
+    let Json(builder) = body?;
+    Ok(apply(&state, &caller, true, move |config| {
+        if config
+            .builders
+            .iter()
+            .any(|existing| existing.name == builder.name)
+        {
+            return Err(ApiError::conflict(format!(
+                "a builder is already named {:?}; names identify a builder in the logs, so \
+                 they must be unique (try {:?}-eu and {:?}-us)",
+                builder.name, builder.name, builder.name
+            )));
+        }
+        let what = format!("added builder {}", builder.name);
+        config.builders.push(builder);
+        config::validate_builders(&config.builders)
+            .map_err(|err| ApiError::invalid(format!("{err:#}")))?;
+        Ok(what)
+    })
+    .await)
+}
+
+async fn remove_builder(
+    State(state): State<Backoffice>,
+    Extension(caller): Extension<Caller>,
+    Path(name): Path<String>,
+) -> Response {
+    apply(&state, &caller, false, move |config| {
+        let before = config.builders.len();
+        config.builders.retain(|builder| builder.name != name);
+        if config.builders.len() == before {
+            return Err(ApiError::not_found(format!("no builder named {name:?}")));
+        }
+        Ok(format!("removed builder {name}"))
+    })
+    .await
+}
+
+/// `target` and `[settings]`, as the pusher read them at start. Read-only: each is consumed
+/// once, at start (the RPC client, the listeners, the price scale), so changing one is an
+/// edit of the config file and a restart, not something this API could apply. The API's
+/// own writes keep whatever the file says for them meanwhile (see `state.rs`).
+async fn settings(State(state): State<Backoffice>) -> Json<serde_json::Value> {
+    let config = state.config.snapshot();
+    Json(serde_json::json!({
+        "config_path": state.config.path().display().to_string(),
+        "target": config.target,
+        "settings": config.settings,
+    }))
+}
+
+/// The pricing kinds this binary registered, in order, each with the fields a form for its
+/// `[pairs.pricing]` stanza would offer (`pricing::FormField`). A kind with no fields has
+/// a stanza only the file's own syntax can write.
+async fn list_kinds(State(state): State<Backoffice>) -> Json<Vec<serde_json::Value>> {
+    let kinds = &state.kinds;
+    Json(
+        kinds
+            .pricer_kinds()
+            .into_iter()
+            .map(|kind| {
+                let fields: Vec<serde_json::Value> = kinds
+                    .pricer_fields(kind)
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|field| {
+                        serde_json::json!({
+                            "name": field.name,
+                            "placeholder": field.placeholder,
+                            "hint": field.hint,
+                            "number": field.number,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "kind": kind,
+                    "help_html": kinds.pricer_form_help(kind).unwrap_or(""),
+                    "fields": fields,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Every venue a pair's `sources` can name, with how it spells a market and where it is
+/// reached unless `[settings.endpoints]` says otherwise.
+async fn list_venues() -> Json<Vec<serde_json::Value>> {
+    Json(
+        VenueId::ALL
+            .iter()
+            .map(|venue| {
+                serde_json::json!({
+                    "venue": venue.as_str(),
+                    "example": venue.expected_symbol("ETH", "USDC"),
+                    "default_endpoint": venue.default_endpoint(),
+                    "polled": matches!(venue, VenueId::Mexc),
+                })
+            })
+            .collect(),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Lookup and preview
+// ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
 struct Tokens {
@@ -607,19 +1302,16 @@ struct Tokens {
     token1: String,
 }
 
-/// What the pair form asks as soon as both addresses are typed (see `templates/pair.js`):
-/// which venues list the pair and how (`discover.rs`), as JSON, one entry per venue the
-/// pusher knows so the table can be drawn whole. Saves nothing.
+/// Which venues list a token pair and how (`discover.rs`), one entry per venue the pusher
+/// knows so a front end can draw its venue table whole: what to ask as soon as both
+/// addresses of a new pair are known. Saves nothing.
 async fn lookup_pair(State(state): State<Backoffice>, Query(tokens): Query<Tokens>) -> Response {
     // Checked before anything is asked: the addresses are read on chain.
     let (Ok(base), Ok(quote)) = (
         config::parse_address(tokens.token0.trim()),
         config::parse_address(tokens.token1.trim()),
     ) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "token addresses are not valid"})),
-        )
+        return ApiError::new(StatusCode::BAD_REQUEST, "token addresses are not valid")
             .into_response();
     };
     let (base_symbol, quote_symbol) = tokio::join!(
@@ -641,17 +1333,20 @@ async fn lookup_pair(State(state): State<Backoffice>, Query(tokens): Query<Token
             "could not read symbol() from both tokens on chain, so their names are unknown"
         )),
     };
-    let (found, error) = match found {
-        Ok(found) => (found, None),
-        Err(err) => (
-            crate::discover::Discovery::default(),
-            Some(format!("{err:#}")),
-        ),
+    // A lookup that could not be made is an error like any other here, and not a 200 a
+    // client has to open to find out: what it asks (the chain, the venues) did not answer.
+    let found = match found {
+        Ok(found) => found,
+        Err(err) => return ApiError::upstream(format!("{err:#}")).into_response(),
     };
     let venues: Vec<serde_json::Value> = VenueId::ALL
         .iter()
         .map(|venue| {
             let row = found.row(*venue);
+            // A market in another dollar is answered but not `selected`, so a front end shows
+            // it and leaves it to the operator: averaged at par it fails preflight unless the
+            // pair opts in (audit F-04).
+            let stand_in = row.is_some_and(|r| r.note.starts_with("quoted in"));
             serde_json::json!({
                 "venue": venue.as_str(),
                 "listed": row.is_some(),
@@ -665,13 +1360,16 @@ async fn lookup_pair(State(state): State<Backoffice>, Query(tokens): Query<Token
                     VenueId::Mexc => "polled every second".to_owned(),
                     _ => String::new(),
                 }),
-                "stand_in": row.is_some_and(|r| r.note.starts_with("quoted in")),
+                "stand_in": stand_in,
+                "selected": row.is_some() && !stand_in,
             })
         })
         .collect();
+    // `ok` and `error` are what a failed lookup used to answer with a 200; kept, constant,
+    // for a client written against that.
     Json(serde_json::json!({
-        "ok": error.is_none(),
-        "error": error,
+        "ok": true,
+        "error": null,
         "swapped": found.swapped,
         "base": found.base_symbol,
         "quote": found.quote_symbol,
@@ -681,7 +1379,7 @@ async fn lookup_pair(State(state): State<Backoffice>, Query(tokens): Query<Token
     .into_response()
 }
 
-/// A message from the page: tick or re-weight a venue, or untick it.
+/// A message from the preview's client: tick or re-weight a venue, or untick it.
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum PreviewCommand {
@@ -695,7 +1393,7 @@ enum PreviewCommand {
     },
 }
 
-/// Most preview pages open at once; a page past it is refused. With one connection per
+/// Most previews open at once; one past it is refused. With one connection per
 /// venue per page, previews hold at most `PREVIEW_PAGES × venues` venue connections.
 const PREVIEW_PAGES: usize = 4;
 
@@ -711,12 +1409,13 @@ struct PreviewVenue {
     rx: Option<tokio::sync::watch::Receiver<Option<crate::feed::PriceSample>>>,
 }
 
-/// The pair form's live prices, over one websocket per open page. The page sends which
-/// venues are ticked, one at a time as they change, and the server connects to exactly
-/// those, with the pusher's own feed code: ticking a venue connects only it, unticking
-/// disconnects only it, and a new weight reconnects nothing. Twice a second the server
-/// sends each venue's mid and the weighted composite, computed the way the composite that
-/// would publish computes it. Closing the page closes every venue it opened.
+/// A pair's live prices before it is added, over one websocket per open preview. The
+/// client sends which venues are ticked, one at a time as they change, and the server
+/// connects to exactly those, with the pusher's own feed code: ticking a venue connects
+/// only it, unticking disconnects only it, and a new weight reconnects nothing. Twice a
+/// second the server sends each venue's mid and the weighted composite, computed the way
+/// the composite that would publish computes it. Closing the socket closes every venue it
+/// opened.
 async fn preview_socket(
     State(state): State<Backoffice>,
     Query(tokens): Query<Tokens>,
@@ -726,16 +1425,14 @@ async fn preview_socket(
     let bad = |status: StatusCode, msg: &str| {
         (status, Json(serde_json::json!({"error": msg}))).into_response()
     };
-    if !same_origin(&headers) {
+    if !origin_allowed(&headers, &state.origins) {
         return bad(
             StatusCode::FORBIDDEN,
-            "the preview only opens from the backoffice's own page",
+            "the preview only opens from a page served under the backoffice's own address \
+             or an origin --backoffice-cors-origin lists",
         );
     }
-    let config = match read_config(&state.config_path) {
-        Ok(config) => config,
-        Err(response) => return *response,
-    };
+    let config = state.config.snapshot();
     let (Ok(base), Ok(quote)) = (
         config::parse_address(tokens.token0.trim()),
         config::parse_address(tokens.token1.trim()),
@@ -752,24 +1449,29 @@ async fn preview_socket(
     let Ok(page) = Arc::clone(&state.preview_pages).try_acquire_owned() else {
         return bad(
             StatusCode::TOO_MANY_REQUESTS,
-            "too many preview pages are open; close one and reload",
+            "too many previews are open; close one and try again",
         );
     };
     // The composite prices the sorted lane; a declared base that sorts second is inverted,
     // and the preview turns it back so the numbers read as the venues quote them.
     let inverted = base > quote;
-    ws.on_upgrade(move |socket| async move {
-        preview_session(socket, endpoints, inverted).await;
-        drop(page);
-    })
+    // Answered when offered, as a browser that sent its token as a subprotocol needs: it
+    // drops a socket that comes back with none of the ones it asked for.
+    ws.protocols([WS_PROTOCOL])
+        .on_upgrade(move |socket| async move {
+            preview_session(socket, endpoints, inverted).await;
+            drop(page);
+        })
 }
 
-/// Whether the websocket was opened by a page served from this same host. A browser
-/// sends the login cookie with a websocket opened from any site, and unlike a fetch, the
-/// browser does not stop another site's script from reading the answer, so without this
-/// any page a logged-in operator visits could open the preview in their name. The browser
-/// always sets `Origin` on a websocket and a script cannot change it; Caddy passes both it
-/// and `Host` through unchanged.
+/// Whether the request came from a page served from this same host: its `Origin` names
+/// the address in its `Host`. Asked of every change by [`guard`] and of the preview
+/// websocket by its handler, through [`origin_allowed`]. A browser opens a websocket from
+/// any site, and unlike a fetch, does not stop another site's script from reading the
+/// answer, so without this any page an operator visits could open the preview in their
+/// name. A browser always sets `Origin` on a websocket and on a change, and a script cannot
+/// change it; a reverse proxy such as Caddy, serving a front end and this API under one
+/// address, passes both it and `Host` through unchanged.
 fn same_origin(headers: &axum::http::HeaderMap) -> bool {
     let (Some(origin), Some(host)) = (
         headers.get(axum::http::header::ORIGIN),
@@ -857,7 +1559,7 @@ async fn preview_session(
     }
 }
 
-/// Applies one command from the page. A new weight changes only the average; a new symbol
+/// Applies one command from the client. A new weight changes only the average; a new symbol
 /// drops that venue's connection at once and leaves it for the next tick to redial.
 fn apply_preview_command(
     venues: &mut std::collections::BTreeMap<VenueId, PreviewVenue>,
@@ -933,7 +1635,7 @@ fn apply_preview_command(
     Ok(())
 }
 
-/// What the page is sent twice a second: each ticked venue's mid, in the venue's own
+/// What the client is sent twice a second: each ticked venue's mid, in the venue's own
 /// orientation, and the composite of the fresh ones, averaged the way the pusher averages
 /// the number it publishes.
 fn preview_snapshot(
@@ -973,9 +1675,10 @@ fn preview_snapshot(
         crate::composite::weighted_average(&fresh).map(|(delta, mid)| crate::feed::PriceSample {
             delta,
             mid,
+            // The preview shows the average and each venue's own mid, not their gap.
+            divergence: ethrex_common::U256::zero(),
             at: now,
             wall,
-            divergence: ethrex_common::U256::zero(),
         });
     serde_json::json!({
         "composite": market(composite),
@@ -988,394 +1691,26 @@ fn preview_snapshot(
 /// fine enough to read; 18 is what production uses.
 const PREVIEW_DECIMALS: u32 = 18;
 
-#[derive(Deserialize)]
-struct SaveSettings {
-    mode: String,
-    rpc_url: String,
-    rpc_ws_url: String,
-    registry: String,
-    price_decimals: String,
-    /// The old single Binance endpoint input, from a form rendered before the venue table.
-    #[serde(default)]
-    binance_ws: String,
-    #[serde(flatten)]
-    endpoints: EndpointsForm,
-    interval: String,
-    requote_ms: String,
-    metrics_addr: String,
-    backoffice_addr: String,
-    #[serde(default)]
-    disable_cross_region: Option<String>,
-}
-
-/// The venue table of the settings form: one endpoint override per venue,
-/// `endpoint_<venue>`, blank for the default. Named fields for the same reason as
-/// [`SourcesForm`].
-#[derive(Deserialize, Default)]
-struct EndpointsForm {
-    #[serde(default)]
-    endpoint_binance: String,
-    #[serde(default)]
-    endpoint_coinbase: String,
-    #[serde(default)]
-    endpoint_kraken: String,
-    #[serde(default)]
-    endpoint_okx: String,
-    #[serde(default)]
-    endpoint_bybit: String,
-    #[serde(default)]
-    endpoint_kucoin: String,
-    #[serde(default)]
-    endpoint_bitget: String,
-    #[serde(default)]
-    endpoint_gate: String,
-    #[serde(default)]
-    endpoint_mexc: String,
-}
-
-impl EndpointsForm {
-    fn row(&self, venue: VenueId) -> &str {
-        match venue {
-            VenueId::Binance => &self.endpoint_binance,
-            VenueId::Coinbase => &self.endpoint_coinbase,
-            VenueId::Kraken => &self.endpoint_kraken,
-            VenueId::Okx => &self.endpoint_okx,
-            VenueId::Bybit => &self.endpoint_bybit,
-            VenueId::Kucoin => &self.endpoint_kucoin,
-            VenueId::Bitget => &self.endpoint_bitget,
-            VenueId::Gate => &self.endpoint_gate,
-            VenueId::Mexc => &self.endpoint_mexc,
-        }
-    }
-}
-
-fn optional_number<T: std::str::FromStr>(name: &str, value: &str) -> Result<Option<T>> {
-    match optional(value) {
-        None => Ok(None),
-        Some(text) => text
-            .parse()
-            .map(Some)
-            .map_err(|_| eyre!("{name} must be a whole number, got {text:?}")),
-    }
-}
-
-/// Writes the `[settings]` table and says a restart is pending. These are read once at
-/// startup, so a reload would be refused, and refusing it here would revert a change the
-/// operator does want.
-async fn save_settings(
-    State(state): State<Backoffice>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Form(form): Form<SaveSettings>,
-) -> Response {
-    let _guard = state.edits.lock().await;
-
-    let mut config = match config::load_raw(&state.config_path) {
-        Ok(config) => config,
-        Err(err) => return Outcome::failed(format!("{err:#}")).redirect(),
-    };
-
-    let settings = match build_settings(&form) {
-        Ok(settings) => settings,
-        Err(err) => return Outcome::failed(format!("{err:#}")).redirect(),
-    };
-    if settings == config.settings {
-        return Outcome::ok("settings unchanged".to_owned()).redirect();
-    }
-    let changed = config.settings.changed_keys(&settings).join(", ");
-    config.settings = settings;
-
-    if let Err(err) = config::write_raw_atomically(&state.config_path, &config) {
-        return Outcome::failed(format!("{err:#}")).redirect();
-    }
-    tracing::info!("backoffice: {peer} changed [settings] {changed}; restart pending");
-    Outcome::ok(format!(
-        "saved {changed}. These are read once at startup, so {} to apply them.",
-        crate::hints::restart_instruction()
-    ))
-    .redirect()
-}
-
-/// Applies every rule startup would, now rather than at the next start: a bad value
-/// written here is a service that fails to come back from a restart hours later, with
-/// nobody at this page. Each check below has a twin that startup runs, named beside it:
-/// `bind` is this file's, `run` is `pusher::run`, the rest are in `cli.rs`. A value that
-/// passes here and fails there is a bug in this function.
-fn build_settings(form: &SaveSettings) -> Result<config::FileSettings> {
-    let mode = optional(&form.mode);
-    if let Some(mode) = &mode {
-        eyre::ensure!(
-            mode == "builder" || mode == "node",
-            "mode must be \"builder\" or \"node\", got {mode:?}"
-        );
-    }
-    if let Some(registry) = optional(&form.registry) {
-        config::parse_address(&registry).wrap_err("registry")?;
-    }
-    for (name, value) in [
-        ("metrics_addr", optional(&form.metrics_addr)),
-        ("backoffice_addr", optional(&form.backoffice_addr)),
-    ] {
-        if let Some(addr) = value {
-            addr.parse::<SocketAddr>()
-                .map_err(|_| eyre!("{name} must be host:port, got {addr:?}"))?;
-        }
-    }
-    // `bind` refuses this at startup. Here it would be saved and only found at the restart.
-    if let Some(addr) = optional(&form.backoffice_addr) {
-        let parsed: SocketAddr = addr.parse().expect("checked above");
-        eyre::ensure!(
-            !is_unspecified_bind(parsed),
-            "backoffice_addr {addr:?} binds every interface, including any facing the \
-             internet; use this host's tailnet address"
-        );
-    }
-    // `refuse_backoffice_in_node_mode`: node mode has no reload for this page to drive.
-    eyre::ensure!(
-        mode.as_deref() != Some("node") || optional(&form.backoffice_addr).is_none(),
-        "mode \"node\" cannot run with a backoffice_addr: node mode has no config reload \
-         for the page to drive. Clear backoffice_addr, or keep mode \"builder\""
-    );
-    // `apply_file_settings`: the arithmetic downstream overflows past this.
-    let price_decimals = optional_number("price_decimals", &form.price_decimals)?;
-    if let Some(decimals) = price_decimals {
-        eyre::ensure!(
-            decimals <= crate::MAX_PRICE_DECIMALS,
-            "price_decimals is {decimals}; the maximum is {}",
-            crate::MAX_PRICE_DECIMALS
-        );
-    }
-    // `run`: `interval must be at least 1 second`.
-    let interval = optional_number("interval", &form.interval)?;
-    eyre::ensure!(interval != Some(0), "interval must be at least 1 second");
-    // `run` parses these before anything connects. `Url::parse` accepts anything with a
-    // scheme, so the two websocket endpoints are also held to ws:// or wss://, as startup
-    // holds rpc_ws_url.
-    if let Some(url) = optional(&form.rpc_url) {
-        url::Url::parse(&url).map_err(|err| eyre!("rpc_url {url:?} is not a URL: {err}"))?;
-    }
-    // Every venue's endpoint too, held to the scheme its transport needs: a WebSocket
-    // venue to ws:// or wss://, a polled one (and KuCoin, whose socket URL is fetched over
-    // HTTP) to http:// or https://. The old `binance_ws` input, if a stale form still posts
-    // it, is the Binance row.
-    let mut endpoints = std::collections::BTreeMap::new();
-    for venue in VenueId::ALL {
-        let value = match (venue, optional(form.endpoints.row(*venue))) {
-            (VenueId::Binance, None) => optional(&form.binance_ws),
-            (_, value) => value,
-        };
-        let Some(url) = value else { continue };
-        let parsed = url::Url::parse(&url)
-            .map_err(|err| eyre!("{venue} endpoint {url:?} is not a URL: {err}"))?;
-        let streamed = !matches!(venue, VenueId::Kucoin | VenueId::Mexc);
-        let schemes: &[&str] = if streamed {
-            &["ws", "wss"]
-        } else {
-            &["http", "https"]
-        };
-        eyre::ensure!(
-            schemes.contains(&parsed.scheme()),
-            "{venue} endpoint must be {}, got {}://",
-            schemes.join(":// or "),
-            parsed.scheme()
-        );
-        endpoints.insert(venue.as_str().to_owned(), url);
-    }
-    for (name, value) in [("rpc_ws_url", optional(&form.rpc_ws_url))] {
-        if let Some(url) = value {
-            let parsed =
-                url::Url::parse(&url).map_err(|err| eyre!("{name} {url:?} is not a URL: {err}"))?;
-            eyre::ensure!(
-                parsed.scheme() == "ws" || parsed.scheme() == "wss",
-                "{name} must be a ws:// or wss:// endpoint, got {}://",
-                parsed.scheme()
-            );
-        }
-    }
-    Ok(config::FileSettings {
-        mode,
-        rpc_url: optional(&form.rpc_url),
-        rpc_ws_url: optional(&form.rpc_ws_url),
-        registry: optional(&form.registry),
-        price_decimals,
-        // Superseded by the Binance row of `endpoints`, so a save moves the value there and
-        // the file has one place that names the Binance endpoint.
-        binance_ws: None,
-        endpoints,
-        interval,
-        requote_ms: optional_number("requote_ms", &form.requote_ms)?,
-        metrics_addr: optional(&form.metrics_addr),
-        disable_cross_region: form.disable_cross_region.is_some().then_some(true),
-        backoffice_addr: optional(&form.backoffice_addr),
-    })
-}
-
-#[derive(Deserialize)]
-struct EditPair {
-    key_env: String,
-    /// See [`AddPair::symbol`].
-    #[serde(default)]
-    symbol: String,
-    #[serde(flatten)]
-    sources: SourcesForm,
-    min_mid: String,
-    max_mid: String,
-    max_deviation: String,
-    // Defaulted like every field added after this struct's first version: a form a
-    // browser is still holding open from before a pusher restart added this field does
-    // not post it at all, and that must still save rather than 422.
-    #[serde(default)]
-    max_deviation_window: String,
-    #[serde(default)]
-    max_deviation_window_blocks: String,
-    /// The late-venue key. `None` is a form rendered before the field existed, which
-    /// keeps whatever the file sets; a blank field clears the key.
-    #[serde(default)]
-    max_source_lag_ms: Option<String>,
-    /// The venues-disagree limit, with the same two meanings of absent and blank.
-    #[serde(default)]
-    max_source_divergence: Option<String>,
-    #[serde(default)]
-    allow_symbol_mismatch: Option<String>,
-    /// The pricing kind the operator chose. Every kind's section is posted whichever is
-    /// showing, so this decides which kind's fields are kept. Defaulted so a form rendered
-    /// before it existed still posts; blank keeps the pair's stanza.
-    #[serde(default)]
-    pricing: String,
-    /// Every other posted input: the chosen kind's fields, named `pricing_<kind>_<field>`
-    /// by the form, which [`pricing_stanza`] reads for the chosen kind alone.
-    #[serde(flatten)]
-    kind_fields: std::collections::HashMap<String, String>,
-}
-
-/// Keyed by `key_env`, not by index: the page may have been rendered before someone else
-/// added a pair, and an index would then edit the wrong row.
-async fn edit_pair(
-    State(state): State<Backoffice>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Form(form): Form<EditPair>,
-) -> Response {
-    let what = format!("edited pair {}", form.key_env);
-    let kinds = Arc::clone(&state.kinds);
-    let form = Arc::new(form);
-    let result = {
-        let (form, kinds) = (Arc::clone(&form), Arc::clone(&kinds));
-        let _guard = state.edits.lock().await;
-        change_locked(&state, peer, &what, move |config| {
-            let pair = config
-                .pairs
-                .iter_mut()
-                .find(|pair| pair.key_env == form.key_env.trim())
-                .ok_or_else(|| {
-                    eyre!(
-                        "no pair with key_env {:?}; it may have been removed since this page \
-                         was loaded",
-                        form.key_env
-                    )
-                })?;
-            edit_from_form(pair, &form, &kinds)?;
-            config::check_source_keys(pair)
-        })
-        .await
-    };
-    let outcome = match result {
-        Ok(message) => return Outcome::ok(message).redirect(),
-        // Written and applied to some lanes: not a rejection, and not the form again, which
-        // would read as one. The list, saying it was saved and what the reload could not do.
-        Err(ReloadFailure::Partial(line)) => {
-            return Outcome::failed(format!("Saved; the reload applied in part: {line}"))
-                .redirect();
-        }
-        Err(ReloadFailure::Rejected(line)) => Outcome::failed(line),
-    };
-    // Refused: the same form again, as it was posted and with the reason above it, so the
-    // field that made it invalid (an age of zero, say) can be fixed or cleared in the same
-    // form rather than lost on the way back to the list.
-    let Ok(config) = config::load_raw(&state.config_path) else {
-        return outcome.redirect();
-    };
-    match config
-        .pairs
-        .iter()
-        .find(|pair| pair.key_env == form.key_env.trim())
-    {
-        Some(pair) => {
-            let mut posted = pair.clone();
-            // Best effort: what could be applied is shown, the rest as the file has it.
-            let _ = edit_from_form(&mut posted, &form, &kinds);
-            (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Html(render_pair_form_with(
-                    Some(&posted),
-                    &kinds,
-                    Some(&outcome.message),
-                )),
-            )
-                .into_response()
-        }
-        None => outcome.redirect(),
-    }
-}
-
-/// An edit form's changes to `pair`, without the checks the reload makes.
-fn edit_from_form(pair: &mut RawPair, form: &EditPair, kinds: &crate::kinds::Kinds) -> Result<()> {
-    apply_sources(pair, &form.sources, &form.symbol)?;
-    pair.pricing = pricing_stanza(kinds, &form.pricing, Some(&pair.pricing), &form.kind_fields)?;
-    pair.min_mid = optional(&form.min_mid);
-    pair.max_mid = optional(&form.max_mid);
-    pair.max_deviation = optional(&form.max_deviation);
-    pair.max_deviation_window = optional(&form.max_deviation_window);
-    pair.max_deviation_window_blocks = optional(&form.max_deviation_window_blocks);
-    set_if_posted(
-        &mut pair.max_source_lag_ms,
-        form.max_source_lag_ms.as_deref(),
-    );
-    set_if_posted(
-        &mut pair.max_source_divergence,
-        form.max_source_divergence.as_deref(),
-    );
-    pair.allow_symbol_mismatch = form.allow_symbol_mismatch.is_some();
-    Ok(())
-}
-
-#[derive(Deserialize)]
-struct RemovePair {
-    key_env: String,
-}
-
-async fn remove_pair(
-    State(state): State<Backoffice>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Form(form): Form<RemovePair>,
-) -> Response {
-    let what = format!("removed pair {}", form.key_env);
-    apply(&state, peer, &what, move |config| {
-        let before = config.pairs.len();
-        config
-            .pairs
-            .retain(|pair| pair.key_env != form.key_env.trim());
-        if config.pairs.len() == before {
-            return Err(eyre!("no pair with key_env {:?}", form.key_env));
-        }
-        // Removing the last pair is allowed: a process with a backoffice may run with none,
-        // which is the state a fresh host starts in, and this page is how it gets out of.
-        Ok(())
-    })
-    .await
-    .redirect()
-}
+// ---------------------------------------------------------------------------
+// Halts
+// ---------------------------------------------------------------------------
 
 /// Sets `halted` on the pair named by `key_env`, or on every pair when it is `None`.
-/// Refuses a change that would do nothing, so the banner never reports a halt that did
+/// Refuses a change that would do nothing, so the answer never reports a halt that did
 /// not happen.
 ///
 /// A halt set here carries no `halt_reason`. One that has a reason was explained by
 /// whoever set it: a binary's `UpdaterHandle::halt` always writes one, since that is its
 /// kill switch, and an operator may write one by hand. The bulk resume (`key_env` `None`,
-/// from "Restart halted pairs") leaves such a halt for that pair's own Resume, so the
-/// button pressed to bring back what was halted here cannot also lift a kill switch;
-/// [`explained_halts`] is what the banner then says it left. A pair's own Resume clears
+/// from `POST /api/reload`) leaves such a halt for that pair's own resume, so the call
+/// made to bring back what was halted here cannot also lift a kill switch;
+/// [`explained_halts`] is what the answer then says it left. A pair's own resume clears
 /// either kind.
-fn set_halted(config: &mut RawConfig, key_env: Option<&str>, halted: bool) -> Result<()> {
+fn set_halted(
+    config: &mut RawConfig,
+    key_env: Option<&str>,
+    halted: bool,
+) -> std::result::Result<(), ApiError> {
     let mut found = false;
     let mut changed = false;
     for pair in &mut config.pairs {
@@ -1395,12 +1730,10 @@ fn set_halted(config: &mut RawConfig, key_env: Option<&str>, halted: bool) -> Re
         pair.halted = halted;
     }
     match key_env {
-        Some(key) if !found => Err(eyre!(
-            "no pair with key_env {key:?}; it may have been removed since this page was loaded"
-        )),
-        None if !found => Err(eyre!("there are no pairs to halt")),
-        _ if !changed && halted => Err(eyre!("already halted")),
-        _ if !changed => Err(eyre!("not halted")),
+        Some(key) if !found => Err(no_pair(key)),
+        None if !found => Err(ApiError::conflict("there are no pairs to halt")),
+        _ if !changed && halted => Err(ApiError::conflict("already halted")),
+        _ if !changed => Err(ApiError::conflict("not halted")),
         _ => Ok(()),
     }
 }
@@ -1410,9 +1743,9 @@ fn is_explained(pair: &RawPair) -> bool {
     pair.halted && pair.halt_reason.is_some()
 }
 
-/// The tail of the banner after a bulk restart, naming each halt it left and its reason;
+/// The tail of the answer to a bulk restart, naming each halt it left and its reason;
 /// empty when it left none. Said rather than left to be noticed, because the operator who
-/// pressed "Restart halted pairs" expects every halted row to come back.
+/// asked to restart halted pairs expects every halted one to come back.
 fn explained_halts(config: &RawConfig) -> String {
     let kept: Vec<String> = config
         .pairs
@@ -1431,894 +1764,25 @@ fn explained_halts(config: &RawConfig) -> String {
     }
     format!(
         ". Left halted, because each was halted with a reason (a binary's kill switch \
-         writes one) that only its own Resume clears: {}",
+         writes one) that only its own resume clears: {}",
         kept.join(", ")
     )
-}
-
-/// Stops a pair quoting and keeps it, with every setting, in the file. The reload treats it
-/// as gone, so its quote is withdrawn at every builder exactly as a removal would.
-async fn halt_pair(
-    State(state): State<Backoffice>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Form(form): Form<RemovePair>,
-) -> Response {
-    let what = format!("halted pair {}", form.key_env);
-    apply(&state, peer, &what, move |config| {
-        set_halted(config, Some(&form.key_env), true)
-    })
-    .await
-    .redirect()
-}
-
-async fn resume_pair(
-    State(state): State<Backoffice>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Form(form): Form<RemovePair>,
-) -> Response {
-    let what = format!("resumed pair {}", form.key_env);
-    apply(&state, peer, &what, move |config| {
-        set_halted(config, Some(&form.key_env), false)
-    })
-    .await
-    .redirect()
-}
-
-async fn halt_all(
-    State(state): State<Backoffice>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-) -> Response {
-    apply(&state, peer, "halted every pair", |config| {
-        set_halted(config, None, true)
-    })
-    .await
-    .redirect()
-}
-
-#[derive(Deserialize)]
-struct AddBuilder {
-    name: String,
-    endpoint: String,
-    api_key: String,
-    #[serde(default)]
-    disable_cross_region: Option<String>,
-}
-
-async fn add_builder(
-    State(state): State<Backoffice>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Form(form): Form<AddBuilder>,
-) -> Response {
-    let builder = BuilderConfig {
-        name: form.name.trim().to_owned(),
-        endpoint: form.endpoint.trim().to_owned(),
-        api_key: form.api_key.trim().to_owned(),
-        disable_cross_region: form.disable_cross_region.is_some().then_some(true),
-    };
-    let what = format!("added builder {}", builder.name);
-    apply(&state, peer, &what, move |config| {
-        if config
-            .builders
-            .iter()
-            .any(|existing| existing.name == builder.name)
-        {
-            return Err(eyre!(
-                "a builder is already named {:?}; names identify a builder in the logs, \
-                     so they must be unique (try {:?}-eu and {:?}-us)",
-                builder.name,
-                builder.name,
-                builder.name
-            ));
-        }
-        config.builders.push(builder);
-        config::validate_builders(&config.builders)
-    })
-    .await
-    .redirect()
-}
-
-#[derive(Deserialize)]
-struct RemoveBuilder {
-    name: String,
-}
-
-async fn remove_builder(
-    State(state): State<Backoffice>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Form(form): Form<RemoveBuilder>,
-) -> Response {
-    let what = format!("removed builder {}", form.name);
-    apply(&state, peer, &what, move |config| {
-        let before = config.builders.len();
-        config.builders.retain(|b| b.name != form.name.trim());
-        if config.builders.len() == before {
-            return Err(eyre!("no builder named {:?}", form.name));
-        }
-        Ok(())
-    })
-    .await
-    .redirect()
-}
-
-/// A reload with no edit behind it. Every other button already reloads, so this covers the
-/// ways the file and the running pairs diverge on their own: a halted pair (much the
-/// commonest), a hand edit over SSH, or a pair whose feed never came up.
-///
-/// Pairs halted from this page are resumed too: their flag is cleared and the reload
-/// starts them, through `apply_locked` so a refused reload puts the flags back. A halt with
-/// a reason is left as it is and named in the banner (see [`set_halted`]). The file is
-/// read under the edit lock, so two presses at once cannot both see a flag the first one
-/// is about to clear, which would have the second report an error for a restart that
-/// worked.
-async fn reload_only(
-    State(state): State<Backoffice>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-) -> Response {
-    let _guard = state.edits.lock().await;
-    let (any_flagged, kept) = match config::load_raw(&state.config_path) {
-        Ok(config) => (
-            config
-                .pairs
-                .iter()
-                .any(|pair| pair.halted && !is_explained(pair)),
-            explained_halts(&config),
-        ),
-        Err(_) => (false, String::new()),
-    };
-    if any_flagged {
-        let result = change_locked(&state, peer, "restarted halted pairs", |config| {
-            set_halted(config, None, false)
-        })
-        .await;
-        // Not on a rejection: a refused restart changed nothing, so nothing was "left".
-        let applied = !matches!(result, Err(ReloadFailure::Rejected(_)));
-        let mut outcome = Outcome::from(result);
-        if applied {
-            outcome.message.push_str(&kept);
-        }
-        return outcome.redirect();
-    }
-    match crate::service::request_reload(&state.reloads).await {
-        Ok(summary) => {
-            tracing::info!("backoffice: {peer} reloaded; {summary}");
-            // The service's no-op line names the config path, which is not what someone
-            // pressing this button wants to know.
-            Outcome::ok(match (summary.contains("nothing to do"), kept.is_empty()) {
-                (true, true) => {
-                    "nothing was halted; the running pairs already match the config".to_owned()
-                }
-                (true, false) => format!("nothing was restarted{kept}"),
-                (false, _) => format!("{summary}{kept}"),
-            })
-        }
-        Err(ReloadFailure::Partial(line)) => {
-            Outcome::failed(format!("the reload applied in part: {line}{kept}"))
-        }
-        Err(ReloadFailure::Rejected(err)) => {
-            Outcome::failed(format!("the reload was rejected: {err}"))
-        }
-    }
-    .redirect()
-}
-
-// ---------------------------------------------------------------------------
-// Pages
-// ---------------------------------------------------------------------------
-
-#[derive(Deserialize)]
-struct Banner {
-    ok: Option<String>,
-    err: Option<String>,
-}
-
-/// Reads the config, or renders why it could not be read: an unparseable config is exactly
-/// when someone comes looking at this page.
-fn read_config(path: &Path) -> std::result::Result<RawConfig, Box<Response>> {
-    config::load_raw(path).map_err(|err| {
-        Box::new(
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Html(
-                    ConfigErrorPage {
-                        error: format!("{err:#}"),
-                    }
-                    .render()
-                    .unwrap_or_else(render_failed),
-                ),
-            )
-                .into_response(),
-        )
-    })
-}
-
-async fn index(
-    State(state): State<Backoffice>,
-    axum::extract::Query(banner): axum::extract::Query<Banner>,
-) -> Response {
-    match read_config(&state.config_path) {
-        Ok(config) => Html(render_index(
-            &config,
-            &state.config_path,
-            &banner,
-            &state.states,
-            &state.kinds,
-        ))
-        .into_response(),
-        Err(response) => *response,
-    }
-}
-
-async fn new_pair_page(State(state): State<Backoffice>) -> Response {
-    match read_config(&state.config_path) {
-        Ok(_) => Html(render_pair_form(None, &state.kinds)).into_response(),
-        Err(response) => *response,
-    }
-}
-
-async fn edit_pair_page(
-    State(state): State<Backoffice>,
-    axum::extract::Path(key_env): axum::extract::Path<String>,
-) -> Response {
-    let config = match read_config(&state.config_path) {
-        Ok(config) => config,
-        Err(response) => return *response,
-    };
-    match config.pairs.iter().find(|pair| pair.key_env == key_env) {
-        Some(pair) => Html(render_pair_form(Some(pair), &state.kinds)).into_response(),
-        // A stale link, most likely. Back to the list rather than a bare 404.
-        None => Outcome::failed(format!("no pair with key_env {key_env:?}")).redirect(),
-    }
-}
-
-async fn settings_page(State(state): State<Backoffice>) -> Response {
-    match read_config(&state.config_path) {
-        Ok(config) => Html(render_settings_form(&config)).into_response(),
-        Err(response) => *response,
-    }
-}
-
-async fn new_builder_page(State(state): State<Backoffice>) -> Response {
-    match read_config(&state.config_path) {
-        Ok(_) => Html(render_builder_form()).into_response(),
-        Err(response) => *response,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Rendering
-// ---------------------------------------------------------------------------
-//
-// The pages are `.html` files under `templates/`, compiled in by askama.
-
-/// One input, as a template sees it.
-pub struct Field {
-    pub name: &'static str,
-    pub placeholder: &'static str,
-    pub hint: &'static str,
-    /// Masked and kept out of autofill. Only the builder API key, the one live credential
-    /// this page takes.
-    pub secret: bool,
-}
-
-impl Field {
-    const fn new(name: &'static str, placeholder: &'static str, hint: &'static str) -> Self {
-        Self {
-            name,
-            placeholder,
-            hint,
-            secret: false,
-        }
-    }
-
-    const fn secret(name: &'static str, hint: &'static str) -> Self {
-        Self {
-            name,
-            placeholder: "",
-            hint,
-            secret: true,
-        }
-    }
-}
-
-/// A field and its value. Flat rather than holding a `&Field`, because `field.html` is
-/// included under the name `field` and `field.field.name` would read worse.
-struct Filled {
-    /// The input's `name`: the key it posts as.
-    name: String,
-    /// What the page shows beside it: the key as the config spells it.
-    label: &'static str,
-    placeholder: &'static str,
-    hint: &'static str,
-    secret: bool,
-    value: String,
-    readonly: bool,
-}
-
-impl Filled {
-    fn new(field: &'static Field, value: Option<&str>) -> Self {
-        Self {
-            name: field.name.to_owned(),
-            label: field.name,
-            placeholder: field.placeholder,
-            hint: field.hint,
-            secret: field.secret,
-            value: value.unwrap_or_default().to_owned(),
-            readonly: false,
-        }
-    }
-
-    /// A pricing kind's declared field, posted as `pricing_<kind>_<field>` so every kind's
-    /// section can be on the page at once ([`pricing_stanza`] reads the chosen kind's).
-    fn kind_field(kind: &str, field: &crate::pricing::FormField, value: Option<&str>) -> Self {
-        Self {
-            name: format!("pricing_{kind}_{}", field.name),
-            label: field.name,
-            placeholder: field.placeholder,
-            hint: field.hint,
-            secret: false,
-            value: value.unwrap_or_default().to_owned(),
-            readonly: false,
-        }
-    }
-
-    fn readonly(field: &'static Field, value: Option<&str>) -> Self {
-        Self {
-            readonly: true,
-            ..Self::new(field, value)
-        }
-    }
-}
-
-/// The price source and its guards. Used by both the add form and the edit form, so the
-/// two cannot drift.
-const SOURCE_FIELDS: &[Field] = &[
-    Field::new("min_mid", "0.0001", "refuse a published mid below this"),
-    Field::new("max_mid", "0.001", "refuse a published mid above this"),
-    Field::new(
-        "max_deviation",
-        "0.02",
-        "circuit breaker: halt on a move this large",
-    ),
-    Field::new(
-        "max_deviation_window",
-        "0.20",
-        "circuit breaker: halt on this much total movement over the window below",
-    ),
-    Field::new(
-        "max_deviation_window_blocks",
-        "1000",
-        "how many blocks that window covers",
-    ),
-    Field::new(
-        "max_source_lag_ms",
-        "1500",
-        "leave a venue out of the average while its prices arrive more than this many \
-         milliseconds behind the exchange's own timestamp; needs a venue that sends one \
-         (not binance, not mexc). Blank is off",
-    ),
-    Field::new(
-        "max_source_divergence",
-        "0.001",
-        "stop quoting while the main venue and any other differ by more than this fraction \
-         of the price (0.001 = 0.1%); needs two or more venues. Blank is the default: 20 \
-         times the spread the pair quotes, and at least 0.05%",
-    ),
-];
-
-/// How many venues must have a fresh price before the pair publishes.
-const MIN_SOURCES_FIELD: Field = Field::new(
-    "min_sources",
-    "1",
-    "how many of the venues above must have a fresh price for us to publish at all. Blank \
-     is 1: keep quoting as long as any one venue is up",
-);
-
-/// Locked on an edit: the lane and the signer are derived from these, so changing one is a
-/// delete and an add.
-const PAIR_IDENTITY: &[Field] = &[
-    Field::new("token0", "0xC02aaA39…", "base token, market orientation"),
-    Field::new("token1", "0xA0b86991…", "quote token"),
-    Field::new(
-        "key_env",
-        "UPDATER_KEY_WETH_USDC",
-        "variable holding this pair's key",
-    ),
-];
-
-const BUILDER_FIELDS: &[Field] = &[
-    Field::new("name", "titan-eu", "how it appears in the logs; unique"),
-    Field::new(
-        "endpoint",
-        "wss://eu.rpc.titanbuilder.xyz/ws/sendquoteupdate",
-        "maker WebSocket URL",
-    ),
-    Field::secret("api_key", "sent as the Authorization header"),
-];
-
-/// Has to be exhaustive: a key missing here is one nobody can change without SSH.
-const SETTING_FIELDS: &[Field] = &[
-    Field::new(
-        "mode",
-        "builder",
-        "builder quotes to the builders; node sends updateState",
-    ),
-    Field::new(
-        "rpc_url",
-        "https://…",
-        "JSON-RPC endpoint, read on the hot loop",
-    ),
-    Field::new(
-        "rpc_ws_url",
-        "wss://…",
-        "optional: push new block headers instead of polling",
-    ),
-    Field::new(
-        "requote_ms",
-        "50",
-        "requote cadence; keep it under the ~400ms eviction",
-    ),
-    Field::new(
-        "metrics_addr",
-        "127.0.0.1:9464",
-        "Prometheus endpoint; blank disables it",
-    ),
-    Field::new(
-        "backoffice_addr",
-        "100.x.y.z:8088",
-        "where this page is served",
-    ),
-    Field::new(
-        "registry",
-        "0xDa7A…",
-        "PrioUpdateRegistry; blank is the mainnet one",
-    ),
-    Field::new(
-        "price_decimals",
-        "18",
-        "scale of the published mid and delta",
-    ),
-    Field::new("interval", "12", "seconds between pushes in node mode"),
-];
-
-/// `0xA0b86991…3606eB48`, with the whole thing on hover. A row carries two, and 42
-/// characters twice over is most of the width.
-struct ShortAddress {
-    full: String,
-    short: String,
-}
-
-impl ShortAddress {
-    fn new(address: &str) -> Self {
-        let short = if address.len() <= 16 {
-            address.to_owned()
-        } else {
-            format!("{}…{}", &address[..8], &address[address.len() - 6..])
-        };
-        Self {
-            full: address.to_owned(),
-            short,
-        }
-    }
-}
-
-/// One row of the pairs table, pre-rendered so the template holds no logic beyond "is this
-/// set".
-struct PairRow {
-    key_env: String,
-    halted: bool,
-    /// Why, when a binary's handle halted it; read-only here.
-    halt_reason: Option<String>,
-    /// What the running pusher is doing with the pair, and the badge colour for it.
-    status: &'static str,
-    status_class: &'static str,
-    tokens: Vec<ShortAddress>,
-    /// The venues the pair streams from, if any.
-    source: Option<String>,
-    /// The kind that prices it, with its summary of the stanza.
-    pricing: String,
-    band: Option<String>,
-    breaker: Option<String>,
-}
-
-impl PairRow {
-    /// `running` is the pair's breaker flag if the pusher has a task for it, `None` if not.
-    fn new(pair: &RawPair, running: Option<bool>, kinds: &crate::kinds::Kinds) -> Self {
-        let (status, status_class) = match (pair.halted, running) {
-            (true, _) => ("halted", "halted"),
-            (false, Some(true)) => ("breaker tripped", "halted"),
-            (false, Some(false)) => ("live", "live"),
-            (false, None) => ("not running", "idle"),
-        };
-        Self {
-            key_env: pair.key_env.clone(),
-            halted: pair.halted,
-            halt_reason: pair.halt_reason.clone(),
-            status,
-            status_class,
-            tokens: pair.tokens.iter().map(|t| ShortAddress::new(t)).collect(),
-            source: describe_sources(pair),
-            pricing: kinds.pricer_summary(&pricing_spec(pair)),
-            band: match (&pair.min_mid, &pair.max_mid) {
-                (None, None) => None,
-                (min, max) => Some(format!(
-                    "{}–{}",
-                    min.as_deref().unwrap_or("*"),
-                    max.as_deref().unwrap_or("*")
-                )),
-            },
-            breaker: pair.max_deviation.clone(),
-        }
-    }
-}
-
-/// The pair's venues as the table shows them: `ETHUSDC` for the short form, and
-/// `binance:ETHUSDC ×2 + kraken:ETH/USD ×1` for a list. Spelled from the raw stanza,
-/// because the index renders whatever is in the file, parsed or not.
-fn describe_sources(pair: &RawPair) -> Option<String> {
-    if let Some(symbol) = &pair.symbol {
-        return Some(symbol.clone());
-    }
-    if pair.sources.is_empty() {
-        return None;
-    }
-    let mut text = pair
-        .sources
-        .iter()
-        .map(|s| {
-            format!(
-                "{}:{} ×{}",
-                s.venue.to_lowercase(),
-                s.symbol,
-                s.weight.as_deref().unwrap_or("1")
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" + ");
-    if let Some(min) = &pair.min_sources {
-        text.push_str(&format!(" (min {min})"));
-    }
-    Some(text)
-}
-
-struct BuilderRow {
-    name: String,
-    endpoint: String,
-    region: Option<String>,
-}
-
-#[derive(Template)]
-#[template(path = "index.html")]
-struct IndexPage {
-    target: String,
-    config_path: String,
-    ok: Option<String>,
-    err: Option<String>,
-    pairs: Vec<PairRow>,
-    builders: Vec<BuilderRow>,
-}
-
-#[derive(Template)]
-#[template(path = "pair_form.html")]
-struct PairFormPage {
-    /// Why the save that brought this form back was refused.
-    error: Option<String>,
-    /// See [`pair_script_version`].
-    script_version: &'static str,
-    /// The `key_env` being edited, or `None` when adding.
-    editing: Option<String>,
-    identity: Vec<Filled>,
-    source: Vec<Filled>,
-    /// One row per venue the binary knows.
-    sources: Vec<SourceRow>,
-    min_sources: Filled,
-    /// One section per registered pricing kind, the pair's own checked.
-    kinds: Vec<KindSection>,
-    allow_symbol_mismatch: bool,
-}
-
-#[derive(Template)]
-#[template(path = "builder_form.html")]
-struct BuilderFormPage {
-    fields: Vec<Filled>,
-}
-
-#[derive(Template)]
-#[template(path = "settings_form.html")]
-struct SettingsFormPage {
-    fields: Vec<Filled>,
-    endpoints: Vec<EndpointRow>,
-    disable_cross_region: bool,
-}
-
-/// One venue's row of the settings form's endpoint table.
-struct EndpointRow {
-    venue: &'static str,
-    value: String,
-    placeholder: &'static str,
-}
-
-/// One venue's row of the pair form's source table.
-struct SourceRow {
-    venue: &'static str,
-    symbol: String,
-    weight: String,
-    /// How this venue spells a market, shown as the symbol's placeholder.
-    example: String,
-    /// What is different about this venue, if anything: polled, or no book. The page's
-    /// script replaces it with what the lookup found.
-    note: &'static str,
-}
-
-#[derive(Template)]
-#[template(path = "config_error.html")]
-struct ConfigErrorPage {
-    error: String,
-}
-
-fn render_index(
-    config: &RawConfig,
-    path: &Path,
-    banner: &Banner,
-    states: &PairStates,
-    kinds: &crate::kinds::Kinds,
-) -> String {
-    // A snapshot, so every row reads the same moment and the lock is not held while
-    // rendering. A poisoned lock still holds a usable map.
-    let states: std::collections::BTreeMap<String, bool> = states
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .iter()
-        .map(|(key, tripped)| (key.clone(), tripped.load(Ordering::SeqCst)))
-        .collect();
-    IndexPage {
-        target: config.target.clone(),
-        config_path: path.display().to_string(),
-        ok: banner.ok.clone(),
-        err: banner.err.clone(),
-        pairs: config
-            .pairs
-            .iter()
-            .map(|pair| PairRow::new(pair, states.get(&pair.key_env).copied(), kinds))
-            .collect(),
-        builders: config
-            .builders
-            .iter()
-            .map(|builder| BuilderRow {
-                name: builder.name.clone(),
-                endpoint: builder.endpoint.clone(),
-                region: (builder.disable_cross_region == Some(true)).then(|| "pinned".to_owned()),
-            })
-            .collect(),
-    }
-    .render()
-    .unwrap_or_else(render_failed)
-}
-
-/// The kind a pair's `[pairs.pricing]` stanza names, if it names one as a string.
-fn pricing_kind(pair: &RawPair) -> Option<&str> {
-    pair.pricing.get("kind")?.as_str()
-}
-
-/// The pair's stanza as the kind table reads it, for the summary a row shows.
-fn pricing_spec(pair: &RawPair) -> crate::config::PricingSpec {
-    crate::config::PricingSpec {
-        kind: pricing_kind(pair).unwrap_or("").to_owned(),
-        config: pair.pricing.clone(),
-    }
-}
-
-/// One pricing kind's section of the pair form: its radio, its help and its fields filled
-/// from the pair's stanza when the pair is priced by it.
-struct KindSection {
-    name: String,
-    checked: bool,
-    help: &'static str,
-    fields: Vec<Filled>,
-    /// A kind with no declared fields: the page says the stanza is edited in the file.
-    in_file: bool,
-}
-
-fn render_pair_form(pair: Option<&RawPair>, kinds: &crate::kinds::Kinds) -> String {
-    render_pair_form_with(pair, kinds, None)
-}
-
-/// [`render_pair_form`], with why the last save of it was refused.
-fn render_pair_form_with(
-    pair: Option<&RawPair>,
-    kinds: &crate::kinds::Kinds,
-    error: Option<&str>,
-) -> String {
-    let editing_key = pair.map(|pair| pair.key_env.clone());
-    let editing = editing_key.is_some();
-    let identity_values: Vec<Option<&str>> = match pair {
-        Some(pair) => vec![
-            pair.tokens.first().map(String::as_str),
-            pair.tokens.get(1).map(String::as_str),
-            Some(pair.key_env.as_str()),
-        ],
-        None => vec![None; PAIR_IDENTITY.len()],
-    };
-    let source_values: Vec<Option<&str>> = match pair {
-        Some(pair) => vec![
-            pair.min_mid.as_deref(),
-            pair.max_mid.as_deref(),
-            pair.max_deviation.as_deref(),
-            pair.max_deviation_window.as_deref(),
-            pair.max_deviation_window_blocks.as_deref(),
-            pair.max_source_lag_ms.as_deref(),
-            pair.max_source_divergence.as_deref(),
-        ],
-        None => vec![None; SOURCE_FIELDS.len()],
-    };
-    let knob = |field: &'static Field, value: fn(&RawPair) -> Option<&str>| {
-        Filled::new(field, pair.and_then(value))
-    };
-    // Every registered kind, the pair's own first checked (a new pair starts on the first
-    // registered). A pair priced by a kind nobody registered still shows it, so its stanza
-    // is not lost on save.
-    let current = pair.and_then(pricing_kind);
-    let mut names: Vec<String> = kinds.pricer_kinds().iter().map(|k| k.to_string()).collect();
-    if let Some(current) = current
-        && !names.iter().any(|n| n == current)
-    {
-        names.push(current.to_owned());
-    }
-    let checked_kind = current
-        .map(str::to_owned)
-        .or_else(|| names.first().cloned());
-    let kind_sections: Vec<KindSection> = names
-        .iter()
-        .map(|name| {
-            let fields = kinds.pricer_fields(name).unwrap_or(&[]);
-            let mine = current == Some(name.as_str());
-            KindSection {
-                name: name.clone(),
-                checked: checked_kind.as_deref() == Some(name.as_str()),
-                help: kinds.pricer_form_help(name).unwrap_or(""),
-                fields: fields
-                    .iter()
-                    .map(|field| {
-                        let value = if mine {
-                            pair.and_then(|p| p.pricing.get(field.name))
-                                .and_then(|v| v.as_str())
-                        } else {
-                            None
-                        };
-                        Filled::kind_field(name, field, value)
-                    })
-                    .collect(),
-                in_file: fields.is_empty(),
-            }
-        })
-        .collect();
-
-    PairFormPage {
-        error: error.map(str::to_owned),
-        script_version: pair_script_version(),
-        editing: editing_key,
-        identity: PAIR_IDENTITY
-            .iter()
-            .zip(identity_values)
-            .filter(|(field, _)| !(editing && field.name == "key_env"))
-            .map(|(field, value)| {
-                if editing {
-                    Filled::readonly(field, value)
-                } else {
-                    Filled::new(field, value)
-                }
-            })
-            .collect(),
-        source: SOURCE_FIELDS
-            .iter()
-            .zip(source_values)
-            .map(|(field, value)| Filled::new(field, value))
-            .collect(),
-        sources: VenueId::ALL
-            .iter()
-            .map(|venue| {
-                // The pair's row for this venue: from `sources`, or for Binance from the
-                // short-form `symbol`.
-                let row = pair.and_then(|pair| {
-                    pair.sources
-                        .iter()
-                        .find(|s| s.venue.eq_ignore_ascii_case(venue.as_str()))
-                        .map(|s| (s.symbol.clone(), s.weight.clone().unwrap_or_default()))
-                        .or_else(|| {
-                            (*venue == VenueId::Binance)
-                                .then(|| pair.symbol.clone().map(|s| (s, String::new())))
-                                .flatten()
-                        })
-                });
-                let (symbol, weight) = row.unwrap_or_default();
-                let note = match venue {
-                    VenueId::Mexc => "polled every second",
-                    _ => "",
-                };
-                SourceRow {
-                    venue: venue.as_str(),
-                    symbol,
-                    weight,
-                    example: venue.expected_symbol("ETH", "USDC"),
-                    note,
-                }
-            })
-            .collect(),
-        min_sources: knob(&MIN_SOURCES_FIELD, |p| p.min_sources.as_deref()),
-        kinds: kind_sections,
-        allow_symbol_mismatch: pair.is_some_and(|pair| pair.allow_symbol_mismatch),
-    }
-    .render()
-    .unwrap_or_else(render_failed)
-}
-
-fn render_builder_form() -> String {
-    BuilderFormPage {
-        fields: BUILDER_FIELDS
-            .iter()
-            .map(|field| Filled::new(field, None))
-            .collect(),
-    }
-    .render()
-    .unwrap_or_else(render_failed)
-}
-
-fn render_settings_form(config: &RawConfig) -> String {
-    let s = &config.settings;
-    // In the order SETTING_FIELDS declares them.
-    let values: Vec<Option<String>> = vec![
-        s.mode.clone(),
-        s.rpc_url.clone(),
-        s.rpc_ws_url.clone(),
-        s.requote_ms.map(|v| v.to_string()),
-        s.metrics_addr.clone(),
-        s.backoffice_addr.clone(),
-        s.registry.clone(),
-        s.price_decimals.map(|v| v.to_string()),
-        s.interval.map(|v| v.to_string()),
-    ];
-    SettingsFormPage {
-        fields: SETTING_FIELDS
-            .iter()
-            .zip(&values)
-            .map(|(field, value)| Filled::new(field, value.as_deref()))
-            .collect(),
-        endpoints: VenueId::ALL
-            .iter()
-            .map(|venue| EndpointRow {
-                venue: venue.as_str(),
-                value: s
-                    .endpoints
-                    .get(venue.as_str())
-                    .cloned()
-                    // The older key, shown in the Binance row until a save moves it.
-                    .or_else(|| {
-                        (*venue == VenueId::Binance)
-                            .then(|| s.binance_ws.clone())
-                            .flatten()
-                    })
-                    .unwrap_or_default(),
-                placeholder: venue.default_endpoint(),
-            })
-            .collect(),
-        disable_cross_region: s.disable_cross_region == Some(true),
-    }
-    .render()
-    .unwrap_or_else(render_failed)
-}
-
-/// Templates are checked at compile time, so this is only reachable through a formatter
-/// error. It still says something: an empty body would look like a page with nothing on it.
-fn render_failed(err: askama::Error) -> String {
-    tracing::warn!("backoffice: a page failed to render: {err}");
-    format!("<h1>This page failed to render</h1><p>{err}</p>")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::{ReloadRequest, tests::a_config};
+    use serde_json::{Value, json};
+
+    const WETH_USDC: &str = "UPDATER_KEY_WETH_USDC";
+    /// A front end's origin, listed with `--backoffice-cors-origin` where a test says so.
+    const UI: &str = "http://ui.example:3000";
+    const USDC: &str = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
+    const USDT: &str = "0xdAC17F958D2ee523a2206206994597C13D831ec7";
 
     /// The kinds a test binary registers: the three shipped ones, and `skewed`, a kind with
-    /// no form fields, so its stanza is edited in the file.
+    /// no form fields, whose stanza is only written whole.
     fn test_kinds() -> Arc<crate::kinds::Kinds> {
         #[derive(Clone, serde::Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -2332,7 +1796,8 @@ mod tests {
                 &mut self,
                 tick: &crate::pricing::TickCtx,
                 _: &mut crate::pricing::Diagnostics,
-            ) -> Result<crate::pricing::PricerOutput, crate::pricing::Refusal> {
+            ) -> std::result::Result<crate::pricing::PricerOutput, crate::pricing::Refusal>
+            {
                 let market = tick.market()?;
                 Ok(crate::pricing::PricerOutput::new(market.delta, market.mid))
             }
@@ -2350,111 +1815,18 @@ mod tests {
         Arc::new(kinds)
     }
 
-    fn a_config() -> RawConfig {
-        toml::from_str(
-            r#"
-target = "0x1111111111111111111111111111111111111111"
-
-[[pairs]]
-tokens  = ["0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
-           "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"]
-symbol  = "ETHUSDC"
-key_env = "UPDATER_KEY_WETH_USDC"
-pricing = { kind = "feed" }
-
-[[builder]]
-name = "titan-eu"
-endpoint = "wss://eu.example/ws"
-api_key = "k"
-"#,
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn halting_keeps_the_pair_and_refuses_a_change_that_does_nothing() {
-        let mut config = a_config();
-        // Left behind by a hand edit: the page's own halt must not inherit it, or it would
-        // read as explained and the bulk restart would skip it.
-        config.pairs[0].halt_reason = Some("stale".to_owned());
-        set_halted(&mut config, Some("UPDATER_KEY_WETH_USDC"), true).unwrap();
-        assert_eq!(config.pairs.len(), 1, "a halt must not remove the pair");
-        assert!(config.pairs[0].halted);
-        assert_eq!(config.pairs[0].halt_reason, None);
-        assert!(set_halted(&mut config, Some("UPDATER_KEY_WETH_USDC"), true).is_err());
-        assert!(set_halted(&mut config, Some("NO_SUCH_KEY"), true).is_err());
-        set_halted(&mut config, None, false).unwrap();
-        assert!(!config.pairs[0].halted);
-        assert!(set_halted(&mut config, None, false).is_err());
-
-        // An explained halt is skipped by the bulk resume and cleared by its own.
-        config.pairs[0].halted = true;
-        config.pairs[0].halt_reason = Some("vault audit".to_owned());
-        assert!(set_halted(&mut config, None, false).is_err());
-        assert!(config.pairs[0].halted);
-        set_halted(&mut config, Some("UPDATER_KEY_WETH_USDC"), false).unwrap();
-        assert!(!config.pairs[0].halted);
-        assert_eq!(config.pairs[0].halt_reason, None);
-    }
-
-    #[test]
-    fn each_row_says_what_the_pusher_is_doing_with_the_pair() {
-        let mut config = a_config();
-        let key = "UPDATER_KEY_WETH_USDC".to_owned();
-        let states = PairStates::default();
-        let tripped = Arc::new(AtomicBool::new(false));
-        let page = |config: &RawConfig, states: &PairStates| {
-            render_index(
-                config,
-                Path::new("config.toml"),
-                &Banner {
-                    ok: None,
-                    err: None,
-                },
-                states,
-                &test_kinds(),
-            )
-        };
-
-        // In the file, no task: not running, and it can be halted.
-        let html = page(&config, &states);
-        assert!(
-            html.contains(r#"class="status idle">not running"#),
-            "{html}"
-        );
-        assert!(html.contains("action=/pairs/halt\n"), "{html}");
-
-        // Running and quoting.
-        states
-            .lock()
-            .unwrap()
-            .insert(key.clone(), Arc::clone(&tripped));
-        assert!(page(&config, &states).contains(r#"class="status live">live"#));
-
-        // Its breaker tripped: the task still exists but it is not quoting.
-        tripped.store(true, Ordering::SeqCst);
-        assert!(page(&config, &states).contains(r#"class="status halted">breaker tripped"#));
-
-        // Halted from the page wins over whatever is running, and offers Resume.
-        config.pairs[0].halted = true;
-        let html = page(&config, &states);
-        assert!(html.contains(r#"class="status halted">halted"#), "{html}");
-        assert!(html.contains("action=/pairs/resume"), "{html}");
-        assert!(!html.contains("action=/pairs/halt\n"), "{html}");
-    }
-
-    /// In its own directory, so the writer's temp-file-and-rename has somewhere to work.
-    /// A chain client for tests that never read the chain.
     fn test_client() -> ethrex_rpc::clients::eth::EthClient {
         ethrex_rpc::clients::eth::EthClient::new(url::Url::parse("http://127.0.0.1:1").unwrap())
             .unwrap()
     }
 
-    fn config_on_disk(
+    /// A shared config over a fresh file holding `a_config` as `edit` leaves it, and the
+    /// service end of its channel.
+    fn shared(
         name: &str,
+        edit: impl FnOnce(&mut RawConfig),
     ) -> (
-        PathBuf,
-        Backoffice,
+        Arc<SharedConfig>,
         tokio::sync::mpsc::Receiver<ReloadRequest>,
     ) {
         let dir = std::env::temp_dir().join(format!(
@@ -2464,151 +1836,188 @@ api_key = "k"
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
-        std::fs::write(&path, config::render_raw(&a_config()).unwrap()).unwrap();
-
+        let mut config = a_config();
+        edit(&mut config);
+        config::write_raw_atomically(&path, &config).unwrap();
         let (tx, rx) = tokio::sync::mpsc::channel(1);
-        let state = Backoffice {
-            states: PairStates::default(),
-            config_path: path.clone(),
-            reloads: tx,
-            client: test_client(),
-            rest: Arc::new(crate::discover::Rest::default()),
-            http: reqwest::Client::new(),
-            lookups: Arc::new(crate::discover::Cache::default()),
-            preview_pages: Arc::new(tokio::sync::Semaphore::new(PREVIEW_PAGES)),
-            edits: Arc::new(tokio::sync::Mutex::new(())),
-            kinds: test_kinds(),
-        };
-        (path, state, rx)
+        // No service here to retire a halted lane: the notice goes nowhere.
+        let (halts, _) = tokio::sync::mpsc::unbounded_channel();
+        (Arc::new(SharedConfig::new(path, config, tx, halts)), rx)
     }
 
-    /// The property the whole page rests on: a refused change leaves the file exactly as it
-    /// was, so what is on disk always describes what is running.
-    #[tokio::test]
-    async fn a_rejected_reload_puts_the_file_back() {
-        let (path, state, mut reloads) = config_on_disk("reject");
-        let before = std::fs::read_to_string(&path).unwrap();
-
-        let service = tokio::spawn(async move {
-            let request = reloads.recv().await.expect("a reload must be requested");
-            // What the service says when preflight fails on the new stanza.
-            let _ = request.reply.send(Err(ReloadFailure::Rejected(
-                "preflight failed for the new config".to_owned(),
-            )));
+    /// The service, answering every reload it is asked for with `verdict`. It keeps
+    /// nothing itself: the shared config does that on the verdict.
+    fn service(
+        mut requests: tokio::sync::mpsc::Receiver<ReloadRequest>,
+        verdict: std::result::Result<String, ReloadFailure>,
+    ) {
+        tokio::spawn(async move {
+            while let Some(request) = requests.recv().await {
+                let _ = request.reply.send(verdict.clone());
+            }
         });
+    }
 
-        let outcome = apply(
-            &state,
-            "100.64.0.9:1234".parse().unwrap(),
-            "added pair TEST",
-            |config| {
-                config.pairs.push(RawPair {
-                    tokens: vec!["0xaa".to_owned(), "0xbb".to_owned()],
-                    key_env: "UPDATER_KEY_TEST".to_owned(),
-                    symbol: Some("TESTUSDC".to_owned()),
-                    sources: Vec::new(),
-                    min_sources: None,
-                    max_source_lag_ms: None,
-                    max_source_divergence: None,
-                    min_mid: None,
-                    max_mid: None,
-                    max_deviation: None,
-                    max_deviation_window: None,
-                    max_deviation_window_blocks: None,
-                    allow_symbol_mismatch: false,
-                    halted: false,
-                    halt_reason: None,
-                    pricing: toml::from_str("kind = \"feed\"").unwrap(),
-                    guards: Vec::new(),
-                });
-                Ok(())
+    /// A backoffice on a free port over [`shared`], with a service answering `verdict`.
+    async fn serve(
+        name: &str,
+        edit: impl FnOnce(&mut RawConfig),
+        verdict: std::result::Result<String, ReloadFailure>,
+    ) -> (SocketAddr, Arc<SharedConfig>) {
+        serve_for(name, edit, verdict, &[]).await
+    }
+
+    /// [`serve`], answering CORS for `origins`.
+    async fn serve_for(
+        name: &str,
+        edit: impl FnOnce(&mut RawConfig),
+        verdict: std::result::Result<String, ReloadFailure>,
+        origins: &[String],
+    ) -> (SocketAddr, Arc<SharedConfig>) {
+        let (config, requests) = shared(name, edit);
+        service(requests, verdict);
+        let (local, _task) = bind(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::clone(&config),
+            test_client(),
+            PairStates::default(),
+            test_kinds(),
+            Access {
+                origins: origins.to_vec(),
+                ..Default::default()
             },
         )
-        .await;
-        service.await.unwrap();
-
-        assert!(!outcome.ok, "{}", outcome.message);
-        assert!(outcome.message.contains("put back"), "{}", outcome.message);
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            before,
-            "the file must be byte-identical to what it was before the rejected edit"
-        );
+        .await
+        .unwrap();
+        (local, config)
     }
 
-    /// A reload that applied in part (another pair's feed would not come up) keeps the edit:
-    /// it is live on every lane the reload reached, and putting the file back would have
-    /// the next reload undo it. The banner is not a success all the same, since a pair is
-    /// still on its previous config, and it says the file kept the change.
-    #[tokio::test]
-    async fn a_partly_applied_reload_keeps_the_edit_and_says_so() {
-        let (path, state, mut reloads) = config_on_disk("partial");
-
-        let service = tokio::spawn(async move {
-            let request = reloads.recv().await.expect("a reload must be requested");
-            let _ = request.reply.send(Err(ReloadFailure::Partial(
-                "reload: 1 halted, 1 failed — some pairs kept their previous config".to_owned(),
-            )));
-        });
-
-        let outcome = apply(
-            &state,
-            "100.64.0.9:1234".parse().unwrap(),
-            "halted pair UPDATER_KEY_WETH_USDC",
-            |config| set_halted(config, Some("UPDATER_KEY_WETH_USDC"), true),
-        )
-        .await;
-        service.await.unwrap();
-
-        assert!(!outcome.ok, "a partial apply is not a clean success");
-        assert!(
-            outcome.message.contains("keeps the change"),
-            "{}",
-            outcome.message
-        );
-        assert!(
-            !outcome.message.contains("nothing changed"),
-            "{}",
-            outcome.message
-        );
-        assert!(config::load_raw(&path).unwrap().pairs[0].halted);
+    fn accepted() -> std::result::Result<String, ReloadFailure> {
+        Ok("reload: 1 changed".to_owned())
     }
 
-    /// And an accepted one keeps the edit, at 0600, still loadable by the real parser.
-    #[tokio::test]
-    async fn an_accepted_reload_keeps_the_edit() {
-        let (path, state, mut reloads) = config_on_disk("accept");
-
-        let service = tokio::spawn(async move {
-            let request = reloads.recv().await.expect("a reload must be requested");
-            let _ = request.reply.send(Ok("reload: 1 added".to_owned()));
-        });
-
-        let outcome = apply(
-            &state,
-            "100.64.0.9:1234".parse().unwrap(),
-            "edited pair UPDATER_KEY_WETH_USDC",
-            |config| {
-                config.pairs[0].max_deviation = Some("0.02".to_owned());
-                Ok(())
-            },
+    /// A request as a client would send a change (`Content-Type: application/json`, no
+    /// `Origin`), through a real socket, so the routing, the guard, `ConnectInfo` and the
+    /// JSON wiring are exercised too. Answered with its status and its body.
+    async fn call(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        call_with(
+            addr,
+            method,
+            path,
+            body,
+            &[("content-type", "application/json")],
         )
-        .await;
-        service.await.unwrap();
+        .await
+    }
 
-        assert!(outcome.ok, "{}", outcome.message);
-        let written = config::load_raw(&path).unwrap();
-        assert_eq!(written.pairs[0].max_deviation.as_deref(), Some("0.02"));
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "the config holds builder API keys");
+    async fn call_with(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, Value) {
+        let mut request = reqwest::Client::new().request(
+            method.parse::<reqwest::Method>().unwrap(),
+            format!("http://{addr}{path}"),
+        );
+        for (name, value) in headers {
+            request = request.header(*name, *value);
         }
+        if let Some(body) = body {
+            request = request.body(body.to_string());
+        }
+        let response = request.send().await.unwrap();
+        let status = StatusCode::from_u16(response.status().as_u16()).unwrap();
+        let bytes = response.bytes().await.unwrap();
+        let body = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()))
+        };
+        (status, body)
     }
 
-    /// A page that rewrites the config, with no login, on whatever the host faces.
+    #[test]
+    fn halting_keeps_the_pair_and_refuses_a_change_that_does_nothing() {
+        let mut config = a_config();
+        // Left behind by a hand edit: the API's own halt must not inherit it, or it would
+        // read as explained and the bulk restart would skip it.
+        config.pairs[0].halt_reason = Some("stale".to_owned());
+        set_halted(&mut config, Some(WETH_USDC), true).unwrap();
+        assert_eq!(config.pairs.len(), 1, "a halt must not remove the pair");
+        assert!(config.pairs[0].halted);
+        assert_eq!(config.pairs[0].halt_reason, None);
+        let again = set_halted(&mut config, Some(WETH_USDC), true).unwrap_err();
+        assert_eq!(again.status, StatusCode::CONFLICT);
+        let missing = set_halted(&mut config, Some("NO_SUCH_KEY"), true).unwrap_err();
+        assert_eq!(missing.status, StatusCode::NOT_FOUND);
+        set_halted(&mut config, None, false).unwrap();
+        assert!(!config.pairs[0].halted);
+        assert!(set_halted(&mut config, None, false).is_err());
+
+        // An explained halt is skipped by the bulk resume and cleared by its own.
+        config.pairs[0].halted = true;
+        config.pairs[0].halt_reason = Some("vault audit".to_owned());
+        assert!(set_halted(&mut config, None, false).is_err());
+        assert!(config.pairs[0].halted);
+        set_halted(&mut config, Some(WETH_USDC), false).unwrap();
+        assert!(!config.pairs[0].halted);
+        assert_eq!(config.pairs[0].halt_reason, None);
+    }
+
+    /// Each pair says what the running pusher is doing with it, not only what the config
+    /// asks for.
+    #[tokio::test]
+    async fn each_pair_says_what_the_pusher_is_doing_with_it() {
+        let mut pair = a_config().pairs.remove(0);
+        assert_eq!(pair_status(&pair, None), PairStatus::NotRunning);
+        assert_eq!(pair_status(&pair, Some(false)), PairStatus::Live);
+        assert_eq!(pair_status(&pair, Some(true)), PairStatus::BreakerTripped);
+        pair.halted = true;
+        assert_eq!(
+            pair_status(&pair, Some(false)),
+            PairStatus::Halted,
+            "a halt in the config wins over whatever is running"
+        );
+
+        let (config, _requests) = shared("status", |_| {});
+        let states = PairStates::default();
+        let tripped = Arc::new(AtomicBool::new(false));
+        states
+            .lock()
+            .unwrap()
+            .insert(WETH_USDC.to_owned(), Arc::clone(&tripped));
+        let (local, _task) = bind(
+            "127.0.0.1:0".parse().unwrap(),
+            config,
+            test_client(),
+            states,
+            test_kinds(),
+            Access::default(),
+        )
+        .await
+        .unwrap();
+        let (status, pairs) = call(local, "GET", "/api/pairs", None).await;
+        assert_eq!(status, StatusCode::OK, "{pairs}");
+        assert_eq!(pairs[0]["status"], "live", "{pairs}");
+        assert_eq!(pairs[0]["pair"]["key_env"], WETH_USDC);
+        assert!(
+            pairs[0]["pricing"].as_str().unwrap().starts_with("feed"),
+            "the kind's summary of the stanza: {pairs}"
+        );
+        tripped.store(true, Ordering::SeqCst);
+        let (_, pair) = call(local, "GET", &format!("/api/pairs/{WETH_USDC}"), None).await;
+        assert_eq!(pair["status"], "breaker_tripped", "{pair}");
+    }
+
+    /// An API that rewrites the config, with no login, on whatever the host faces.
     #[tokio::test]
     async fn an_unspecified_bind_is_refused() {
         assert!(is_unspecified_bind("0.0.0.0:8088".parse().unwrap()));
@@ -2616,24 +2025,988 @@ api_key = "k"
         assert!(!is_unspecified_bind("127.0.0.1:8088".parse().unwrap()));
         assert!(!is_unspecified_bind("100.64.1.2:8088".parse().unwrap()));
 
-        let (_tx, rx) = tokio::sync::mpsc::channel(1);
-        drop(rx);
+        let (config, _requests) = shared("unspecified", |_| {});
         let err = bind(
             "0.0.0.0:0".parse().unwrap(),
-            PathBuf::from("config.toml"),
-            _tx,
+            config,
             test_client(),
             PairStates::default(),
-            std::sync::Arc::new(tokio::sync::Mutex::new(())),
             test_kinds(),
+            Access::default(),
         )
         .await
         .expect_err("an unspecified bind must be refused");
         assert!(format!("{err:#}").contains("tailnet"), "{err:#}");
     }
 
-    /// Through a socket rather than by calling handlers, so the routing, `ConnectInfo` and
-    /// `Form` wiring is exercised too.
+    /// The whole life of a pair through the API, each change kept in the shared config and
+    /// written to the file, and the stanza kept exactly as sent: a number stays a number.
+    #[tokio::test]
+    async fn a_pair_is_added_edited_halted_resumed_and_removed() {
+        let (local, config) = serve("crud", |_| {}, accepted()).await;
+        let key = "UPDATER_KEY_USDC_USDT";
+        let path = format!("/api/pairs/{key}");
+
+        let (status, body) = call(
+            local,
+            "POST",
+            "/api/pairs",
+            Some(json!({
+                "tokens": [USDC, USDT],
+                "key_env": key,
+                "sources": [
+                    {"venue": "binance", "symbol": "USDCUSDT"},
+                    {"venue": "kraken", "symbol": "USDC/USDT", "weight": "2"},
+                ],
+                "max_deviation": "0.02",
+                "pricing": {"kind": "skewed", "half_spread": 0.0005},
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["status"], "applied", "{body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("added pair {key}")),
+            "{body}"
+        );
+        let written = config::load_raw(config.path()).unwrap();
+        assert_eq!(written.pairs.len(), 2);
+        assert_eq!(
+            written.pairs[1].pricing.get("half_spread"),
+            Some(&toml::Value::Float(0.0005))
+        );
+        assert_eq!(written.pairs[1].sources[1].weight.as_deref(), Some("2"));
+        assert_eq!(config.snapshot().pairs[1], written.pairs[1]);
+
+        // What a GET shows is what a PUT takes back.
+        let (status, got) = call(local, "GET", &path, None).await;
+        assert_eq!(status, StatusCode::OK, "{got}");
+        assert_eq!(got["status"], "not_running");
+        let mut edited = got["pair"].clone();
+        edited["max_deviation"] = json!("0.05");
+        let (status, body) = call(local, "PUT", &path, Some(edited)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            config.snapshot().pairs[1].max_deviation.as_deref(),
+            Some("0.05")
+        );
+        assert_eq!(
+            config::load_raw(config.path()).unwrap().pairs[1]
+                .max_deviation
+                .as_deref(),
+            Some("0.05")
+        );
+
+        let (status, body) = call(local, "POST", &format!("{path}/halt"), None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(config.snapshot().pairs[1].halted);
+        assert!(config::load_raw(config.path()).unwrap().pairs[1].halted);
+        let (_, got) = call(local, "GET", &path, None).await;
+        assert_eq!(got["status"], "halted", "{got}");
+        let (status, body) = call(local, "POST", &format!("{path}/halt"), None).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a halt that does nothing: {body}"
+        );
+        let (status, body) = call(local, "POST", &format!("{path}/resume"), None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!config.snapshot().pairs[1].halted);
+
+        let (status, body) = call(local, "DELETE", &path, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(config.snapshot().pairs.len(), 1);
+        assert_eq!(config::load_raw(config.path()).unwrap().pairs.len(), 1);
+        let (status, _) = call(local, "GET", &path, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, body) = call(local, "DELETE", &path, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(body["error"].as_str().unwrap().contains(key), "{body}");
+    }
+
+    /// A change the service rejects answers 422 and changes nothing, in memory or on disk.
+    #[tokio::test]
+    async fn a_rejected_change_answers_422_and_changes_nothing() {
+        let (local, config) = serve(
+            "rejected",
+            |_| {},
+            Err(ReloadFailure::Rejected(
+                "preflight failed for the new config".to_owned(),
+            )),
+        )
+        .await;
+        let before = std::fs::read_to_string(config.path()).unwrap();
+
+        let (status, body) = call(local, "DELETE", &format!("/api/pairs/{WETH_USDC}"), None).await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        let error = body["error"].as_str().unwrap();
+        assert!(error.contains("preflight failed"), "{error}");
+        assert!(error.contains("nothing changed"), "{error}");
+        assert_eq!(std::fs::read_to_string(config.path()).unwrap(), before);
+        assert_eq!(config.snapshot().pairs.len(), 1);
+    }
+
+    /// One the service applied in part is kept, and says `partial` rather than `applied`.
+    #[tokio::test]
+    async fn a_partly_applied_change_is_kept_and_says_partial() {
+        let (local, config) = serve(
+            "partial",
+            |_| {},
+            Err(ReloadFailure::Partial(
+                "reload: 1 halted, 1 failed".to_owned(),
+            )),
+        )
+        .await;
+
+        let (status, body) = call(local, "DELETE", &format!("/api/pairs/{WETH_USDC}"), None).await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "partial", "{body}");
+        assert!(
+            body["message"].as_str().unwrap().contains("is kept"),
+            "{body}"
+        );
+        assert!(config.snapshot().pairs.is_empty());
+        assert!(config::load_raw(config.path()).unwrap().pairs.is_empty());
+    }
+
+    /// A halt is the kill switch, not a converged change (audit F-06): a service that would
+    /// reject every change, as one with a pair failing its checks does, is not asked, and
+    /// the halt is recorded in the config and the file all the same.
+    #[tokio::test]
+    async fn a_halt_is_not_refused_by_a_service_that_refuses_every_change() {
+        let (local, config) = serve(
+            "halt-not-refused",
+            |_| {},
+            Err(ReloadFailure::Rejected(
+                "preflight failed: another pair is not authorized".to_owned(),
+            )),
+        )
+        .await;
+
+        let (status, body) =
+            call(local, "POST", &format!("/api/pairs/{WETH_USDC}/halt"), None).await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "applied", "{body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("withdrawn at every builder"),
+            "{body}"
+        );
+        assert!(config.snapshot().pairs[0].halted);
+        assert!(config::load_raw(config.path()).unwrap().pairs[0].halted);
+        let (status, _) = call(local, "POST", &format!("/api/pairs/{WETH_USDC}/halt"), None).await;
+        assert_eq!(status, StatusCode::CONFLICT, "already halted");
+    }
+
+    /// A change that could not be made through no fault of its own (here, a pusher that is
+    /// stopping) is a 500, apart from the 422 of a change to fix, and leaves everything as
+    /// it was.
+    #[tokio::test]
+    async fn a_fault_on_this_side_is_a_500_and_not_the_changes_mistake() {
+        let (local, config) = serve(
+            "fault",
+            |_| {},
+            Err(ReloadFailure::Fault("the pusher is stopping".to_owned())),
+        )
+        .await;
+        let before = std::fs::read_to_string(config.path()).unwrap();
+
+        let (status, body) = call(local, "DELETE", &format!("/api/pairs/{WETH_USDC}"), None).await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        let error = body["error"].as_str().unwrap();
+        assert!(error.contains("the pusher is stopping"), "{error}");
+        assert_eq!(std::fs::read_to_string(config.path()).unwrap(), before);
+        assert_eq!(config.snapshot().pairs.len(), 1);
+    }
+
+    /// A lookup that could not be made (here, no node to read the tokens' names from)
+    /// answers an error status and `{"error"}`, like everything else this API refuses, and
+    /// not a 200 to be opened.
+    #[tokio::test]
+    async fn a_lookup_that_cannot_be_made_is_an_error_and_not_a_200() {
+        let (local, _config) = serve("lookup-fails", |_| {}, accepted()).await;
+
+        let (status, body) = call(
+            local,
+            "GET",
+            &format!("/api/lookup?token0={USDC}&token1={USDT}"),
+            None,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("symbol()"),
+            "{body}"
+        );
+        assert!(body.get("ok").is_none(), "{body}");
+    }
+
+    /// The guard: a change only as JSON, and never from another site's page, whatever its
+    /// method. A read is answered to anyone; a browser keeps another site's page from
+    /// reading the answer.
+    #[tokio::test]
+    async fn a_change_is_taken_only_as_json_and_from_no_other_site() {
+        let (local, config) = serve("guard", |_| {}, accepted()).await;
+        let halt = format!("/api/pairs/{WETH_USDC}/halt");
+        let pair = format!("/api/pairs/{WETH_USDC}");
+
+        // What a form on another site posts: no JSON.
+        for headers in [
+            &[][..],
+            &[("content-type", "application/x-www-form-urlencoded")][..],
+            &[("content-type", "text/plain")][..],
+        ] {
+            let (status, body) = call_with(local, "POST", &halt, None, headers).await;
+            assert_eq!(
+                status,
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "{headers:?}: {body}"
+            );
+        }
+        // Another site's page, by any method.
+        let evil = [
+            ("content-type", "application/json"),
+            ("origin", "https://evil.example"),
+        ];
+        for (method, path) in [("POST", &halt), ("DELETE", &pair), ("PUT", &pair)] {
+            let (status, body) = call_with(local, method, path, Some(json!({})), &evil).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}: {body}");
+        }
+        assert_eq!(config.snapshot().pairs.len(), 1);
+        assert!(!config.snapshot().pairs[0].halted, "nothing was changed");
+
+        // A read, from anywhere.
+        let (status, _) = call_with(local, "GET", "/api/pairs", None, &evil).await;
+        assert_eq!(status, StatusCode::OK);
+        // A page served under this address, as through a proxy that serves a front end
+        // beside the API.
+        let own = format!("http://{local}");
+        let (status, body) = call_with(
+            local,
+            "POST",
+            &halt,
+            None,
+            &[
+                ("content-type", "application/json; charset=utf-8"),
+                ("origin", &own),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(config.snapshot().pairs[0].halted);
+    }
+
+    /// `--backoffice-cors-origin` is written as a browser writes `Origin`, so a listed one
+    /// matches byte for byte; anything that would answer for every page is refused.
+    #[test]
+    fn cors_origins_are_written_as_a_browser_sends_them() {
+        let parsed = parse_origins(&[
+            "HTTP://UI.Example:3000/".to_owned(),
+            " https://ui.example:443 ".to_owned(),
+            "http://[::1]:5173".to_owned(),
+            String::new(),
+        ])
+        .unwrap();
+        assert_eq!(
+            parsed,
+            [
+                "http://ui.example:3000",
+                "https://ui.example",
+                "http://[::1]:5173"
+            ]
+        );
+        for refused in [
+            "*",
+            "null",
+            "ui.example:3000",
+            "http://ui.example/app",
+            "http://ui.example?x=1",
+            "ftp://ui.example",
+            "http://user@ui.example",
+        ] {
+            let err = parse_origins(&[refused.to_owned()]).expect_err(refused);
+            let err = format!("{err:#}");
+            assert!(err.contains("origin"), "{refused}: {err}");
+        }
+    }
+
+    /// The CORS answers: a listed origin's preflight is approved for what the API takes,
+    /// its change is applied and its page may read the answer. Any other origin gets no
+    /// approval, and its change is still refused by the guard.
+    #[tokio::test]
+    async fn a_listed_origin_is_answered_with_cors_and_its_change_is_taken() {
+        let (local, config) = serve_for("cors", |_| {}, accepted(), &[UI.to_owned()]).await;
+        let halt = format!("http://{local}/api/pairs/{WETH_USDC}/halt");
+        let client = reqwest::Client::new();
+        let allow_origin = |response: &reqwest::Response| {
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .map(|value| value.to_str().unwrap().to_owned())
+        };
+        let preflight = |origin: &'static str| {
+            client
+                .request(reqwest::Method::OPTIONS, &halt)
+                .header("origin", origin)
+                .header("access-control-request-method", "POST")
+                .header("access-control-request-headers", "content-type")
+                .send()
+        };
+
+        let approved = preflight(UI).await.unwrap();
+        assert!(approved.status().is_success(), "{}", approved.status());
+        assert_eq!(allow_origin(&approved).as_deref(), Some(UI));
+        let methods = approved
+            .headers()
+            .get("access-control-allow-methods")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        for method in ["GET", "POST", "PUT", "DELETE"] {
+            assert!(methods.contains(method), "{methods}");
+        }
+        let not_listed = preflight("https://evil.example").await.unwrap();
+        assert_eq!(allow_origin(&not_listed), None);
+
+        let evil = client
+            .post(&halt)
+            .header("origin", "https://evil.example")
+            .header("content-type", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(evil.status().as_u16(), 403);
+        assert_eq!(allow_origin(&evil), None);
+        assert!(!config.snapshot().pairs[0].halted);
+
+        let taken = client
+            .post(&halt)
+            .header("origin", UI)
+            .header("content-type", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(taken.status().as_u16(), 200);
+        assert_eq!(allow_origin(&taken).as_deref(), Some(UI));
+        assert!(config.snapshot().pairs[0].halted);
+        // Still JSON only: a listed origin's form post is no more welcome than anyone's.
+        let form = client
+            .post(format!("http://{local}/api/pairs/{WETH_USDC}/resume"))
+            .header("origin", UI)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(form.status().as_u16(), 415);
+
+        // With no origin listed there is no CORS at all.
+        let (plain, _) = serve("no-cors", |_| {}, accepted()).await;
+        let unanswered = client
+            .request(
+                reqwest::Method::OPTIONS,
+                format!("http://{plain}/api/pairs"),
+            )
+            .header("origin", UI)
+            .header("access-control-request-method", "POST")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(allow_origin(&unanswered), None);
+    }
+
+    /// A client that takes any certificate, keeps the one it was given, and opens a new
+    /// connection for every request, so a renewed certificate is the one it sees next.
+    fn https_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .tls_info(true)
+            .pool_max_idle_per_host(0)
+            .build()
+            .unwrap()
+    }
+
+    /// The status of a `GET` of `url`, and the certificate the server presented for it.
+    async fn presented(client: &reqwest::Client, url: &str) -> (u16, Vec<u8>) {
+        let response = client.get(url).send().await.unwrap();
+        let certificate = response
+            .extensions()
+            .get::<reqwest::tls::TlsInfo>()
+            .and_then(|info| info.peer_certificate())
+            .expect("an HTTPS answer carries the server's certificate")
+            .to_vec();
+        (response.status().as_u16(), certificate)
+    }
+
+    /// With a certificate the API is HTTPS: it presents that certificate, takes a change
+    /// (the peer's address still reaching the guard and the log), turns plain HTTP away
+    /// without falling over, and presents a renewed certificate once its files change.
+    #[tokio::test]
+    async fn the_api_is_served_over_https_and_a_renewal_is_picked_up() {
+        use crate::tls::tests::{fixture, leaf};
+        let dir = std::env::temp_dir().join(format!(
+            "quote-updater-backoffice-certificate-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (cert, key) = (dir.join("server.crt"), dir.join("server.key"));
+        std::fs::copy(fixture("a.crt"), &cert).unwrap();
+        std::fs::copy(fixture("a.key"), &key).unwrap();
+        let (config, requests) = shared("https", |_| {});
+        service(requests, accepted());
+        let (local, _task) = bind(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::clone(&config),
+            test_client(),
+            PairStates::default(),
+            test_kinds(),
+            Access {
+                tls: Some(crate::tls::Tls::load(&cert, &key).unwrap()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let client = https_client();
+        let pairs = format!("https://{local}/api/pairs");
+
+        let (status, certificate) = presented(&client, &pairs).await;
+        assert_eq!(status, 200);
+        assert_eq!(certificate, leaf("a.crt"));
+
+        let halted = client
+            .post(format!("https://{local}/api/pairs/{WETH_USDC}/halt"))
+            .header("content-type", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(halted.status().as_u16(), 200);
+        assert!(config.snapshot().pairs[0].halted);
+
+        assert!(
+            reqwest::get(format!("http://{local}/api/pairs"))
+                .await
+                .is_err(),
+            "plain HTTP is not answered on the HTTPS port"
+        );
+        assert_eq!(presented(&client, &pairs).await.0, 200, "and still serves");
+
+        std::fs::copy(fixture("b.crt"), &cert).unwrap();
+        std::fs::copy(fixture("b.key"), &key).unwrap();
+        let (status, renewed) = presented(&client, &pairs).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            renewed,
+            leaf("b.crt"),
+            "the renewed certificate, with no restart"
+        );
+    }
+
+    /// `--backoffice-host` is a bare name, as a `Host` header carries it without its port.
+    #[test]
+    fn backoffice_hosts_are_bare_names() {
+        assert_eq!(
+            parse_hosts(&[
+                "Pusher.Example.ts.net.".to_owned(),
+                " ".to_owned(),
+                "ui_1.example".to_owned(),
+            ])
+            .unwrap(),
+            ["pusher.example.ts.net", "ui_1.example"]
+        );
+        for refused in [
+            "https://pusher.example",
+            "pusher.example:8088",
+            "pusher.example/api",
+            "*",
+            "*.example",
+            "a..b",
+            "[::1]",
+        ] {
+            let err = format!("{:#}", parse_hosts(&[refused.to_owned()]).unwrap_err());
+            assert!(err.contains("not a hostname"), "{refused}: {err}");
+        }
+    }
+
+    /// Answered: an IP address, `localhost`, a listed name, in any case, with or without its
+    /// port or a trailing dot. Not: any other name, a listed name inside a longer one, or
+    /// no name at all.
+    #[test]
+    fn only_an_ip_localhost_or_a_listed_name_is_answered() {
+        let allowed = |host: Option<&str>, uri: &str| {
+            let mut headers = axum::http::HeaderMap::new();
+            if let Some(host) = host {
+                headers.insert("host", host.parse().unwrap());
+            }
+            host_allowed(
+                &headers,
+                &uri.parse().unwrap(),
+                &["pusher.example.ts.net".to_owned()],
+            )
+        };
+        for answered in [
+            "100.64.1.2:8088",
+            "127.0.0.1",
+            "[::1]:8088",
+            "localhost:8088",
+            "LOCALHOST",
+            "pusher.example.ts.net:8088",
+            "Pusher.Example.TS.net",
+            "pusher.example.ts.net.:8088",
+        ] {
+            assert!(allowed(Some(answered), "/api/pairs"), "{answered}");
+        }
+        for refused in [
+            "evil.example:8088",
+            "pusher.example.ts.net.evil.example",
+            "localhost.evil.example",
+            "100.64.1.2.nip.io",
+            "",
+        ] {
+            assert!(!allowed(Some(refused), "/api/pairs"), "{refused}");
+        }
+        assert!(!allowed(None, "/api/pairs"), "no name at all");
+        assert!(
+            allowed(None, "http://pusher.example.ts.net:8088/api/pairs"),
+            "the request line's own authority stands in for a missing Host"
+        );
+    }
+
+    /// DNS rebinding as the backoffice sees it: its own routes, asked by a page whose name
+    /// was pointed at this host, so `Host` and `Origin` both carry that name. Refused, reads
+    /// (which would hand over the settings) and changes alike, the preview too. A listed
+    /// name, and an IP address, are answered.
+    #[tokio::test]
+    async fn a_request_addressed_to_another_name_is_refused() {
+        let (config, requests) = shared("hosts", |_| {});
+        service(requests, accepted());
+        let (local, _task) = bind(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::clone(&config),
+            test_client(),
+            PairStates::default(),
+            test_kinds(),
+            Access {
+                hosts: vec!["Pusher.Example.ts.net".to_owned()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let halt = format!("/api/pairs/{WETH_USDC}/halt");
+        let rebound = [
+            ("host", "evil.example:8088"),
+            ("origin", "http://evil.example:8088"),
+            ("content-type", "application/json"),
+        ];
+
+        let (status, body) = call_with(local, "GET", "/api/settings", None, &rebound).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("--backoffice-host"),
+            "{body}"
+        );
+        let (status, body) = call_with(local, "POST", &halt, None, &rebound).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(!config.snapshot().pairs[0].halted, "nothing changed");
+        let preview = http(
+            local,
+            "GET /api/preview?token0=0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2\
+             &token1=0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 HTTP/1.1\r\n\
+             Host: evil.example:8088\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(preview.starts_with("HTTP/1.1 403"), "{preview}");
+
+        // The listed name, as a page served under it sends it.
+        let named = [
+            ("host", "pusher.example.ts.net:8088"),
+            ("origin", "http://pusher.example.ts.net:8088"),
+            ("content-type", "application/json"),
+        ];
+        let (status, body) = call_with(local, "POST", &halt, None, &named).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(config.snapshot().pairs[0].halted);
+        // And an IP address, which needs no listing.
+        let (status, body) = call(local, "GET", "/api/pairs", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// Audit F-17: a pair halted on its breaker comes back only through its own re-arm, which
+    /// the service is asked for by lane, with the config as it is. A pair that is not
+    /// tripped, one halted rather than tripped, and one that is not there are refused
+    /// before anything is asked; and `POST /api/reload` names the tripped pairs it leaves.
+    #[tokio::test]
+    async fn a_tripped_pair_is_re_armed_by_its_own_route_alone() {
+        let (config, mut requests) = shared("rearm", |config| {
+            let mut halted = config.pairs[0].clone();
+            halted.tokens = vec![USDC.to_owned(), USDT.to_owned()];
+            halted.key_env = "UPDATER_KEY_USDC_USDT".to_owned();
+            halted.halted = true;
+            config.pairs.push(halted);
+        });
+        let states = PairStates::default();
+        let tripped = Arc::new(AtomicBool::new(false));
+        states
+            .lock()
+            .unwrap()
+            .insert(WETH_USDC.to_owned(), Arc::clone(&tripped));
+        let (local, _task) = bind(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::clone(&config),
+            test_client(),
+            states,
+            test_kinds(),
+            Access::default(),
+        )
+        .await
+        .unwrap();
+        let rearm = format!("/api/pairs/{WETH_USDC}/rearm");
+
+        let (status, body) = call(local, "POST", &rearm, None).await;
+        assert_eq!(status, StatusCode::CONFLICT, "not tripped: {body}");
+        let (status, body) = call(
+            local,
+            "POST",
+            "/api/pairs/UPDATER_KEY_USDC_USDT/rearm",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "halted, not tripped: {body}");
+        assert!(body["error"].as_str().unwrap().contains("resume"), "{body}");
+        let (status, _) = call(local, "POST", "/api/pairs/NO_SUCH_KEY/rearm", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            requests.try_recv().is_err(),
+            "nothing was asked of the service"
+        );
+
+        tripped.store(true, Ordering::SeqCst);
+        // A reload leaves it, and says so.
+        let service = tokio::spawn(async move {
+            let reload = requests.recv().await.unwrap();
+            assert!(reload.rearm.is_empty(), "a reload re-arms nothing");
+            let _ = reload.reply.send(Ok(
+                "reload: the config matches what is running; nothing to do".to_owned(),
+            ));
+            let rearm = requests.recv().await.unwrap();
+            let _ = rearm.reply.send(Ok(
+                "reload: 1 restarted; [WETH/USDC] re-armed, trusting mid 2500".to_owned(),
+            ));
+            rearm.rearm
+        });
+        let (status, body) = call(local, "POST", "/api/reload", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let message = body["message"].as_str().unwrap();
+        assert!(
+            message.contains("Left halted on their circuit breaker") && message.contains(WETH_USDC),
+            "{message}"
+        );
+
+        let (status, body) = call(local, "POST", &rearm, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("trusting mid 2500"),
+            "{body}"
+        );
+        let lanes = service.await.unwrap();
+        let weth: crate::Address = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+            .parse()
+            .unwrap();
+        let usdc: crate::Address = USDC.parse().unwrap();
+        assert_eq!(lanes, [config::lane_of(weth.min(usdc), weth.max(usdc))]);
+    }
+
+    /// An edit replaces the stanza and nothing that makes the pair what it is: not its key,
+    /// not its tokens, and not its halt, which only the halt and resume routes change.
+    #[tokio::test]
+    async fn an_edit_keeps_the_pairs_identity_and_its_halt() {
+        let (local, config) = serve(
+            "identity",
+            |config| {
+                crate::updater::halt_line(&mut config.pairs[0], "vault audit").unwrap();
+            },
+            accepted(),
+        )
+        .await;
+        let path = format!("/api/pairs/{WETH_USDC}");
+        let (_, got) = call(local, "GET", &path, None).await;
+        let pair = got["pair"].clone();
+        assert_eq!(pair["halted"], true, "{pair}");
+
+        let mut other_key = pair.clone();
+        other_key["key_env"] = json!("UPDATER_KEY_OTHER");
+        let (status, body) = call(local, "PUT", &path, Some(other_key)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+        let mut swapped = pair.clone();
+        swapped["tokens"] = json!([pair["tokens"][1], pair["tokens"][0]]);
+        let (status, body) = call(local, "PUT", &path, Some(swapped)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+        // A halt is not lifted by an edit that leaves the flag out.
+        let mut unhalted = pair.clone();
+        unhalted.as_object_mut().unwrap().remove("halted");
+        unhalted.as_object_mut().unwrap().remove("halt_reason");
+        let (status, body) = call(local, "PUT", &path, Some(unhalted)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+        // A misspelt key is refused by name rather than dropped.
+        let mut typo = pair.clone();
+        typo["max_deviaton"] = json!("0.02");
+        let (status, body) = call(local, "PUT", &path, Some(typo)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("max_deviaton"),
+            "{body}"
+        );
+
+        let mut missing = pair.clone();
+        missing["key_env"] = json!("NO_SUCH_KEY");
+        let (status, body) = call(local, "PUT", "/api/pairs/NO_SUCH_KEY", Some(missing)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+        assert_eq!(
+            config.snapshot().pairs[0].max_deviation,
+            None,
+            "nothing changed"
+        );
+
+        let mut fine = pair.clone();
+        fine["max_deviation"] = json!("0.03");
+        let (status, body) = call(local, "PUT", &path, Some(fine)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let now = &config.snapshot().pairs[0];
+        assert_eq!(now.max_deviation.as_deref(), Some("0.03"));
+        assert!(now.halted, "the halt stays");
+        assert_eq!(now.halt_reason.as_deref(), Some("vault audit"));
+
+        // And a pair is added quoting, never halted.
+        let mut halted = pair.clone();
+        halted["key_env"] = json!("UPDATER_KEY_NEW");
+        halted["tokens"] = json!([USDC, USDT]);
+        let (status, body) = call(local, "POST", "/api/pairs", Some(halted)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    }
+
+    /// A key or a builder name already in use is a conflict, and nothing is written.
+    #[tokio::test]
+    async fn a_taken_key_or_builder_name_is_a_conflict() {
+        let (local, config) = serve("taken", |_| {}, accepted()).await;
+        let mut pair = serde_json::to_value(&a_config().pairs[0]).unwrap();
+        pair["tokens"] = json!([USDC, USDT]);
+        let (status, body) = call(local, "POST", "/api/pairs", Some(pair)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("nonce"), "{body}");
+
+        let builder =
+            json!({"name": "titan-eu", "endpoint": "wss://us.example/ws", "api_key": "k2"});
+        let (status, body) = call(local, "POST", "/api/builders", Some(builder)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+        let (status, body) = call(local, "DELETE", "/api/builders/nobody", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(config.snapshot().pairs.len(), 1);
+        assert_eq!(config.snapshot().builders.len(), 1);
+    }
+
+    /// A builder's API key goes in and never comes out: no answer carries one.
+    #[tokio::test]
+    async fn no_answer_carries_a_builder_api_key() {
+        let (local, config) = serve(
+            "secrets",
+            |config| config.builders[0].api_key = "sekrit-one".to_owned(),
+            accepted(),
+        )
+        .await;
+        let (status, body) = call(
+            local,
+            "POST",
+            "/api/builders",
+            Some(json!({
+                "name": "titan-us",
+                "endpoint": "wss://us.example/ws",
+                "api_key": "sekrit-two",
+                "disable_cross_region": true,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert!(!body.to_string().contains("sekrit"), "{body}");
+        assert_eq!(config.snapshot().builders[1].api_key, "sekrit-two");
+
+        let mut answers = String::new();
+        for path in ["/api/builders", "/api/settings", "/api/pairs", "/api/kinds"] {
+            let (status, body) = call(local, "GET", path, None).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+            answers.push_str(&body.to_string());
+        }
+        assert!(!answers.contains("sekrit"), "{answers}");
+        let (_, builders) = call(local, "GET", "/api/builders", None).await;
+        assert_eq!(builders[1]["name"], "titan-us");
+        assert_eq!(builders[1]["disable_cross_region"], true);
+
+        let (status, body) = call(local, "DELETE", "/api/builders/titan-us", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(config.snapshot().builders.len(), 1);
+    }
+
+    /// A halt a binary's handle set is its kill switch: the bulk restart brings back what
+    /// was halted through the API and leaves that one halted, saying which and why. That
+    /// pair's own resume still clears it.
+    #[tokio::test]
+    async fn restarting_halted_pairs_leaves_a_handle_halt_alone() {
+        let (local, config) = serve(
+            "kill-switch",
+            |config| {
+                let mut second = config.pairs[0].clone();
+                second.tokens = vec![USDC.to_owned(), USDT.to_owned()];
+                second.symbol = Some("USDCUSDT".to_owned());
+                second.key_env = "UPDATER_KEY_USDC_USDT".to_owned();
+                config.pairs.push(second);
+                // The first, halted exactly as `UpdaterHandle::halt` writes it.
+                crate::updater::halt_line(&mut config.pairs[0], "vault audit").unwrap();
+            },
+            accepted(),
+        )
+        .await;
+
+        let (status, body) =
+            call(local, "POST", "/api/pairs/UPDATER_KEY_USDC_USDT/halt", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = call(local, "POST", "/api/reload", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "applied", "{body}");
+
+        let now = config.snapshot();
+        assert!(
+            now.pairs[0].halted,
+            "the handle's halt survives the bulk restart"
+        );
+        assert_eq!(now.pairs[0].halt_reason.as_deref(), Some("vault audit"));
+        assert!(!now.pairs[1].halted, "the API's own halt is restarted");
+        let message = body["message"].as_str().unwrap();
+        assert!(
+            message.contains(WETH_USDC) && message.contains("vault audit"),
+            "the answer says which pair it left halted, and why: {message}"
+        );
+        assert_eq!(config::load_raw(config.path()).unwrap().pairs, now.pairs);
+
+        // Again with only the handle's halt left: nothing to restart, and it says why that
+        // pair is still down rather than "nothing was halted".
+        let (status, body) = call(local, "POST", "/api/reload", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let message = body["message"].as_str().unwrap();
+        assert!(message.contains(WETH_USDC), "{message}");
+        assert!(!message.contains("nothing was halted"), "{message}");
+        assert!(config.snapshot().pairs[0].halted);
+
+        let (status, body) = call(
+            local,
+            "POST",
+            &format!("/api/pairs/{WETH_USDC}/resume"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            !config.snapshot().pairs[0].halted,
+            "its own resume clears it"
+        );
+        assert_eq!(config.snapshot().pairs[0].halt_reason, None);
+    }
+
+    /// `[settings]` are shown and never changed: each is read once, at start.
+    #[tokio::test]
+    async fn settings_are_shown_and_not_changed() {
+        let (local, config) = serve(
+            "settings",
+            |config| config.settings.requote_ms = Some(50),
+            accepted(),
+        )
+        .await;
+        let (status, body) = call(local, "GET", "/api/settings", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["settings"]["requote_ms"], 50, "{body}");
+        assert_eq!(body["target"], a_config().target);
+        assert_eq!(
+            body["config_path"],
+            config.path().display().to_string(),
+            "{body}"
+        );
+        for method in ["PUT", "POST"] {
+            let (status, _) = call(
+                local,
+                method,
+                "/api/settings",
+                Some(json!({"requote_ms": 25})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{method}");
+        }
+        assert_eq!(config.snapshot().settings.requote_ms, Some(50));
+    }
+
+    /// What a front end needs to draw a pair form: the kinds with their fields, and the
+    /// venues with how each spells a market.
+    #[tokio::test]
+    async fn the_kinds_and_the_venues_are_listed() {
+        let (local, _config) = serve("lists", |_| {}, accepted()).await;
+        let (status, kinds) = call(local, "GET", "/api/kinds", None).await;
+        assert_eq!(status, StatusCode::OK, "{kinds}");
+        let kind = |name: &str| {
+            kinds
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|kind| kind["kind"] == name)
+                .unwrap_or_else(|| panic!("{name} in {kinds}"))
+                .clone()
+        };
+        let fixed = kind("fixed");
+        assert!(
+            fixed["fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field["name"] == "mid"),
+            "{fixed}"
+        );
+        assert!(!fixed["help_html"].as_str().unwrap().is_empty());
+        assert_eq!(
+            kind("skewed")["fields"],
+            json!([]),
+            "a kind with no form fields"
+        );
+
+        let (status, venues) = call(local, "GET", "/api/venues", None).await;
+        assert_eq!(status, StatusCode::OK, "{venues}");
+        assert_eq!(venues.as_array().unwrap().len(), VenueId::ALL.len());
+        assert_eq!(venues[0]["venue"], "binance");
+        assert_eq!(venues[0]["example"], "ETHUSDC");
+
+        let (status, body) = call(local, "GET", "/", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "no pages are served: {body}");
+        assert!(body["error"].as_str().unwrap().contains("/api"), "{body}");
+    }
+
+    /// Through a socket, for the tests that read the raw answer.
     async fn http(addr: SocketAddr, request: &str) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -2644,468 +3017,9 @@ api_key = "k"
         String::from_utf8_lossy(&response).into_owned()
     }
 
-    /// The page renders over a real socket, and a real form post reaches a handler and
-    /// comes back as the redirect the browser needs.
-    #[tokio::test]
-    async fn the_page_serves_and_a_form_post_reaches_its_handler() {
-        let (path, state, mut reloads) = config_on_disk("http");
-        let (local, _task) = bind(
-            "127.0.0.1:0".parse().unwrap(),
-            path.clone(),
-            state.reloads.clone(),
-            test_client(),
-            PairStates::default(),
-            std::sync::Arc::new(tokio::sync::Mutex::new(())),
-            test_kinds(),
-        )
-        .await
-        .unwrap();
-
-        let page = http(
-            local,
-            "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
-        )
-        .await;
-        assert!(page.contains("200 OK"), "{page}");
-        assert!(page.contains("UPDATER_KEY_WETH_USDC"), "{page}");
-        assert!(page.contains("titan-eu"), "{page}");
-        assert!(page.contains("/pairs/edit/UPDATER_KEY_WETH_USDC"), "{page}");
-
-        let service = tokio::spawn(async move {
-            let request = reloads.recv().await.expect("a reload must be requested");
-            let _ = request.reply.send(Ok("reload: 1 restarted".to_owned()));
-        });
-
-        let body = "key_env=UPDATER_KEY_WETH_USDC&symbol=ETHUSDC&pricing=feed\
-                    &pricing_feed_delta=0.0005&pricing_fixed_mid=&pricing_fixed_delta=\
-                    &min_mid=&max_mid=&max_deviation=0.02&max_deviation_window=0.20\
-                    &max_deviation_window_blocks=1000&pricing_volatile_gamma=";
-        let posted = http(
-            local,
-            &format!(
-                "POST /pairs/edit HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\
-                 Content-Type: application/x-www-form-urlencoded\r\n\
-                 Content-Length: {}\r\n\r\n{body}",
-                body.len()
-            ),
-        )
-        .await;
-        service.await.unwrap();
-
-        assert!(posted.contains("303 See Other"), "{posted}");
-        assert!(posted.contains("location: /?ok="), "{posted}");
-
-        // And the edit is on disk, which is the only thing that actually matters.
-        let written = config::load_raw(&path).unwrap();
-        assert_eq!(
-            written.pairs[0].pricing.get("delta"),
-            Some(&toml::Value::String("0.0005".to_owned()))
-        );
-        assert_eq!(
-            written.pairs[0].pricing.get("kind"),
-            Some(&toml::Value::String("feed".to_owned()))
-        );
-        assert_eq!(written.pairs[0].max_deviation.as_deref(), Some("0.02"));
-        assert_eq!(
-            written.pairs[0].max_deviation_window.as_deref(),
-            Some("0.20")
-        );
-        assert_eq!(
-            written.pairs[0].max_deviation_window_blocks.as_deref(),
-            Some("1000")
-        );
-        // An empty form field is an absent key, not an empty string; another kind's
-        // inputs, blank or not, are not the chosen kind's.
-        assert_eq!(written.pairs[0].min_mid, None);
-        assert_eq!(written.pairs[0].pricing.get("mid"), None);
-        assert_eq!(written.pairs[0].pricing.get("gamma"), None);
-    }
-
-    /// A POST of `body` to `route`, through the socket, answered with the banner the page
-    /// would show: the redirect's message, decoded, and whether it was the ok kind.
-    async fn post(addr: SocketAddr, route: &str, body: &str) -> (bool, String) {
-        let response = http(
-            addr,
-            &format!(
-                "POST {route} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\
-                 Content-Type: application/x-www-form-urlencoded\r\n\
-                 Content-Length: {}\r\n\r\n{body}",
-                body.len()
-            ),
-        )
-        .await;
-        let location = response
-            .lines()
-            .find_map(|line| line.strip_prefix("location: /?"))
-            .unwrap_or_else(|| panic!("no redirect in {response}"));
-        let (kind, message) = location.split_once('=').expect("kind=message");
-        (kind == "ok", urldecode(message.trim()))
-    }
-
-    /// A halt a binary's handle set is its kill switch: "Restart halted pairs" brings back
-    /// what was halted from this page and leaves that one halted, saying which and why.
-    /// That pair's own Resume still clears it.
-    #[tokio::test]
-    async fn restarting_halted_pairs_leaves_a_handle_halt_alone() {
-        let (path, state, mut reloads) = config_on_disk("kill-switch");
-        let mut config = a_config();
-        let mut second = config.pairs[0].clone();
-        second.tokens = vec![
-            "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_owned(),
-            "0xdAC17F958D2ee523a2206206994597C13D831ec7".to_owned(),
-        ];
-        second.symbol = Some("USDCUSDT".to_owned());
-        second.key_env = "UPDATER_KEY_USDC_USDT".to_owned();
-        config.pairs.push(second);
-        // The first, halted exactly as `UpdaterHandle::halt` writes it.
-        crate::updater::halt_line(&mut config.pairs[0], "vault audit").unwrap();
-        std::fs::write(&path, config::render_raw(&config).unwrap()).unwrap();
-        let (local, _task) = bind(
-            "127.0.0.1:0".parse().unwrap(),
-            path.clone(),
-            state.reloads.clone(),
-            test_client(),
-            PairStates::default(),
-            std::sync::Arc::new(tokio::sync::Mutex::new(())),
-            test_kinds(),
-        )
-        .await
-        .unwrap();
-        // The service, accepting every reload it is asked for.
-        tokio::spawn(async move {
-            while let Some(request) = reloads.recv().await {
-                let _ = request.reply.send(Ok("reload: 1 changed".to_owned()));
-            }
-        });
-
-        let (ok, banner) = post(local, "/pairs/halt", "key_env=UPDATER_KEY_USDC_USDT").await;
-        assert!(ok, "{banner}");
-        let (ok, banner) = post(local, "/reload", "").await;
-        assert!(ok, "{banner}");
-
-        let written = config::load_raw(&path).unwrap();
-        assert!(
-            written.pairs[0].halted,
-            "the handle's halt survives the bulk restart"
-        );
-        assert_eq!(written.pairs[0].halt_reason.as_deref(), Some("vault audit"));
-        assert!(!written.pairs[1].halted, "the page's own halt is restarted");
-        assert!(
-            banner.contains("UPDATER_KEY_WETH_USDC") && banner.contains("vault audit"),
-            "the page says which pair it left halted, and why: {banner}"
-        );
-
-        // Pressed again with only the handle's halt left: nothing to restart, and it says
-        // why that pair is still down rather than "nothing was halted".
-        let (ok, banner) = post(local, "/reload", "").await;
-        assert!(ok, "{banner}");
-        assert!(banner.contains("UPDATER_KEY_WETH_USDC"), "{banner}");
-        assert!(!banner.contains("nothing was halted"), "{banner}");
-        assert!(config::load_raw(&path).unwrap().pairs[0].halted);
-
-        let (ok, banner) = post(local, "/pairs/resume", "key_env=UPDATER_KEY_WETH_USDC").await;
-        assert!(ok, "{banner}");
-        let written = config::load_raw(&path).unwrap();
-        assert!(!written.pairs[0].halted, "its own Resume clears it");
-        assert_eq!(written.pairs[0].halt_reason, None);
-    }
-
-    /// The venue table posts one symbol and one weight per venue through the real form
-    /// decoder (the flattened struct is the part worth proving), and lands in the file as
-    /// `sources`; a single Binance row with no weight lands as the short-form `symbol`.
-    #[tokio::test]
-    async fn the_venue_table_is_saved_as_sources_or_as_the_short_form() {
-        let (path, state, mut reloads) = config_on_disk("venues");
-        let (local, _task) = bind(
-            "127.0.0.1:0".parse().unwrap(),
-            path.clone(),
-            state.reloads.clone(),
-            test_client(),
-            PairStates::default(),
-            std::sync::Arc::new(tokio::sync::Mutex::new(())),
-            test_kinds(),
-        )
-        .await
-        .unwrap();
-        let service = tokio::spawn(async move {
-            for _ in 0..2 {
-                let request = reloads.recv().await.expect("a reload must be requested");
-                let _ = request.reply.send(Ok("reload: 1 restarted".to_owned()));
-            }
-        });
-        let post = |body: String| {
-            format!(
-                "POST /pairs/edit HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\
-                 Content-Type: application/x-www-form-urlencoded\r\n\
-                 Content-Length: {}\r\n\r\n{body}",
-                body.len()
-            )
-        };
-
-        // Two venues and a minimum: `sources`, weights kept as written, blank weight absent.
-        let body = "key_env=UPDATER_KEY_WETH_USDC&symbol_binance=ETHUSDC&weight_binance=2\
-                    &symbol_kraken=ETH%2FUSD&weight_kraken=&symbol_okx=&weight_okx=\
-                    &min_sources=2&pricing=feed&pricing_feed_delta=0.0005&min_mid=&max_mid=\
-                    &max_deviation=&max_deviation_window=&max_deviation_window_blocks=";
-        let posted = http(local, &post(body.to_owned())).await;
-        assert!(posted.contains("location: /?ok="), "{posted}");
-        let written = config::load_raw(&path).unwrap();
-        assert_eq!(written.pairs[0].symbol, None);
-        assert_eq!(
-            written.pairs[0].sources,
-            vec![
-                RawSource {
-                    venue: "binance".into(),
-                    symbol: "ETHUSDC".into(),
-                    weight: Some("2".into()),
-                },
-                RawSource {
-                    venue: "kraken".into(),
-                    symbol: "ETH/USD".into(),
-                    weight: None,
-                },
-            ]
-        );
-        assert_eq!(written.pairs[0].min_sources.as_deref(), Some("2"));
-        // The file parses, and the index and the edit form show the rows.
-        config::parse_config(&std::fs::read_to_string(&path).unwrap(), 18)
-            .expect("a saved venue table is a config that loads");
-        let page = http(
-            local,
-            "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
-        )
-        .await;
-        assert!(
-            page.contains("binance:ETHUSDC ×2 + kraken:ETH/USD ×1 (min 2)"),
-            "{page}"
-        );
-        let form = http(
-            local,
-            "GET /pairs/edit/UPDATER_KEY_WETH_USDC HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
-        )
-        .await;
-        assert!(
-            form.contains(r#"name="symbol_kraken" value="ETH/USD""#),
-            "{form}"
-        );
-        assert!(
-            form.contains(r#"name="weight_binance" value="2""#),
-            "{form}"
-        );
-        assert!(form.contains(r#"name="min_sources""#), "{form}");
-
-        // Back to one Binance row with no weight and no minimum: the short form.
-        let body = "key_env=UPDATER_KEY_WETH_USDC&symbol_binance=ETHUSDC&weight_binance=\
-                    &min_sources=&pricing=feed&pricing_feed_delta=0.0005&min_mid=&max_mid=\
-                    &max_deviation=&max_deviation_window=&max_deviation_window_blocks=";
-        let posted = http(local, &post(body.to_owned())).await;
-        assert!(posted.contains("location: /?ok="), "{posted}");
-        service.await.unwrap();
-        let written = config::load_raw(&path).unwrap();
-        assert_eq!(written.pairs[0].symbol.as_deref(), Some("ETHUSDC"));
-        assert!(written.pairs[0].sources.is_empty());
-        assert_eq!(written.pairs[0].min_sources, None);
-    }
-
-    /// The source check through the real form decoder: set, kept by a form that predates
-    /// the field (absent), cleared by a blank one. An edit the file parser would refuse (an
-    /// age of zero) is refused before anything is written, and the same form comes back with
-    /// the reason and the posted values, so the field can be fixed right there.
-    #[tokio::test]
-    async fn the_source_lag_key_is_set_kept_cleared_and_refused_in_the_form() {
-        let (path, state, mut reloads) = config_on_disk("source-checks");
-        let (local, _task) = bind(
-            "127.0.0.1:0".parse().unwrap(),
-            path.clone(),
-            state.reloads.clone(),
-            test_client(),
-            PairStates::default(),
-            std::sync::Arc::new(tokio::sync::Mutex::new(())),
-            test_kinds(),
-        )
-        .await
-        .unwrap();
-        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let _service = {
-            let served = Arc::clone(&served);
-            tokio::spawn(async move {
-                while let Some(request) = reloads.recv().await {
-                    served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let _ = request.reply.send(Ok("reload: 1 restarted".to_owned()));
-                }
-            })
-        };
-        let post = |body: &str| {
-            format!(
-                "POST /pairs/edit HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\
-                 Content-Type: application/x-www-form-urlencoded\r\n\
-                 Content-Length: {}\r\n\r\n{body}",
-                body.len()
-            )
-        };
-        let common = "key_env=UPDATER_KEY_WETH_USDC&pricing=feed&pricing_feed_delta=0.0005\
-                      &min_mid=&max_mid=&max_deviation=&max_deviation_window=\
-                      &max_deviation_window_blocks=";
-        // OKX stamps its frames, which the key needs one venue to do.
-        let two = "&symbol_binance=ETHUSDC&weight_binance=&symbol_okx=ETH-USDC&weight_okx=2";
-        let one = "&symbol_binance=&weight_binance=&symbol_okx=ETH-USDC&weight_okx=";
-        let read = || config::load_raw(&path).unwrap().pairs.remove(0);
-
-        // Set.
-        let posted = http(
-            local,
-            &post(&format!("{common}{two}&max_source_lag_ms=1500")),
-        )
-        .await;
-        assert!(posted.contains("location: /?ok="), "{posted}");
-        let pair = read();
-        assert_eq!(pair.max_source_lag_ms.as_deref(), Some("1500"));
-
-        // A form from before the field existed does not post it: kept.
-        let posted = http(local, &post(&format!("{common}{two}"))).await;
-        assert!(posted.contains("location: /?ok="), "{posted}");
-        let pair = read();
-        assert_eq!(pair.max_source_lag_ms.as_deref(), Some("1500"));
-
-        // Down to one venue, the key kept: saved.
-        let posted = http(
-            local,
-            &post(&format!("{common}{one}&max_source_lag_ms=1500")),
-        )
-        .await;
-        assert!(posted.contains("location: /?ok="), "{posted}");
-        let pair = read();
-        assert_eq!(pair.sources.len(), 1);
-        assert_eq!(pair.max_source_lag_ms.as_deref(), Some("1500"));
-
-        // An age the file parser refuses is refused here too: nothing written, and the
-        // form comes back with the reason and what was posted.
-        let refused = http(local, &post(&format!("{common}{one}&max_source_lag_ms=0"))).await;
-        assert!(refused.starts_with("HTTP/1.1 422"), "{refused}");
-        assert!(refused.contains("class=banner-err"), "{refused}");
-        assert!(refused.contains("max_source_lag_ms is zero"), "{refused}");
-        assert!(
-            refused.contains("name=\"max_source_lag_ms\"\n         value=\"0\""),
-            "{refused}"
-        );
-        assert_eq!(
-            read().max_source_lag_ms.as_deref(),
-            Some("1500"),
-            "nothing written"
-        );
-
-        // Cleared by a blank: saved.
-        let posted = http(local, &post(&format!("{common}{one}&max_source_lag_ms="))).await;
-        assert!(posted.contains("location: /?ok="), "{posted}");
-        assert_eq!(read().max_source_lag_ms, None);
-        config::parse_config(&std::fs::read_to_string(&path).unwrap(), 18)
-            .expect("what the form saved loads");
-
-        assert_eq!(
-            served.load(std::sync::atomic::Ordering::SeqCst),
-            4,
-            "the refused edit asked for no reload"
-        );
-    }
-
-    /// A reload that applies an edit in part is not a rejection: the file keeps the change,
-    /// so the page goes back to the list saying it was saved, not to the form as if the
-    /// edit had been refused.
-    #[tokio::test]
-    async fn an_edit_the_reload_applies_in_part_is_saved_not_refused() {
-        let (path, state, mut reloads) = config_on_disk("partial-edit");
-        let (local, _task) = bind(
-            "127.0.0.1:0".parse().unwrap(),
-            path.clone(),
-            state.reloads.clone(),
-            test_client(),
-            PairStates::default(),
-            std::sync::Arc::new(tokio::sync::Mutex::new(())),
-            test_kinds(),
-        )
-        .await
-        .unwrap();
-        let _service = tokio::spawn(async move {
-            if let Some(request) = reloads.recv().await {
-                let _ = request.reply.send(Err(ReloadFailure::Partial(
-                    "1 restarted, 1 failed to start".to_owned(),
-                )));
-            }
-        });
-        let body = "key_env=UPDATER_KEY_WETH_USDC&pricing=feed&pricing_feed_delta=0.0005\
-                    &min_mid=&max_mid=&max_deviation=&max_deviation_window=\
-                    &max_deviation_window_blocks=&symbol_binance=&weight_binance=\
-                    &symbol_okx=ETH-USDC&weight_okx=&max_source_lag_ms=1500";
-        let posted = http(
-            local,
-            &format!(
-                "POST /pairs/edit HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\
-                 Content-Type: application/x-www-form-urlencoded\r\n\
-                 Content-Length: {}\r\n\r\n{body}",
-                body.len()
-            ),
-        )
-        .await;
-        assert!(posted.starts_with("HTTP/1.1 303"), "{posted}");
-        assert!(posted.contains("location: /?err=Saved"), "{posted}");
-        assert!(
-            !posted.contains("banner-err"),
-            "not the form again: {posted}"
-        );
-        assert_eq!(
-            config::load_raw(&path).unwrap().pairs[0]
-                .max_source_lag_ms
-                .as_deref(),
-            Some("1500"),
-            "the file keeps the change"
-        );
-    }
-
-    /// The venues-disagree limit is on both forms, the edit form showing the file's value,
-    /// and an edit sets it, keeps it when the field is absent, and clears it when blank.
-    #[test]
-    fn the_divergence_limit_is_shown_and_edited_from_the_form() {
-        assert!(
-            render_pair_form(None, &test_kinds()).contains(r#"name="max_source_divergence""#),
-            "max_source_divergence is missing from the new-pair form"
-        );
-        let mut config = a_config();
-        config.pairs[0].max_source_divergence = Some("0.0005".to_owned());
-        let form = render_pair_form(Some(&config.pairs[0]), &test_kinds());
-        assert!(
-            form.contains("name=\"max_source_divergence\"\n         value=\"0.0005\""),
-            "{form}"
-        );
-
-        let mut pair = config.pairs[0].clone();
-        set_if_posted(&mut pair.max_source_divergence, None);
-        assert_eq!(pair.max_source_divergence.as_deref(), Some("0.0005"));
-        set_if_posted(&mut pair.max_source_divergence, Some("0.001"));
-        assert_eq!(pair.max_source_divergence.as_deref(), Some("0.001"));
-        set_if_posted(&mut pair.max_source_divergence, Some(" "));
-        assert_eq!(pair.max_source_divergence, None);
-    }
-
-    /// The source-check field is on both forms, the edit form showing the file's value.
-    #[test]
-    fn the_source_lag_field_renders_on_both_forms() {
-        assert!(
-            render_pair_form(None, &test_kinds()).contains(r#"name="max_source_lag_ms""#),
-            "max_source_lag_ms is missing from the new-pair form"
-        );
-        let mut config = a_config();
-        config.pairs[0].max_source_lag_ms = Some("10000".to_owned());
-        let form = render_pair_form(Some(&config.pairs[0]), &test_kinds());
-        assert!(
-            form.contains("name=\"max_source_lag_ms\"\n         value=\"10000\""),
-            "{form}"
-        );
-        assert!(!form.contains("class=banner-err"), "{form}");
-    }
-
-    /// The lookup the page's script calls once both addresses are typed: the token names
-    /// read on chain, each exchange's own market list matched on base and quote, one
-    /// entry per venue, and nothing saved. An exchange that cannot be asked is a note, not
+    /// The lookup a front end calls once both addresses are known: the token names read on
+    /// chain, each exchange's own market list matched on base and quote, one entry per
+    /// venue, and nothing saved. An exchange that cannot be asked is a note, not
     /// a failed lookup.
     #[tokio::test]
     async fn the_lookup_answers_one_entry_per_venue_and_saves_nothing() {
@@ -3150,16 +3064,15 @@ api_key = "k"
         let exchanges = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let (path, state, _reloads) = config_on_disk("lookup");
-        let before = std::fs::read_to_string(&path).unwrap();
+        let (config, mut requests) = shared("lookup", |_| {});
+        let before = std::fs::read_to_string(config.path()).unwrap();
         let (local, _task) = bind_with(
             "127.0.0.1:0".parse().unwrap(),
-            path.clone(),
-            state.reloads.clone(),
+            Arc::clone(&config),
             ethrex_rpc::clients::eth::EthClient::new(url::Url::parse(&rpc.url).unwrap()).unwrap(),
             PairStates::default(),
-            std::sync::Arc::new(tokio::sync::Mutex::new(())),
             test_kinds(),
+            Access::default(),
             crate::discover::Rest::all_at(&format!("http://{exchanges}")),
         )
         .await
@@ -3168,7 +3081,7 @@ api_key = "k"
         let page = http(
             local,
             &format!(
-                "GET /pairs/lookup?token0={WETH}&token1={USDC} HTTP/1.1\r\nHost: t\r\n\
+                "GET /api/lookup?token0={WETH}&token1={USDC} HTTP/1.1\r\nHost: 127.0.0.1\r\n\
                  Connection: close\r\n\r\n"
             ),
         )
@@ -3197,6 +3110,15 @@ api_key = "k"
         );
         assert_eq!(by("coinbase")["weight"], "10");
         assert_eq!(by("coinbase")["stand_in"], true);
+        // Answered, never selected for the operator: averaged at par it fails preflight unless
+        // the pair opts in (audit F-04), so only markets in the pair's own quote are selected.
+        assert_eq!(by("binance")["selected"], true);
+        assert_eq!(by("coinbase")["selected"], false);
+        let note = by("coinbase")["note"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(note.contains("not selected"), "{note}");
         assert_eq!(
             by("okx")["listed"],
             false,
@@ -3225,8 +3147,9 @@ api_key = "k"
             false,
             "okx answered; it just has no market"
         );
-        // Nothing saved.
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        // Nothing saved, nothing asked of the service.
+        assert_eq!(std::fs::read_to_string(config.path()).unwrap(), before);
+        assert!(requests.try_recv().is_err());
     }
 
     /// Two mock venues on one port, standing in for what the preview dials: Binance on any
@@ -3316,27 +3239,39 @@ api_key = "k"
     const BINANCE_ETH: &str = "/ethusdc@bookTicker";
     const BYBIT: &str = "/bybit";
 
-    /// A backoffice whose Binance and Bybit endpoints are the mocks.
+    /// A backoffice whose Binance and Bybit endpoints are the mocks, answering CORS for
+    /// [`UI`].
     async fn preview_backoffice(name: &str, venues: SocketAddr) -> SocketAddr {
-        let (path, state, _reloads) = config_on_disk(name);
-        let mut config = config::load_raw(&path).unwrap();
-        config
-            .settings
-            .endpoints
-            .insert("binance".to_owned(), format!("ws://{venues}"));
-        config
-            .settings
-            .endpoints
-            .insert("bybit".to_owned(), format!("ws://{venues}{BYBIT}"));
-        config::write_raw_atomically(&path, &config).unwrap();
+        preview_backoffice_with(name, venues, None).await
+    }
+
+    /// [`preview_backoffice`], over HTTPS when given a certificate.
+    async fn preview_backoffice_with(
+        name: &str,
+        venues: SocketAddr,
+        tls: Option<crate::tls::Tls>,
+    ) -> SocketAddr {
+        let (config, _requests) = shared(name, |config| {
+            config
+                .settings
+                .endpoints
+                .insert("binance".to_owned(), format!("ws://{venues}"));
+            config
+                .settings
+                .endpoints
+                .insert("bybit".to_owned(), format!("ws://{venues}{BYBIT}"));
+        });
         let (local, _task) = bind(
             "127.0.0.1:0".parse().unwrap(),
-            path.clone(),
-            state.reloads.clone(),
+            config,
             test_client(),
             PairStates::default(),
-            std::sync::Arc::new(tokio::sync::Mutex::new(())),
             test_kinds(),
+            Access {
+                origins: vec![UI.to_owned()],
+                tls,
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -3361,7 +3296,7 @@ api_key = "k"
     ) -> Result<PreviewPage, tokio_tungstenite::tungstenite::Error> {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         let mut request = format!(
-            "ws://{local}/pairs/preview?token0=0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2\
+            "ws://{local}/api/preview?token0=0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2\
              &token1=0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
         )
         .into_client_request()
@@ -3547,10 +3482,11 @@ api_key = "k"
         .expect("redialled once the gap passed");
     }
 
-    /// A page on another site cannot open the preview, even from a browser that is logged
-    /// in; the backoffice's own page can, whether reached by its tailnet address or by name.
+    /// A page on another site cannot open the preview; one served under the backoffice's
+    /// own address can, whether reached by its tailnet address or by name, and so can a
+    /// client that is not a browser.
     #[tokio::test]
-    async fn only_the_backoffices_own_page_can_open_the_preview() {
+    async fn no_other_sites_page_can_open_the_preview() {
         let (_mocks, venues) = MockVenues::start().await;
         let local = preview_backoffice("preview-origin", venues).await;
         for origin in ["https://evil.example", "http://127.0.0.1:1", "null"] {
@@ -3561,15 +3497,69 @@ api_key = "k"
                 other => panic!("{origin}: expected a 403, got {:?}", other.map(|_| ())),
             }
         }
-        open_preview(local).await.expect("its own page opens it");
+        open_preview(local)
+            .await
+            .expect("a page under its own address opens it");
+        open_preview_from(local, UI)
+            .await
+            .expect("so does a page from an origin --backoffice-cors-origin lists");
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("host", "backoffice.example.com".parse().unwrap());
         headers.insert("origin", "https://backoffice.example.com".parse().unwrap());
         assert!(same_origin(&headers));
         headers.insert("origin", "https://grafana.example.com".parse().unwrap());
         assert!(!same_origin(&headers));
+        assert!(!origin_allowed(&headers, &[]));
+        assert!(origin_allowed(
+            &headers,
+            &["https://grafana.example.com".to_owned()]
+        ));
         headers.remove("origin");
-        assert!(!same_origin(&headers), "no origin is not a browser page");
+        assert!(!same_origin(&headers));
+        assert!(
+            origin_allowed(&headers, &[]),
+            "no origin is not a browser page, so no other site's"
+        );
+    }
+
+    /// Over HTTPS the preview is a `wss://` socket: the websocket upgrade runs on the TLS
+    /// connection the backoffice's own listener accepted, and the venues come through.
+    #[tokio::test]
+    async fn the_preview_opens_over_wss() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let (_mocks, venues) = MockVenues::start().await;
+        let tls = crate::tls::Tls::load(
+            &crate::tls::tests::fixture("a.crt"),
+            &crate::tls::tests::fixture("a.key"),
+        )
+        .unwrap();
+        let local = preview_backoffice_with("preview-wss", venues, Some(tls)).await;
+        let mut request = format!(
+            "wss://{local}/api/preview?token0=0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2\
+             &token1=0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+        )
+        .into_client_request()
+        .unwrap();
+        request
+            .headers_mut()
+            .insert("origin", format!("https://{local}").parse().unwrap());
+        let connector = tokio_tungstenite::Connector::NativeTls(
+            native_tls::TlsConnector::builder()
+                .danger_accept_invalid_certs(true)
+                .build()
+                .unwrap(),
+        );
+        let (mut page, _) =
+            tokio_tungstenite::connect_async_tls_with_config(request, None, false, Some(connector))
+                .await
+                .expect("the preview opens over wss://");
+        send(
+            &mut page,
+            serde_json::json!({"type": "set", "venue": "binance", "symbol": "ETHUSDC", "weight": "1"}),
+        )
+        .await;
+        let found = snapshot_where(&mut page, |v| v["fresh"] == 1).await;
+        assert!((found["venues"][0]["mid"].as_f64().unwrap() - 2000.0).abs() < 0.01);
     }
 
     /// At most PREVIEW_PAGES pages at once; one more is refused before it opens anything,
@@ -3601,15 +3591,14 @@ api_key = "k"
     /// Anything that is not an address is refused before it can reach CoinGecko's URL.
     #[tokio::test]
     async fn the_lookup_refuses_what_is_not_an_address() {
-        let (path, state, _reloads) = config_on_disk("lookup-validation");
+        let (config, _requests) = shared("lookup-validation", |_| {});
         let (local, _task) = bind(
             "127.0.0.1:0".parse().unwrap(),
-            path.clone(),
-            state.reloads.clone(),
+            config,
             test_client(),
             PairStates::default(),
-            std::sync::Arc::new(tokio::sync::Mutex::new(())),
             test_kinds(),
+            Access::default(),
         )
         .await
         .unwrap();
@@ -3621,8 +3610,8 @@ api_key = "k"
             let answer = http(
                 local,
                 &format!(
-                    "GET /pairs/lookup?token0={token0}&token1=0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 \
-                     HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"
+                    "GET /api/lookup?token0={token0}&token1=0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 \
+                     HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
                 ),
             )
             .await;
@@ -3631,842 +3620,278 @@ api_key = "k"
         }
     }
 
-    /// The volatile knobs go through the same edit form and land in the file, which is what
-    /// makes them tunable without a deploy.
-    #[tokio::test]
-    async fn the_volatile_knobs_are_edited_from_the_page() {
-        let (path, state, mut reloads) = config_on_disk("knobs");
+    // -----------------------------------------------------------------------
+    // Google sign-in
+    // -----------------------------------------------------------------------
+
+    use crate::auth::tests::{CLIENT_ID, KeysEndpoint, claims, sign, token};
+
+    /// [`serve_for`], with Google sign-in on: `example.com`'s Workspace and `ops@gmail.com`
+    /// let in, Google's keys at `keys`.
+    async fn serve_signed_in(
+        name: &str,
+        keys: &KeysEndpoint,
+        origins: &[String],
+    ) -> (SocketAddr, Arc<SharedConfig>) {
+        let (config, requests) = shared(name, |_| {});
+        service(requests, accepted());
         let (local, _task) = bind(
             "127.0.0.1:0".parse().unwrap(),
-            path.clone(),
-            state.reloads.clone(),
+            Arc::clone(&config),
             test_client(),
             PairStates::default(),
-            std::sync::Arc::new(tokio::sync::Mutex::new(())),
             test_kinds(),
+            Access {
+                origins: origins.to_vec(),
+                google: Some(crate::auth::tests::sign_in(keys)),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
-        let service = tokio::spawn(async move {
-            let request = reloads.recv().await.expect("a reload must be requested");
-            let _ = request.reply.send(Ok("reload: 1 restarted".to_owned()));
-        });
-
-        // Deliberately omits max_deviation_window and max_deviation_window_blocks: a
-        // browser holding this form open from before those keys existed posts exactly
-        // this body, and it must still save rather than 422 on the two missing fields.
-        let body = "key_env=UPDATER_KEY_WETH_USDC&symbol=ETHUSDC&pricing=volatile\
-                    &min_mid=&max_mid=&max_deviation=&pricing_volatile_gamma=0.2\
-                    &pricing_volatile_k=700&pricing_volatile_kappa=1\
-                    &pricing_volatile_target_share=0.6&pricing_volatile_hold_secs=\
-                    &pricing_volatile_fill_delay_secs=&pricing_volatile_volatility_window_secs=300\
-                    &pricing_feed_delta=0.0005";
-        let posted = http(
-            local,
-            &format!(
-                "POST /pairs/edit HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\
-                 Content-Type: application/x-www-form-urlencoded\r\n\
-                 Content-Length: {}\r\n\r\n{body}",
-                body.len()
-            ),
-        )
-        .await;
-        service.await.unwrap();
-        assert!(posted.contains("303 See Other"), "{posted}");
-
-        let written = config::load_raw(&path).unwrap();
-        let pair = &written.pairs[0];
-        let knob = |name: &str| pair.pricing.get(name).and_then(|v| v.as_str());
-        assert_eq!(knob("kind"), Some("volatile"));
-        assert_eq!(knob("gamma"), Some("0.2"));
-        assert_eq!(knob("k"), Some("700"));
-        assert_eq!(knob("kappa"), Some("1"));
-        assert_eq!(knob("target_share"), Some("0.6"));
-        assert_eq!(knob("volatility_window_secs"), Some("300"));
-        assert_eq!(knob("hold_secs"), None, "a blank input is an absent key");
-        assert_eq!(
-            knob("delta"),
-            None,
-            "another kind's input is not this kind's"
-        );
-        // And the file parses as a volatile pair.
-        let text = std::fs::read_to_string(&path).unwrap();
-        let parsed = config::parse_config(&text, 18).unwrap();
-        assert_eq!(parsed.pairs[0].pricing.kind, "volatile");
-        // The index shows the kind and its summary, and the edit form opens on its section.
-        let page = http(
-            local,
-            "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
-        )
-        .await;
-        assert!(page.contains("volatile γ=0.2 k=700 κ=1"), "{page}");
-        let form = render_pair_form(Some(&written.pairs[0]), &test_kinds());
-        assert!(
-            form.contains(r#"id="pricing-volatile" name=pricing value="volatile" checked"#),
-            "{form}"
-        );
-        assert!(
-            form.contains("name=\"pricing_volatile_gamma\"\n         value=\"0.2\""),
-            "{form}"
-        );
+        (local, config)
     }
 
-    /// Every kind's inputs are posted whichever section is showing, so the stanza is built
-    /// from the chosen kind's alone; a blank choice keeps the stanza, an unknown kind is
-    /// refused, and a kind with no fields keeps a stanza it already prices.
-    /// A kind whose config reads numbers declares its fields as numbers, and the page writes
-    /// them as TOML numbers; a value that is not one is refused rather than written.
-    #[test]
-    fn a_numeric_field_is_written_as_a_number() {
-        #[derive(Clone, serde::Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Numeric {
-            #[allow(dead_code)]
-            half_spread: f64,
-            #[allow(dead_code)]
-            age_secs: u64,
-        }
-        struct Fields;
-        impl crate::pricing::Factory for Fields {
-            type Config = Numeric;
-            type Pricer = crate::pricing::FixedPricer;
-            fn fields(&self) -> &'static [crate::pricing::FormField] {
-                const FIELDS: &[crate::pricing::FormField] = &[
-                    crate::pricing::FormField::number("half_spread", "0.0005", ""),
-                    crate::pricing::FormField::number("age_secs", "60", ""),
-                ];
-                FIELDS
-            }
-            fn build<'a>(
-                &'a self,
-                _: &'a Numeric,
-                _: &'a mut crate::pricing::BuildCtx,
-            ) -> crate::pricing::BoxFuture<'a, eyre::Result<Self::Pricer>> {
-                Box::pin(std::future::ready(Err(eyre!("not built here"))))
-            }
-        }
-        let mut kinds = crate::kinds::Kinds::default();
-        kinds.insert("numeric", Arc::new(Fields));
-        let posted = |pairs: &[(&str, &str)]| -> std::collections::HashMap<String, String> {
-            pairs
-                .iter()
-                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-                .collect()
-        };
-        let table = pricing_stanza(
-            &kinds,
-            "numeric",
-            None,
-            &posted(&[
-                ("pricing_numeric_half_spread", "0.0005"),
-                ("pricing_numeric_age_secs", "60"),
-            ]),
-        )
-        .unwrap();
-        assert_eq!(table.get("half_spread"), Some(&toml::Value::Float(0.0005)));
-        assert_eq!(table.get("age_secs"), Some(&toml::Value::Integer(60)));
-        let err = format!(
-            "{:#}",
-            pricing_stanza(
-                &kinds,
-                "numeric",
-                None,
-                &posted(&[("pricing_numeric_half_spread", "five")]),
-            )
-            .unwrap_err()
-        );
-        assert!(err.contains("`half_spread` must be a number"), "{err}");
-    }
-
-    #[test]
-    fn the_pricing_choice_decides_which_kinds_fields_are_kept() {
-        let kinds = test_kinds();
-        let posted: std::collections::HashMap<String, String> = [
-            ("pricing_fixed_mid", "1.0001"),
-            ("pricing_fixed_delta", "0.0005"),
-            ("pricing_feed_delta", ""),
-            ("pricing_volatile_gamma", "0.1"),
-            ("pricing_volatile_k", "2000"),
-            ("pricing_volatile_kappa", "1"),
-            ("pricing_volatile_hold_secs", ""),
+    /// The headers of a request signed in with `token`, sent as a client would a change.
+    fn signed(token: &str) -> Vec<(&'static str, String)> {
+        vec![
+            ("authorization", format!("Bearer {token}")),
+            ("content-type", "application/json".to_owned()),
         ]
-        .into_iter()
-        .map(|(k, v)| (k.to_owned(), v.to_owned()))
-        .collect();
-        let text = |table: &toml::Table, key: &str| {
-            table.get(key).and_then(|v| v.as_str()).map(str::to_owned)
-        };
-
-        let fixed = pricing_stanza(&kinds, "fixed", None, &posted).unwrap();
-        assert_eq!(text(&fixed, "kind").as_deref(), Some("fixed"));
-        assert_eq!(text(&fixed, "mid").as_deref(), Some("1.0001"));
-        assert_eq!(text(&fixed, "delta").as_deref(), Some("0.0005"));
-        assert_eq!(fixed.get("gamma"), None);
-
-        let volatile = pricing_stanza(&kinds, "volatile", None, &posted).unwrap();
-        assert_eq!(text(&volatile, "gamma").as_deref(), Some("0.1"));
-        assert_eq!(text(&volatile, "k").as_deref(), Some("2000"));
-        assert_eq!(volatile.get("hold_secs"), None, "blank is absent");
-        assert_eq!(volatile.get("delta"), None);
-
-        let feed = pricing_stanza(&kinds, "feed", None, &posted).unwrap();
-        assert_eq!(
-            feed.len(),
-            1,
-            "a blank delta leaves only the kind: {feed:?}"
-        );
-
-        // No choice posted: an older form. The stanza stays as it is.
-        let existing: toml::Table =
-            toml::from_str("kind = \"skewed\"\nhalf_spread = 0.0005").unwrap();
-        assert_eq!(
-            pricing_stanza(&kinds, "", Some(&existing), &posted).unwrap(),
-            existing
-        );
-        assert!(pricing_stanza(&kinds, "", None, &posted).is_err());
-        // A kind with no fields keeps the stanza it already prices, and names itself alone
-        // on a pair it did not.
-        assert_eq!(
-            pricing_stanza(&kinds, "skewed", Some(&existing), &posted).unwrap(),
-            existing
-        );
-        let bare = pricing_stanza(&kinds, "skewed", None, &posted).unwrap();
-        assert_eq!(bare.len(), 1);
-        // A kind nobody registered names the ones that are.
-        let err = pricing_stanza(&kinds, "nope", None, &posted)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("nope") && err.contains("volatile"), "{err}");
     }
 
-    /// The form opens on the section of the kind that prices the pair, offers every
-    /// registered kind, and carries each kind's help and fields under their posted names.
-    #[test]
-    fn the_pair_form_opens_on_the_pairs_pricing() {
-        let form = render_pair_form(Some(&a_config().pairs[0]), &test_kinds());
-        assert!(
-            form.contains(r#"id="pricing-feed" name=pricing value="feed" checked"#),
-            "{form}"
-        );
-        assert!(!form.contains(r#"value="volatile" checked"#), "{form}");
-        assert!(form.contains("ln(1 + γ/k)"), "{form}");
-        for name in [
-            "pricing_volatile_gamma",
-            "pricing_volatile_k",
-            "pricing_volatile_kappa",
-            "pricing_volatile_target_share",
-            "pricing_volatile_hold_secs",
-            "pricing_volatile_fill_delay_secs",
-            "pricing_volatile_volatility_window_secs",
-            "pricing_volatile_inventory_aversion",
-            "pricing_volatile_inventory_band_lower",
-            "pricing_volatile_inventory_band_upper",
-            "pricing_volatile_inventory_aversion_hard",
-            "pricing_volatile_inventory_band_hard_lower",
-            "pricing_volatile_inventory_band_hard_upper",
-            "pricing_feed_delta",
-            "pricing_fixed_mid",
-            "pricing_fixed_delta",
-        ] {
-            assert!(
-                form.contains(&format!(r#"name="{name}""#)),
-                "{name} is missing from the form"
-            );
-        }
-        // A new pair starts on the first registered kind.
-        let new = render_pair_form(None, &test_kinds());
-        assert!(
-            new.contains(r#"id="pricing-feed" name=pricing value="feed" checked"#),
-            "{new}"
-        );
+    async fn call_signed(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        token: &str,
+    ) -> (StatusCode, Value) {
+        let headers = signed(token);
+        let headers: Vec<(&str, &str)> = headers.iter().map(|(n, v)| (*n, v.as_str())).collect();
+        call_with(addr, method, path, body, &headers).await
     }
 
-    /// The two window fields are ordinary `SOURCE_FIELDS` entries, appended after
-    /// `max_deviation` — a regression guard for the length-mismatched `zip` this would
-    /// silently produce: `source_values` for the "editing" branch is a hand-written list,
-    /// so an unmatched addition to `SOURCE_FIELDS` drops the last fields from the rendered
-    /// form instead of failing to compile.
-    #[test]
-    fn the_window_fields_render_on_both_forms_and_edit_shows_the_current_value() {
-        for name in ["max_deviation_window", "max_deviation_window_blocks"] {
-            assert!(
-                render_pair_form(None, &test_kinds()).contains(&format!(r#"name="{name}""#)),
-                "{name} is missing from the new-pair form"
-            );
-        }
-
-        let mut config = a_config();
-        config.pairs[0].max_deviation_window = Some("0.20".to_owned());
-        config.pairs[0].max_deviation_window_blocks = Some("1000".to_owned());
-        let form = render_pair_form(Some(&config.pairs[0]), &test_kinds());
-        assert!(
-            form.contains("name=\"max_deviation_window\"\n         value=\"0.20\""),
-            "{form}"
-        );
-        assert!(
-            form.contains("name=\"max_deviation_window_blocks\"\n         value=\"1000\""),
-            "{form}"
-        );
-    }
-
-    /// A value an operator typed and left blank means "leave this key out", not "set it to
-    /// the empty string", which every one of these keys would reject.
-    #[test]
-    fn a_blank_field_is_an_absent_key() {
-        assert_eq!(optional(""), None);
-        assert_eq!(optional("   "), None);
-        assert_eq!(optional("  0.02 "), Some("0.02".to_owned()));
-    }
-
-    /// A key missing from the page is one nobody can change without SSH.
-    #[test]
-    fn the_settings_page_covers_every_key() {
-        // Round-tripped through the writer, so this compares against the real serialised
-        // field names rather than a list written out by hand beside the struct.
-        let full = config::FileSettings {
-            mode: Some("builder".to_owned()),
-            rpc_url: Some("https://a".to_owned()),
-            rpc_ws_url: Some("wss://a".to_owned()),
-            registry: Some("0x1".to_owned()),
-            price_decimals: Some(18),
-            binance_ws: Some("wss://b".to_owned()),
-            endpoints: Default::default(),
-            interval: Some(12),
-            requote_ms: Some(50),
-            metrics_addr: Some("127.0.0.1:9464".to_owned()),
-            disable_cross_region: Some(true),
-            backoffice_addr: Some("100.1.2.3:8088".to_owned()),
-        };
-        let rendered = toml::to_string_pretty(&full).unwrap();
-        let keys: Vec<&str> = rendered
-            .lines()
-            .filter_map(|line| line.split_once(" = ").map(|(key, _)| key))
-            .collect();
-        assert_eq!(keys.len(), 11, "the struct grew: {keys:?}");
-
-        let mut config = a_config();
-        config.settings = full;
-        let page = render_settings_form(&config);
-        for key in keys {
-            // `binance_ws` is the older spelling of the Binance row of the endpoint table,
-            // and its value is what that row shows.
-            let key = if key == "binance_ws" {
-                assert!(page.contains(r#"value="wss://b""#), "{page}");
-                "endpoint_binance"
-            } else {
-                key
-            };
-            // disable_cross_region is the checkbox, not a text input.
-            let present = page.contains(&format!(r#"name="{key}""#))
-                || page.contains(&format!("name={key}>"))
-                || page.contains(&format!("name={key} "));
-            assert!(present, "{key} is not on the settings page");
-        }
-        // And the endpoint table has a row per venue.
-        for venue in VenueId::ALL {
-            assert!(
-                page.contains(&format!(r#"name="endpoint_{venue}""#)),
-                "{venue} has no endpoint row"
-            );
-        }
-    }
-
-    /// The endpoint table is saved as `[settings.endpoints]`, held to each venue's
-    /// transport, and a stale form's `binance_ws` lands in the Binance row.
-    #[test]
-    fn venue_endpoints_are_saved_under_their_venue() {
-        let mut form = SaveSettings {
-            mode: "builder".to_owned(),
-            rpc_url: "https://a".to_owned(),
-            rpc_ws_url: String::new(),
-            registry: String::new(),
-            price_decimals: String::new(),
-            binance_ws: "wss://old-binance".to_owned(),
-            endpoints: EndpointsForm {
-                endpoint_kraken: "wss://kraken-mock".to_owned(),
-                endpoint_mexc: "https://mexc-mock".to_owned(),
-                ..EndpointsForm::default()
-            },
-            interval: String::new(),
-            requote_ms: "50".to_owned(),
-            metrics_addr: String::new(),
-            backoffice_addr: String::new(),
-            disable_cross_region: None,
-        };
-        let built = build_settings(&form).unwrap();
-        assert_eq!(built.binance_ws, None, "moved into the table");
-        assert_eq!(
-            built.endpoints,
-            [
-                ("binance".to_owned(), "wss://old-binance".to_owned()),
-                ("kraken".to_owned(), "wss://kraken-mock".to_owned()),
-                ("mexc".to_owned(), "https://mexc-mock".to_owned()),
-            ]
-            .into()
-        );
-        // The row wins over the stale field.
-        form.endpoints.endpoint_binance = "wss://new-binance".to_owned();
-        assert_eq!(
-            build_settings(&form).unwrap().endpoints["binance"],
-            "wss://new-binance"
-        );
-        // A streamed venue is held to ws(s), a polled one to http(s).
-        form.endpoints.endpoint_kraken = "https://kraken-mock".to_owned();
-        let err = build_settings(&form).unwrap_err().to_string();
-        assert!(err.contains("kraken endpoint must be ws"), "{err}");
-        form.endpoints.endpoint_kraken = String::new();
-        form.endpoints.endpoint_mexc = "wss://mexc-mock".to_owned();
-        let err = build_settings(&form).unwrap_err().to_string();
-        assert!(err.contains("mexc endpoint must be http"), "{err}");
-    }
-
-    /// The current values come back in the inputs, so saving one key does not blank the
-    /// others.
-    #[test]
-    fn the_settings_page_shows_the_current_values() {
-        let mut config = a_config();
-        config.settings.requote_ms = Some(25);
-        config.settings.rpc_url = Some("https://from-the-file".to_owned());
-        let page = render_settings_form(&config);
-        for expected in [
-            r#"name="requote_ms""#,
-            r#"value="25""#,
-            r#"name="rpc_url""#,
-            r#"value="https://from-the-file""#,
-        ] {
-            assert!(page.contains(expected), "{expected} missing from:\n{page}");
-        }
-    }
-
-    /// A bad value here is a service that fails to come back from a restart hours later.
-    #[test]
-    fn a_malformed_setting_is_refused_before_it_is_written() {
-        fn form() -> SaveSettings {
-            SaveSettings {
-                mode: "builder".to_owned(),
-                rpc_url: "https://a".to_owned(),
-                rpc_ws_url: String::new(),
-                registry: String::new(),
-                price_decimals: String::new(),
-                binance_ws: String::new(),
-                endpoints: EndpointsForm::default(),
-                interval: String::new(),
-                requote_ms: "50".to_owned(),
-                metrics_addr: "127.0.0.1:9464".to_owned(),
-                backoffice_addr: "100.1.2.3:8088".to_owned(),
-                disable_cross_region: None,
-            }
-        }
-
-        let built = build_settings(&form()).expect("a good form saves");
-        assert_eq!(built.requote_ms, Some(50));
-        // A blank field is an absent key, not an empty string: every one of these rejects
-        // an empty value, so writing "" would be a config that no longer loads.
-        assert_eq!(built.registry, None);
-        assert_eq!(built.price_decimals, None);
-        assert_eq!(built.disable_cross_region, None);
-
-        type Mutate = Box<dyn Fn(&mut SaveSettings)>;
-        let cases: Vec<(&str, Mutate)> = vec![
-            ("mode", Box::new(|f| f.mode = "builders".to_owned())),
-            (
-                "metrics_addr",
-                Box::new(|f| f.metrics_addr = "nope".to_owned()),
-            ),
-            ("registry", Box::new(|f| f.registry = "0xnothex".to_owned())),
-            ("requote_ms", Box::new(|f| f.requote_ms = "fast".to_owned())),
-            (
-                "backoffice_addr",
-                Box::new(|f| f.backoffice_addr = "8088".to_owned()),
-            ),
-            // Each of these parses, saves, and kills the next start; see the twin check
-            // named in `build_settings`.
-            (
-                "backoffice_addr",
-                Box::new(|f| f.backoffice_addr = "0.0.0.0:8088".to_owned()),
-            ),
-            ("node", Box::new(|f| f.mode = "node".to_owned())),
-            (
-                "price_decimals",
-                Box::new(|f| f.price_decimals = "60".to_owned()),
-            ),
-            ("interval", Box::new(|f| f.interval = "0".to_owned())),
-            ("rpc_url", Box::new(|f| f.rpc_url = "not a url".to_owned())),
-            (
-                "rpc_ws_url",
-                Box::new(|f| f.rpc_ws_url = "https://a".to_owned()),
-            ),
-            (
-                "binance endpoint",
-                Box::new(|f| f.binance_ws = "stream.binance.com".to_owned()),
-            ),
+    /// With sign-in on, every route answers 401 to a request with no token, reads included,
+    /// and says how to sign in; all but `GET /api/auth`, which tells a page what to sign in
+    /// with. Unknown routes too, so nothing is learnt about what exists.
+    #[tokio::test]
+    async fn with_sign_in_every_route_but_auth_needs_a_token() {
+        let keys = KeysEndpoint::spawn("a").await;
+        let (local, config) = serve_signed_in("signin-routes", &keys, &[]).await;
+        let pair = format!("/api/pairs/{WETH_USDC}");
+        let routes = [
+            ("GET", "/api/pairs".to_owned()),
+            ("POST", "/api/pairs".to_owned()),
+            ("GET", pair.clone()),
+            ("PUT", pair.clone()),
+            ("DELETE", pair.clone()),
+            ("POST", format!("{pair}/halt")),
+            ("POST", format!("{pair}/resume")),
+            ("POST", format!("{pair}/rearm")),
+            ("POST", "/api/halt".to_owned()),
+            ("POST", "/api/reload".to_owned()),
+            ("GET", "/api/builders".to_owned()),
+            ("POST", "/api/builders".to_owned()),
+            ("DELETE", "/api/builders/titan".to_owned()),
+            ("GET", "/api/settings".to_owned()),
+            ("GET", "/api/kinds".to_owned()),
+            ("GET", "/api/venues".to_owned()),
+            ("GET", "/api/lookup?token0=0x1&token1=0x2".to_owned()),
+            ("GET", "/api/preview".to_owned()),
+            ("GET", "/api/no-such-route".to_owned()),
         ];
-        // And the values startup accepts still save.
-        let mut fine = form();
-        fine.price_decimals = "59".to_owned();
-        fine.interval = "1".to_owned();
-        fine.rpc_ws_url = "wss://a".to_owned();
-        fine.binance_ws = "wss://stream.binance.com:9443/ws".to_owned();
-        build_settings(&fine).expect("values startup accepts must save");
-        let mut node = form();
-        node.mode = "node".to_owned();
-        node.backoffice_addr = String::new();
-        build_settings(&node).expect("node mode without a backoffice saves");
-        for (key, mutate) in cases {
-            let mut bad = form();
-            mutate(&mut bad);
-            let err = match build_settings(&bad) {
-                Ok(_) => panic!("{key}: expected a rejection"),
-                Err(err) => format!("{err:#}"),
-            };
-            assert!(err.contains(key), "{key}: {err}");
+        for (method, path) in &routes {
+            let response = reqwest::Client::new()
+                .request(method.parse().unwrap(), format!("http://{local}{path}"))
+                .header("content-type", "application/json")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 401, "{method} {path}");
+            assert_eq!(
+                response.headers()["www-authenticate"],
+                "Bearer",
+                "{method} {path}"
+            );
         }
+        assert!(!config.snapshot().pairs[0].halted, "nothing changed");
+
+        let (status, body) = call(local, "GET", "/api/auth", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["google_client_id"], CLIENT_ID);
     }
 
-    /// The one live credential this page takes.
-    #[test]
-    fn only_the_api_key_field_is_masked() {
-        let form = render_builder_form();
-        assert!(form.contains(r#"type="password""#), "{form}");
-        assert!(form.contains(r#"autocomplete="new-password""#), "{form}");
-        // And only that one field: a masked endpoint or name would just make the form
-        // harder to check.
-        assert_eq!(form.matches(r#"type="password""#).count(), 1, "{form}");
-
-        let pair = render_pair_form(None, &test_kinds());
-        assert!(!pair.contains(r#"type="password""#), "{pair}");
-    }
-
-    /// Characters in the config that would otherwise end an attribute and swallow the form.
-    #[test]
-    fn rendered_values_are_escaped() {
-        let mut config = a_config();
-        config.builders[0].name = "ti\"tan<eu>&".to_owned();
-        let html = render_index(
-            &config,
-            Path::new("config.toml"),
-            &Banner {
-                ok: None,
-                err: None,
-            },
-            &PairStates::default(),
-            &test_kinds(),
-        );
-        assert!(!html.contains("ti\"tan<eu>&"), "{html}");
-        // askama's numeric entities, not the named ones a hand-rolled escaper would emit.
-        assert!(html.contains("ti&#34;tan&#60;eu&#62;&#38;"), "{html}");
-    }
-
-    /// What axum's `Query` extractor does, so the assertion is about the encoder.
-    fn urldecode(text: &str) -> String {
-        let bytes = text.as_bytes();
-        let mut out = Vec::with_capacity(bytes.len());
-        let mut i = 0;
-        while i < bytes.len() {
-            match bytes[i] {
-                b'+' => {
-                    out.push(b' ');
-                    i += 1;
-                }
-                b'%' if i + 2 < bytes.len() => {
-                    let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap();
-                    out.push(u8::from_str_radix(hex, 16).unwrap());
-                    i += 3;
-                }
-                byte => {
-                    out.push(byte);
-                    i += 1;
-                }
-            }
-        }
-        String::from_utf8(out).unwrap()
-    }
-
-    /// A raw `&` would truncate the message at the query separator.
-    #[test]
-    fn the_banner_round_trips_through_the_query_string() {
-        let message = "pair \"WETH/USDC\" was rejected: min_mid > max_mid (2% & rising)";
-        let encoded = urlencode(message);
-        // Not '%': it is the escape marker, so it appears in the output by construction.
-        // The message's own '%' is checked by the round-trip below.
-        for raw in [' ', '"', '&', '='] {
-            assert!(!encoded.contains(raw), "{raw:?} left raw in {encoded}");
-        }
-        assert_eq!(urldecode(&encoded), message);
-    }
-
-    /// A renamed route leaves a button that 405s and a link that 404s, invisible until
-    /// someone clicks it.
-    #[test]
-    fn every_form_and_link_reaches_a_real_route() {
-        let config = a_config();
-        let index = render_index(
-            &config,
-            Path::new("config.toml"),
-            &Banner {
-                ok: None,
-                err: None,
-            },
-            &PairStates::default(),
-            &test_kinds(),
-        );
-        for target in [
-            "action=/reload",
-            "action=/pairs/remove",
-            "action=/builders/remove",
-            r#"href="/pairs/new""#,
-            r#"href="/builders/new""#,
-            r#"href="/settings""#,
-            r#"href="/pairs/edit/UPDATER_KEY_WETH_USDC""#,
-        ] {
-            assert!(index.contains(target), "the index has no {target}");
-        }
-
-        let new_pair = render_pair_form(None, &test_kinds());
-        assert!(new_pair.contains(r#"action="/pairs/add""#), "{new_pair}");
-        let edit_pair = render_pair_form(Some(&config.pairs[0]), &test_kinds());
-        assert!(edit_pair.contains(r#"action="/pairs/edit""#), "{edit_pair}");
-        assert!(render_builder_form().contains("action=/builders/add"));
-    }
-
-    const CUSTOM_PAIR: &str = r#"target = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
-
-[[pairs]]
-tokens  = ["0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"]
-symbol  = "ETHUSDC"
-key_env = "UPDATER_KEY_WETH_USDC"
-
-[pairs.pricing]
-kind = "skewed"
-half_spread = 0.0005
-
-[[builder]]
-name = "titan-eu"
-endpoint = "wss://eu.rpc.titanbuilder.xyz/ws/sendquoteupdate"
-api_key = "k"
-"#;
-
-    /// The backoffice cannot edit the stanza of a kind that declares no fields, so it must
-    /// carry it through an edit of anything else untouched, and add no other kind's keys.
+    /// An allowed account's token is let in, and its change is made; another account's,
+    /// however good, is refused with 403; a bad token with 401, saying why.
     #[tokio::test]
-    async fn editing_a_custom_pair_keeps_its_stanza_and_adds_no_pricing_keys() {
-        let (path, state, mut reloads) = config_on_disk("custom-stanza");
-        std::fs::write(&path, CUSTOM_PAIR).unwrap();
-        let before = config::load_raw(&path).unwrap().pairs[0].pricing.clone();
-        let (local, _task) = bind(
-            "127.0.0.1:0".parse().unwrap(),
-            path.clone(),
-            state.reloads.clone(),
-            test_client(),
-            PairStates::default(),
-            std::sync::Arc::new(tokio::sync::Mutex::new(())),
-            test_kinds(),
-        )
-        .await
-        .unwrap();
-        let service = tokio::spawn(async move {
-            let request = reloads.recv().await.expect("a reload must be requested");
-            let _ = request.reply.send(Ok("reload: 1 restarted".to_owned()));
-        });
-        // Every kind's inputs are posted; with the pair's own kind chosen, none of them is
-        // read and the stanza the page has no form for is kept as it was.
-        let body = "key_env=UPDATER_KEY_WETH_USDC&symbol=ETHUSDC&pricing=skewed\
-                    &pricing_fixed_mid=1&pricing_fixed_delta=0.001\
-                    &min_mid=0.0002&max_mid=&max_deviation=&pricing_volatile_gamma=0.1";
-        let posted = http(
-            local,
-            &format!(
-                "POST /pairs/edit HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\
-                 Content-Type: application/x-www-form-urlencoded\r\n\
-                 Content-Length: {}\r\n\r\n{body}",
-                body.len()
-            ),
-        )
-        .await;
-        service.await.unwrap();
-        assert!(posted.contains("303 See Other"), "{posted}");
+    async fn only_an_allowed_account_gets_in() {
+        let keys = KeysEndpoint::spawn("a").await;
+        let (local, config) = serve_signed_in("signin-accounts", &keys, &[]).await;
+        let halt = format!("/api/pairs/{WETH_USDC}/halt");
 
-        let pair = &config::load_raw(&path).unwrap().pairs[0];
-        assert_eq!(pair.pricing, before, "the stanza survives value-equal");
-        assert_eq!(pair.min_mid.as_deref(), Some("0.0002"));
-    }
+        let workspace = sign("a", &claims("alice@example.com", Some("example.com")));
+        let (status, body) = call_signed(local, "GET", "/api/pairs", None, &workspace).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
 
-    /// What a browser posts from the page's first form: every named `<input>`, a checkbox
-    /// or radio only when checked, values unescaped. Enough HTML for these templates
-    /// (attribute values quoted or bare; the pair form has no `<select>` or `<textarea>`).
-    fn posted_fields(page: &str) -> Vec<(String, String)> {
-        let form = page
-            .split("</form>")
-            .next()
-            .expect("the page has a form")
-            .split_once("<form")
-            .expect("the page has a form")
-            .1;
-        let mut fields = Vec::new();
-        for tag in form.split("<input").skip(1) {
-            let tag = tag.split('>').next().unwrap_or_default();
-            let mut attrs = std::collections::HashMap::new();
-            let mut rest = tag.trim_start();
-            while !rest.is_empty() {
-                let end = rest
-                    .find(|c: char| c == '=' || c.is_whitespace())
-                    .unwrap_or(rest.len());
-                let name = rest[..end].to_owned();
-                rest = &rest[end..];
-                let value = if let Some(after) = rest.strip_prefix('=') {
-                    let (value, after) = match after.strip_prefix('"') {
-                        Some(quoted) => quoted.split_once('"').expect("a closed quote"),
-                        None => {
-                            after.split_at(after.find(char::is_whitespace).unwrap_or(after.len()))
-                        }
-                    };
-                    rest = after;
-                    value.to_owned()
-                } else {
-                    String::new()
-                };
-                attrs.insert(name, value);
-                rest = rest.trim_start();
-            }
-            let Some(name) = attrs.get("name") else {
-                continue;
-            };
-            let kind = attrs.get("type").map(String::as_str).unwrap_or("text");
-            if matches!(kind, "checkbox" | "radio") && !attrs.contains_key("checked") {
-                continue;
-            }
-            let value = attrs
-                .get("value")
-                .cloned()
-                .unwrap_or_else(|| "on".to_owned())
-                .replace("&#34;", "\"")
-                .replace("&#39;", "'")
-                .replace("&#60;", "<")
-                .replace("&#62;", ">")
-                .replace("&#38;", "&");
-            fields.push((name.clone(), value));
-        }
-        fields
-    }
-
-    /// The custom pair's own page, saved with exactly what it posts, read off the rendered
-    /// form rather than written by hand: the page posts neither `mid` nor `delta`, and a
-    /// body written to match the handler instead of the form is how this page shipped
-    /// unsavable (a 422 for want of `mid`).
-    #[tokio::test]
-    async fn a_custom_pairs_page_saves_with_exactly_what_it_posts() {
-        let (path, state, mut reloads) = config_on_disk("custom-form");
-        std::fs::write(&path, CUSTOM_PAIR).unwrap();
-        let raw = config::load_raw(&path).unwrap();
-        let before = raw.pairs[0].pricing.clone();
-        let mut fields = posted_fields(&render_pair_form(Some(&raw.pairs[0]), &test_kinds()));
+        let outsider = sign("a", &claims("eve@other.com", Some("other.com")));
+        let (status, body) = call_signed(local, "POST", &halt, None, &outsider).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
         assert!(
-            fields.iter().any(|(name, _)| name == "key_env")
-                && !fields
-                    .iter()
-                    .any(|(name, _)| name == "mid" || name == "delta"),
-            "{fields:?}"
+            body["error"].as_str().unwrap().contains("eve@other.com"),
+            "{body}"
         );
-        // The operator's edit: a floor on the mid.
-        for (name, value) in &mut fields {
-            if name == "min_mid" {
-                *value = "0.0002".to_owned();
-            }
-        }
-        let body = fields
-            .iter()
-            .map(|(name, value)| format!("{}={}", urlencode(name), urlencode(value)))
-            .collect::<Vec<_>>()
-            .join("&");
-        let (local, _task) = bind(
-            "127.0.0.1:0".parse().unwrap(),
-            path.clone(),
-            state.reloads.clone(),
-            test_client(),
-            PairStates::default(),
-            std::sync::Arc::new(tokio::sync::Mutex::new(())),
-            test_kinds(),
-        )
-        .await
-        .unwrap();
-        let service = tokio::spawn(async move {
-            let request = reloads.recv().await.expect("a reload must be requested");
-            let _ = request.reply.send(Ok("reload: 1 restarted".to_owned()));
-        });
-        let posted = http(
-            local,
-            &format!(
-                "POST /pairs/edit HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\
-                 Content-Type: application/x-www-form-urlencoded\r\n\
-                 Content-Length: {}\r\n\r\n{body}",
-                body.len()
-            ),
-        )
-        .await;
-        assert!(posted.contains("303 See Other"), "{posted}");
-        service.await.unwrap();
+        assert!(!config.snapshot().pairs[0].halted);
 
-        let pair = &config::load_raw(&path).unwrap().pairs[0];
-        assert_eq!(pair.pricing, before, "the stanza survives value-equal");
-        assert_eq!(pair.min_mid.as_deref(), Some("0.0002"));
+        let mut expired = claims("ops@gmail.com", None);
+        expired["exp"] = serde_json::json!(1);
+        let response = reqwest::Client::new()
+            .get(format!("http://{local}/api/pairs"))
+            .bearer_auth(sign("a", &expired))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 401);
         assert_eq!(
-            pair.symbol.as_deref(),
-            Some("ETHUSDC"),
-            "its market is kept"
+            response.headers()["www-authenticate"],
+            "Bearer error=\"invalid_token\""
         );
+        let body: Value = response.json().await.unwrap();
+        assert!(
+            body["error"].as_str().unwrap().contains("expired"),
+            "{body}"
+        );
+
+        let (status, body) = call_signed(local, "POST", &halt, None, &token("ops@gmail.com")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(config.snapshot().pairs[0].halted);
     }
 
-    /// A body with no pricing choice (a page from before the choice existed, a hand-made
-    /// request) keeps the pair's stanza as it is rather than reading as "clear it".
+    /// The F-06 half: Google's keys endpoint hanging does not hold up a halt signed with a
+    /// key already fetched.
     #[tokio::test]
-    async fn an_edit_without_a_pricing_choice_keeps_the_stanza() {
-        let (path, state, mut reloads) = config_on_disk("no-choice");
-        let before = config::load_raw(&path).unwrap().pairs[0].pricing.clone();
-        let (local, _task) = bind(
-            "127.0.0.1:0".parse().unwrap(),
-            path.clone(),
-            state.reloads.clone(),
-            test_client(),
-            PairStates::default(),
-            std::sync::Arc::new(tokio::sync::Mutex::new(())),
-            test_kinds(),
+    async fn a_halt_does_not_wait_for_googles_keys() {
+        let keys = KeysEndpoint::spawn("a").await;
+        let (local, config) = serve_signed_in("signin-halt", &keys, &[]).await;
+        let ops = token("ops@gmail.com");
+        let (status, body) = call_signed(local, "GET", "/api/pairs", None, &ops).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        keys.stall();
+        let (status, body) = tokio::time::timeout(
+            Duration::from_secs(1),
+            call_signed(local, "POST", "/api/halt", None, &ops),
         )
         .await
-        .unwrap();
-        let service = tokio::spawn(async move {
-            let request = reloads.recv().await.expect("a reload must be requested");
-            let _ = request.reply.send(Ok("reload: 1 restarted".to_owned()));
-        });
-        let body =
-            "key_env=UPDATER_KEY_WETH_USDC&symbol=ETHUSDC&min_mid=0.0002&max_mid=&max_deviation=";
-        let posted = http(
-            local,
-            &format!(
-                "POST /pairs/edit HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\
-                 Content-Type: application/x-www-form-urlencoded\r\n\
-                 Content-Length: {}\r\n\r\n{body}",
-                body.len()
-            ),
-        )
-        .await;
-        service.await.unwrap();
-        assert!(posted.contains("303 See Other"), "{posted}");
-        let pair = &config::load_raw(&path).unwrap().pairs[0];
-        assert_eq!(pair.pricing, before);
-        assert_eq!(pair.min_mid.as_deref(), Some("0.0002"));
+        .expect("the halt answers without a fetch");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(config.snapshot().pairs[0].halted);
     }
 
-    #[test]
-    fn the_pair_form_says_where_a_custom_pairs_pricing_is_edited() {
-        let config: config::RawConfig = toml::from_str(CUSTOM_PAIR).unwrap();
-        let form = render_pair_form(Some(&config.pairs[0]), &test_kinds());
-        for expected in ["[pairs.pricing]", "config.toml", "skewed"] {
-            assert!(form.contains(expected), "{expected}:\n{form}");
+    /// A front end on another origin: the preflight lets it send `Authorization`, and a 401
+    /// reaches its page readable, rather than as a network error it cannot tell apart.
+    #[tokio::test]
+    async fn a_front_end_on_another_origin_can_sign_in_and_read_a_refusal() {
+        let keys = KeysEndpoint::spawn("a").await;
+        let (local, _config) = serve_signed_in("signin-cors", &keys, &[UI.to_owned()]).await;
+        let client = reqwest::Client::new();
+
+        let preflight = client
+            .request(reqwest::Method::OPTIONS, format!("http://{local}/api/halt"))
+            .header("origin", UI)
+            .header("access-control-request-method", "POST")
+            .header(
+                "access-control-request-headers",
+                "authorization, content-type",
+            )
+            .send()
+            .await
+            .unwrap();
+        assert!(preflight.status().is_success(), "{}", preflight.status());
+        let allowed = preflight.headers()["access-control-allow-headers"]
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(allowed.contains("authorization"), "{allowed}");
+
+        let refused = client
+            .get(format!("http://{local}/api/pairs"))
+            .header("origin", UI)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status().as_u16(), 401);
+        assert_eq!(refused.headers()["access-control-allow-origin"], UI);
+
+        let signed_in = client
+            .get(format!("http://{local}/api/pairs"))
+            .header("origin", UI)
+            .bearer_auth(token("ops@gmail.com"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(signed_in.status().as_u16(), 200);
+    }
+
+    /// The preview websocket, which a browser cannot give a header: the token as a
+    /// subprotocol opens it, answered as `backoffice`; none is refused before the upgrade.
+    #[tokio::test]
+    async fn the_preview_takes_its_token_as_a_subprotocol() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let keys = KeysEndpoint::spawn("a").await;
+        let (local, _config) = serve_signed_in("signin-preview", &keys, &[]).await;
+        let request = |protocols: Option<String>| {
+            let mut request = format!(
+                "ws://{local}/api/preview?token0=0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2\
+                 &token1=0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+            )
+            .into_client_request()
+            .unwrap();
+            let headers = request.headers_mut();
+            headers.insert("origin", format!("http://{local}").parse().unwrap());
+            if let Some(protocols) = protocols {
+                headers.insert("sec-websocket-protocol", protocols.parse().unwrap());
+            }
+            request
+        };
+
+        match tokio_tungstenite::connect_async(request(None)).await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                assert_eq!(response.status().as_u16(), 401)
+            }
+            other => panic!("opened with no token: {:?}", other.map(|_| ())),
         }
-        assert!(
-            form.contains(r#"id="pricing-skewed" name=pricing value="skewed" checked"#),
-            "{form}"
+
+        let offered = format!("backoffice, bearer.{}", token("ops@gmail.com"));
+        let (_page, response) = tokio_tungstenite::connect_async(request(Some(offered)))
+            .await
+            .expect("opened with a token");
+        assert_eq!(response.headers()["sec-websocket-protocol"], "backoffice");
+    }
+
+    /// With sign-in off, `GET /api/auth` says so and nothing asks for a token.
+    #[tokio::test]
+    async fn without_sign_in_auth_says_there_is_none() {
+        let (local, _config) = serve("signin-off", |_| {}, accepted()).await;
+        let (status, body) = call(local, "GET", "/api/auth", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["google_client_id"], Value::Null);
+        let (status, _) = call(local, "GET", "/api/pairs", None).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// A change's log line names who signed in, beside the peer.
+    #[test]
+    fn a_caller_reads_as_who_signed_in_and_from_where() {
+        let peer: SocketAddr = "100.64.1.5:51234".parse().unwrap();
+        let signed_in = Caller {
+            peer,
+            email: Some("alice@example.com".to_owned()),
+        };
+        assert_eq!(
+            signed_in.to_string(),
+            "alice@example.com (100.64.1.5:51234)"
         );
-        assert!(!form.contains(r#"name="pricing_skewed_"#), "{form}");
+        assert_eq!(Caller { peer, email: None }.to_string(), "100.64.1.5:51234");
     }
 }

@@ -1,6 +1,7 @@
 //! A quote updater with a pricing model that reads the vault: `tilted`, a fixed half-spread
 //! with the mid tilted away from the side the vault is long, the way the volatile model
-//! tilts, by an amount the operator chooses. What the library offers beyond the market
+//! tilts, by an amount the operator chooses and never by more than the half-spread, so the
+//! quote stays around the market's mid. What the library offers beyond the market
 //! (`ctx.inventory()`, `ctx.history()`, `ctx.chain()`) is reached in the build, so the
 //! tick stays a few lines of arithmetic; and reading the vault is async, which is why this
 //! is a [`Factory`] rather than a `pricer_fn` closure. A pair opts in with:
@@ -9,10 +10,11 @@
 //! [pairs.pricing]
 //! kind        = "tilted"
 //! half_spread = 0.0005   # published as the delta, a fraction of the mid
-//! tilt        = 0.01     # the mid moves by tilt × (base share − 0.5), in market terms
+//! tilt        = 0.01     # the mid moves by tilt × (base share − 0.5), in market terms,
+//!                        # and by no more than half_spread either way
 //! ```
 //!
-//! `make e2e-custom` runs this binary against the mocks:
+//! `make e2e` runs this binary against the mocks:
 //! `cargo run -p quote-updater --example tilted -- --config c.toml`.
 
 use std::time::Duration;
@@ -45,9 +47,15 @@ impl Pricer for Tilted {
         }
         let share = reading.base_share(market.mid_f64());
         out.set(&self.share, share);
-        let skew = self.cfg.tilt * (share - 0.5);
+        // Never further than the half-spread, where one of our two prices sits on the
+        // market's mid. Past it the quote is through the market: a vault long the base
+        // would sell it below the market's price (one short would buy above it), and a
+        // taker who put the vault there fills that and unwinds on the market, at our cost,
+        // again after every vault reading. The core does not check this; the pricer does.
+        let half_spread = self.cfg.half_spread;
+        let skew = (self.cfg.tilt * (share - 0.5)).clamp(-half_spread, half_spread);
         Ok(PricerOutput::new(
-            market.scaled_fraction(self.cfg.half_spread)?,
+            market.scaled_fraction(half_spread)?,
             market.shift(skew)?,
         ))
     }
@@ -61,6 +69,11 @@ impl Factory for TiltedFactory {
 
     fn validate(&self, cfg: &Cfg, _pair: &PairShape) -> eyre::Result<()> {
         // The run prefixes the pair's label and the stanza, so say only what is wrong.
+        eyre::ensure!(
+            (0.0..1.0).contains(&cfg.half_spread),
+            "half_spread {} is outside 0..1, a fraction of the mid",
+            cfg.half_spread
+        );
         eyre::ensure!(
             (0.0..=0.5).contains(&cfg.tilt),
             "tilt {} is outside 0..=0.5, a full tilt at an empty vault",

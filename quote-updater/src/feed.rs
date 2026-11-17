@@ -880,12 +880,9 @@ fn quote_from_book(
     Ok((delta, mid))
 }
 
-/// Parses a decimal string like "0.99980000" into value * 10^decimals, truncating
-/// fractional digits beyond `decimals`.
-pub fn parse_decimal_scaled(s: &str, decimals: u32) -> Result<U256> {
-    // U256::MAX has 78 digits, so 78+ decimals can never fit; rejecting up front also
-    // bounds the zero-padding allocation below, which grows with `decimals`.
-    ensure!(decimals < 78, "{decimals} decimals cannot fit in a uint256");
+/// A decimal number's digits before and after the point, and its exponent: everything
+/// [`parse_decimal_scaled`] checks about the text before it scales anything.
+fn decimal_parts(s: &str) -> Result<(&str, &str, i32)> {
     // Exponent notation too (`8.31e-6`, `1E3`): JSON allows it and some venues print small
     // prices that way, and a number that is correct but spelled with an exponent must not
     // be refused as malformed. The exponent moves the decimal point; nothing else changes.
@@ -897,8 +894,11 @@ pub fn parse_decimal_scaled(s: &str, decimals: u32) -> Result<U256> {
         ),
         None => (s, 0),
     };
+    // A range, not `exponent.abs()`: the `abs` of `i32::MIN` overflows, which panics a debug
+    // build and in a release one wraps back to `i32::MIN`, below any bound. `1e-2147483648`
+    // then passed, and the padding in `parse_decimal_scaled` asked for two billion zeros.
     ensure!(
-        exponent.abs() <= 100,
+        (-100..=100).contains(&exponent),
         "exponent out of range in number: {s:?}"
     );
     let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
@@ -913,6 +913,23 @@ pub fn parse_decimal_scaled(s: &str, decimals: u32) -> Result<U256> {
             .all(|c| c.is_ascii_digit()),
         "invalid decimal number: {s:?}"
     );
+    Ok((int_part, frac_part, exponent))
+}
+
+/// Whether `s` reads as a decimal number [`parse_decimal_scaled`] would scale. For a venue
+/// parser that has more of a frame to read than its prices: a frame whose prices are not
+/// numbers is refused whatever else it says, so nothing else in it needs reading.
+pub(crate) fn is_decimal(s: &str) -> bool {
+    decimal_parts(s).is_ok()
+}
+
+/// Parses a decimal string like "0.99980000" into value * 10^decimals, truncating
+/// fractional digits beyond `decimals`.
+pub fn parse_decimal_scaled(s: &str, decimals: u32) -> Result<U256> {
+    // U256::MAX has 78 digits, so 78+ decimals can never fit; rejecting up front also
+    // bounds the zero-padding allocation below, which grows with `decimals`.
+    ensure!(decimals < 78, "{decimals} decimals cannot fit in a uint256");
+    let (int_part, frac_part, exponent) = decimal_parts(s)?;
     // All digits in one string, with where the point sits; the exponent shifts it.
     let mut all: String = format!("{int_part}{frac_part}");
     let point = int_part.len() as i64 + exponent as i64;
@@ -1055,6 +1072,17 @@ mod tests {
         assert!(parse_decimal_scaled("1e", 8).is_err());
         assert!(parse_decimal_scaled("e5", 8).is_err());
         assert!(parse_decimal_scaled("1e999", 8).is_err());
+        // The bound holds at both ends of an i32, where `abs()` does not: `i32::MIN` has no
+        // positive counterpart, and read as its own absolute value it passed the bound and
+        // asked for two billion zeros of padding.
+        assert_eq!(p("1e-100", 8), U256::zero());
+        assert!(parse_decimal_scaled("1e-101", 8).is_err());
+        assert!(parse_decimal_scaled("1e101", 8).is_err());
+        assert!(parse_decimal_scaled("1e-2147483648", 8).is_err());
+        assert!(parse_decimal_scaled("1e2147483647", 8).is_err());
+        assert!(parse_decimal_scaled("1e-2147483649", 8).is_err());
+        assert!(is_decimal("8.31e-6") && is_decimal("0") && is_decimal(".5"));
+        assert!(!is_decimal("") && !is_decimal("1e-2147483648") && !is_decimal("1,5"));
         // An empty side reads as zero, which the book check then refuses as one-sided.
         assert_eq!(
             quote_from_book(

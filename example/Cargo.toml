@@ -29,3 +29,6 @@ tracing = "0.1"
 lto = "fat"
 codegen-units = 1
 debug = "line-tables-only"
+# An integer overflow panics, as in a debug build, instead of wrapping: one pair's lane
+# restarts, where a wrapped number would have been carried on as if it were right.
+overflow-checks = true
