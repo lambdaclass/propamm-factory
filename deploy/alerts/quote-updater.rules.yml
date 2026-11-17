@@ -606,8 +606,12 @@ groups:
       # check working. Five minutes of it is a venue that froze behind a live socket, one
       # delivering a backlog, a thin book that was pushed, or a limit set inside the
       # venues' ordinary noise.
+      #
+      # The rate is over one minute, not five, so `for: 5m` means withdrawn in every one of
+      # five minutes. Over five, one withdrawn tick reads as nonzero for the whole five that
+      # follow, and two of them a few minutes apart raised a ticket saying five minutes.
       - alert: PusherSourcesDisagree
-        expr: rate(quote_updater_price_unusable_total{reason="source_divergence"}[5m]) > 0
+        expr: rate(quote_updater_price_unusable_total{reason="source_divergence"}[1m]) > 0
         for: 5m
         labels: { severity: ticket }
         annotations:
