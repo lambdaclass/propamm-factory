@@ -383,6 +383,48 @@ beyond it `_quote` reverts `SpreadTooWide`. Refusing withdraws the quote rather 
 reverting every fill. `--check`'s delta column prints whichever number applies, because it
 runs through the same function the service publishes with.
 
+### Size charges: a larger fill pays more
+
+`delta` is one number for every size. A pair that sets `size_charges` also publishes a table
+of what a fill pays on top of it for its size:
+
+```toml
+# Up to 10% of the vault at no charge, from 10% to 30% at 2 bp, everything past that at 5 bp.
+size_charges = "10:0, 30:2, rest:5"
+```
+
+Each row is `percent:bps`: where the row ends, as a percentage of the vault, and what the part
+of a fill inside it pays, in basis points. A fill pays the average of the rows it spans, so one
+taking 20% of the vault above pays 0 bp on its first half and 2 bp on its second, 1 bp in all.
+Rows must end further into the vault each time and never charge less than the one before: a
+larger fill never gets a better price than a smaller one. `rest` is everything past the last
+row; without it the last row's charge carries on past its end. Percentages take up to four
+decimals and charges up to two, at most 655.35 bp.
+
+The percentage is of what the fill is worth at the mid, over the vault's balance of the token
+it pays out. That makes one table mean the same on every pair, and it makes the charge follow
+the vault with no help from the updater: a vault half as full makes the same fill twice the
+share.
+
+A block's fills are counted together. The contract keeps, for each direction of the pair, what
+has been filled against the current update and the balance the vault had when the first of
+those fills arrived, and each fill continues the table from where the last one stopped. Two
+fills of 10% in one block pay what one fill of 20% pays, so splitting an order gains nothing,
+and a fill that follows a large one pays for it without waiting for the next update. The count
+starts over with each update, against what the vault holds then. The two directions are
+counted apart, and the one table prices both.
+
+The table rides in the update the pair already sends. Three rows fit beside `delta` in its
+first slot, which the update writes anyway, so they add no storage write; each six rows past
+that add a slot, and the update's gas limit grows by 25,000 for each. An update without a
+table is what it always was, and the contract prices it with its fixed impact of 1 bp for a
+fill of the whole vault. A table replaces that impact.
+
+The PropAMM has to be one that reads size tables: one that does not would take the rows for
+part of `delta` and refuse every quote. `--check` and startup ask the target, and fail the
+pair when it does not answer. A table is a setting like any other: changing it rebuilds the
+lane on reload, and the backoffice's pair form has a field for it.
+
 ### Volatile pairs: a computed spread
 
 A fixed `delta` is right for USDC/USDT and wrong for WETH/USDC: the pool is stuck holding

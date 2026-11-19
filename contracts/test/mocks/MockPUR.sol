@@ -32,11 +32,26 @@ contract MockPUR {
     /// A registry that keeps no window: it answers with its last update however old, stamped
     /// truthfully. PropAMM has to refuse that answer on its own.
     bool public lenient;
+    /// The slots past the first two, by index, for an update that carries more (a size table's
+    /// rows). Read only when `slotCount` says there are any.
+    mapping(uint256 => uint256) public extra;
 
     function setState(uint256 delta_, uint256 mid_) external {
         delta = delta_;
         mid = mid_;
         updatedAt = uint32(block.timestamp);
+    }
+
+    /// A whole update as the updater would publish it, however many slots it has, stamped with
+    /// this block's timestamp like `setState`.
+    function setSlots(uint256[] calldata slots_) external {
+        delta = slots_[0];
+        mid = slots_[1];
+        slotCount = uint64(slots_.length);
+        updatedAt = uint32(block.timestamp);
+        for (uint256 i = 2; i < slots_.length; i++) {
+            extra[i] = slots_[i];
+        }
     }
 
     function setSlotCount(uint64 slotCount_) external {
@@ -57,6 +72,9 @@ contract MockPUR {
         slots = new uint256[](count);
         if (count > 0) slots[0] = delta;
         if (count > 1) slots[1] = mid;
+        for (uint256 i = 2; i < count; i++) {
+            slots[i] = extra[i];
+        }
         return (updatedAt, slots);
     }
 

@@ -33,6 +33,16 @@ pub const BLOCK_TIME_SECS: u64 = 12;
 /// is behind the update's, so the registry's freshness check would make estimation revert.
 pub const UPDATE_GAS_LIMIT: u64 = 120_000;
 
+/// What each slot a size table adds past the third raises the limit by. The first update to
+/// write a slot pays for a fresh storage word, 22,100 gas, and the limit is not estimated.
+pub const SIZE_TABLE_SLOT_GAS: u64 = 25_000;
+
+/// The gas limit of one update: [`UPDATE_GAS_LIMIT`], raised for the slots a size table past
+/// three rows adds. Three rows ride in slot 0 and change nothing.
+pub fn update_gas_limit(table: Option<&crate::size_table::SizeTable>) -> u64 {
+    UPDATE_GAS_LIMIT + SIZE_TABLE_SLOT_GAS * table.map_or(0, |table| table.extra_slots() as u64)
+}
+
 /// How long past an update's timestamp its slot may stay empty before it is given up on.
 ///
 /// The block for a slot is proposed at the slot's own timestamp and reaches an RPC
@@ -59,6 +69,8 @@ pub struct UpdateParams {
     pub target: Address,
     pub lane: U256,
     pub chain_id: u64,
+    /// The pair's size charges, published with every update; `None` for a pair without any.
+    pub size_table: Option<Arc<crate::size_table::SizeTable>>,
 }
 
 /// What each update derives from the latest (parent) block: the timestamp it is stamped
@@ -290,6 +302,9 @@ pub struct ValueSource {
     /// `BuildCtx::landings` feed. A pricer that never asked for it has no reader, and the
     /// report goes nowhere.
     landings: tokio::sync::watch::Sender<Option<crate::pricing::LandingReport>>,
+    /// The pair's size charges, which every update it publishes carries; `None` for a pair
+    /// that states none.
+    size_table: Option<Arc<crate::size_table::SizeTable>>,
 }
 
 /// What a pricer's build declared, bound to its metric series, and the tasks it started.
@@ -431,7 +446,22 @@ impl ValueSource {
             latch: crate::guard::Latch::new(),
             guards: Arc::new(Mutex::new(Vec::new())),
             landings: tokio::sync::watch::channel(None).0,
+            size_table: None,
         }
+    }
+
+    /// The pair's size charges, for both send paths to publish with its price.
+    pub(crate) fn with_size_table(
+        mut self,
+        size_table: Option<Arc<crate::size_table::SizeTable>>,
+    ) -> Self {
+        self.size_table = size_table;
+        self
+    }
+
+    /// The pair's size charges, if it states any.
+    pub(crate) fn size_table(&self) -> Option<Arc<crate::size_table::SizeTable>> {
+        self.size_table.clone()
     }
 
     /// The sender of the build context the pricer took its landing feed from, so the
@@ -775,15 +805,21 @@ fn test_shape(inverted: bool, price_decimals: u32) -> PairShape {
     }
 }
 
-/// updateState(target, lane, ts, [delta, mid]) calldata, shared by both send paths.
+/// updateState(target, lane, ts, slots) calldata, shared by both send paths. The slots are
+/// `[delta, mid]`, and the pair's size charges when it has a table (see
+/// `size_table::update_slots`).
 pub fn update_calldata(params: &UpdateParams, ts: u32, delta: U256, mid: U256) -> Result<Vec<u8>> {
+    let slots = crate::size_table::update_slots(delta, mid, params.size_table.as_deref())?
+        .into_iter()
+        .map(Value::Uint)
+        .collect();
     Ok(encode_calldata(
         UPDATE_STATE_SIG,
         &[
             Value::Address(params.target),
             Value::Uint(params.lane),
             Value::Uint(ts.into()),
-            Value::Array(vec![Value::Uint(delta), Value::Uint(mid)]),
+            Value::Array(slots),
         ],
     )?)
 }
@@ -814,7 +850,7 @@ pub async fn sign_update_tx(
         signer.address(),
         update_calldata(params, stamp.ts, delta, mid)?.into(),
         Overrides {
-            gas_limit: Some(UPDATE_GAS_LIMIT),
+            gas_limit: Some(update_gas_limit(params.size_table.as_deref())),
             max_fee_per_gas: Some(next_block_max_fee(stamp.parent_base_fee, 0)),
             max_priority_fee_per_gas: Some(0),
             nonce: Some(nonce),
@@ -1144,6 +1180,7 @@ mod tests {
             target: Address::from_slice(&[0x22; 20]),
             lane: U256::from(7u64),
             chain_id: 1,
+            size_table: None,
         }
     }
 
@@ -1167,6 +1204,47 @@ mod tests {
                 ]),
             ]
         );
+    }
+
+    /// A pair's size charges ride in the same update: three rows above delta in slot 0, the
+    /// rest from slot 3 on, and the gas limit grows with the slots that adds.
+    #[test]
+    fn a_size_table_rides_in_the_updates_slots() {
+        use crate::size_table::SizeTable;
+        let slots_of = |params: &UpdateParams| {
+            let calldata = update_calldata(params, 1, U256::from(5u64), U256::from(9u64)).unwrap();
+            match decode_calldata(UPDATE_STATE_SIG, Bytes::from(calldata))
+                .unwrap()
+                .remove(3)
+            {
+                Value::Array(slots) => slots,
+                other => panic!("the slots are an array, not {other:?}"),
+            }
+        };
+        let mut params = params();
+        params.size_table = Some(Arc::new(SizeTable::parse("10:0, 30:2, rest:5").unwrap()));
+        let slots = slots_of(&params);
+        assert_eq!(slots.len(), 2, "three rows add no slot");
+        assert_eq!(slots[1], Value::Uint(U256::from(9u64)));
+        let Value::Uint(slot0) = slots[0] else {
+            panic!("slot 0 is a uint")
+        };
+        assert_eq!(slot0 & U256::from(u64::MAX), U256::from(5u64), "delta");
+        assert_ne!(slot0 >> 64, U256::zero(), "the rows sit above it");
+        assert_eq!(
+            update_gas_limit(params.size_table.as_deref()),
+            UPDATE_GAS_LIMIT
+        );
+
+        params.size_table = Some(Arc::new(
+            SizeTable::parse("1:1, 2:2, 3:3, 4:4, rest:5").unwrap(),
+        ));
+        assert_eq!(slots_of(&params).len(), 4, "a fourth row starts slot 3");
+        assert_eq!(
+            update_gas_limit(params.size_table.as_deref()),
+            UPDATE_GAS_LIMIT + SIZE_TABLE_SLOT_GAS
+        );
+        assert_eq!(update_gas_limit(None), UPDATE_GAS_LIMIT);
     }
 
     /// The registry is the transaction's `to`, not an ABI argument, so it must not appear

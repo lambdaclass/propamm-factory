@@ -717,6 +717,7 @@ use eyre::Result;
 
 const IS_UPDATER_SIG: &str = "isUpdater(address,address)";
 const PAIR_VAULTS_SIG: &str = "pairVaults(uint256)";
+const FILLS_SIG: &str = "fills(uint256,uint256)";
 const ERC20_SYMBOL_SIG: &str = "symbol()";
 const BALANCE_OF_SIG: &str = "balanceOf(address)";
 
@@ -976,6 +977,30 @@ pub async fn build_report(
                                 "could not read balanceOf({vault:#x}) on {token:#x}, so the \
                                  vault-balance check did not run for that token"
                             )),
+                        }
+                    }
+                    // A pair with size charges publishes its rows above `delta` in slot 0.
+                    // A PropAMM that reads size tables takes them from there; one that does
+                    // not reads the whole slot as `delta` and refuses every quote. `fills`
+                    // is what such a PropAMM counts a block's fills in, so its answering is
+                    // the sign. A failure, not a warning: starting on an unanswered check
+                    // risks a pair that quotes nothing.
+                    if spec.size_table.is_some() {
+                        let calldata = encode_calldata(
+                            FILLS_SIG,
+                            &[Value::Uint(spec.lane), Value::Uint(U256::zero())],
+                        )?;
+                        let answer = call_view(client, config.target, calldata, None, None)
+                            .await
+                            .ok();
+                        if decode_one("r(uint256)", answer.as_deref()).is_none() {
+                            row.failures.push(format!(
+                                "this pair sets size_charges, and fills({:#x}, 0) on {:#x} did \
+                                 not answer: either the PropAMM does not read size tables, and \
+                                 would refuse every quote published with one (upgrade it, or \
+                                 remove size_charges), or the call itself failed",
+                                spec.lane, config.target
+                            ));
                         }
                     }
                 }

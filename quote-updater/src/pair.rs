@@ -597,7 +597,16 @@ pub(crate) async fn build_live(
     // Both sides' kinds, for `guards{pair,kind}` and the removal that retires it.
     let mut guard_kinds = guard_kinds;
     guard_kinds.extend(quote_guards.iter().map(|guard| guard.kind));
-    let values = values.with_guards(latch.clone(), quote_guards);
+    if let Some(table) = &resolved.size_table {
+        tracing::info!(
+            "[{}] size charges, as percent of the vault to bp: {}",
+            resolved.pair.label,
+            table.describe()
+        );
+    }
+    let values = values
+        .with_guards(latch.clone(), quote_guards)
+        .with_size_table(resolved.size_table.map(Arc::new));
     Ok(Built {
         live: Live {
             halt: Default::default(),
@@ -1415,6 +1424,7 @@ mod tests {
             pricing: config::PricingSpec::fixed_for_tests("1", "0"),
             feeds: None,
             invert: false,
+            size_table: None,
             breaker: None,
             guards: Vec::new(),
         };

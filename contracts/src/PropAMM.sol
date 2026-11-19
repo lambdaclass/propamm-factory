@@ -13,6 +13,7 @@ import "@openzeppelin/contracts-upgradeable/utils/introspection/ERC165Upgradeabl
 import {IPrioUpdateRegistry} from "./interfaces/IPrioUpdateRegistry.sol";
 import {IPropAMM} from "./interfaces/IPropAMM.sol";
 import {IPropAMMFillable} from "./interfaces/IPropAMMFillable.sol";
+import {SizeTable} from "./SizeTable.sol";
 
 error Expired();
 error InsufficientOutput(uint256 expectedOutput, uint256 receivedAmount);
@@ -57,6 +58,8 @@ error ZeroAmountOut();
 /// pair's own vault, where the output leg is a transfer from the vault to itself and delivers
 /// nothing.
 error InvalidRecipient(address recipient);
+/// With a size table: a vault balance, or one direction's fills against one update, past 2^112.
+error FilledOverflow(uint256 amount);
 /// `setOracle` naming the registry the instance already reads: nothing would change, and the
 /// event would report a move that did not happen.
 error OracleUnchanged(address oracle);
@@ -88,13 +91,25 @@ contract PropAMM is
     }
 
     /// @notice What `_pricing` reads for one pair in one direction, for `_amountOut` to price with.
-    /// @dev A fill's worth at mid, in tokenOut units, is `amountIn * midNum / midDen`.
+    /// @dev A fill's worth at mid, in tokenOut units, is `amountIn * midNum / midDen`. The last
+    /// six fields are set only when the update carries a size table (see `SizeTable`).
     struct Pricing {
         address vault;
         uint256 vaultBalance;
         uint256 delta;
         uint256 midNum;
         uint256 midDen;
+        /// The update's slots, when it carries a size table (`hasTable`); empty otherwise.
+        uint256[] slots;
+        bool hasTable;
+        /// 0 when the taker sells token0, 1 when it sells token1.
+        uint256 side;
+        /// What this direction has already filled against this update, worth at mid in tokenOut.
+        uint256 filled;
+        /// The vault's tokenOut balance when the first of those fills arrived: what the table's
+        /// shares are shares of. The balance now, when there has been none.
+        uint256 ref;
+        uint256 pairKey;
     }
 
     /// @dev Every pair mutation announces itself, in canonical token order, so pair and vault
@@ -147,6 +162,14 @@ contract PropAMM is
     /// creation rather than hardcoded, so an instance can be pointed at another registry (see
     /// `setOracle`) without a new implementation.
     IPrioUpdateRegistry public oracle;
+    /// @notice Per pair and direction (0: takers selling token0), what the direction has filled
+    /// against the current update: bits 0..111 the fills' worth at mid in tokenOut, bits 112..223
+    /// the vault's tokenOut balance when the first of them arrived, bits 224..255 the timestamp
+    /// of the update they belong to. Anything from another update reads as nothing filled.
+    /// Written only while the update carries a size table.
+    mapping(uint256 pairKey => mapping(uint256 side => uint256)) public fills;
+
+    uint256 constant LOW112 = (1 << 112) - 1;
 
     constructor() {
         _disableInitializers();
@@ -198,6 +221,10 @@ contract PropAMM is
     /// enough: a registry without code, one that reverts and one whose answer is malformed all
     /// read as inactive. A registry or token answering megabytes can still exhaust the gas.
     ///
+    /// `delta` is read from the low 64 bits of its slot, as `_pricing` reads it. A size table
+    /// above it is not checked here: a row out of order refuses the fills that reach it, and
+    /// which those are depends on their size.
+    ///
     /// It is not told the swap's size and sizes nothing: a vault holding a wei reads as active,
     /// and the allowance is not read. `quote` and `quoteFillable` answer for an amount. Two
     /// things `quote` reverts on are left to it as well: a token whose `decimals()` has stopped
@@ -236,6 +263,8 @@ contract PropAMM is
             abi.decode(answer, (uint256, uint256, uint256, uint256, uint256));
         // The decoder wants every slot the length announces to be present, not only the two read.
         bool wellFormed = offset == 64 && count >= 2 && count <= (answer.length - 96) / 32;
+        // `delta` keeps the low bits of its slot; a size table's rows sit above them.
+        delta &= SizeTable.DELTA_MASK;
         return wellFormed && stamp == uint32(block.timestamp) && delta < SPREAD_SCALE && mid != 0;
     }
 
@@ -287,16 +316,20 @@ contract PropAMM is
         require(amountIn != 0, ZeroAmountIn());
         require(recipient != address(0), InvalidRecipient(recipient));
 
-        uint256 realAmountOut = _quote(tokenIn, tokenOut, amountIn);
+        Pricing memory p = _pricing(tokenIn, tokenOut);
+        uint256 realAmountOut = _amountOut(p, tokenOut, amountIn);
         require(realAmountOut != 0, ZeroAmountOut());
         require(realAmountOut >= minAmountOut, InsufficientOutput(minAmountOut, realAmountOut));
 
         // One vault per pair, so the account the quote was just priced against is the one both
-        // legs move through. `_quote` already proved it is set; this re-read of the same slot is
-        // warm, and cheaper than threading the address out of the pricing function.
-        address vault = pairVaults[_pairKey(tokenIn, tokenOut)];
+        // legs move through.
+        address vault = p.vault;
         // Paid to the vault it comes out of, the output would move nothing.
         require(recipient != vault, InvalidRecipient(recipient));
+
+        // Counted before anything moves, so the next fill of the block continues the table from
+        // where this one stopped.
+        if (p.hasTable) _recordFill(p, amountIn);
 
         // What `recipient` holds before, so the output is measured, not assumed: a token that
         // charges a fee on transfer delivers less than `realAmountOut`.
@@ -321,6 +354,9 @@ contract PropAMM is
     /// allowance counts too, because the router builds a leg around the answer, and a leg that
     /// reverts sends its input to the Uniswap remainder, which has no minimum output of its own.
     ///
+    /// Under a size table the fill is found by walking its rows (`SizeTable.fillable`) from where
+    /// the block's earlier fills left off; without one, by the closed form in `_midCap`.
+    ///
     /// Reverts wherever `quote` does for any reason but size (paused, unlisted pair, stale or
     /// malformed oracle data, empty vault), and for a `delta` so close to one that even the
     /// best-paying fill spreads past it. The router reads a revert as no candidate.
@@ -336,7 +372,9 @@ contract PropAMM is
     {
         Pricing memory p = _pricing(tokenIn, tokenOut);
         uint256 capacity = Math.min(p.vaultBalance, IERC20(tokenOut).allowance(p.vault, address(this)));
-        uint256 midCap = _midCap(p, capacity);
+        uint256 midCap = p.hasTable
+            ? SizeTable.fillable(p.slots, p.delta, p.filled, p.ref, capacity, type(uint256).max)
+            : _midCap(p, capacity);
 
         // Compared at mid before converting the cap back to tokenIn. The conversion overflows for
         // a vault worth more than 2^256 wei of tokenIn, which any order fits inside; past this
@@ -421,6 +459,11 @@ contract PropAMM is
     /// folded together with both tokens' decimals into one tokenIn-to-tokenOut conversion.
     /// @dev Kept apart from `_amountOut` so `quoteFillable` can price two sizes off one read.
     ///
+    /// The update is `[delta, mid]`, and may carry a size table: rows packed above `delta` in
+    /// slot 0 and from slot 3 on (`SizeTable`). With one, a fill pays the table's charge in place
+    /// of the fixed impact, continued from what its direction already filled against this
+    /// update, which `fills` holds. An update with nothing above `delta` prices as it always did.
+    ///
     /// A price is good for one block: the registry is asked for the update stamped with this
     /// block's timestamp and no other, and the stamp it answers with is checked as well, so a
     /// registry that hands back an older update is not priced from. That holds for a registry
@@ -448,8 +491,17 @@ contract PropAMM is
         // Checked here, once, so `quote`, `swap` and `quoteFillable` refuse an out-of-range
         // `delta` for the same reason; left to `_amountOut`, the sum with the impact overflows
         // for a `delta` near 2^256 and panics instead.
-        p.delta = slots[0];
-        require(p.delta < SPREAD_SCALE, SpreadTooWide(p.delta));
+        // `delta` keeps the low 64 bits of its slot, which hold any fraction below one; a size
+        // table's rows sit above them. Refused by the whole slot, so the revert names what the
+        // registry holds.
+        p.delta = slots[0] & SizeTable.DELTA_MASK;
+        require(p.delta < SPREAD_SCALE, SpreadTooWide(slots[0]));
+        if (SizeTable.present(slots)) {
+            p.slots = slots;
+            p.hasTable = true;
+            p.side = tokenIn < tokenOut ? 0 : 1;
+            p.pairKey = pairKey;
+        }
         uint256 mid = slots[1];
         require(mid != 0, InvalidMid(pairKey));
 
@@ -458,6 +510,17 @@ contract PropAMM is
 
         p.vaultBalance = IERC20(tokenOut).balanceOf(p.vault);
         require(p.vaultBalance != 0, EmptyVault(tokenOut));
+        if (p.hasTable) {
+            // What `fills` has room for, and what keeps the table's arithmetic inside a word.
+            require(p.vaultBalance <= LOW112, FilledOverflow(p.vaultBalance));
+            uint256 f = fills[pairKey][p.side];
+            if (f >> 224 == uint32(block.timestamp)) {
+                p.filled = f & LOW112;
+                p.ref = (f >> 112) & LOW112;
+            } else {
+                p.ref = p.vaultBalance;
+            }
+        }
 
         // `mid` prices one whole token0 in whole token1, so selling token0 multiplies by it and
         // buying token0 divides by it.
@@ -477,7 +540,14 @@ contract PropAMM is
 
         // The taker pays the spread either way, as a fraction taken off the mid fill, so both
         // directions are discounted identically and a round trip costs exactly (1 - spread)^2.
-        uint256 spread = p.delta + _priceImpact(midAmountOut, p.vaultBalance);
+        uint256 spread = p.delta
+            + (p.hasTable
+                    ? SizeTable.average(
+                        p.slots,
+                        Math.mulDiv(p.filled, SPREAD_SCALE, p.ref, Math.Rounding.Ceil),
+                        Math.mulDiv(p.filled + midAmountOut, SPREAD_SCALE, p.ref, Math.Rounding.Ceil)
+                    )
+                    : _priceImpact(midAmountOut, p.vaultBalance));
         require(spread < SPREAD_SCALE, SpreadTooWide(spread));
 
         // Rounded once: amountIn * midNum * (S - spread) / (midDen * S), floored, rather than
@@ -500,7 +570,15 @@ contract PropAMM is
         require(amountOut <= p.vaultBalance, InsufficientVaultBalance(tokenOut, amountOut, p.vaultBalance));
     }
 
-    /// @notice Prices the impact a fill has, on top of the oracle's spread.
+    /// @notice Adds a fill to its direction's count against the current update.
+    function _recordFill(Pricing memory p, uint256 amountIn) internal {
+        uint256 filled = p.filled + Math.mulDiv(amountIn, p.midNum, p.midDen);
+        require(filled <= LOW112, FilledOverflow(filled));
+        fills[p.pairKey][p.side] = (uint256(uint32(block.timestamp)) << 224) | (p.ref << 112) | filled;
+    }
+
+    /// @notice Prices the impact a fill has, on top of the oracle's spread, when the update
+    /// carries no size table.
     /// @dev Linear in the share of the vault's `tokenOut` balance the fill consumes: a fill that
     /// would take the whole balance is charged `IMPACT_FACTOR`, half the balance half of it.
     /// Both arguments are in `tokenOut` units, so the share is what carries the mid price and

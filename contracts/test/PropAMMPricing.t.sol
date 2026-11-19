@@ -901,7 +901,9 @@ contract PropAMMPricingTest is Test {
         // Up to 1e36: past about 1e41, scaling `mid` by a token's decimals overflows, which
         // `isActive` leaves to `quote`.
         mid = fault == 1 ? 0 : bound(mid, 1, 1e36);
-        delta = fault == 2 ? bound(delta, SPREAD_SCALE, type(uint256).max) : bound(delta, 0, SPREAD_SCALE - 1);
+        // `delta` keeps the low 64 bits of its slot, so that is the range it can be out of: what
+        // sits above them is a size table's rows, which `PropAMMSizeTable.t.sol` covers.
+        delta = fault == 2 ? bound(delta, SPREAD_SCALE, type(uint64).max) : bound(delta, 0, SPREAD_SCALE - 1);
         MockPUR(ORACLE).setState(delta, mid);
         // Two slots, or more: the mock pads with zeros, and extra slots are not `_pricing`'s concern.
         MockPUR(ORACLE).setSlotCount(fault == 3 ? 1 : uint64(bound(slots, 2, 4)));

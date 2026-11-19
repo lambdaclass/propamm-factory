@@ -135,6 +135,7 @@ mod tests {
             pricing: PricingSpec::feed_for_tests(delta.map(|d| d.to_string()).as_deref()),
             feeds: Some(crate::config::Feeds::single_binance("ETHUSDC")),
             band: MidBand::default(),
+            size_table: None,
             breaker: None,
             guards: Vec::new(),
             key_env: format!("UPDATER_KEY_{lane_id}"),

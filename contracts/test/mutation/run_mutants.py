@@ -248,7 +248,33 @@ MUTANTS = [
         PROPAMM,
         drop(f"{I8}require(slots.length >= 2, InsufficientOracleData(pairKey, slots.length));\n"),
     ),
-    ("price: delta of one or more", PROPAMM, drop(f"{I8}require(p.delta < SPREAD_SCALE, SpreadTooWide(p.delta));\n")),
+    ("price: delta of one or more", PROPAMM, drop(f"{I8}require(p.delta < SPREAD_SCALE, SpreadTooWide(slots[0]));\n")),
+    # An update that carries a size table.
+    (
+        "size table: delta is read with the rows above it",
+        PROPAMM,
+        ("p.delta = slots[0] & SizeTable.DELTA_MASK;", "p.delta = slots[0];"),
+    ),
+    (
+        "size table: isActive reads the rows as delta",
+        PROPAMM,
+        drop(f"{I8}delta &= SizeTable.DELTA_MASK;\n"),
+    ),
+    (
+        "size table: a fill is not counted",
+        PROPAMM,
+        drop(f"{I8}if (p.hasTable) _recordFill(p, amountIn);\n"),
+    ),
+    (
+        "size table: a count outlives its update",
+        PROPAMM,
+        ("if (f >> 224 == uint32(block.timestamp)) {", "if (f >> 224 != 0) {"),
+    ),
+    (
+        "size table: a vault too large to count is priced",
+        PROPAMM,
+        drop(f"{I12}require(p.vaultBalance <= LOW112, FilledOverflow(p.vaultBalance));\n"),
+    ),
     ("price: zero mid", PROPAMM, drop(f"{I8}require(mid != 0, InvalidMid(pairKey));\n")),
     ("price: empty vault", PROPAMM, drop(f"{I8}require(p.vaultBalance != 0, EmptyVault(tokenOut));\n")),
     ("price: spread reaches one", PROPAMM, drop(f"{I8}require(spread < SPREAD_SCALE, SpreadTooWide(spread));\n")),

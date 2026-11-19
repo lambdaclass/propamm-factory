@@ -14,7 +14,7 @@ use ethrex_rpc::{
 use eyre::{Result, WrapErr, ensure, eyre};
 
 use crate::{
-    UPDATE_GAS_LIMIT, feed,
+    feed,
     landing::{get_state_calldata, runway_check},
     metrics::NodePush,
     pair::{Live, SendOpts},
@@ -67,6 +67,7 @@ pub(crate) async fn push_update(
         target: opts.target,
         lane: live.pair.lane,
         chain_id: opts.chain_id,
+        size_table: live.values.size_table(),
     };
 
     let parent = client
@@ -160,7 +161,7 @@ pub(crate) async fn push_update(
         signer.address(),
         calldata.into(),
         Overrides {
-            gas_limit: Some(UPDATE_GAS_LIMIT),
+            gas_limit: Some(update::update_gas_limit(params.size_table.as_deref())),
             nonce: Some(nonce),
             max_fee_per_gas: Some(next_block_max_fee(parent_base_fee, priority_fee)),
             max_priority_fee_per_gas: Some(priority_fee),
@@ -297,10 +298,13 @@ async fn confirm_and_verify(
     )
     .await?;
     let got = decode_return_data("r(uint32,uint256[])", &ret)?;
-    let want = vec![
-        Value::Uint(ts.into()),
-        Value::Array(vec![Value::Uint(delta), Value::Uint(mid)]),
-    ];
+    // The registry stores the slots as sent, so every one is read back: the pair's size
+    // charges too, when it has a table.
+    let slots = crate::size_table::update_slots(delta, mid, params.size_table.as_deref())?
+        .into_iter()
+        .map(Value::Uint)
+        .collect();
+    let want = vec![Value::Uint(ts.into()), Value::Array(slots)];
     if got != want {
         return Err(PostSendFailure {
             outcome: NodePush::Mismatch,
@@ -316,8 +320,11 @@ async fn confirm_and_verify(
     // `Mismatch`, and no test would catch it — the two `.inc()` calls are far enough apart
     // in the function that nothing else enforces the ordering.
     live.metrics.node_pushes(NodePush::Landed).inc();
+    let table = params.size_table.as_ref().map_or(String::new(), |table| {
+        format!(" size charges {}", table.describe())
+    });
     tracing::info!(
-        "[{label}] verified via getState as {:#x}: lane {} -> slots = [{delta}, {mid}] at timestamp {ts}",
+        "[{label}] verified via getState as {:#x}: lane {} -> slots = [{delta}, {mid}] at timestamp {ts}{table}",
         params.target,
         params.lane
     );
@@ -401,6 +408,7 @@ mod tests {
             pricing: PricingSpec::fixed_for_tests("1", "0.000000000000000001"),
             feeds: None,
             invert: false,
+            size_table: None,
             breaker: None,
             guards: Vec::new(),
         };
@@ -479,6 +487,7 @@ mod tests {
             pricing: PricingSpec::for_tests("low", &[]),
             feeds: None,
             invert: false,
+            size_table: None,
             breaker: None,
             guards: Vec::new(),
         };

@@ -64,6 +64,14 @@ reads every capacity before any leg fills, so two instances it lists must not fi
 output token from the same vault: when one instance replaces another, take the old one off the
 router's venue list first.
 
+A fill pays the spread the update publishes plus a charge for its size. By default that is a
+fixed impact, 1 bp for a fill worth the whole vault and in proportion below it. An update can
+carry a size table in its place (`SizeTable.sol`): rows of "up to this share of the vault,
+this much more", of which a fill pays the average over the rows it spans. A block's fills in
+one direction are counted together, in `fills`, so each continues the table from where the
+last one stopped and a split order pays what the whole would. See "Size charges" in
+[the manual](manual.md).
+
 Sources and tests are in [`contracts/`](../contracts/). `make test` runs the tests, and
 `make mutants` checks the tests themselves: it plants one bug at a time in the contracts and
 fails if any of them goes unnoticed.

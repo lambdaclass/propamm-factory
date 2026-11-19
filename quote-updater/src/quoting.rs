@@ -947,6 +947,7 @@ pub async fn run(
         target: opts.target,
         lane: live.pair.lane,
         chain_id: opts.chain_id,
+        size_table: live.values.size_table(),
     };
     let requote = Duration::from_millis(opts.requote_ms.max(1));
     let names: Vec<String> = config.builders.iter().map(|b| b.name.clone()).collect();
@@ -3837,6 +3838,7 @@ mod tests {
             target: Address::from_slice(&[0x99; 20]),
             lane,
             chain_id: 31337,
+            size_table: None,
         };
         let opts = SendOpts {
             registry: params.registry,
@@ -4069,6 +4071,7 @@ mod tests {
             target: Address::from_slice(&[0x99; 20]),
             lane,
             chain_id: 31337,
+            size_table: None,
         };
         let opts = SendOpts {
             registry: params.registry,
@@ -4215,6 +4218,7 @@ mod tests {
             target: Address::from_slice(&[0x99; 20]),
             lane,
             chain_id: 31337,
+            size_table: None,
         };
         let opts = SendOpts {
             registry: params.registry,
@@ -4455,6 +4459,7 @@ mod tests {
             target: Address::from_slice(&[0x99; 20]),
             lane,
             chain_id: 31337,
+            size_table: None,
         };
         let opts = SendOpts {
             registry: params.registry,
@@ -4583,6 +4588,7 @@ mod tests {
             target: Address::from_slice(&[0x99; 20]),
             lane,
             chain_id: 31337,
+            size_table: None,
         };
         let opts = SendOpts {
             registry: params.registry,
@@ -4755,6 +4761,7 @@ mod tests {
             target: Address::from_slice(&[0x99; 20]),
             lane,
             chain_id: 31337,
+            size_table: None,
         };
         let opts = SendOpts {
             registry: params.registry,
@@ -4910,6 +4917,7 @@ mod tests {
             target: Address::from_slice(&[0x99; 20]),
             lane,
             chain_id: 31337,
+            size_table: None,
         };
         let opts = SendOpts {
             registry: params.registry,
@@ -5035,6 +5043,7 @@ mod tests {
             target: Address::from_slice(&[0x99; 20]),
             lane,
             chain_id: 31337,
+            size_table: None,
         };
         let opts = SendOpts {
             registry: params.registry,

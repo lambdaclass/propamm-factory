@@ -17,11 +17,16 @@ use url::Url;
 use crate::{
     breaker::{BreakerConfig, WindowConfig, percent},
     feed::{format_scaled, parse_decimal_scaled},
+    size_table::SizeTable,
     venue::VenueId,
 };
 
 /// Squaring the price scale during inversion must fit a uint256: 10^(2d) < 2^256.
 const MAX_INVERTED_PRICE_DECIMALS: u32 = 38;
+
+/// A pair with `size_charges` publishes its rows beside `delta` in the update's first slot,
+/// where `delta` keeps 64 bits: 10^19 is the largest whole unit that fits them.
+const MAX_SIZE_TABLE_PRICE_DECIMALS: u32 = 19;
 
 /// The largest window a pair may configure, in blocks — a day at `BLOCK_TIME_SECS`.
 ///
@@ -224,6 +229,10 @@ pub struct RawPair {
     pub min_mid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_mid: Option<String>,
+    /// What a fill pays on top of `delta` for its size, as rows `percent:bps` of the vault:
+    /// `"10:0, 30:2, rest:5"`. See [`SizeTable`]. Blank: the contract's own fixed impact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_charges: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_deviation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -669,6 +678,9 @@ fn parse_feeds(raw: &RawPair, price_decimals: u32, at: &str) -> Result<Option<Fe
 /// message: for the backoffice, which checks an edit before writing it. A pair not setting
 /// it is not looked at, so nothing else changes there.
 pub(crate) fn check_source_keys(raw: &RawPair) -> Result<()> {
+    if let Some(text) = &raw.size_charges {
+        SizeTable::parse(text).wrap_err("this pair: invalid size_charges")?;
+    }
     if raw.max_source_lag_ms.is_none() && raw.max_source_divergence.is_none() {
         return Ok(());
     }
@@ -884,6 +896,9 @@ pub struct PairSpec {
     /// no `symbol`/`sources`, which only a kind that reads no market can price.
     pub feeds: Option<Feeds>,
     pub band: MidBand,
+    /// The pair's `size_charges`, published with every update; `None` leaves fills to the
+    /// contract's fixed impact, which is the default.
+    pub size_table: Option<SizeTable>,
     /// Trip/recovery settings for this pair's price circuit breaker; `None` leaves the
     /// pair unguarded, which is the default.
     pub breaker: Option<BreakerConfig>,
@@ -1193,6 +1208,21 @@ pub fn config_from_raw(
 
         let guards = parse_guards(raw_pair, &at)?;
 
+        let size_table = raw_pair
+            .size_charges
+            .as_deref()
+            .map(|text| {
+                // The rows share slot 0 with `delta`, which keeps its low 64 bits: enough for
+                // any fraction below one whole unit at 18 decimals, the scale PropAMM reads.
+                ensure!(
+                    price_decimals <= MAX_SIZE_TABLE_PRICE_DECIMALS,
+                    "{at}: size_charges needs price-decimals of {MAX_SIZE_TABLE_PRICE_DECIMALS} \
+                     or less, so that delta fits beside the rows in the update's first slot"
+                );
+                SizeTable::parse(text).wrap_err_with(|| format!("{at}: invalid size_charges"))
+            })
+            .transpose()?;
+
         let spec = PairSpec {
             tokens,
             lane,
@@ -1200,6 +1230,7 @@ pub fn config_from_raw(
             pricing,
             feeds,
             band,
+            size_table,
             breaker,
             guards,
             key_env: raw_pair.key_env.clone(),
@@ -1264,6 +1295,8 @@ pub struct ResolvedPair {
     pub feeds: Option<Feeds>,
     /// The lane's orientation, which the feed it spawns and every kind's `PairShape` carry.
     pub invert: bool,
+    /// The pair's size charges, which its `ValueSource` carries to both send paths.
+    pub size_table: Option<SizeTable>,
     /// The settings a live breaker is built from, which the caller does exactly once.
     ///
     /// Deliberately here and not on [`Pair`]: `Pair` is cloned on every supervised restart,
@@ -1356,6 +1389,7 @@ pub fn resolve_pairs<F: Fn(&str) -> Option<String>>(
             pricing: spec.pricing,
             feeds: spec.feeds,
             invert: spec.invert,
+            size_table: spec.size_table,
             guards: spec.guards,
             breaker: spec.breaker,
         });
@@ -1598,6 +1632,55 @@ pricing = {{ kind = "feed" }}
             config.pairs[2].lane,
             u256_hex("0x4aafb64a36177dc82e7ace74cf60cc655659bc049da9533b5f7a6881bea995c6")
         );
+    }
+
+    /// `size_charges` is parsed with the pair, survives the backoffice's round-trip as
+    /// written, and a table the contract would refuse fails the file, naming the pair.
+    #[test]
+    fn a_pairs_size_charges_are_parsed_and_a_bad_table_fails_the_file() {
+        let with = |line: &str| {
+            three_pair_toml().replacen(
+                "key_env = \"K_WETH_USDC\"",
+                &format!("key_env = \"K_WETH_USDC\"\n{line}"),
+                1,
+            )
+        };
+        let text = with("size_charges = \"10:0, 30:2, rest:5\"");
+        let config = parse_config(&text, 18).unwrap();
+        assert_eq!(
+            config.pairs[0].size_table,
+            Some(SizeTable::parse("10:0, 30:2, rest:5").unwrap())
+        );
+        assert_eq!(
+            config.pairs[1].size_table, None,
+            "off unless a pair sets it"
+        );
+        // A change to the table is a change to the pair: a reload rebuilds the lane.
+        let other = parse_config(&with("size_charges = \"10:0, rest:5\""), 18).unwrap();
+        assert_ne!(config.pairs[0], other.pairs[0]);
+
+        let raw: RawConfig = toml::from_str(&text).unwrap();
+        let written = render_raw(&raw).unwrap();
+        assert!(
+            written.contains("size_charges = \"10:0, 30:2, rest:5\""),
+            "{written}"
+        );
+
+        let err = format!(
+            "{:#}",
+            parse_config(&with("size_charges = \"30:2, 10:5\""), 18)
+                .err()
+                .unwrap()
+        );
+        assert!(
+            err.contains("pair 1: invalid size_charges") && err.contains("row 2"),
+            "{err}"
+        );
+        // The backoffice checks an edit before it writes the file, with the same parser.
+        let mut raw_pair = raw.pairs[0].clone();
+        raw_pair.size_charges = Some("30:2, 10:5".to_owned());
+        let err = format!("{:#}", check_source_keys(&raw_pair).unwrap_err());
+        assert!(err.contains("invalid size_charges"), "{err}");
     }
 
     #[test]

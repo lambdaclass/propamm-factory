@@ -367,6 +367,17 @@ max_deviation = "0.002"
 # See "Venues that disagree" in docs/manual.md.
 # max_source_divergence = "0.0005"
 
+# Optional, and off unless set: what a fill pays on top of `delta` for its size. Rows of
+# percent:bps, each a share of the vault and the charge on the part of a fill inside it: here
+# up to 10% of the vault at no charge, from 10% to 30% at 2 bp, the rest at 5 bp. A fill pays
+# the average of the rows it spans, and a block's fills continue the table from where the last
+# one stopped, so splitting an order gains nothing. Rows end further into the vault each time
+# and never charge less than the one before. Three rows ride in the update at no extra cost;
+# each six more add a slot to it. Without it the contract charges its fixed impact, 1 bp for a
+# fill of the whole vault. Needs a PropAMM that reads size tables, which `--check` asks.
+# See "Size charges" in docs/manual.md.
+# size_charges = "10:0, 30:2, rest:5"
+
 # A pair priced by a pricing kind a binary registered (docs/building-your-own.md),
 # the same way `feed`, `fixed` and `volatile` are. A stanza naming a kind its
 # binary did not register is refused at startup, so a binary that registers none refuses

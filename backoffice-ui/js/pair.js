@@ -41,6 +41,14 @@ const SOURCE_FIELDS = [
       "fraction of the price; needs two venues or more. Blank is the default: 20 times the " +
       "half-spread being published, and no less than 0.0005",
   ],
+  [
+    "size_charges",
+    "10:0, 30:2, rest:5",
+    "what a fill pays on top of the spread for its size, as percent:bps rows of the vault: up " +
+      "to 10% of it at no charge, up to 30% at 2 bp, the rest at 5 bp. A block's fills continue " +
+      "the table from where the last one stopped. Blank leaves the contract's fixed impact; " +
+      "needs a PropAMM that reads size tables",
+  ],
 ];
 
 const MIN_SOURCES_HINT =

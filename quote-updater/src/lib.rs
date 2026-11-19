@@ -99,6 +99,7 @@ mod rpc;
 #[cfg(test)]
 mod rpc_mock;
 mod service;
+mod size_table;
 mod state;
 mod supervisor;
 mod tasks;

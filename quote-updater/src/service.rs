@@ -1774,6 +1774,7 @@ mod tests {
                     pricing: config::PricingSpec::fixed_for_tests("0.000000000000000001", "0"),
                     feeds: None,
                     band: config::MidBand::default(),
+                    size_table: None,
                     breaker: None,
                     guards: Vec::new(),
                     key_env: "UPDATER_KEY_TEST".to_owned(),
