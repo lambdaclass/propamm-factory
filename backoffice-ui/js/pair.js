@@ -49,6 +49,14 @@ const SOURCE_FIELDS = [
       "the table from where the last one stopped. Blank leaves the contract's fixed impact; " +
       "needs a PropAMM that reads size tables",
   ],
+  [
+    "retail_delta",
+    "0.0002",
+    "the half-spread retail flow pays in place of the spread everyone else pays, as a fraction " +
+      "of the price: a swap is retail when it carries an attestation signed by one of the " +
+      "PropAMM's retail signers. Never published above the spread itself. Blank is off: retail " +
+      "pays the same; needs a PropAMM that prices retail flow",
+  ],
 ];
 
 const MIN_SOURCES_HINT =

@@ -425,6 +425,68 @@ part of `delta` and refuse every quote. `--check` and startup ask the target, an
 pair when it does not answer. A table is a setting like any other: changing it rebuilds the
 lane on reload, and the backoffice's pair form has a field for it.
 
+### Retail flow: a better price for swaps a venue vouches for
+
+`delta` is what every taker pays. A pair that sets `retail_delta` also publishes a second,
+smaller half-spread, for swaps a retail venue has vouched for:
+
+```toml
+# 2 bp for retail flow, whatever `delta` everyone else is paying.
+retail_delta = "0.0002"
+```
+
+It is a fraction of the mid like `delta`, as fine as 0.000001 (a hundredth of a basis point).
+It is never published above `delta`: in a block where `delta` comes in lower, as the `feed`
+and `volatile` kinds can make it, retail pays that `delta`. Size charges, or the contract's
+fixed impact, apply to retail fills as to any other, and a block's retail and other fills
+continue one count.
+
+A swap is retail when it carries an attestation signed by one of the PropAMM's retail
+signers: the keys of the venues you trust to say which flow is retail. The owner lists them:
+
+```bash
+cast send $PROPAMM "addRetailSigner(address)" $VENUE_SIGNER --rpc-url $RPC_URL --private-key $OWNER_KEY
+cast send $PROPAMM "removeRetailSigner(address)" $VENUE_SIGNER --rpc-url $RPC_URL --private-key $OWNER_KEY
+```
+
+Removing a signer stops every attestation it has signed at once. Whether a swap really is
+retail is the venue's word; the contract cannot check it. Each retail fill logs
+`RetailFill(signer, account, nonce)` next to its `Swapped`, so a venue's flow can be measured
+and the venue removed.
+
+The venue signs one attestation per swap, as EIP-712 typed data under the domain
+`(name "PropAMM", version "1", chainId, verifyingContract)` of the instance:
+
+```
+RetailAttestation(address account,address tokenIn,address tokenOut,uint256 maxAmountIn,uint256 expiry,uint256 nonce)
+```
+
+- `tokenIn`, `tokenOut`: the pair and direction of the swap.
+- `maxAmountIn`: the most the swap may sell. A router splitting the order may send less.
+- `expiry`: a timestamp a few seconds ahead. Short, since the price it buys is good for one
+  block at a time.
+- `nonce`: any number the signer has not used on this instance. An attestation is good for
+  one swap: the swap that uses it spends the nonce, whatever part of `maxAmountIn` it
+  filled. `retailNonceUsed(signer, nonce)` says whether one is spent.
+- `account`: an account that takes part in the swap, as the sender of its transaction, the
+  caller of the PropAMM, or the recipient of the output. For a swap the user sends, the
+  user's wallet; for one the venue sends on the user's behalf, the venue's own relayer. It
+  is what makes an attestation copied out of the mempool useless to anyone else. It must
+  never be a contract anyone can call, such as a router or an aggregator: every swap made
+  through that contract would pass as the account.
+
+The swap then goes through `swapRetail`, which takes `swap`'s arguments followed by the
+attestation and its 65-byte signature, and reverts when the attestation does not hold: it
+does not fall back to `delta`. `quoteRetail` and `quoteFillableRetail` answer what such a
+swap would get and ask for no attestation. `swap`, `quote` and `quoteFillable` are
+unchanged, so a router that knows nothing of this keeps getting `delta`. An instance
+advertises all three retail functions as `IPropAMMRetail` through ERC-165.
+
+Like size charges, the retail delta rides in the update the pair already sends, in its first
+slot, and adds no storage write. The PropAMM has to be one that prices retail flow: `--check`
+and startup ask the target, and fail the pair when it does not answer. An update without a
+retail delta prices retail at `delta`.
+
 ### Volatile pairs: a computed spread
 
 A fixed `delta` is right for USDC/USDT and wrong for WETH/USDC: the pool is stuck holding

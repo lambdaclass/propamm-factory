@@ -718,6 +718,7 @@ use eyre::Result;
 const IS_UPDATER_SIG: &str = "isUpdater(address,address)";
 const PAIR_VAULTS_SIG: &str = "pairVaults(uint256)";
 const FILLS_SIG: &str = "fills(uint256,uint256)";
+const RETAIL_SIGNERS_SIG: &str = "retailSigners(address)";
 const ERC20_SYMBOL_SIG: &str = "symbol()";
 const BALANCE_OF_SIG: &str = "balanceOf(address)";
 
@@ -1000,6 +1001,30 @@ pub async fn build_report(
                                  would refuse every quote published with one (upgrade it, or \
                                  remove size_charges), or the call itself failed",
                                 spec.lane, config.target
+                            ));
+                        }
+                    }
+                    // A retail delta rides above the rows in the same slot. A PropAMM that
+                    // prices retail flow reads it there; an older one that reads size tables
+                    // takes anything above `delta` for a table of no rows, and stops
+                    // charging fills for their size. `retailSigners` is what a PropAMM with
+                    // retail flow keeps its venues' keys in, so its answering is the sign.
+                    if spec.retail_delta.is_some() {
+                        let calldata = encode_calldata(
+                            RETAIL_SIGNERS_SIG,
+                            &[Value::Address(Address::zero())],
+                        )?;
+                        let answer = call_view(client, config.target, calldata, None, None)
+                            .await
+                            .ok();
+                        if decode_one("r(bool)", answer.as_deref()).is_none() {
+                            row.failures.push(format!(
+                                "this pair sets retail_delta, and retailSigners(0x0) on {:#x} \
+                                 did not answer: either the PropAMM does not price retail \
+                                 flow, and would misread an update published with a retail \
+                                 delta (upgrade it, or remove retail_delta), or the call \
+                                 itself failed",
+                                config.target
                             ));
                         }
                     }

@@ -6,6 +6,7 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {ERC165Checker} from "@openzeppelin/contracts/utils/introspection/ERC165Checker.sol";
 import {PropAMM} from "../src/PropAMM.sol";
 import {IPropAMMFillable} from "../src/interfaces/IPropAMMFillable.sol";
+import {IPropAMMRetail} from "../src/interfaces/IPropAMMRetail.sol";
 import {MockPUR} from "./mocks/MockPUR.sol";
 import {MockToken} from "./mocks/MockToken.sol";
 
@@ -146,6 +147,36 @@ contract PropAMMGasTest is Test {
 
         propAmm.swap(WETH, USDT, fill, out, trader, block.timestamp);
         vm.snapshotGasLastCall("swap");
+
+        assertEq(MockToken(USDT).balanceOf(trader), out);
+    }
+
+    /// The same leg as retail flow, for the record of what the attestation costs over `swap`:
+    /// recovering the signer, the nonce's fresh storage word, and one more log.
+    function test_gas_swapRetailAtTheReportedFill() public {
+        (address signer, uint256 key) = makeAddrAndKey("venue");
+        vm.prank(owner);
+        propAmm.addRetailSigner(signer);
+        MockPUR(ORACLE).setState(5e14 | (((1 << 31) | 200) << 184), 1600e18);
+
+        (uint256 fill, uint256 out) = propAmm.quoteFillableRetail(WETH, USDT, 10_000e18);
+        IPropAMMRetail.RetailAttestation memory attestation = IPropAMMRetail.RetailAttestation({
+            account: trader, tokenIn: WETH, tokenOut: USDT, maxAmountIn: fill, expiry: block.timestamp, nonce: 1
+        });
+        bytes32 structHash = keccak256(
+            abi.encode(
+                keccak256(
+                    "RetailAttestation(address account,address tokenIn,address tokenOut,uint256 maxAmountIn,uint256 expiry,uint256 nonce)"
+                ),
+                attestation
+            )
+        );
+        (uint8 v, bytes32 r, bytes32 s) =
+            vm.sign(key, keccak256(abi.encodePacked("\x19\x01", propAmm.domainSeparator(), structHash)));
+        MockToken(WETH).mint(address(propAmm), fill); // the router's push
+
+        propAmm.swapRetail(WETH, USDT, fill, out, trader, block.timestamp, attestation, abi.encodePacked(r, s, v));
+        vm.snapshotGasLastCall("swapRetail");
 
         assertEq(MockToken(USDT).balanceOf(trader), out);
     }

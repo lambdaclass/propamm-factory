@@ -378,6 +378,15 @@ max_deviation = "0.002"
 # See "Size charges" in docs/manual.md.
 # size_charges = "10:0, 30:2, rest:5"
 
+# Optional, and off unless set: the half-spread retail flow pays in place of `delta`, as a
+# fraction of the mid like `delta` (here 2 bp), as fine as 0.000001. A swap is retail when it
+# carries an attestation signed by one of the PropAMM's retail signers, the keys of the venues
+# you trust to say so (`addRetailSigner`); every other swap keeps paying `delta`. Size charges
+# apply to both. It is never published above `delta`: in a block where `delta` comes in lower,
+# retail pays that `delta`. Needs a PropAMM that prices retail flow, which `--check` asks.
+# See "Retail flow" in docs/manual.md.
+# retail_delta = "0.0002"
+
 # A pair priced by a pricing kind a binary registered (docs/building-your-own.md),
 # the same way `feed`, `fixed` and `volatile` are. A stanza naming a kind its
 # binary did not register is refused at startup, so a binary that registers none refuses

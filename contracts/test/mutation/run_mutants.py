@@ -35,6 +35,7 @@ import tempfile
 
 CONTRACTS = pathlib.Path(__file__).resolve().parents[2]
 PROPAMM = "src/PropAMM.sol"
+SIZE_TABLE = "src/SizeTable.sol"
 FACTORY = "src/PropAMMFactory.sol"
 
 
@@ -53,8 +54,18 @@ def open_to_anyone(signature):
     return (f"{signature} external onlyOwner {{", f"{signature} external {{")
 
 
+I4 = " " * 4
 I8 = " " * 8
 I12 = " " * 12
+
+# What follows the modifiers of each entry point, down to the line that tells it from its
+# retail twin: the two share every modifier, so a mutant of one names its body too.
+SWAP = f" (uint256 amountOut) {{\n{I8}return _swap(tokenIn, tokenOut, amountIn, minAmountOut, recipient, deadline, false);"
+SWAP_RETAIL = f" (uint256 amountOut) {{\n{I8}_spendAttestation("
+QUOTE = f"\n{I4}{{\n{I8}return _quote(tokenIn, tokenOut, amountIn, false);"
+QUOTE_RETAIL = f"\n{I4}{{\n{I8}return _quote(tokenIn, tokenOut, amountIn, true);"
+FILLABLE = f"\n{I4}{{\n{I8}return _quoteFillable(tokenIn, tokenOut, amountIn, false);"
+FILLABLE_RETAIL = f"\n{I4}{{\n{I8}return _quoteFillable(tokenIn, tokenOut, amountIn, true);"
 
 # (name, file, (old, new)), or a list of (old, new) where one bug takes more than one edit.
 MUTANTS = [
@@ -115,8 +126,8 @@ MUTANTS = [
             f"{I8}require(recipient != address(0) && recipient != address(this), InvalidRecipient(recipient));\n",
         ),
     ),
-    ("swap: runs while paused", PROPAMM, ("override nonReentrant whenNotPaused returns", "override nonReentrant returns")),
-    ("swap: can be re-entered", PROPAMM, ("override nonReentrant whenNotPaused returns", "override whenNotPaused returns")),
+    ("swap: runs while paused", PROPAMM, (f"override nonReentrant whenNotPaused returns{SWAP}", f"override nonReentrant returns{SWAP}")),
+    ("swap: can be re-entered", PROPAMM, (f"override nonReentrant whenNotPaused returns{SWAP}", f"override whenNotPaused returns{SWAP}")),
     (
         "swap: logs Swapped before delivering",
         PROPAMM,
@@ -154,14 +165,14 @@ MUTANTS = [
     (
         "pause: quote answers",
         PROPAMM,
-        (f"{I8}whenNotPaused\n{I8}returns (uint256 amountOut)", f"{I8}returns (uint256 amountOut)"),
+        (f"{I8}whenNotPaused\n{I8}returns (uint256 amountOut){QUOTE}", f"{I8}returns (uint256 amountOut){QUOTE}"),
     ),
     (
         "pause: quoteFillable answers",
         PROPAMM,
         (
-            f"{I8}whenNotPaused\n{I8}returns (uint256 fillableAmountIn, uint256 amountOut)",
-            f"{I8}returns (uint256 fillableAmountIn, uint256 amountOut)",
+            f"{I8}whenNotPaused\n{I8}returns (uint256 fillableAmountIn, uint256 amountOut){FILLABLE}",
+            f"{I8}returns (uint256 fillableAmountIn, uint256 amountOut){FILLABLE}",
         ),
     ),
     ("pause: isActive stays true", PROPAMM, drop(f"{I8}if (paused()) return false;\n")),
@@ -274,6 +285,199 @@ MUTANTS = [
         "size table: a vault too large to count is priced",
         PROPAMM,
         drop(f"{I12}require(p.vaultBalance <= LOW112, FilledOverflow(p.vaultBalance));\n"),
+    ),
+    # Retail flow: the price.
+    (
+        "retail: everyone is priced at the retail delta",
+        PROPAMM,
+        (f"{I8}if (retail) {{\n{I12}uint256 field", f"{I8}{{\n{I12}uint256 field"),
+    ),
+    (
+        "retail: a retail delta that is not set is read",
+        PROPAMM,
+        ("if (field & RETAIL_SET != 0) {", "{"),
+    ),
+    (
+        "retail: a retail delta above delta is priced from",
+        PROPAMM,
+        drop(f"{I8}{I8}require(retailDelta <= p.delta, RetailDeltaAboveDelta(retailDelta, p.delta));\n"),
+    ),
+    (
+        "retail: a retail delta reads as a size table",
+        SIZE_TABLE,
+        ("return (slots[0] >> 64) & SLOT0_ROWS_MASK != 0;", "return slots[0] >> 64 != 0;"),
+    ),
+    (
+        "retail: swapRetail fills at delta",
+        PROPAMM,
+        ("return _swap(tokenIn, tokenOut, amountIn, minAmountOut, recipient, deadline, true);",
+         "return _swap(tokenIn, tokenOut, amountIn, minAmountOut, recipient, deadline, false);"),
+    ),
+    (
+        "retail: swap fills at the retail delta",
+        PROPAMM,
+        ("return _swap(tokenIn, tokenOut, amountIn, minAmountOut, recipient, deadline, false);",
+         "return _swap(tokenIn, tokenOut, amountIn, minAmountOut, recipient, deadline, true);"),
+    ),
+    (
+        "retail: quoteRetail quotes at delta",
+        PROPAMM,
+        ("return _quote(tokenIn, tokenOut, amountIn, true);", "return _quote(tokenIn, tokenOut, amountIn, false);"),
+    ),
+    (
+        "retail: quoteFillableRetail sizes at delta",
+        PROPAMM,
+        ("return _quoteFillable(tokenIn, tokenOut, amountIn, true);",
+         "return _quoteFillable(tokenIn, tokenOut, amountIn, false);"),
+    ),
+    # Retail flow: what swapRetail asks of an attestation.
+    (
+        "retail: swapRetail asks for no attestation",
+        PROPAMM,
+        drop(f"{I8}_spendAttestation(attestation, signature, tokenIn, tokenOut, amountIn, recipient);\n"),
+    ),
+    (
+        "retail: an expired attestation is taken",
+        PROPAMM,
+        drop(f"{I8}require(attestation.expiry >= block.timestamp, AttestationExpired(attestation.expiry));\n"),
+    ),
+    (
+        "retail: an attestation expires a second early",
+        PROPAMM,
+        ("require(attestation.expiry >= block.timestamp,", "require(attestation.expiry > block.timestamp,"),
+    ),
+    (
+        "retail: an attestation for another tokenIn is taken",
+        PROPAMM,
+        ("attestation.tokenIn == tokenIn && attestation.tokenOut == tokenOut,", "attestation.tokenOut == tokenOut,"),
+    ),
+    (
+        "retail: an attestation for another tokenOut is taken",
+        PROPAMM,
+        ("attestation.tokenIn == tokenIn && attestation.tokenOut == tokenOut,", "attestation.tokenIn == tokenIn,"),
+    ),
+    (
+        "retail: an attestation covers any amount",
+        PROPAMM,
+        drop(
+            f"{I8}require(amountIn <= attestation.maxAmountIn, "
+            "AttestationAmountExceeded(attestation.maxAmountIn, amountIn));\n"
+        ),
+    ),
+    (
+        "retail: an attestation is good for anyone",
+        PROPAMM,
+        ("account == tx.origin || account == msg.sender || account == recipient,", "true,"),
+    ),
+    (
+        "retail: the account may not send the transaction",
+        PROPAMM,
+        ("account == tx.origin || account == msg.sender || account == recipient,",
+         "account == msg.sender || account == recipient,"),
+    ),
+    (
+        "retail: the account may not call",
+        PROPAMM,
+        ("account == tx.origin || account == msg.sender || account == recipient,",
+         "account == tx.origin || account == recipient,"),
+    ),
+    (
+        "retail: the account may not receive",
+        PROPAMM,
+        ("account == tx.origin || account == msg.sender || account == recipient,",
+         "account == tx.origin || account == msg.sender,"),
+    ),
+    (
+        "retail: anyone's signature counts",
+        PROPAMM,
+        (
+            f"{I8}require(retailSigners[signer], NotRetailSigner(signer));\n\n{I8}uint256 word",
+            f"{I8}uint256 word",
+        ),
+    ),
+    (
+        "retail: an attestation is good on every instance",
+        PROPAMM,
+        ('keccak256("1"), block.chainid, address(this))', 'keccak256("1"), block.chainid, address(0))'),
+    ),
+    (
+        "retail: an attestation is good on every chain",
+        PROPAMM,
+        ('keccak256("1"), block.chainid, address(this))', 'keccak256("1"), uint256(1), address(this))'),
+    ),
+    (
+        "retail: a spent nonce is taken again",
+        PROPAMM,
+        drop(f"{I8}require(spent & bit == 0, AttestationUsed(signer, attestation.nonce));\n"),
+    ),
+    (
+        "retail: a nonce is never spent",
+        PROPAMM,
+        drop(f"{I8}retailNonces[signer][word] = spent | bit;\n"),
+    ),
+    (
+        "retail: spending a nonce spends its whole word",
+        PROPAMM,
+        ("uint256 bit = 1 << (attestation.nonce & 0xff);", "uint256 bit = type(uint256).max;"),
+    ),
+    (
+        "retail: nonces are shared between signers",
+        PROPAMM,
+        [
+            ("uint256 spent = retailNonces[signer][word];", "uint256 spent = retailNonces[address(0)][word];"),
+            ("retailNonces[signer][word] = spent | bit;", "retailNonces[address(0)][word] = spent | bit;"),
+        ],
+    ),
+    (
+        "retail: a fill does not log its signer",
+        PROPAMM,
+        drop(f"{I8}emit RetailFill(signer, account, attestation.nonce);\n"),
+    ),
+    ("retail: swapRetail runs while paused", PROPAMM, (f"override nonReentrant whenNotPaused returns{SWAP_RETAIL}", f"override nonReentrant returns{SWAP_RETAIL}")),
+    ("retail: swapRetail can be re-entered", PROPAMM, (f"override nonReentrant whenNotPaused returns{SWAP_RETAIL}", f"override whenNotPaused returns{SWAP_RETAIL}")),
+    (
+        "retail: quoteRetail answers while paused",
+        PROPAMM,
+        (f"{I8}whenNotPaused\n{I8}returns (uint256 amountOut){QUOTE_RETAIL}", f"{I8}returns (uint256 amountOut){QUOTE_RETAIL}"),
+    ),
+    (
+        "retail: quoteFillableRetail answers while paused",
+        PROPAMM,
+        (
+            f"{I8}whenNotPaused\n{I8}returns (uint256 fillableAmountIn, uint256 amountOut){FILLABLE_RETAIL}",
+            f"{I8}returns (uint256 fillableAmountIn, uint256 amountOut){FILLABLE_RETAIL}",
+        ),
+    ),
+    (
+        "retail: the retail interface is not advertised",
+        PROPAMM,
+        (" || interfaceId == type(IPropAMMRetail).interfaceId", ""),
+    ),
+    # Retail flow: the signers.
+    ("access: addRetailSigner", PROPAMM, open_to_anyone("function addRetailSigner(address signer)")),
+    ("access: removeRetailSigner", PROPAMM, open_to_anyone("function removeRetailSigner(address signer)")),
+    (
+        "retail: the zero address is added as a signer",
+        PROPAMM,
+        drop(f"{I8}require(signer != address(0), InvalidRetailSigner());\n"),
+    ),
+    (
+        "retail: a signer is added twice",
+        PROPAMM,
+        drop(f"{I8}require(!retailSigners[signer], RetailSignerAlreadyAdded(signer));\n"),
+    ),
+    (
+        "retail: a removed signer stays",
+        PROPAMM,
+        drop(f"{I8}retailSigners[signer] = false;\n"),
+    ),
+    (
+        "retail: removing a signer that is not one is logged",
+        PROPAMM,
+        (
+            f"{I8}require(retailSigners[signer], NotRetailSigner(signer));\n{I8}retailSigners[signer] = false;\n",
+            f"{I8}retailSigners[signer] = false;\n",
+        ),
     ),
     ("price: zero mid", PROPAMM, drop(f"{I8}require(mid != 0, InvalidMid(pairKey));\n")),
     ("price: empty vault", PROPAMM, drop(f"{I8}require(p.vaultBalance != 0, EmptyVault(tokenOut));\n")),
@@ -522,7 +726,7 @@ def main(argv):
         print(f"no mutant matches {' '.join(wanted)!r}", file=sys.stderr)
         return 2
 
-    pristine = {file: (CONTRACTS / file).read_text() for file in (PROPAMM, FACTORY)}
+    pristine = {file: (CONTRACTS / file).read_text() for file in (PROPAMM, FACTORY, SIZE_TABLE)}
     jobs = max(1, min(len(mutants), os.cpu_count() or 1, 4))
 
     with tempfile.TemporaryDirectory(prefix="propamm-mutants-") as tmp:

@@ -948,6 +948,7 @@ pub async fn run(
         lane: live.pair.lane,
         chain_id: opts.chain_id,
         size_table: live.values.size_table(),
+        retail_delta: live.values.retail_delta(),
     };
     let requote = Duration::from_millis(opts.requote_ms.max(1));
     let names: Vec<String> = config.builders.iter().map(|b| b.name.clone()).collect();
@@ -3839,6 +3840,7 @@ mod tests {
             lane,
             chain_id: 31337,
             size_table: None,
+            retail_delta: None,
         };
         let opts = SendOpts {
             registry: params.registry,
@@ -4072,6 +4074,7 @@ mod tests {
             lane,
             chain_id: 31337,
             size_table: None,
+            retail_delta: None,
         };
         let opts = SendOpts {
             registry: params.registry,
@@ -4219,6 +4222,7 @@ mod tests {
             lane,
             chain_id: 31337,
             size_table: None,
+            retail_delta: None,
         };
         let opts = SendOpts {
             registry: params.registry,
@@ -4460,6 +4464,7 @@ mod tests {
             lane,
             chain_id: 31337,
             size_table: None,
+            retail_delta: None,
         };
         let opts = SendOpts {
             registry: params.registry,
@@ -4589,6 +4594,7 @@ mod tests {
             lane,
             chain_id: 31337,
             size_table: None,
+            retail_delta: None,
         };
         let opts = SendOpts {
             registry: params.registry,
@@ -4762,6 +4768,7 @@ mod tests {
             lane,
             chain_id: 31337,
             size_table: None,
+            retail_delta: None,
         };
         let opts = SendOpts {
             registry: params.registry,
@@ -4918,6 +4925,7 @@ mod tests {
             lane,
             chain_id: 31337,
             size_table: None,
+            retail_delta: None,
         };
         let opts = SendOpts {
             registry: params.registry,
@@ -5044,6 +5052,7 @@ mod tests {
             lane,
             chain_id: 31337,
             size_table: None,
+            retail_delta: None,
         };
         let opts = SendOpts {
             registry: params.registry,

@@ -72,6 +72,15 @@ one direction are counted together, in `fills`, so each continues the table from
 last one stopped and a split order pays what the whole would. See "Size charges" in
 [the manual](manual.md).
 
+An update can also carry a retail delta: a smaller spread, paid in place of the published one
+by a swap that carries an attestation from one of the instance's retail signers
+(`addRetailSigner`, `removeRetailSigner`), the keys of venues trusted to say which flow is
+retail. Such a swap goes through `swapRetail`, and `quoteRetail` and `quoteFillableRetail`
+answer what it would get (`IPropAMMRetail`); `swap` and `quote` keep the published spread. An
+attestation names the pair, the direction, the most it may sell, an expiry, a nonce good once
+per signer, and an account that has to take part in the swap. See "Retail flow" in
+[the manual](manual.md).
+
 Sources and tests are in [`contracts/`](../contracts/). `make test` runs the tests, and
 `make mutants` checks the tests themselves: it plants one bug at a time in the contracts and
 fails if any of them goes unnoticed.

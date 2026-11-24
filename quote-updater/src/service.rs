@@ -1775,6 +1775,7 @@ mod tests {
                     feeds: None,
                     band: config::MidBand::default(),
                     size_table: None,
+                    retail_delta: None,
                     breaker: None,
                     guards: Vec::new(),
                     key_env: "UPDATER_KEY_TEST".to_owned(),

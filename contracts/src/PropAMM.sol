@@ -6,6 +6,8 @@ import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/math/Math.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
+import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
@@ -13,6 +15,7 @@ import "@openzeppelin/contracts-upgradeable/utils/introspection/ERC165Upgradeabl
 import {IPrioUpdateRegistry} from "./interfaces/IPrioUpdateRegistry.sol";
 import {IPropAMM} from "./interfaces/IPropAMM.sol";
 import {IPropAMMFillable} from "./interfaces/IPropAMMFillable.sol";
+import {IPropAMMRetail} from "./interfaces/IPropAMMRetail.sol";
 import {SizeTable} from "./SizeTable.sol";
 
 error Expired();
@@ -63,6 +66,29 @@ error FilledOverflow(uint256 amount);
 /// `setOracle` naming the registry the instance already reads: nothing would change, and the
 /// event would report a move that did not happen.
 error OracleUnchanged(address oracle);
+/// `addRetailSigner` for the zero address, which no signature recovers to.
+error InvalidRetailSigner();
+/// `addRetailSigner` for a signer the instance already has: the event would record a change that
+/// did not happen.
+error RetailSignerAlreadyAdded(address signer);
+/// `removeRetailSigner` for an address that is not a retail signer, or a `swapRetail` whose
+/// attestation was signed by one. A signature over anything but the attestation the swap
+/// carries recovers to some other address, so this is also what a tampered attestation reverts
+/// with.
+error NotRetailSigner(address signer);
+/// A `swapRetail` after its attestation's `expiry`.
+error AttestationExpired(uint256 expiry);
+/// A `swapRetail` for a pair or a direction other than the one its attestation names.
+error AttestationForAnotherPair(address tokenIn, address tokenOut);
+/// A `swapRetail` selling more than its attestation allows.
+error AttestationAmountExceeded(uint256 maxAmountIn, uint256 amountIn);
+/// A `swapRetail` in which the attestation's `account` takes no part: it is not the
+/// transaction's sender, the caller or the recipient.
+error AttestationAccountAbsent(address account);
+/// A `swapRetail` whose attestation has already paid for a swap.
+error AttestationUsed(address signer, uint256 nonce);
+/// An update whose retail delta is above its `delta`: retail flow never pays more than the rest.
+error RetailDeltaAboveDelta(uint256 retailDelta, uint256 delta);
 
 /// @notice Push payment (see `IPropAMM`) is atomic only inside the caller's transaction: tokens
 /// left on an instance between transactions can be swapped by anyone, and `withdrawERC20`
@@ -72,6 +98,7 @@ error OracleUnchanged(address oracle);
 contract PropAMM is
     IPropAMM,
     IPropAMMFillable,
+    IPropAMMRetail,
     ERC165Upgradeable,
     PausableUpgradeable,
     Ownable2StepUpgradeable,
@@ -127,6 +154,8 @@ contract PropAMM is
     event UpdaterAuthorized(address indexed updater, address indexed oracle);
     event UpdaterRevoked(address indexed updater, address indexed oracle);
     event ERC20Withdrawn(address indexed token, address indexed to, uint256 amount);
+    event RetailSignerAdded(address indexed signer);
+    event RetailSignerRemoved(address indexed signer);
 
     /// @dev Fixed-point scale the oracle publishes `mid` in. A `mid` of 1e18 means one whole
     /// token0 is worth one whole token1, whatever decimals the two tokens use, so `_quote`
@@ -169,7 +198,29 @@ contract PropAMM is
     /// Written only while the update carries a size table.
     mapping(uint256 pairKey => mapping(uint256 side => uint256)) public fills;
 
+    /// @notice The addresses whose attestation makes a swap retail (see `swapRetail`): keys the
+    /// retail venues sign with for swaps they have confirmed are retail. One set for the whole
+    /// instance, whatever the pair.
+    mapping(address signer => bool) public retailSigners;
+    /// @notice The attestation nonces each signer has spent, 256 to a word: nonce `n` is bit
+    /// `n & 0xff` of word `n >> 8`. Per signer, so one venue cannot spend another's. See
+    /// `retailNonceUsed`.
+    mapping(address signer => mapping(uint256 word => uint256)) public retailNonces;
+
     uint256 constant LOW112 = (1 << 112) - 1;
+
+    /// @dev Where an update carries the retail delta: 32 bits of slot 0, above the size table's
+    /// rows and below what the registry keeps for itself. The top bit says there is one, so a
+    /// retail delta of zero can be told from none; the 31 below it are the delta in 1e-6, the
+    /// unit of the table's charges.
+    uint256 constant RETAIL_SHIFT = 184;
+    uint256 constant RETAIL_SET = 1 << 31;
+
+    bytes32 constant EIP712_DOMAIN_TYPEHASH =
+        keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
+    bytes32 constant RETAIL_ATTESTATION_TYPEHASH = keccak256(
+        "RetailAttestation(address account,address tokenIn,address tokenOut,uint256 maxAmountIn,uint256 expiry,uint256 nonce)"
+    );
 
     constructor() {
         _disableInitializers();
@@ -283,7 +334,20 @@ contract PropAMM is
         whenNotPaused
         returns (uint256 amountOut)
     {
-        return _quote(tokenIn, tokenOut, amountIn);
+        return _quote(tokenIn, tokenOut, amountIn, false);
+    }
+
+    /// @inheritdoc IPropAMMRetail
+    /// @dev `quote` at the retail delta, when the update carries one, and `quote` itself when it
+    /// does not. Asks for no attestation: it moves nothing.
+    function quoteRetail(address tokenIn, address tokenOut, uint256 amountIn)
+        external
+        view
+        override
+        whenNotPaused
+        returns (uint256 amountOut)
+    {
+        return _quote(tokenIn, tokenOut, amountIn, true);
     }
 
     /// @inheritdoc IPropAMM
@@ -312,11 +376,112 @@ contract PropAMM is
         address recipient,
         uint256 deadline
     ) external override nonReentrant whenNotPaused returns (uint256 amountOut) {
+        return _swap(tokenIn, tokenOut, amountIn, minAmountOut, recipient, deadline, false);
+    }
+
+    /// @inheritdoc IPropAMMRetail
+    /// @dev `swap` in everything but the price and the attestation it asks for: the same push
+    /// payment, the same checks, the same `Swapped`, and the same count against a size table,
+    /// which retail and other fills share. The price is the update's retail delta in place of
+    /// `delta` (see `_pricing`); an update that carries none fills at `delta`.
+    ///
+    /// The attestation is spent before anything is priced or moved, and a swap that reverts
+    /// takes that back with it, so an attestation is used up only by a swap that happened.
+    function swapRetail(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        address recipient,
+        uint256 deadline,
+        RetailAttestation calldata attestation,
+        bytes calldata signature
+    ) external override nonReentrant whenNotPaused returns (uint256 amountOut) {
+        _spendAttestation(attestation, signature, tokenIn, tokenOut, amountIn, recipient);
+        return _swap(tokenIn, tokenOut, amountIn, minAmountOut, recipient, deadline, true);
+    }
+
+    /// @notice Checks that `attestation` makes this swap retail, and spends its nonce.
+    /// @dev What stands between a swap and the retail price:
+    ///
+    /// - The signature recovers to one of `retailSigners`. It is over the EIP-712 hash of the
+    ///   attestation under this instance's domain, so it is good here and on this chain only.
+    /// - The attestation is for this pair and direction, covers `amountIn`, and has not expired.
+    /// - Its `account` takes part in the swap: it sent the transaction, called this function,
+    ///   or receives the output. Whoever lifts an attestation out of the mempool is none of
+    ///   the three, and can only name the account as recipient, which pays the account the
+    ///   output of a swap the copier funded.
+    /// - Its nonce is unspent. Spending it is what makes an attestation good for one swap.
+    ///
+    /// `tx.origin` is read here, where a contract usually should not. Nothing is authorized by
+    /// it but a price: a contract the account calls while an attestation naming it is still
+    /// live can make one swap at the retail price, on the attested pair, up to the attested
+    /// amount, with its own funds. That is the most it buys.
+    ///
+    /// Whether the flow is retail is the signer's word. Nothing here can check it, which is why
+    /// every fill logs the signer that vouched for it.
+    function _spendAttestation(
+        RetailAttestation calldata attestation,
+        bytes calldata signature,
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        address recipient
+    ) internal {
+        require(attestation.expiry >= block.timestamp, AttestationExpired(attestation.expiry));
+        require(
+            attestation.tokenIn == tokenIn && attestation.tokenOut == tokenOut,
+            AttestationForAnotherPair(attestation.tokenIn, attestation.tokenOut)
+        );
+        require(amountIn <= attestation.maxAmountIn, AttestationAmountExceeded(attestation.maxAmountIn, amountIn));
+        address account = attestation.account;
+        require(
+            account == tx.origin || account == msg.sender || account == recipient, AttestationAccountAbsent(account)
+        );
+
+        bytes32 structHash = keccak256(abi.encode(RETAIL_ATTESTATION_TYPEHASH, attestation));
+        address signer = ECDSA.recover(MessageHashUtils.toTypedDataHash(domainSeparator(), structHash), signature);
+        require(retailSigners[signer], NotRetailSigner(signer));
+
+        uint256 word = attestation.nonce >> 8;
+        uint256 bit = 1 << (attestation.nonce & 0xff);
+        uint256 spent = retailNonces[signer][word];
+        require(spent & bit == 0, AttestationUsed(signer, attestation.nonce));
+        retailNonces[signer][word] = spent | bit;
+
+        emit RetailFill(signer, account, attestation.nonce);
+    }
+
+    /// @notice The EIP-712 domain separator attestations for this instance are signed under.
+    /// @dev Computed on each call from the chain id and this instance's address, so it follows a
+    /// fork and needs no storage, which an instance upgraded onto this implementation would not
+    /// have initialized.
+    function domainSeparator() public view returns (bytes32) {
+        return keccak256(
+            abi.encode(EIP712_DOMAIN_TYPEHASH, keccak256("PropAMM"), keccak256("1"), block.chainid, address(this))
+        );
+    }
+
+    /// @notice Whether `signer`'s attestation nonce `nonce` has been spent.
+    function retailNonceUsed(address signer, uint256 nonce) external view returns (bool) {
+        return retailNonces[signer][nonce >> 8] & (1 << (nonce & 0xff)) != 0;
+    }
+
+    /// @notice What `swap` and `swapRetail` share: everything but the attestation.
+    function _swap(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        address recipient,
+        uint256 deadline,
+        bool retail
+    ) internal returns (uint256 amountOut) {
         require(deadline >= block.timestamp, Expired());
         require(amountIn != 0, ZeroAmountIn());
         require(recipient != address(0), InvalidRecipient(recipient));
 
-        Pricing memory p = _pricing(tokenIn, tokenOut);
+        Pricing memory p = _pricing(tokenIn, tokenOut, retail);
         uint256 realAmountOut = _amountOut(p, tokenOut, amountIn);
         require(realAmountOut != 0, ZeroAmountOut());
         require(realAmountOut >= minAmountOut, InsufficientOutput(minAmountOut, realAmountOut));
@@ -370,7 +535,28 @@ contract PropAMM is
         whenNotPaused
         returns (uint256 fillableAmountIn, uint256 amountOut)
     {
-        Pricing memory p = _pricing(tokenIn, tokenOut);
+        return _quoteFillable(tokenIn, tokenOut, amountIn, false);
+    }
+
+    /// @inheritdoc IPropAMMRetail
+    /// @dev `quoteFillable` at the retail delta. Asks for no attestation, like `quoteRetail`.
+    function quoteFillableRetail(address tokenIn, address tokenOut, uint256 amountIn)
+        external
+        view
+        override
+        whenNotPaused
+        returns (uint256 fillableAmountIn, uint256 amountOut)
+    {
+        return _quoteFillable(tokenIn, tokenOut, amountIn, true);
+    }
+
+    /// @notice What `quoteFillable` and `quoteFillableRetail` share.
+    function _quoteFillable(address tokenIn, address tokenOut, uint256 amountIn, bool retail)
+        internal
+        view
+        returns (uint256 fillableAmountIn, uint256 amountOut)
+    {
+        Pricing memory p = _pricing(tokenIn, tokenOut, retail);
         uint256 capacity = Math.min(p.vaultBalance, IERC20(tokenOut).allowance(p.vault, address(this)));
         uint256 midCap = p.hasTable
             ? SizeTable.fillable(p.slots, p.delta, p.filled, p.ref, capacity, type(uint256).max)
@@ -388,10 +574,11 @@ contract PropAMM is
     }
 
     /// @notice ERC-165. `PropAMMRouter` checks for `IPropAMMFillable` here before pricing this
-    /// instance through `quoteFillable`. `IPropAMM` is reported too, for off-chain discovery.
+    /// instance through `quoteFillable`, and a router with a retail path checks for
+    /// `IPropAMMRetail`. `IPropAMM` is reported too, for off-chain discovery.
     function supportsInterface(bytes4 interfaceId) public view override returns (bool) {
-        return interfaceId == type(IPropAMMFillable).interfaceId || interfaceId == type(IPropAMM).interfaceId
-            || super.supportsInterface(interfaceId);
+        return interfaceId == type(IPropAMMFillable).interfaceId || interfaceId == type(IPropAMMRetail).interfaceId
+            || interfaceId == type(IPropAMM).interfaceId || super.supportsInterface(interfaceId);
     }
 
     /// @notice The vault a pair fills from.
@@ -449,9 +636,14 @@ contract PropAMM is
     /// @param tokenIn The token being sent.
     /// @param tokenOut The token being received.
     /// @param amountIn The amount of tokens being sent.
+    /// @param retail Whether to quote at the retail delta.
     /// @return amountOut The amount of tokens that will be received.
-    function _quote(address tokenIn, address tokenOut, uint256 amountIn) internal view returns (uint256 amountOut) {
-        return _amountOut(_pricing(tokenIn, tokenOut), tokenOut, amountIn);
+    function _quote(address tokenIn, address tokenOut, uint256 amountIn, bool retail)
+        internal
+        view
+        returns (uint256 amountOut)
+    {
+        return _amountOut(_pricing(tokenIn, tokenOut, retail), tokenOut, amountIn);
     }
 
     /// @notice Reads what pricing a fill on a pair, in one direction, needs from outside this
@@ -463,6 +655,12 @@ contract PropAMM is
     /// slot 0 and from slot 3 on (`SizeTable`). With one, a fill pays the table's charge in place
     /// of the fixed impact, continued from what its direction already filled against this
     /// update, which `fills` holds. An update with nothing above `delta` prices as it always did.
+    ///
+    /// It may also carry a retail delta, in the 32 bits of slot 0 above the table's rows. A
+    /// `retail` read prices with it in place of `delta`, and everything else the same: the
+    /// table's charges and the count in `fills` are about the vault, not about who trades, so
+    /// retail and other fills share them. An update that carries none prices retail at `delta`.
+    /// One above `delta` is refused, for retail reads only: the rest are not priced from it.
     ///
     /// A price is good for one block: the registry is asked for the update stamped with this
     /// block's timestamp and no other, and the stamp it answers with is checked as well, so a
@@ -479,7 +677,7 @@ contract PropAMM is
     /// correctly. A token that reports decimals its balances do not follow is priced wrong by
     /// the matching power of ten. Nothing here can tell the two apart: listing a token means
     /// trusting it, its `decimals()` included.
-    function _pricing(address tokenIn, address tokenOut) internal view returns (Pricing memory p) {
+    function _pricing(address tokenIn, address tokenOut, bool retail) internal view returns (Pricing memory p) {
         uint256 pairKey;
         (p.vault, pairKey) = _vaultFor(tokenIn, tokenOut);
 
@@ -496,6 +694,14 @@ contract PropAMM is
         // registry holds.
         p.delta = slots[0] & SizeTable.DELTA_MASK;
         require(p.delta < SPREAD_SCALE, SpreadTooWide(slots[0]));
+        if (retail) {
+            uint256 field = (slots[0] >> RETAIL_SHIFT) & type(uint32).max;
+            if (field & RETAIL_SET != 0) {
+                uint256 retailDelta = (field ^ RETAIL_SET) * SizeTable.UNIT;
+                require(retailDelta <= p.delta, RetailDeltaAboveDelta(retailDelta, p.delta));
+                p.delta = retailDelta;
+            }
+        }
         if (SizeTable.present(slots)) {
             p.slots = slots;
             p.hasTable = true;
@@ -773,6 +979,27 @@ contract PropAMM is
         } catch {}
         emit UpdaterRevoked(updater, address(registry));
         registry.removeUpdater(updater);
+    }
+
+    /// @notice Adds a retail signer: from here on a swap carrying its attestation fills at the
+    /// retail price.
+    /// @dev Adding a signer is trusting a venue to say which flow is retail. Reverts for one the
+    /// instance already has, so every event records a real change.
+    function addRetailSigner(address signer) external onlyOwner {
+        require(signer != address(0), InvalidRetailSigner());
+        require(!retailSigners[signer], RetailSignerAlreadyAdded(signer));
+        retailSigners[signer] = true;
+        emit RetailSignerAdded(signer);
+    }
+
+    /// @notice Removes a retail signer: every attestation it has signed stops working at once,
+    /// spent or not.
+    /// @dev Its spent nonces are kept, so adding the signer back does not revive an attestation
+    /// that was already used.
+    function removeRetailSigner(address signer) external onlyOwner {
+        require(retailSigners[signer], NotRetailSigner(signer));
+        retailSigners[signer] = false;
+        emit RetailSignerRemoved(signer);
     }
 
     /// @notice Withdraws ERC20 tokens from the contract to a specified address.

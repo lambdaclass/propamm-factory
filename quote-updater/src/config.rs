@@ -17,7 +17,7 @@ use url::Url;
 use crate::{
     breaker::{BreakerConfig, WindowConfig, percent},
     feed::{format_scaled, parse_decimal_scaled},
-    size_table::SizeTable,
+    size_table::{RetailDelta, SizeTable},
     venue::VenueId,
 };
 
@@ -233,6 +233,10 @@ pub struct RawPair {
     /// `"10:0, 30:2, rest:5"`. See [`SizeTable`]. Blank: the contract's own fixed impact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_charges: Option<String>,
+    /// The half-spread retail flow pays in place of `delta`, as a fraction of the mid:
+    /// `"0.0002"`. See [`RetailDelta`]. Blank: retail pays `delta` like everyone else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retail_delta: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_deviation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -681,6 +685,9 @@ pub(crate) fn check_source_keys(raw: &RawPair) -> Result<()> {
     if let Some(text) = &raw.size_charges {
         SizeTable::parse(text).wrap_err("this pair: invalid size_charges")?;
     }
+    if let Some(text) = &raw.retail_delta {
+        RetailDelta::parse(text).wrap_err("this pair: invalid retail_delta")?;
+    }
     if raw.max_source_lag_ms.is_none() && raw.max_source_divergence.is_none() {
         return Ok(());
     }
@@ -899,6 +906,9 @@ pub struct PairSpec {
     /// The pair's `size_charges`, published with every update; `None` leaves fills to the
     /// contract's fixed impact, which is the default.
     pub size_table: Option<SizeTable>,
+    /// The pair's `retail_delta`, published with every update; `None` leaves retail flow
+    /// paying `delta`, which is the default.
+    pub retail_delta: Option<RetailDelta>,
     /// Trip/recovery settings for this pair's price circuit breaker; `None` leaves the
     /// pair unguarded, which is the default.
     pub breaker: Option<BreakerConfig>,
@@ -1222,6 +1232,21 @@ pub fn config_from_raw(
                 SizeTable::parse(text).wrap_err_with(|| format!("{at}: invalid size_charges"))
             })
             .transpose()?;
+        let retail_delta = raw_pair
+            .retail_delta
+            .as_deref()
+            .map(|text| {
+                // It shares slot 0 with `delta` as the rows do, and is capped at `delta` in
+                // millionths of the 1e18 PropAMM reads both at.
+                ensure!(
+                    price_decimals == crate::PRICE_DECIMALS,
+                    "{at}: retail_delta needs price-decimals of {}, the scale PropAMM reads \
+                     delta at and the one a retail delta is held under",
+                    crate::PRICE_DECIMALS
+                );
+                RetailDelta::parse(text).wrap_err_with(|| format!("{at}: invalid retail_delta"))
+            })
+            .transpose()?;
 
         let spec = PairSpec {
             tokens,
@@ -1231,6 +1256,7 @@ pub fn config_from_raw(
             feeds,
             band,
             size_table,
+            retail_delta,
             breaker,
             guards,
             key_env: raw_pair.key_env.clone(),
@@ -1297,6 +1323,8 @@ pub struct ResolvedPair {
     pub invert: bool,
     /// The pair's size charges, which its `ValueSource` carries to both send paths.
     pub size_table: Option<SizeTable>,
+    /// The pair's retail delta, which travels with its size charges.
+    pub retail_delta: Option<RetailDelta>,
     /// The settings a live breaker is built from, which the caller does exactly once.
     ///
     /// Deliberately here and not on [`Pair`]: `Pair` is cloned on every supervised restart,
@@ -1390,6 +1418,7 @@ pub fn resolve_pairs<F: Fn(&str) -> Option<String>>(
             feeds: spec.feeds,
             invert: spec.invert,
             size_table: spec.size_table,
+            retail_delta: spec.retail_delta,
             guards: spec.guards,
             breaker: spec.breaker,
         });
@@ -1681,6 +1710,56 @@ pricing = {{ kind = "feed" }}
         raw_pair.size_charges = Some("30:2, 10:5".to_owned());
         let err = format!("{:#}", check_source_keys(&raw_pair).unwrap_err());
         assert!(err.contains("invalid size_charges"), "{err}");
+    }
+
+    /// `retail_delta` is parsed with the pair, survives the backoffice's round-trip as
+    /// written, and one the update cannot carry fails the file, naming the pair.
+    #[test]
+    fn a_pairs_retail_delta_is_parsed_and_a_bad_one_fails_the_file() {
+        let with = |line: &str| {
+            three_pair_toml().replacen(
+                "key_env = \"K_WETH_USDC\"",
+                &format!("key_env = \"K_WETH_USDC\"\n{line}"),
+                1,
+            )
+        };
+        let text = with("retail_delta = \"0.0002\"");
+        let config = parse_config(&text, 18).unwrap();
+        assert_eq!(
+            config.pairs[0].retail_delta,
+            Some(RetailDelta::parse("0.0002").unwrap())
+        );
+        assert_eq!(
+            config.pairs[1].retail_delta, None,
+            "off unless a pair sets it"
+        );
+        // A change to it is a change to the pair: a reload rebuilds the lane.
+        let other = parse_config(&with("retail_delta = \"0.0003\""), 18).unwrap();
+        assert_ne!(config.pairs[0], other.pairs[0]);
+
+        let raw: RawConfig = toml::from_str(&text).unwrap();
+        let written = render_raw(&raw).unwrap();
+        assert!(written.contains("retail_delta = \"0.0002\""), "{written}");
+
+        let refused = |line: &str, decimals: u32| {
+            format!("{:#}", parse_config(&with(line), decimals).err().unwrap())
+        };
+        let err = refused("retail_delta = \"0.00000025\"", 18);
+        assert!(
+            err.contains("pair 1: invalid retail_delta") && err.contains("6 decimal places"),
+            "{err}"
+        );
+        // It is held under `delta` at the scale PropAMM reads, and no other.
+        let err = refused("retail_delta = \"0.0002\"", 8);
+        assert!(
+            err.contains("retail_delta needs price-decimals of 18"),
+            "{err}"
+        );
+        // The backoffice checks an edit before it writes the file, with the same parser.
+        let mut raw_pair = raw.pairs[0].clone();
+        raw_pair.retail_delta = Some("1.5".to_owned());
+        let err = format!("{:#}", check_source_keys(&raw_pair).unwrap_err());
+        assert!(err.contains("invalid retail_delta"), "{err}");
     }
 
     #[test]

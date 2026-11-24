@@ -136,6 +136,7 @@ mod tests {
             feeds: Some(crate::config::Feeds::single_binance("ETHUSDC")),
             band: MidBand::default(),
             size_table: None,
+            retail_delta: None,
             breaker: None,
             guards: Vec::new(),
             key_env: format!("UPDATER_KEY_{lane_id}"),

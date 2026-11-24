@@ -1,10 +1,11 @@
 {
-  "isActive": "29362",
-  "quote": "39547",
-  "quoteFillable": "45039",
-  "quoteFillable_capped": "45244",
-  "quote_afterIsActive": "16047",
-  "quote_warm": "9547",
-  "supportsInterface": "5038",
-  "swap": "68095"
+  "isActive": "29472",
+  "quote": "39720",
+  "quoteFillable": "45041",
+  "quoteFillable_capped": "45246",
+  "quote_afterIsActive": "16220",
+  "quote_warm": "9720",
+  "supportsInterface": "5058",
+  "swap": "68305",
+  "swapRetail": "98759"
 }

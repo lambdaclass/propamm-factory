@@ -71,6 +71,8 @@ pub struct UpdateParams {
     pub chain_id: u64,
     /// The pair's size charges, published with every update; `None` for a pair without any.
     pub size_table: Option<Arc<crate::size_table::SizeTable>>,
+    /// The pair's retail delta, published with every update; `None` for a pair without one.
+    pub retail_delta: Option<crate::size_table::RetailDelta>,
 }
 
 /// What each update derives from the latest (parent) block: the timestamp it is stamped
@@ -305,6 +307,9 @@ pub struct ValueSource {
     /// The pair's size charges, which every update it publishes carries; `None` for a pair
     /// that states none.
     size_table: Option<Arc<crate::size_table::SizeTable>>,
+    /// The pair's retail delta, which every update it publishes carries; `None` for a pair
+    /// that states none.
+    retail_delta: Option<crate::size_table::RetailDelta>,
 }
 
 /// What a pricer's build declared, bound to its metric series, and the tasks it started.
@@ -447,7 +452,22 @@ impl ValueSource {
             guards: Arc::new(Mutex::new(Vec::new())),
             landings: tokio::sync::watch::channel(None).0,
             size_table: None,
+            retail_delta: None,
         }
+    }
+
+    /// The pair's retail delta, for both send paths to publish with its price.
+    pub(crate) fn with_retail_delta(
+        mut self,
+        retail_delta: Option<crate::size_table::RetailDelta>,
+    ) -> Self {
+        self.retail_delta = retail_delta;
+        self
+    }
+
+    /// The pair's retail delta, if it states one.
+    pub(crate) fn retail_delta(&self) -> Option<crate::size_table::RetailDelta> {
+        self.retail_delta
     }
 
     /// The pair's size charges, for both send paths to publish with its price.
@@ -806,13 +826,18 @@ fn test_shape(inverted: bool, price_decimals: u32) -> PairShape {
 }
 
 /// updateState(target, lane, ts, slots) calldata, shared by both send paths. The slots are
-/// `[delta, mid]`, and the pair's size charges when it has a table (see
-/// `size_table::update_slots`).
+/// `[delta, mid]`, with the pair's size charges when it has a table and its retail delta when
+/// it has one (see `size_table::update_slots`).
 pub fn update_calldata(params: &UpdateParams, ts: u32, delta: U256, mid: U256) -> Result<Vec<u8>> {
-    let slots = crate::size_table::update_slots(delta, mid, params.size_table.as_deref())?
-        .into_iter()
-        .map(Value::Uint)
-        .collect();
+    let slots = crate::size_table::update_slots(
+        delta,
+        mid,
+        params.size_table.as_deref(),
+        params.retail_delta,
+    )?
+    .into_iter()
+    .map(Value::Uint)
+    .collect();
     Ok(encode_calldata(
         UPDATE_STATE_SIG,
         &[
@@ -1181,6 +1206,7 @@ mod tests {
             lane: U256::from(7u64),
             chain_id: 1,
             size_table: None,
+            retail_delta: None,
         }
     }
 
@@ -1245,6 +1271,21 @@ mod tests {
             UPDATE_GAS_LIMIT + SIZE_TABLE_SLOT_GAS
         );
         assert_eq!(update_gas_limit(None), UPDATE_GAS_LIMIT);
+
+        // A retail delta rides in slot 0 too, above the rows, and adds no slot.
+        let mut params = self::params();
+        params.retail_delta = Some(crate::size_table::RetailDelta::parse("0.000003").unwrap());
+        let slots = slots_of(&params);
+        assert_eq!(slots.len(), 2);
+        let Value::Uint(slot0) = slots[0] else {
+            panic!("slot 0 is a uint")
+        };
+        assert_eq!(slot0 & U256::from(u64::MAX), U256::from(5u64), "delta");
+        assert_ne!(
+            slot0 >> 184,
+            U256::zero(),
+            "the retail delta sits above the rows"
+        );
     }
 
     /// The registry is the transaction's `to`, not an ABI argument, so it must not appear

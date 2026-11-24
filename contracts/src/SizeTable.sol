@@ -16,17 +16,21 @@ error InvalidSizeTable(uint256 row);
 /// Rows 0..2 sit in slot 0 above delta (bits 64..183); rows 3.. sit six to a slot from slot 3 on
 /// (slot 1 is mid, slot 2 is left to the updater). The table ends at the first row with no end. A
 /// row of all zeros is one, at the previous row's charge, and so is the last row an update can
-/// hold whatever its end.
+/// hold whatever its end. Above the rows, slot 0 holds the retail delta (bits 184..215, see
+/// `PropAMM._pricing`), which is no part of the table.
 library SizeTable {
     uint256 internal constant SCALE = 1e18;
     uint256 internal constant DELTA_MASK = (1 << 64) - 1;
     /// Charges and ends are published at 1e-6.
     uint256 internal constant UNIT = 1e12;
     uint256 private constant ROW_MASK = (1 << 40) - 1;
+    /// The three rows slot 0 holds, once shifted down past delta.
+    uint256 private constant SLOT0_ROWS_MASK = (1 << 120) - 1;
     uint256 private constant FIRST_SLOT = 3;
 
     function present(uint256[] memory slots) internal pure returns (bool) {
-        return slots[0] >> 64 != 0;
+        // Only the rows: a retail delta above them does not make a table.
+        return (slots[0] >> 64) & SLOT0_ROWS_MASK != 0;
     }
 
     function _count(uint256[] memory slots) private pure returns (uint256) {

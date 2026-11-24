@@ -604,9 +604,17 @@ pub(crate) async fn build_live(
             table.describe()
         );
     }
+    if let Some(retail) = &resolved.retail_delta {
+        tracing::info!(
+            "[{}] retail delta, the half-spread attested retail flow pays: {}",
+            resolved.pair.label,
+            retail.describe()
+        );
+    }
     let values = values
         .with_guards(latch.clone(), quote_guards)
-        .with_size_table(resolved.size_table.map(Arc::new));
+        .with_size_table(resolved.size_table.map(Arc::new))
+        .with_retail_delta(resolved.retail_delta);
     Ok(Built {
         live: Live {
             halt: Default::default(),
@@ -1425,6 +1433,7 @@ mod tests {
             feeds: None,
             invert: false,
             size_table: None,
+            retail_delta: None,
             breaker: None,
             guards: Vec::new(),
         };

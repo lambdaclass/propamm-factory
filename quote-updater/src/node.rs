@@ -68,6 +68,7 @@ pub(crate) async fn push_update(
         lane: live.pair.lane,
         chain_id: opts.chain_id,
         size_table: live.values.size_table(),
+        retail_delta: live.values.retail_delta(),
     };
 
     let parent = client
@@ -299,11 +300,16 @@ async fn confirm_and_verify(
     .await?;
     let got = decode_return_data("r(uint32,uint256[])", &ret)?;
     // The registry stores the slots as sent, so every one is read back: the pair's size
-    // charges too, when it has a table.
-    let slots = crate::size_table::update_slots(delta, mid, params.size_table.as_deref())?
-        .into_iter()
-        .map(Value::Uint)
-        .collect();
+    // charges too, when it has a table, and its retail delta.
+    let slots = crate::size_table::update_slots(
+        delta,
+        mid,
+        params.size_table.as_deref(),
+        params.retail_delta,
+    )?
+    .into_iter()
+    .map(Value::Uint)
+    .collect();
     let want = vec![Value::Uint(ts.into()), Value::Array(slots)];
     if got != want {
         return Err(PostSendFailure {
@@ -322,6 +328,8 @@ async fn confirm_and_verify(
     live.metrics.node_pushes(NodePush::Landed).inc();
     let table = params.size_table.as_ref().map_or(String::new(), |table| {
         format!(" size charges {}", table.describe())
+    }) + &params.retail_delta.map_or(String::new(), |retail| {
+        format!(" retail delta {}", retail.describe())
     });
     tracing::info!(
         "[{label}] verified via getState as {:#x}: lane {} -> slots = [{delta}, {mid}] at timestamp {ts}{table}",
@@ -409,6 +417,7 @@ mod tests {
             feeds: None,
             invert: false,
             size_table: None,
+            retail_delta: None,
             breaker: None,
             guards: Vec::new(),
         };
@@ -488,6 +497,7 @@ mod tests {
             feeds: None,
             invert: false,
             size_table: None,
+            retail_delta: None,
             breaker: None,
             guards: Vec::new(),
         };
