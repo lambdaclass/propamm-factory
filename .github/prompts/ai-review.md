@@ -14,7 +14,7 @@ Review only the changes in this pull request. Where you can read the surrounding
 decide whether a change is correct. Look for:
 
 1. **Security vulnerabilities**, labelled Critical / High / Medium / Low.
-   - Contracts: who can call what (owner, updaters, anyone); initializers and upgrades that a
+   - Contracts: who can call what (owner, pauser, updaters, anyone); initializers and upgrades that a
      stranger can reach, or that break the storage layout; a stale price used, or one read from
      the wrong pair's slots; rounding in pricing and fill math that favours the trader over
      the vault; a fill beyond what the vault holds or has approved; token transfers that assume a

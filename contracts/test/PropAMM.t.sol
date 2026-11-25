@@ -3,6 +3,8 @@ pragma solidity ^0.8.35;
 
 import {Test} from "forge-std/Test.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {ERC1967Utils} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Utils.sol";
+import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {PropAMM, NoVault, PairAlreadyExists, UnsupportedPair} from "../src/PropAMM.sol";
 import {IPropAMM} from "../src/interfaces/IPropAMM.sol";
 import {MockPUR} from "./mocks/MockPUR.sol";
@@ -81,6 +83,12 @@ contract PropAMMTest is Test {
     /// without re-running it lands on the same default: open for business.
     function test_initialize_startsUnpaused() public view {
         assertFalse(propAmm.paused());
+    }
+
+    /// No pauser until the owner names one: until then only the owner can pause, as before the
+    /// role existed.
+    function test_initialize_startsWithNoPauser() public view {
+        assertEq(propAmm.pauser(), address(0));
     }
 
     //------------------------------
@@ -254,6 +262,98 @@ contract PropAMMTest is Test {
         vm.expectRevert();
         propAmm.withdrawERC20(USDC, rando, 1);
         vm.stopPrank();
+    }
+
+    //------------------------------
+    // setPauser
+    //------------------------------
+
+    function test_setPauser_storesThePauserAndEmits() public {
+        address pauser = makeAddr("pauser");
+        vm.expectEmit(true, true, false, true, address(propAmm));
+        emit PropAMM.PauserChanged(address(0), pauser);
+        vm.prank(owner);
+        propAmm.setPauser(pauser);
+        assertEq(propAmm.pauser(), pauser);
+
+        // Replacing and clearing announce the account they retire, so an indexer following the
+        // log alone always knows who holds the role.
+        address next = makeAddr("next-pauser");
+        vm.expectEmit(true, true, false, true, address(propAmm));
+        emit PropAMM.PauserChanged(pauser, next);
+        vm.prank(owner);
+        propAmm.setPauser(next);
+
+        vm.expectEmit(true, true, false, true, address(propAmm));
+        emit PropAMM.PauserChanged(next, address(0));
+        vm.prank(owner);
+        propAmm.setPauser(address(0));
+        assertEq(propAmm.pauser(), address(0));
+    }
+
+    /// `pauser` is appended after `oracle`, at slot 5, so instances upgrading onto this
+    /// implementation keep every earlier variable where it was. Pinned here because a variable
+    /// declared above it would compile and pass every other test while shifting the layout.
+    function test_setPauser_writesSlotFiveAndLeavesTheOracleAlone() public {
+        address pauser = makeAddr("pauser");
+        vm.prank(owner);
+        propAmm.setPauser(pauser);
+
+        assertEq(address(uint160(uint256(vm.load(address(propAmm), bytes32(uint256(5)))))), pauser);
+        assertEq(address(uint160(uint256(vm.load(address(propAmm), bytes32(uint256(4)))))), ORACLE);
+        assertEq(address(propAmm.oracle()), ORACLE);
+    }
+
+    /// While paused is when the owner most needs to swap a pauser out, so the setter must not
+    /// be gated on the pause.
+    function test_setPauser_worksWhilePaused() public {
+        vm.prank(owner);
+        propAmm.pause();
+
+        address pauser = makeAddr("pauser");
+        vm.prank(owner);
+        propAmm.setPauser(pauser);
+        assertEq(propAmm.pauser(), pauser);
+    }
+
+    /// The pauser can pause and nothing more: naming its own successor would let a leaked key
+    /// keep the role after the owner moves to retire it.
+    function test_setPauser_onlyTheOwnerCanSetIt() public {
+        address pauser = makeAddr("pauser");
+        vm.prank(owner);
+        propAmm.setPauser(pauser);
+
+        address rando = makeAddr("rando");
+        vm.prank(rando);
+        vm.expectRevert(abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, rando));
+        propAmm.setPauser(rando);
+
+        vm.prank(pauser);
+        vm.expectRevert(abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, pauser));
+        propAmm.setPauser(rando);
+
+        assertEq(propAmm.pauser(), pauser);
+    }
+
+    /// An owner that is a multisig upgrades an existing instance and names its pauser in one
+    /// transaction: `upgradeToAndCall` delegatecalls `setPauser` with the owner still the
+    /// sender, so the owner check passes. No reinitializer is involved, so there is nothing for
+    /// anyone else to call first.
+    function test_setPauser_inTheUpgradeTransaction() public {
+        address pauser = makeAddr("pauser");
+        address newImplementation = address(new PropAMM());
+
+        vm.prank(owner);
+        propAmm.upgradeToAndCall(newImplementation, abi.encodeCall(PropAMM.setPauser, (pauser)));
+
+        assertEq(
+            address(uint160(uint256(vm.load(address(propAmm), ERC1967Utils.IMPLEMENTATION_SLOT)))), newImplementation
+        );
+        assertEq(propAmm.pauser(), pauser);
+
+        vm.prank(pauser);
+        propAmm.pause();
+        assertTrue(propAmm.paused());
     }
 
     //------------------------------

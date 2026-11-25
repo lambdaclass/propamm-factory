@@ -22,6 +22,11 @@ over them.
 add and remove updaters (`addUpdater`, `removeUpdater`) and pause it. Traders call `swap`;
 anyone can call `quote` and `isActive` to see what a trade would get.
 
+The owner can also name a pauser (`setPauser`): one more account that can `pause`, and do
+nothing else. It is meant for an owner that is slow to act, such as a multisig, so a single key
+can stop quotes and swaps at once. Only the owner can `unpause`, and `setPauser(0)` removes the
+pauser.
+
 Instances also implement `IPropAMMFillable`, advertised through ERC-165, which
 `PropAMMRouter`'s split routing (`swapSplitV1`) prices a venue with in one call:
 `quoteFillable(tokenIn, tokenOut, amountIn)` answers with how much of the order the pair's vault
