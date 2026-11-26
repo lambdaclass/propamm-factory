@@ -23,6 +23,11 @@ add and remove updaters (`addUpdater`, `removeUpdater`, and `removeUpdaterFrom` 
 the instance has moved away from), point it at another registry (`setOracle`) and pause it. Traders call `swap`;
 anyone can call `quote` and `isActive` to see what a trade would get.
 
+The owner can also name a pauser (`setPauser`): one more account that can `pause`, and do
+nothing else. It is meant for an owner that is slow to act, such as a multisig, so a single key
+can stop quotes and swaps at once. Only the owner can `unpause`, and `setPauser(0)` removes the
+pauser.
+
 A price is good for one block. The instance asks the registry for the update stamped with the
 current block's timestamp and checks the stamp on the answer, so a registry that keeps no such
 window and hands back an older update is refused rather than priced from. The check is only as

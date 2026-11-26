@@ -3,7 +3,7 @@ pragma solidity ^0.8.35;
 
 import {Test} from "forge-std/Test.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-import {PropAMM, InvalidOracle, NotAToken, UpdaterAlreadyAuthorized} from "../src/PropAMM.sol";
+import {PropAMM, InvalidOracle, NotAToken, UnauthorizedPauser, UpdaterAlreadyAuthorized} from "../src/PropAMM.sol";
 import {CreationIsDisabled, PropAMMFactory} from "../src/PropAMMFactory.sol";
 import {IPropAMM} from "../src/interfaces/IPropAMM.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
@@ -377,10 +377,13 @@ contract PropAMMFactoryTest is Test {
         propAmm.upgradeToAndCall(newImplementation, "");
         vm.expectRevert(notOwner);
         propAmm.setOracle(OTHER_PUR_ADDR);
-        vm.expectRevert(notOwner);
+        // `pause` is open to the pauser too, so its refusal names that role; none is set here.
+        vm.expectRevert(abi.encodeWithSelector(UnauthorizedPauser.selector, rando));
         propAmm.pause();
         vm.expectRevert(notOwner);
         propAmm.unpause();
+        vm.expectRevert(notOwner);
+        propAmm.setPauser(rando);
         vm.expectRevert(notOwner);
         propAmm.withdrawERC20(address(held), rando, 1);
         vm.expectRevert(notOwner);

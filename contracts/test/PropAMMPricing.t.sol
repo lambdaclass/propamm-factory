@@ -19,6 +19,7 @@ import {
     InvalidRecipient,
     SpreadTooWide,
     StaleOracleData,
+    UnauthorizedPauser,
     UnsupportedPair,
     ZeroAmountIn,
     ZeroAmountOut
@@ -128,6 +129,7 @@ contract PropAMMPricingTest is Test {
     address owner = makeAddr("owner");
     address vault = makeAddr("vault");
     address trader = makeAddr("trader");
+    address pauser = makeAddr("pauser");
 
     PropAMM propAmm;
 
@@ -700,8 +702,8 @@ contract PropAMMPricingTest is Test {
     // Pause
     //------------------------------
 
-    /// The owner's kill switch on the taker-facing path: while it is on, quotes revert instead
-    /// of pricing, and the same quote comes back unchanged once it is off.
+    /// The kill switch on the taker-facing path: while it is on, quotes revert instead of
+    /// pricing, and the same quote comes back unchanged once it is off.
     function test_pause_stopsQuotesUntilUnpaused() public {
         _setPrice(1600e18, 5e14);
         _fundVault(USDT, 1_600_000e6);
@@ -973,9 +975,9 @@ contract PropAMMPricingTest is Test {
         assertFalse(propAmm.isActive(USDT, WETH), "still no WETH");
     }
 
-    function test_pause_onlyOwnerCanFlipIt() public {
+    function test_pause_strangersCanNeitherPauseNorUnpause() public {
         vm.prank(trader);
-        vm.expectRevert(abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, trader));
+        vm.expectRevert(abi.encodeWithSelector(UnauthorizedPauser.selector, trader));
         propAmm.pause();
         assertFalse(propAmm.paused());
 
@@ -986,6 +988,75 @@ contract PropAMMPricingTest is Test {
         vm.expectRevert(abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, trader));
         propAmm.unpause();
         assertTrue(propAmm.paused(), "a non-owner lifted the pause");
+    }
+
+    /// The pauser exists so one key can stop the instance without waiting on the owner, say a
+    /// multisig: its pause has to cut off quotes, swaps and `isActive` exactly like the owner's.
+    function test_pause_thePauserStopsQuotesSwapsAndIsActive() public {
+        _setPrice(1600e18, 5e14);
+        _fundVault(USDT, 1_600_000e6);
+        vm.prank(owner);
+        propAmm.setPauser(pauser);
+
+        vm.prank(pauser);
+        propAmm.pause();
+        assertTrue(propAmm.paused());
+
+        vm.expectRevert(PausableUpgradeable.EnforcedPause.selector);
+        propAmm.quote(WETH, USDT, 1e18);
+        vm.expectRevert(PausableUpgradeable.EnforcedPause.selector);
+        propAmm.swap(WETH, USDT, 1e18, 0, trader, block.timestamp);
+        assertFalse(propAmm.isActive(WETH, USDT));
+    }
+
+    /// Pausing is all the pauser can do. Reopening stays with the owner, so a leaked pauser key
+    /// can stop the instance but never undo a pause the owner put on for a reason.
+    function test_pause_onlyTheOwnerLiftsThePausersPause() public {
+        vm.prank(owner);
+        propAmm.setPauser(pauser);
+        vm.prank(pauser);
+        propAmm.pause();
+
+        vm.prank(pauser);
+        vm.expectRevert(abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, pauser));
+        propAmm.unpause();
+        assertTrue(propAmm.paused(), "the pauser lifted the pause");
+
+        vm.prank(owner);
+        propAmm.unpause();
+        assertFalse(propAmm.paused());
+    }
+
+    /// Naming a pauser adds a second key; it does not take the owner's away.
+    function test_pause_theOwnerStillPausesWithAPauserSet() public {
+        vm.prank(owner);
+        propAmm.setPauser(pauser);
+
+        vm.prank(owner);
+        propAmm.pause();
+        assertTrue(propAmm.paused());
+    }
+
+    /// The right goes with the address: a replaced or cleared pauser can no longer pause, which
+    /// is how the owner retires a key it no longer trusts.
+    function test_pause_aReplacedOrClearedPauserLosesTheRight() public {
+        address next = makeAddr("next-pauser");
+        vm.startPrank(owner);
+        propAmm.setPauser(pauser);
+        propAmm.setPauser(next);
+        vm.stopPrank();
+
+        vm.prank(pauser);
+        vm.expectRevert(abi.encodeWithSelector(UnauthorizedPauser.selector, pauser));
+        propAmm.pause();
+
+        vm.prank(owner);
+        propAmm.setPauser(address(0));
+
+        vm.prank(next);
+        vm.expectRevert(abi.encodeWithSelector(UnauthorizedPauser.selector, next));
+        propAmm.pause();
+        assertFalse(propAmm.paused());
     }
 
     //------------------------------

@@ -59,8 +59,18 @@ I12 = " " * 12
 # (name, file, (old, new)), or a list of (old, new) where one bug takes more than one edit.
 MUTANTS = [
     # Owner-only functions, open to anyone.
-    ("access: pause", PROPAMM, open_to_anyone("function pause()")),
+    (
+        "access: pause",
+        PROPAMM,
+        drop(f"{I8}require(msg.sender == owner() || msg.sender == pauser, UnauthorizedPauser(msg.sender));\n"),
+    ),
+    (
+        "access: pause refuses the pauser",
+        PROPAMM,
+        ("msg.sender == owner() || msg.sender == pauser", "msg.sender == owner()"),
+    ),
     ("access: unpause", PROPAMM, open_to_anyone("function unpause()")),
+    ("access: setPauser", PROPAMM, open_to_anyone("function setPauser(address newPauser)")),
     ("access: addPair", PROPAMM, open_to_anyone("function addPair(address tokenX, address tokenY, address vault)")),
     (
         "access: setPairVault",

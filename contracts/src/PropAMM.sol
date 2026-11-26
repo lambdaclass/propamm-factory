@@ -60,6 +60,8 @@ error InvalidRecipient(address recipient);
 /// `setOracle` naming the registry the instance already reads: nothing would change, and the
 /// event would report a move that did not happen.
 error OracleUnchanged(address oracle);
+/// `pause` called by an account that is neither the owner nor the pauser.
+error UnauthorizedPauser(address account);
 
 /// @notice Push payment (see `IPropAMM`) is atomic only inside the caller's transaction: tokens
 /// left on an instance between transactions can be swapped by anyone, and `withdrawERC20`
@@ -112,6 +114,7 @@ contract PropAMM is
     event UpdaterAuthorized(address indexed updater, address indexed oracle);
     event UpdaterRevoked(address indexed updater, address indexed oracle);
     event ERC20Withdrawn(address indexed token, address indexed to, uint256 amount);
+    event PauserChanged(address indexed previousPauser, address indexed newPauser);
 
     /// @dev Fixed-point scale the oracle publishes `mid` in. A `mid` of 1e18 means one whole
     /// token0 is worth one whole token1, whatever decimals the two tokens use, so `_quote`
@@ -147,6 +150,10 @@ contract PropAMM is
     /// creation rather than hardcoded, so an instance can be pointed at another registry (see
     /// `setOracle`) without a new implementation.
     IPrioUpdateRegistry public oracle;
+    /// @dev The one account besides the owner that can `pause`, and only that.
+    /// So a single key can stop quotes and swaps the moment something looks wrong.
+    /// Zero means no pauser. The pauser outlives ownership.
+    address public pauser;
 
     constructor() {
         _disableInitializers();
@@ -550,14 +557,25 @@ contract PropAMM is
     // Management functions
     //------------------------------
 
-    /// @notice Pauses the contract, preventing swaps from being executed.
-    function pause() external onlyOwner {
+    /// @notice Pauses the contract: quotes and swaps revert and `isActive` answers false until
+    /// the owner unpauses.
+    /// @dev Open to the owner and to the pauser (see `pauser`).
+    function pause() external {
+        require(msg.sender == owner() || msg.sender == pauser, UnauthorizedPauser(msg.sender));
         _pause();
     }
 
     /// @notice Unpauses the contract, allowing swaps to be executed.
+    /// @dev Owner only; the pauser cannot unpause.
     function unpause() external onlyOwner {
         _unpause();
+    }
+
+    /// @notice Names the account that can pause alongside the owner, replacing any previous one.
+    /// @param newPauser The new pauser, or zero for none.
+    function setPauser(address newPauser) external onlyOwner {
+        emit PauserChanged(pauser, newPauser);
+        pauser = newPauser;
     }
 
     /// @notice Adds a token pair, filled from `vault`.

@@ -28,7 +28,7 @@ cast send $FACTORY "createPropAMM(address,address,address[],(address,address,add
 ```
 
 - `OWNER`: the wallet that will manage the PropAMM afterwards (add pairs, add updaters,
-  pause). Can be the same as the deployer.
+  pause). Can be the same as the deployer. If it is a multisig, name a pauser too (see below).
 - `REGISTRY`: the priority update registry the PropAMM reads prices from. On mainnet it is
   `0xDa7AfEeD021EAFC1c1Af9C362dE477DaD0396B81`. It must be a deployed contract on this chain:
   `createPropAMM` reverts with `InvalidOracle` otherwise.
@@ -58,6 +58,37 @@ cast send $FACTORY "createPropAMM(address,address,address[],(address,address,add
 ```
 
 You do not need to add all the pairs upfront on contract creation. You can both and or remove pairs by having the owner calling the appropriate contract functions.
+
+### Name a pauser if the owner is a multisig
+
+Pausing stops every quote and swap until the owner unpauses. A multisig owner needs its
+signers to agree before it can pause, which is too slow for an emergency, so name a pauser:
+one account that can call `pause` and nothing else. Unpausing, and every other change, stays
+with the owner.
+
+From the owner:
+
+```bash
+cast send $PROPAMM "setPauser(address)" $PAUSER_ADDRESS --rpc-url $RPC_URL --private-key $OWNER_KEY
+```
+
+Then, from the pauser, whenever something looks wrong:
+
+```bash
+cast send $PROPAMM "pause()" --rpc-url $RPC_URL --private-key $PAUSER_KEY
+```
+
+`setPauser` with the zero address removes the pauser, and naming another one replaces it. If
+the pauser's key leaks, have the owner replace or remove the pauser before unpausing, or that
+key can pause again right away. The pauser stays when ownership changes hands, so a new owner
+should replace it if it is not theirs, and an owner about to renounce ownership should remove it
+first: once no one owns the PropAMM, a pause from the pauser can never be lifted.
+
+A PropAMM created from a factory deployed before `setPauser` existed (the mainnet factory above
+included) runs an implementation without it. Its owner can upgrade and name the pauser in one
+transaction, with `upgradeToAndCall(newImplementation, setPauserCalldata)`, where
+`newImplementation` is a deployed `PropAMM` that has `setPauser` and `setPauserCalldata` is
+`cast calldata "setPauser(address)" $PAUSER_ADDRESS`.
 
 ### Tokens and transfers
 
