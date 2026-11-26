@@ -133,12 +133,7 @@ contract PropAMM is
 
     /// @dev The vault each pair fills from, by pair key, and the registry of pairs in one: a pair
     /// is registered exactly when its vault is nonzero. `_addPair` sets it, `removePair` clears
-    /// it, and `setPairVault` never writes zero, so there is no separate set of keys to keep in
-    /// step with it.
-    ///
-    /// The layout starts at `tokenPairs`: it holds no slot for the instance-wide vault or the
-    /// set of pair keys that earlier instances kept. An instance created on a layout that had
-    /// them is not upgraded onto this implementation; it is replaced.
+    /// it, and `setPairVault` never writes zero.
     mapping(uint256 pairKey => address) public pairVaults;
     /// @dev The registry this instance reads prices from and registers its updaters with. Set at
     /// creation rather than hardcoded, so an instance can be pointed at another registry (see
