@@ -52,6 +52,9 @@ pub(crate) fn adopt_breaker_metrics(live: &Live) {
         if let Some(ratio) = ratios.tick {
             m.breaker_deviation_ratio.set(ratio);
         }
+        if let Some(moved) = ratios.tick_move {
+            m.breaker_deviation.set(moved);
+        }
         if let Some(ratio) = ratios.window {
             m.breaker_window_deviation_ratio.set(ratio);
         }
@@ -92,6 +95,7 @@ pub(crate) fn adopt_metrics(live: &Live, price_decimals: u32, metrics: &crate::m
     // tick sets them. Before the gauges below, like every other initial value here.
     metrics.quiesce_diagnostics(&live.pair.label);
     m.breaker_armed.set(if live.armed { 1.0 } else { 0.0 });
+    m.breaker_limit.set(live.limit.unwrap_or(f64::NAN));
     for kind in &live.guard_kinds {
         m.guard(kind).set(1.0);
     }
@@ -208,6 +212,8 @@ pub(crate) struct Live {
     pub(crate) halt: crate::halts::HaltSignal,
     /// Whether the pair configured a deviation guard, for `breaker_armed`.
     pub(crate) armed: bool,
+    /// Its `max_deviation` as a fraction of the mid, for `breaker_limit`; `None` without one.
+    pub(crate) limit: Option<f64>,
     /// The registered guard kinds this pair runs (market and quote), for `guards{pair,kind}`.
     pub(crate) guard_kinds: Vec<&'static str>,
     /// The deviation guard's last ratios, for adoption to seed its gauges from; `None` for
@@ -464,7 +470,17 @@ pub(crate) async fn build_live(
     let pair_metrics = metrics.for_pair(&resolved.pair.label);
     let adopted = feed::Adoption::new();
     latch.attach_metrics(feed::Gated::new(pair_metrics.clone(), adopted.clone()));
+    // Not gated on adoption like the series: a trip is one row whichever generation the
+    // lane is, and a rebuild that trips while the lane it replaces still quotes is a halt
+    // worth the record too.
+    if let Some(recorder) = recorder {
+        latch.attach_recorder(recorder.clone(), resolved.pair.label.clone());
+    }
     let armed = resolved.breaker.is_some();
+    let limit = resolved
+        .breaker
+        .and_then(|config| config.threshold_scaled)
+        .map(|threshold| feed::scaled_to_f64(threshold, price_decimals));
     let deviation = resolved.breaker.map(|config| {
         crate::guard::deviation::DeviationGuard::new(
             config,
@@ -606,6 +622,7 @@ pub(crate) async fn build_live(
             values,
             latch,
             armed,
+            limit,
             guard_kinds,
             deviation: readout,
             metrics: pair_metrics,
@@ -1095,6 +1112,7 @@ mod tests {
             values: ValueSource::feed_for_tests(rx, None, false, 18),
             latch: crate::guard::Latch::new(),
             armed: false,
+            limit: None,
             guard_kinds: Vec::new(),
             deviation: None,
             metrics: metrics.for_pair("FEED/TEST"),
@@ -1167,6 +1185,7 @@ mod tests {
             values: ValueSource::feed_for_tests(rx.clone(), None, false, 18),
             latch: crate::guard::Latch::new(),
             armed: false,
+            limit: None,
             guard_kinds: Vec::new(),
             deviation: None,
             metrics: metrics.for_pair("UP/TEST"),
@@ -1258,6 +1277,7 @@ mod tests {
             values: ValueSource::feed_for_tests(rx, None, false, 18),
             latch,
             armed: true,
+            limit: Some(0.02),
             guard_kinds: Vec::new(),
             deviation: Some(readout),
             metrics: metrics.for_pair("TRIP/TEST"),
@@ -1330,6 +1350,7 @@ mod tests {
             values: ValueSource::feed_for_tests(rx, None, false, 18),
             latch: latch.clone(),
             armed: true,
+            limit: Some(0.02),
             guard_kinds: Vec::new(),
             deviation: None,
             metrics: pair_metrics.clone(),
