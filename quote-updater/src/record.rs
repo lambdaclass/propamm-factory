@@ -1614,10 +1614,15 @@ api_key = "{builder_key}"
 
     /// An authority, and a server certificate it signed for `name`, made in memory for this
     /// run of the tests so no key is ever committed: (the authority's PEM, the server's
-    /// certificate PEM, its key PEM).
+    /// certificate PEM, its key PEM). Each has a subject of its own: rcgen gives every
+    /// certificate the same default one, and OpenSSL takes a certificate whose subject is its
+    /// issuer's for self-signed instead of looking for the authority above it.
     fn authority_and_server(name: &str) -> (String, String, String) {
         let authority_key = rcgen::KeyPair::generate().unwrap();
         let mut authority = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        authority
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "record test authority");
         authority.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         authority.key_usages = vec![
             rcgen::KeyUsagePurpose::KeyCertSign,
@@ -1626,6 +1631,9 @@ api_key = "{builder_key}"
         let authority = authority.self_signed(&authority_key).unwrap();
         let key = rcgen::KeyPair::generate().unwrap();
         let mut server = rcgen::CertificateParams::new(vec![name.to_owned()]).unwrap();
+        server
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, name);
         server.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
         let server = server.signed_by(&key, &authority, &authority_key).unwrap();
         (authority.pem(), server.pem(), key.serialize_pem())
