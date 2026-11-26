@@ -4,7 +4,7 @@
 
 use std::{
     sync::{Arc, Mutex},
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 
 use ethrex_common::{
@@ -126,10 +126,7 @@ impl UpdateStamp {
 
 /// Seconds since the epoch on the wall clock.
 pub fn wall_clock_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+    (crate::poll::wall_clock_ms() / 1_000) as u64
 }
 
 /// max_fee_per_gas for a transaction that must land in the very next block: twice the
@@ -799,17 +796,45 @@ fn test_shape(inverted: bool, price_decimals: u32) -> PairShape {
         price_decimals,
         target: Address::zero(),
         sources: 1,
+        mid_only_sources: 0,
         min_mid: None,
         max_mid: None,
         max_source_divergence: None,
     }
 }
 
+/// The slots of one update, shared by the send paths and the read-back that checks them:
+/// `[delta, mid]` and the pair's size charges when it has a table (see
+/// `size_table::update_slots`), with `quote_id` in slot 2, which the table leaves empty.
+/// The contract never reads slot 2.
+pub(crate) fn update_slots(
+    params: &UpdateParams,
+    delta: U256,
+    mid: U256,
+    quote_id: Option<U256>,
+) -> Result<Vec<U256>> {
+    let mut slots = crate::size_table::update_slots(delta, mid, params.size_table.as_deref())?;
+    if let Some(id) = quote_id {
+        if slots.len() > 2 {
+            slots[2] = id;
+        } else {
+            slots.push(id);
+        }
+    }
+    Ok(slots)
+}
+
 /// updateState(target, lane, ts, slots) calldata, shared by both send paths. The slots are
-/// `[delta, mid]`, and the pair's size charges when it has a table (see
-/// `size_table::update_slots`).
-pub fn update_calldata(params: &UpdateParams, ts: u32, delta: U256, mid: U256) -> Result<Vec<u8>> {
-    let slots = crate::size_table::update_slots(delta, mid, params.size_table.as_deref())?
+/// `[delta, mid]`, the pair's size charges when it has a table, and `quote_id` in slot 2 when
+/// one is given (see [`update_slots`]).
+pub fn update_calldata(
+    params: &UpdateParams,
+    ts: u32,
+    delta: U256,
+    mid: U256,
+    quote_id: Option<U256>,
+) -> Result<Vec<u8>> {
+    let slots = update_slots(params, delta, mid, quote_id)?
         .into_iter()
         .map(Value::Uint)
         .collect();
@@ -842,13 +867,14 @@ pub async fn sign_update_tx(
     stamp: UpdateStamp,
     nonce: u64,
     (delta, mid): (U256, U256),
+    quote_id: Option<u64>,
 ) -> Result<Vec<u8>> {
     let tx = build_generic_tx(
         client,
         TxType::EIP1559,
         params.registry,
         signer.address(),
-        update_calldata(params, stamp.ts, delta, mid)?.into(),
+        update_calldata(params, stamp.ts, delta, mid, quote_id.map(U256::from))?.into(),
         Overrides {
             gas_limit: Some(update_gas_limit(params.size_table.as_deref())),
             max_fee_per_gas: Some(next_block_max_fee(stamp.parent_base_fee, 0)),
@@ -882,8 +908,30 @@ pub(crate) fn stamped_ts(raw_tx: &[u8]) -> u32 {
     ts.as_u32()
 }
 
+/// The slots a signed update carries, read back out of its raw bytes. Test-only, like
+/// `stamped_ts`.
+#[cfg(test)]
+pub(crate) fn stamped_slots(raw_tx: &[u8]) -> Vec<U256> {
+    use ethrex_l2_sdk::calldata::decode_calldata;
+    use ethrex_rlp::decode::RLPDecode;
+    let tx = EIP1559Transaction::decode(&raw_tx[1..]).expect("a type-prefixed EIP-1559 tx");
+    let values = decode_calldata(UPDATE_STATE_SIG, tx.data).expect("updateState calldata");
+    let Value::Array(slots) = &values[3] else {
+        panic!("the fourth argument of updateState is the slots");
+    };
+    slots
+        .iter()
+        .map(|slot| match slot {
+            Value::Uint(v) => *v,
+            other => panic!("a slot is a uint, not {other:?}"),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+    use std::time::SystemTime;
+
     use ethrex_common::Bytes;
     use ethrex_l2_sdk::calldata::decode_calldata;
 
@@ -1189,8 +1237,14 @@ mod tests {
     #[test]
     fn update_calldata_round_trips_through_the_registry_abi() {
         let params = params();
-        let calldata =
-            update_calldata(&params, 1_755_000_012, U256::from(5u64), U256::from(9u64)).unwrap();
+        let calldata = update_calldata(
+            &params,
+            1_755_000_012,
+            U256::from(5u64),
+            U256::from(9u64),
+            None,
+        )
+        .unwrap();
         let decoded = decode_calldata(UPDATE_STATE_SIG, Bytes::from(calldata)).unwrap();
         assert_eq!(
             decoded,
@@ -1212,7 +1266,8 @@ mod tests {
     fn a_size_table_rides_in_the_updates_slots() {
         use crate::size_table::SizeTable;
         let slots_of = |params: &UpdateParams| {
-            let calldata = update_calldata(params, 1, U256::from(5u64), U256::from(9u64)).unwrap();
+            let calldata =
+                update_calldata(params, 1, U256::from(5u64), U256::from(9u64), None).unwrap();
             match decode_calldata(UPDATE_STATE_SIG, Bytes::from(calldata))
                 .unwrap()
                 .remove(3)
@@ -1247,12 +1302,72 @@ mod tests {
         assert_eq!(update_gas_limit(None), UPDATE_GAS_LIMIT);
     }
 
+    /// A quote id rides as a third slot after the two the contract reads, and nowhere else:
+    /// everything before the slots is byte-identical to the two-slot calldata.
+    #[test]
+    fn a_quote_id_is_a_third_slot() {
+        let params = params();
+        let quote_id = U256::from(0xDEAD_BEEF_0000_0001u64);
+        let calldata = update_calldata(
+            &params,
+            1_755_000_012,
+            U256::from(5u64),
+            U256::from(9u64),
+            Some(quote_id),
+        )
+        .unwrap();
+        let without = update_calldata(
+            &params,
+            1_755_000_012,
+            U256::from(5u64),
+            U256::from(9u64),
+            None,
+        )
+        .unwrap();
+        // Selector, three static arguments, the array offset and its length: the slots start
+        // after that, and only the length word and the tail differ.
+        let head = 4 + 32 * 4;
+        assert_eq!(calldata[..head], without[..head]);
+        assert_eq!(calldata.len(), without.len() + 32);
+        let decoded = decode_calldata(UPDATE_STATE_SIG, Bytes::from(calldata)).unwrap();
+        assert_eq!(
+            decoded[3],
+            Value::Array(vec![
+                Value::Uint(U256::from(5u64)),
+                Value::Uint(U256::from(9u64)),
+                Value::Uint(quote_id),
+            ])
+        );
+    }
+
+    /// A quote id beside a size table takes slot 2, the one the table leaves empty, whether
+    /// the table stops at slot 0 or runs on from slot 3: the rows stay where the contract
+    /// reads them.
+    #[test]
+    fn a_quote_id_takes_the_slot_a_size_table_leaves_empty() {
+        use crate::size_table::SizeTable;
+        let (delta, mid, id) = (U256::from(5u64), U256::from(9u64), U256::from(0xABCDu64));
+        let mut params = params();
+        for table in ["10:0, 30:2, rest:5", "1:1, 2:2, 3:3, 4:4, rest:5"] {
+            params.size_table = Some(Arc::new(SizeTable::parse(table).unwrap()));
+            let without = update_slots(&params, delta, mid, None).unwrap();
+            let with = update_slots(&params, delta, mid, Some(id)).unwrap();
+            assert_eq!(with.len(), without.len().max(3), "{table}");
+            assert_eq!(with[2], id, "{table}");
+            for (i, (a, b)) in with.iter().zip(&without).enumerate() {
+                if i != 2 {
+                    assert_eq!(a, b, "{table}: slot {i}");
+                }
+            }
+        }
+    }
+
     /// The registry is the transaction's `to`, not an ABI argument, so it must not appear
     /// in the calldata — a swap of the two would silently publish for the wrong target.
     #[test]
     fn update_calldata_does_not_encode_the_registry() {
         let params = params();
-        let calldata = update_calldata(&params, 1, U256::one(), U256::one()).unwrap();
+        let calldata = update_calldata(&params, 1, U256::one(), U256::one(), None).unwrap();
         assert!(
             !calldata
                 .windows(20)

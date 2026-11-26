@@ -1,0 +1,87 @@
+# A tokenized-stock pair: one Ondo stock token against USDC on Ethereum mainnet. The file
+# format is the library's (see docs/manual.md). A stock pair is a pair like any other: its
+# price is the `ondo` venue, Ondo's own price for the token, averaged, aged and judged by
+# the circuit breaker and the band like every venue's; its pricing kind is any the binary
+# registers (`feed` at a fixed spread here); and the guards named in [[pairs.guards]] are
+# the ones src/main.rs registers through .us_market_hours() and .stock_issuer(Ondo). The
+# backoffice API takes the same stanza as JSON (docs/stocks.md).
+#
+# Before it runs:
+# - ONDO_API_KEY: an Ondo GM API key (partner-only; Ondo onboarding). The `ondo` venue
+#   reads it from the environment; the `ondo` guard names it in its stanza.
+# - UPDATER_KEY_AAPLON_USDC: the pair's updater key, registered on the PropAMM.
+# - The vault holds AAPLon and USDC and has approved the PropAMM for both.
+# Then `my-propamm --config config.toml --check`, and without `--check` to run.
+
+# The PropAMM the pair quotes on. Zero here: fill in your instance's.
+target = "0x0000000000000000000000000000000000000000"
+
+[settings]
+mode = "builder"
+rpc_url = "http://127.0.0.1:8545"
+requote_ms = 50
+metrics_addr = "127.0.0.1:9464"
+
+[[pairs]]
+# The stock token first: the `ondo` guard checks it is the token `symbol` names.
+tokens  = ["0x14c3abF95Cb9C93a8b82C1CdCB76D72Cb87b2d4c",   # AAPLon
+           "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"]   # USDC
+key_env = "UPDATER_KEY_AAPLON_USDC"
+# The price: Ondo's own, for the token, polled once a second. The symbol is the token's.
+sources = [{ venue = "ondo", symbol = "AAPLon", weight = "1" }]
+# Ondo stamps each price with its own time; leave the venue out of the average (and so stop
+# quoting, with one venue) when its prices arrive more than this late behind that stamp.
+max_source_lag_ms = "5000"
+# The circuit breaker, as on any pair: halt on a move this large between two prices.
+max_deviation = "0.02"
+# The band, as the lane carries the price: the core withdraws any mid outside it. Keep it
+# tight around where the stock trades. The lane carries USDC per token here because
+# AAPLon's address sorts before USDC's (0xA0b8...). For a stock token whose address sorts
+# after it, the lane carries token per USDC and the band is 1/price: for a $150-$400
+# stock, min_mid = "0.0025", max_mid = "0.0066667". --check's mid column prints the
+# lane's number.
+min_mid = "150"
+max_mid = "400"
+
+[pairs.pricing]
+kind  = "feed"
+delta = "0.003"                 # 30 bp half-spread on Ondo's mid: fixed, so sized for the open
+
+[[pairs.guards]]
+kind    = "ondo"
+symbol  = "AAPLon"
+api_key = { env = "ONDO_API_KEY" }
+# The Ondo sessions to quote in: any of regular, premarket, postmarket, overnight, offhours.
+# Ondo trades the tokens in all of them; the default is the regular session alone.
+sessions = ["regular"]
+# Defaults, written out:
+# ticker              = "AAPL"   # unset: Ondo's price answer names it (the build fails if not)
+# api                 = "https://api.gm.ondo.finance"
+# multiplier_oracle   = "0x9BC39DB6fbB44B91a48b8D5A6C208B82B1741bE6"   # SyntheticSharesOracle
+# status_poll_secs    = 15
+# max_status_age_secs = 60
+# pause_lead_secs     = 300      # stop this long before a scheduled corporate action
+# max_multiplier_gap  = 0.001    # Ondo's multiplier against the chain's, for a token it lists
+
+[[pairs.guards]]
+kind              = "us_market_hours"
+open_delay_secs   = 60          # let the opening auction settle
+close_margin_secs = 60
+# NYSE's calendar (nyse.com/markets/hours-calendars), from today through 2027. Extend it
+# before it runs out: past listed_through the guard withdraws (reason calendar_ended),
+# since it cannot tell a holiday from a trading day, and the build warns a month before.
+holidays     = ["2026-11-26", "2026-12-25",
+                "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26", "2027-05-31",
+                "2027-06-18", "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24"]
+early_closes = ["2026-11-27", "2026-12-24", "2027-11-26"]
+listed_through = "2027-12-31"
+
+[[pairs.guards]]
+kind         = "ondo_token"
+poll_secs    = 12
+max_age_secs = 60
+
+[[builder]]
+name = "titan-eu"
+endpoint = "wss://eu.rpc.titanbuilder.xyz/ws/sendquoteupdate"
+api_key = "your-maker-key"

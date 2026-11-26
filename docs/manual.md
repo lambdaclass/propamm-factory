@@ -179,6 +179,7 @@ The venues, and how each spells a market (wrapped tokens are spelled as the unde
 | `bitget` | `ETHUSDC` | ticker stream |
 | `gate` | `ETH_USDC` | book_ticker stream |
 | `mexc` | `ETHUSDC` | REST, polled every second (its stream is protobuf-only) |
+| `ondo` | `AAPLon` | Ondo's own price for one of its stock tokens, polled every second with the key in `ONDO_API_KEY` (docs/stocks.md) |
 
 CoinGecko is not a price source. The updater uses it for one thing: the USD price of every
 vault token, once a minute, for the dashboard's vault totals (`quote_updater_token_price_usd`
@@ -239,7 +240,7 @@ of seconds old.
 
 What the key measures is the stream, not the market. Most venues write the exchange's own
 clock reading into every price frame: Kraken (`timestamp`), Coinbase (`timestamp`), OKX (`ts`),
-Bybit (`ts`), KuCoin (`timestamp`), Bitget (`ts`) and Gate (`t`). The feed subtracts that from
+Bybit (`ts`), KuCoin (`timestamp`), Bitget (`ts`), Gate (`t`) and Ondo (`timestamp`). The feed subtracts that from
 the frame's arrival, which gives how long the frame took to reach us. A backlog makes every
 frame late by seconds; a quiet book whose last frame arrived promptly reads as prompt
 however long ago that was, so a thin market is not read as a late one. That difference is
@@ -742,9 +743,15 @@ Some things need a restart, because nothing changes them while the updater runs:
 Set `[settings] backoffice_addr`, or `--backoffice-ip` and `--backoffice-port`, and the
 updater serves the backoffice: a JSON API, under
 `/api`, for the changes an operator actually makes: add or remove a pair, choose which venues
-its mid is averaged over and with what weights, edit a band or a `delta`, add or remove a
-builder, halt a pair (or all of them), resume a halted pair, re-arm a pair its circuit
-breaker halted, and reload. It serves no pages
+its mid is averaged over and with what weights, edit its band and every knob its pricing kind
+declares, add or remove its guards and edit theirs, add or remove a builder, halt a pair (or
+all of them), resume a halted pair, re-arm a pair its circuit breaker halted, and reload. A
+pair is sent and read back as its `[[pairs]]` stanza, so a guard or pricing kind the binary
+does not register is kept as written. `GET /api/kinds` and `GET /api/guards` list each
+registered kind's fields and their types, for a front end that draws a form for them. A
+field that holds a key, Ondo's API key say, holds the name of the environment variable
+holding it (`{ env = "NAME" }`), never the value, so the key never crosses the API. It serves
+no pages
 (`GET /` answers 404 with an `{"error": ...}`), so whatever front end an operator uses, or
 `curl`, talks to it. Every change goes through the shared config described in
 [Reloading the config](#reloading-the-config): written to `config.toml`, then converged onto.
@@ -818,6 +825,7 @@ journal says why.
 | `DELETE /api/builders/{name}` | removes a builder |
 | `GET /api/settings` | `config_path`, `target` and `[settings]`, read-only |
 | `GET /api/kinds` | the registered pricing kinds and their fields |
+| `GET /api/guards` | the registered guard kinds and their fields |
 | `GET /api/venues` | the venues a pair can read |
 | `GET /api/lookup?token0=&token1=` | which exchanges list a token pair; saves nothing |
 | `GET /api/preview?token0=&token1=` | a websocket of live venue mids; saves nothing |
@@ -859,10 +867,16 @@ builders would connect. A pair that cannot be rebuilt onto a list that lost a bu
 stopped rather than left quoting to it, and the answer is `partial`.
 
 **Kinds and venues.** `GET /api/kinds` lists each registered pricing kind as `{"kind",
-"help_html", "fields": [{"name", "placeholder", "hint", "number"}]}`, which is what a form for
-a pair's `pricing` table needs. The kinds the library ships read their stanza values as
-strings; a field with `"number": true` is sent as a JSON number. `GET /api/venues` lists each
-venue as `{"venue", "example", "default_endpoint", "polled"}`.
+"help_html", "fields": [{"name", "placeholder", "hint", "type", "number"}]}`, which is what a
+form for a pair's `pricing` table needs, and `GET /api/guards` lists each registered guard
+kind the same way, for the pair's `guards`. A field's `type` says how its input is written
+into the stanza: `text` as a string (the kinds the library ships read their pricing values as
+strings), `number` as a JSON number, `list` as an array of strings, `choices` as an array of
+some of the field's `options`, and `env` as `{"env": "NAME"}`, naming the environment
+variable that holds a key. A stanza holding anything else where an `env` field is declared is
+refused (422) before anything is written, and the answer does not repeat it. `number` is
+`type == "number"`, kept for a client written before `type`. `GET /api/venues` lists each
+venue as `{"venue", "example", "default_endpoint", "polled", "note"}`.
 
 **Answers.** A change that was made answers 2xx (201 for a `POST` that adds a pair or a
 builder) with `{"status": "applied" | "partial", "message": ...}`. `partial` means the change
@@ -1125,9 +1139,9 @@ overridable per run: `my-quote-updater --requote-ms 25`.
 Two conventions make a file that documents every knob safe to keep around:
 
 - A blank value (`MINE=`) reads as *not set*, and the option falls back to its default.
-- The on/off flags (`ONCE`, `NO_PIN`, `MINE`, `DISABLE_CROSS_REGION`) take `false`, `f`,
-  `no`, `n`, `off`, `0` and blank as off, anything else as on — so a variable left at
-  `false` is genuinely off rather than merely present. This matters because the updater
+- The on/off flags (`ONCE`, `NO_PIN`, `MINE`, `DISABLE_CROSS_REGION`, `QUOTE_ID`) take
+  `false`, `f`, `no`, `n`, `off`, `0` and blank as off, anything else as on — so a variable
+  left at `false` is genuinely off rather than merely present. This matters because the updater
   checks the *values* of mutually exclusive options rather than leaning on clap's
   `conflicts_with`, which counts anything that came from the environment as set.
 
@@ -1156,6 +1170,11 @@ variable exists so a flag-driven run stays possible, and setting one overrides t
   ignored entirely.
 - `REQUOTE_MS` — the requote cadence; keep it well under the builder's ~400ms eviction
   (Titan's protocol, and its own guidance is a ~50ms cadence).
+- `QUOTE_ID` — publish each update with a third slot holding its signing instant in UNIX
+  nanoseconds, so an update found on chain says by itself when its price was computed.
+  Public: anyone reading the calldata sees it. Shown as `quote_id 0x…` in the block summary.
+  PropAMM reads only the first two slots; the third costs one more storage write per landed
+  update. Off by default.
 
 `REGISTRY` and `BINANCE_WS` already default to the mainnet values. `PRICE_DECIMALS` is 18
 and takes no other value: PropAMM reads the mid and the spread at 1e18, so at any other scale

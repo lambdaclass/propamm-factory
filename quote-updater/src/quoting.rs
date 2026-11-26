@@ -40,7 +40,7 @@ use crate::{
     head::{self, Head},
     landing_label,
     metrics::{BuilderMetrics, Metrics, PairMetrics, PublishAction, RpcCall, timed},
-    runway_check,
+    quote_id, runway_check,
     supervisor::Shutdown,
     unquoted,
     update::{UpdateParams, UpdateStamp, sign_update_tx, wall_clock_secs},
@@ -728,6 +728,8 @@ pub enum Quoted {
         delta: U256,
         mid: U256,
         ts: u32,
+        /// The last signed quote's id, when `quote_id` is on.
+        quote_id: Option<u64>,
     },
     /// No usable price for this block, and why. A block that prints nothing would be
     /// indistinguishable from a stalled service.
@@ -877,10 +879,18 @@ impl BlockSummary {
     /// The two lines a block prints: what was quoted, then how each builder answered.
     pub fn render(&self, quoted: &Quoted) -> String {
         let header = match quoted {
-            Quoted::Slots { delta, mid, ts } => format!(
-                "quoting block {}: slots = [{delta}, {mid}] at timestamp {ts}",
-                self.block_number
-            ),
+            Quoted::Slots {
+                delta,
+                mid,
+                ts,
+                quote_id,
+            } => {
+                let id = quote_id.map_or(String::new(), |id| format!(" quote_id {id:#x}"));
+                format!(
+                    "quoting block {}: slots = [{delta}, {mid}] at timestamp {ts}{id}",
+                    self.block_number
+                )
+            }
             Quoted::Withdrawn(reason) => {
                 format!("quoting block {}: withdrawn ({reason})", self.block_number)
             }
@@ -1334,6 +1344,8 @@ async fn drive(
         // another key wrote (see `verify_landed`). One entry per price move, so a few
         // hundred at the fastest a liquid pair requotes, dropped with the block.
         let mut signed: HashSet<(U256, U256)> = HashSet::new();
+        // The id of the last quote signed for this block, for the summary line.
+        let mut block_quote_id: Option<u64> = None;
         // The latest block once this target has passed — the next target's parent —
         // assigned by the one arm below that leaves the loop with a block. `None` past
         // the loop means the halt arm broke out, which returns before the rollover.
@@ -1401,12 +1413,24 @@ async fn drive(
                     break;
                 }
                 Action::Publish(quote) => {
-                    match sign_update_tx(client, &live.pair.signer, params, stamp, nonce, quote)
-                        .await
+                    // Minted at the sign, not at the price: it says when these bytes were
+                    // produced, and nothing before.
+                    let quote_id = opts.quote_id.then(quote_id::mint);
+                    match sign_update_tx(
+                        client,
+                        &live.pair.signer,
+                        params,
+                        stamp,
+                        nonce,
+                        quote,
+                        quote_id,
+                    )
+                    .await
                     {
                         Ok(raw_tx) => {
                             gate.published(quote);
                             signed.insert(quote);
+                            block_quote_id = quote_id;
                             // Set only here, after a successful sign and send: a failed
                             // attempt retries next tick with the same quote (see
                             // `gate.published`'s own doc), and setting the gauge on a
@@ -1613,6 +1637,7 @@ async fn drive(
                 delta,
                 mid,
                 ts: stamp.ts,
+                quote_id: block_quote_id,
             },
             (None, Some(reason)) => Quoted::Withdrawn(reason.to_owned()),
             // Reached both when the feed never produced a price and when it did but every
@@ -2183,6 +2208,18 @@ mod tests {
         values: ValueSource,
         subscribe: bool,
     ) -> PairRun {
+        spawn_pair_opts(rpc, builders, values, subscribe, false)
+    }
+
+    /// `spawn_pair_with`, and whether every update carries its signing instant as a third
+    /// slot.
+    fn spawn_pair_opts(
+        rpc: &MockRpc,
+        builders: &[&mock::Mock],
+        values: ValueSource,
+        subscribe: bool,
+        quote_id: bool,
+    ) -> PairRun {
         let client = EthClient::new(Url::parse(&rpc.url).unwrap()).unwrap();
         // One registry, shared: `run` takes the whole thing (it binds the builder handles
         // itself), and `live` carries the pair handle bound off that same registry, so a
@@ -2222,6 +2259,7 @@ mod tests {
             disable_cross_region: false,
             price_decimals: 6,
             recorder: None,
+            quote_id,
         };
         let config = Arc::new(BuildersConfig {
             builders: builders
@@ -2385,6 +2423,45 @@ mod tests {
              was in flight"
         );
         pair.shutdown().await;
+    }
+
+    /// With `quote_id` on, the bytes every builder receives carry a third slot: the
+    /// instant they were signed, in UNIX nanoseconds. Off, which is the default, they carry
+    /// the two slots the contract reads and nothing else.
+    #[tokio::test]
+    async fn with_quote_id_on_every_update_carries_its_signing_instant() {
+        let rpc = MockRpc::spawn(100).await;
+        let b = mock::spawn(mock::Behaviour::Ack).await;
+        let before = unix_nanos();
+        let pair = spawn_pair_opts(&rpc, &[&b], fixed_values(), false, true);
+        assert!(b.wait_for(1, Duration::from_secs(5)).await, "no quote");
+        let after = unix_nanos();
+        let slots = crate::update::stamped_slots(&b.received()[0].tx);
+        assert_eq!(slots.len(), 3, "{slots:?}");
+        assert_eq!(slots[0], U256::from(5u64));
+        assert_eq!(slots[1], U256::exp10(18));
+        let signed_at = slots[2].as_u64();
+        assert!(
+            before <= signed_at && signed_at <= after,
+            "{before} <= {signed_at} <= {after}"
+        );
+        pair.shutdown().await;
+
+        let plain = mock::spawn(mock::Behaviour::Ack).await;
+        let pair = spawn_pair(&rpc, &[&plain], fixed_values());
+        assert!(plain.wait_for(1, Duration::from_secs(5)).await, "no quote");
+        assert_eq!(
+            crate::update::stamped_slots(&plain.received()[0].tx),
+            [U256::from(5u64), U256::exp10(18)]
+        );
+        pair.shutdown().await;
+    }
+
+    fn unix_nanos() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
     }
 
     /// An update is stamped one block time after its parent, and the registry accepts
@@ -3419,9 +3496,22 @@ mod tests {
             delta: U256::from(500_000_000_000_000u64),
             mid: U256::exp10(18),
             ts: 1_755_000_012,
+            quote_id: None,
         });
         assert!(rendered.contains("quoting block 21500431"), "{rendered}");
         assert!(rendered.contains("at timestamp 1755000012"), "{rendered}");
+        assert!(!rendered.contains("quote_id"), "{rendered}");
+        // With the setting on, the header names the id, in the hex the chain shows it in.
+        let with_id = summary.render(&Quoted::Slots {
+            delta: U256::from(500_000_000_000_000u64),
+            mid: U256::exp10(18),
+            ts: 1_755_000_012,
+            quote_id: Some(0xDEAD_BEEF_0000_0001),
+        });
+        assert!(
+            with_id.contains("at timestamp 1755000012 quote_id 0xdeadbeef00000001"),
+            "{with_id}"
+        );
         // Configuration order, not arrival order: quasar acked first but titan is listed
         // first, so a glance down the column always means the same builder.
         let line = rendered.lines().last().unwrap();
@@ -3484,6 +3574,7 @@ mod tests {
                 delta: U256::zero(),
                 mid: U256::one(),
                 ts: 1,
+                quote_id: None,
             })
             .lines()
             .last()
@@ -3851,6 +3942,7 @@ mod tests {
             disable_cross_region: false,
             price_decimals: 6,
             recorder: None,
+            quote_id: false,
         };
         let names = names();
         // The head watcher polls the stub, which stays at block 99 forever, so the target
@@ -4084,6 +4176,7 @@ mod tests {
             disable_cross_region: false,
             price_decimals: 6,
             recorder: None,
+            quote_id: false,
         };
         let names = names();
         let mut head_tasks = crate::tasks::Tasks::default();
@@ -4231,6 +4324,7 @@ mod tests {
             disable_cross_region: false,
             price_decimals: 6,
             recorder: None,
+            quote_id: false,
         };
         let names = names();
         // The head watcher polls the stub, which stays at block 99 forever, so the target
@@ -4472,6 +4566,7 @@ mod tests {
             disable_cross_region: false,
             price_decimals: 6,
             recorder: None,
+            quote_id: false,
         };
         let names: Vec<String> = Vec::new();
 
@@ -4603,6 +4698,7 @@ mod tests {
             disable_cross_region: false,
             price_decimals: 6,
             recorder: None,
+            quote_id: false,
         };
         let names = vec!["a".to_owned()];
 
@@ -4774,6 +4870,7 @@ mod tests {
             disable_cross_region: false,
             price_decimals: 6,
             recorder: None,
+            quote_id: false,
         };
         let names: Vec<String> = Vec::new();
 
@@ -4931,6 +5028,7 @@ mod tests {
             disable_cross_region: false,
             price_decimals: 6,
             recorder: None,
+            quote_id: false,
         };
         let names: Vec<String> = Vec::new();
 
@@ -5056,6 +5154,7 @@ mod tests {
             disable_cross_region: false,
             price_decimals: 6,
             recorder: None,
+            quote_id: false,
         };
         let names = vec!["a".to_owned()];
         let head_at = |number: u64| Head {
