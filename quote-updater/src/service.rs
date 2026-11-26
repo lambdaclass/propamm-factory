@@ -1703,6 +1703,7 @@ mod tests {
                 disable_cross_region: false,
                 price_decimals: 18,
                 recorder: None,
+                quote_id: false,
             },
             builders: Arc::new(config::BuildersConfig { builders }),
             builders_path: "config.toml".to_owned(),

@@ -29,8 +29,8 @@ use serde::de::DeserializeOwned;
 use crate::{
     feed::PriceSample,
     pricing::{
-        BuildCtx, Diagnostics, Factory, History, Inventory, InventoryFeed, Market, PairShape,
-        Pricer, PricerOutput, TickCtx,
+        BuildCtx, Diagnostics, Factory, FormField, History, Inventory, InventoryFeed, Market,
+        PairShape, Pricer, PricerOutput, TickCtx,
     },
 };
 
@@ -66,6 +66,7 @@ pub fn pair_for(
         price_decimals,
         target,
         sources: 1,
+        mid_only_sources: 0,
         min_mid: None,
         max_mid: None,
         max_source_divergence: None,
@@ -86,6 +87,7 @@ pub fn pair_with(inverted: bool, price_decimals: u32) -> PairShape {
         price_decimals,
         target: ethrex_common::Address::repeat_byte(3),
         sources: 1,
+        mid_only_sources: 0,
         min_mid: None,
         max_mid: None,
         max_source_divergence: None,
@@ -342,6 +344,42 @@ fn config<C: DeserializeOwned>(stanza: &str) -> eyre::Result<C> {
     Ok(toml::Value::Table(table).try_into()?)
 }
 
+/// Checks a kind's form fields against its config type `C`, for a kind that declares them
+/// (a pricing kind's `Factory::fields`, a guard kind's `fields`): a stanza written from
+/// every field's placeholder, as a form left at its defaults writes it, reads as `C`; and
+/// `example`, a stanza of the kind as a config holds it, shown in the fields and written
+/// back ([`FormField::show`], [`FormField::write`]), comes back unchanged. So every key a
+/// form writes is one the stanza reads, and a form round trip loses nothing. Panics with
+/// the reason otherwise.
+pub fn assert_fields_round_trip<C: DeserializeOwned>(fields: &[FormField], example: &toml::Table) {
+    assert!(!fields.is_empty(), "the kind declares no fields");
+    let write = |field: &FormField, text: &str| {
+        field
+            .write(text)
+            .unwrap_or_else(|err| panic!("`{}`: {err:#}", field.name))
+    };
+    let mut defaults = toml::Table::new();
+    for field in fields {
+        if let Some(value) = write(field, field.placeholder) {
+            defaults.insert(field.name.to_owned(), value);
+        }
+    }
+    if let Err(err) = crate::kinds::typed::<C>(&defaults) {
+        panic!("a stanza of the placeholders does not read: {err:#}");
+    }
+    let mut rebuilt = example.clone();
+    for field in fields {
+        match write(field, &field.show(example.get(field.name))) {
+            Some(value) => rebuilt.insert(field.name.to_owned(), value),
+            None => rebuilt.remove(field.name),
+        };
+    }
+    assert_eq!(
+        &rebuilt, example,
+        "a round trip through the fields changed the stanza"
+    );
+}
+
 /// Builds a pricer the way `UpdaterBuilder::pricer_fn` would: `make` gets `stanza`'s config
 /// and a fresh build context, which is returned beside the pricer so a test can size its
 /// diagnostics with [`diagnostics`].
@@ -433,5 +471,99 @@ pub fn assert_rejects_unknown_fields<C: DeserializeOwned>(valid_stanza: &str) {
             format!("{err:#}").contains("not_a_field_of_this_config"),
             "the refusal does not name the unknown key: {err:#}"
         ),
+    }
+}
+
+// ----------------------------------------------------------------------------------------
+// A stock design's adapters: an HTTP API on this machine, and a chain answering only what
+// it was told to.
+// ----------------------------------------------------------------------------------------
+
+mod mock_http;
+pub use mock_http::MockApi;
+
+use std::collections::HashMap;
+
+use crate::{
+    Address,
+    calldata::{Value, encode_calldata},
+    pricing::{BoxFuture, CallOutcome},
+    stocks::chain::Calls,
+};
+
+/// `values` ABI-encoded as a call's return data: calldata without its selector.
+pub fn returned(types: &str, values: &[Value]) -> Vec<u8> {
+    encode_calldata(&format!("f({types})"), values).unwrap()[4..].to_vec()
+}
+
+/// Answers each call it was given, by contract and exact calldata (and, for a call made
+/// as an account, that account), and nothing else: a call to another contract, another
+/// function, with other arguments or as another account fails, as a read that could
+/// not be made.
+#[derive(Debug, Default)]
+pub struct FakeChain {
+    answers: HashMap<(Address, Vec<u8>), Vec<u8>>,
+    outcomes: HashMap<(Address, Address, Vec<u8>), CallOutcome>,
+}
+
+impl FakeChain {
+    /// `to.sig(args)` answers `values`, of the return types `types` (as `address`).
+    pub fn answer(
+        mut self,
+        to: Address,
+        sig: &str,
+        args: &[Value],
+        types: &str,
+        values: &[Value],
+    ) -> FakeChain {
+        let calldata = encode_calldata(sig, args).unwrap();
+        self.answers.insert((to, calldata), returned(types, values));
+        self
+    }
+
+    /// `to.sig(args)`, made as `from`, ends in `outcome`.
+    pub fn outcome(
+        mut self,
+        from: Address,
+        to: Address,
+        sig: &str,
+        args: &[Value],
+        outcome: CallOutcome,
+    ) -> FakeChain {
+        let calldata = encode_calldata(sig, args).unwrap();
+        self.outcomes.insert((from, to, calldata), outcome);
+        self
+    }
+}
+
+impl Calls for FakeChain {
+    fn call_sig<'a>(
+        &'a self,
+        to: Address,
+        sig: &'a str,
+        args: &'a [Value],
+    ) -> BoxFuture<'a, eyre::Result<Vec<u8>>> {
+        let answer = encode_calldata(sig, args)
+            .ok()
+            .and_then(|calldata| self.answers.get(&(to, calldata)).cloned());
+        Box::pin(async move {
+            answer.ok_or_else(|| eyre::eyre!("no contract at {to:#x} answers {sig} so called"))
+        })
+    }
+
+    fn call_sig_as<'a>(
+        &'a self,
+        from: Address,
+        to: Address,
+        sig: &'a str,
+        args: &'a [Value],
+    ) -> BoxFuture<'a, eyre::Result<CallOutcome>> {
+        let outcome = encode_calldata(sig, args)
+            .ok()
+            .and_then(|calldata| self.outcomes.get(&(from, to, calldata)).cloned());
+        Box::pin(async move {
+            outcome
+                .ok_or_else(|| eyre::eyre!("no call of {sig} on {to:#x} as {from:#x} was expected"))
+        })
     }
 }

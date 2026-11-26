@@ -43,6 +43,7 @@
 //! | `DELETE /api/builders/{name}`     | removes a builder                                |
 //! | `GET /api/settings`               | `target` and `[settings]`, read-only             |
 //! | `GET /api/kinds`                  | the registered pricing kinds and their fields    |
+//! | `GET /api/guards`                 | the registered guard kinds and their fields      |
 //! | `GET /api/venues`                 | the venues a pair can read                       |
 //! | `GET /api/lookup`                 | where a token pair trades; saves nothing         |
 //! | `GET /api/preview`                | a websocket of live venue mids; saves nothing    |
@@ -91,7 +92,8 @@ struct Backoffice {
     /// What the API reads and changes; the service converges onto it.
     config: Arc<SharedConfig>,
     states: PairStates,
-    /// The registered pricing kinds: what `/api/kinds` lists, with each kind's fields.
+    /// The registered pricing and guard kinds: what `/api/kinds` and `/api/guards` list,
+    /// with each kind's fields.
     kinds: Arc<crate::kinds::Kinds>,
     /// For the venue lookup (`discover.rs`): the node that reads the tokens' `symbol()`, the
     /// client that asks the exchanges, and where each exchange's API is.
@@ -319,6 +321,7 @@ async fn bind_with(
         .route("/api/builders/{name}", delete(remove_builder))
         .route("/api/settings", get(settings))
         .route("/api/kinds", get(list_kinds))
+        .route("/api/guards", get(list_guards))
         .route("/api/venues", get(list_venues))
         .route("/api/lookup", get(lookup_pair))
         .route("/api/preview", get(preview_socket))
@@ -864,6 +867,7 @@ async fn add_pair(
         )));
     }
     config::check_source_keys(&pair).map_err(|err| ApiError::invalid(format!("{err:#}")))?;
+    refuse_inline_secrets(&pair, &state.kinds)?;
     Ok(apply(&state, &caller, true, move |config| {
         if config
             .pairs
@@ -904,6 +908,7 @@ async fn edit_pair(
         )));
     }
     config::check_source_keys(&edited).map_err(|err| ApiError::invalid(format!("{err:#}")))?;
+    refuse_inline_secrets(&edited, &state.kinds)?;
     Ok(apply(&state, &caller, false, move |config| {
         let pair = config
             .pairs
@@ -1251,27 +1256,120 @@ async fn list_kinds(State(state): State<Backoffice>) -> Json<Vec<serde_json::Val
             .pricer_kinds()
             .into_iter()
             .map(|kind| {
-                let fields: Vec<serde_json::Value> = kinds
-                    .pricer_fields(kind)
-                    .unwrap_or(&[])
-                    .iter()
-                    .map(|field| {
-                        serde_json::json!({
-                            "name": field.name,
-                            "placeholder": field.placeholder,
-                            "hint": field.hint,
-                            "number": field.number,
-                        })
-                    })
-                    .collect();
-                serde_json::json!({
-                    "kind": kind,
-                    "help_html": kinds.pricer_form_help(kind).unwrap_or(""),
-                    "fields": fields,
-                })
+                kind_json(
+                    kind,
+                    kinds.pricer_form_help(kind),
+                    kinds.pricer_fields(kind),
+                )
             })
             .collect(),
     )
+}
+
+/// The guard kinds this binary registered, in order, market and quote guards together, each
+/// with the fields a form for its `[[pairs.guards]]` stanza would offer. A pair holds at
+/// most one stanza of each kind. A kind with no fields has a stanza only the file's own
+/// syntax can write.
+async fn list_guards(State(state): State<Backoffice>) -> Json<Vec<serde_json::Value>> {
+    let kinds = &state.kinds;
+    Json(
+        kinds
+            .guard_kinds()
+            .into_iter()
+            .map(|kind| kind_json(kind, kinds.guard_form_help(kind), kinds.guard_fields(kind)))
+            .collect(),
+    )
+}
+
+/// A registered kind as `/api/kinds` and `/api/guards` list it.
+fn kind_json(
+    kind: &str,
+    help_html: Option<&str>,
+    fields: Option<&[crate::pricing::FormField]>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": kind,
+        "help_html": help_html.unwrap_or(""),
+        "fields": fields.unwrap_or(&[]).iter().map(field_json).collect::<Vec<_>>(),
+    })
+}
+
+/// A form field as the API lists it. `type` says how its input is written into the stanza
+/// (`FormField::write`): `text` a string, `number` a TOML number, `list` an array of
+/// strings, `env` `{ "env": NAME }`, `choices` an array of some of `options`. `number`
+/// is `type == "number"`, kept for a client written before `type`.
+fn field_json(field: &crate::pricing::FormField) -> serde_json::Value {
+    use crate::pricing::FieldKind;
+    let (kind, options): (&str, &[&str]) = match field.kind {
+        FieldKind::Text => ("text", &[]),
+        FieldKind::Number => ("number", &[]),
+        FieldKind::List => ("list", &[]),
+        FieldKind::Env => ("env", &[]),
+        FieldKind::Choices(options) => ("choices", options),
+    };
+    let mut json = serde_json::json!({
+        "name": field.name,
+        "placeholder": field.placeholder,
+        "hint": field.hint,
+        "type": kind,
+        "number": field.kind == FieldKind::Number,
+    });
+    if let FieldKind::Choices(_) = field.kind {
+        json["options"] = serde_json::json!(options);
+    }
+    json
+}
+
+/// Refuses a stanza that holds a value where a declared env field (`FieldKind::Env`) wants
+/// `{ env = "NAME" }`, before anything is written: the config is recorded, served and
+/// shown, so a key typed in place of its variable's name would be published with it. The
+/// value is not echoed. The reload would refuse it too (`pricing::EnvSecret`), but only
+/// after the file held it.
+fn refuse_inline_secrets(pair: &RawPair, kinds: &crate::kinds::Kinds) -> Result<(), ApiError> {
+    let kind_of = |stanza: &toml::Table| {
+        stanza
+            .get("kind")
+            .and_then(|kind| kind.as_str())
+            .map(str::to_owned)
+    };
+    let pricing = kind_of(&pair.pricing)
+        .and_then(|kind| {
+            kinds
+                .pricer_fields(&kind)
+                .map(|fields| ("pricing", kind, fields))
+        })
+        .map(|(what, kind, fields)| (what, kind, fields, &pair.pricing));
+    let guards = pair.guards.iter().filter_map(|stanza| {
+        let kind = kind_of(stanza)?;
+        let fields = kinds.guard_fields(&kind)?;
+        Some(("guard", kind, fields, stanza))
+    });
+    for (what, kind, fields, stanza) in pricing.into_iter().chain(guards) {
+        for field in fields {
+            if field.kind != crate::pricing::FieldKind::Env {
+                continue;
+            }
+            let Some(value) = stanza.get(field.name) else {
+                continue;
+            };
+            let named = value.as_table().is_some_and(|table| {
+                table.len() == 1
+                    && table
+                        .get("env")
+                        .and_then(|name| name.as_str())
+                        .is_some_and(crate::pricing::is_variable_name)
+            });
+            if !named {
+                return Err(ApiError::invalid(format!(
+                    "{what} `{kind}`: `{}` is written {{ \"env\": \"NAME\" }}, naming the \
+                     environment variable that holds it, never as its value (it is not \
+                     repeated here)",
+                    field.name
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Every venue a pair's `sources` can name, with how it spells a market and where it is
@@ -1285,12 +1383,30 @@ async fn list_venues() -> Json<Vec<serde_json::Value>> {
                     "venue": venue.as_str(),
                     "example": venue.expected_symbol("ETH", "USDC"),
                     "default_endpoint": venue.default_endpoint(),
-                    "polled": matches!(venue, VenueId::Mexc),
+                    "polled": matches!(venue, VenueId::Mexc | VenueId::Ondo),
+                    "note": venue_note(*venue),
                 })
             })
             .collect(),
     )
 }
+
+/// What a venue table says beside a venue's row when nothing more particular is known.
+fn venue_note(venue: VenueId) -> &'static str {
+    match venue {
+        VenueId::Mexc => "polled every second",
+        VenueId::Ondo => ONDO_NOTE,
+        _ => "",
+    }
+}
+
+/// What the venue table says beside the `ondo` row: it is an issuer's price for its own
+/// stock token, not a market the lookup can list, and it has no spread for a blank delta
+/// to copy.
+const ONDO_NOTE: &str = "Ondo's own price for one of its stock tokens, polled every second \
+                         with the key in ONDO_API_KEY; the symbol is the token's, e.g. AAPLon. \
+                         It is one price with no spread: set a delta in the pricing, or a \
+                         blank one quotes at the mid";
 
 // ---------------------------------------------------------------------------
 // Lookup and preview
@@ -1356,10 +1472,9 @@ async fn lookup_pair(State(state): State<Backoffice>, Query(tokens): Query<Token
                 "weight": row.map(|r| r.weight.clone()),
                 "last": row.and_then(|r| r.last),
                 "volume_usd": row.and_then(|r| r.volume_usd),
-                "note": row.map(|r| r.note.clone()).unwrap_or_else(|| match venue {
-                    VenueId::Mexc => "polled every second".to_owned(),
-                    _ => String::new(),
-                }),
+                "note": row
+                    .map(|r| r.note.clone())
+                    .unwrap_or_else(|| venue_note(*venue).to_owned()),
                 "stand_in": stand_in,
                 "selected": row.is_some() && !stand_in,
             })
@@ -1812,6 +1927,23 @@ mod tests {
                 Ok(SkewedPricer)
             }),
         );
+        // The stock guards, as `.us_market_hours()` and `.stock_issuer(Ondo)` register them:
+        // fields of every type, and an env field among them.
+        {
+            use crate::stocks::{Issuer, hours::UsMarketHoursFactory, issuers::ondo::Ondo};
+            kinds.insert_guard(
+                "us_market_hours",
+                crate::kinds::quote_guard_factory(UsMarketHoursFactory),
+            );
+            kinds.insert_guard(
+                Ondo::STATUS_GUARD_KIND,
+                crate::kinds::quote_guard_factory(Ondo),
+            );
+            kinds.insert_guard(
+                Ondo::TOKEN_GUARD_KIND,
+                crate::kinds::quote_guard_factory(Ondo.token_guard()),
+            );
+        }
         Arc::new(kinds)
     }
 
@@ -2852,7 +2984,13 @@ mod tests {
         assert_eq!(config.snapshot().builders[1].api_key, "sekrit-two");
 
         let mut answers = String::new();
-        for path in ["/api/builders", "/api/settings", "/api/pairs", "/api/kinds"] {
+        for path in [
+            "/api/builders",
+            "/api/settings",
+            "/api/pairs",
+            "/api/kinds",
+            "/api/guards",
+        ] {
             let (status, body) = call(local, "GET", path, None).await;
             assert_eq!(status, StatusCode::OK, "{path}: {body}");
             answers.push_str(&body.to_string());
@@ -2995,15 +3133,186 @@ mod tests {
             "a kind with no form fields"
         );
 
+        for field in fixed["fields"].as_array().unwrap() {
+            assert_eq!(field["type"], "text", "{field}");
+            assert_eq!(field["number"], false, "{field}");
+        }
+
         let (status, venues) = call(local, "GET", "/api/venues", None).await;
         assert_eq!(status, StatusCode::OK, "{venues}");
         assert_eq!(venues.as_array().unwrap().len(), VenueId::ALL.len());
         assert_eq!(venues[0]["venue"], "binance");
         assert_eq!(venues[0]["example"], "ETHUSDC");
+        let ondo = venues
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|venue| venue["venue"] == "ondo")
+            .expect("ondo is a venue");
+        assert_eq!(ondo["polled"], true, "{ondo}");
+        assert!(
+            ondo["note"].as_str().unwrap().contains("set a delta"),
+            "{ondo}"
+        );
 
         let (status, body) = call(local, "GET", "/", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "no pages are served: {body}");
         assert!(body["error"].as_str().unwrap().contains("/api"), "{body}");
+    }
+
+    /// The guard kinds are listed as the pricing kinds are, each field with the type a form
+    /// writes it as, so a front end can draw a guard's form as it draws a pricing kind's.
+    #[tokio::test]
+    async fn the_guard_kinds_are_listed_with_typed_fields() {
+        let (local, _config) = serve("guards", |_| {}, accepted()).await;
+        let (status, guards) = call(local, "GET", "/api/guards", None).await;
+        assert_eq!(status, StatusCode::OK, "{guards}");
+        let kind = |name: &str| {
+            guards
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|kind| kind["kind"] == name)
+                .unwrap_or_else(|| panic!("{name} in {guards}"))
+                .clone()
+        };
+        let field = |kind: &Value, name: &str| {
+            kind["fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|field| field["name"] == name)
+                .unwrap_or_else(|| panic!("{name} in {kind}"))
+                .clone()
+        };
+        let ondo = kind("ondo");
+        assert!(!ondo["help_html"].as_str().unwrap().is_empty(), "{ondo}");
+        assert_eq!(field(&ondo, "ticker")["type"], "text");
+        assert_eq!(field(&ondo, "api_key")["type"], "env");
+        let sessions = field(&ondo, "sessions");
+        assert_eq!(sessions["type"], "choices");
+        assert!(
+            sessions["options"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("regular")),
+            "{sessions}"
+        );
+        let hours = kind("us_market_hours");
+        assert_eq!(field(&hours, "holidays")["type"], "list");
+        let poll = field(&kind("ondo_token"), "poll_secs");
+        assert_eq!(poll["type"], "number");
+        assert_eq!(
+            poll["number"], true,
+            "kept for a client written before `type`"
+        );
+        assert!(poll.get("options").is_none(), "{poll}");
+    }
+
+    /// A stock pair is a pair: the example's, guards and all, is added as its stanza and
+    /// read back unchanged, with no form of its own and nothing about it needing the file.
+    #[tokio::test]
+    async fn a_stock_pair_is_added_and_read_back_as_the_example_stanza() {
+        let example: RawConfig =
+            toml::from_str(include_str!("../../example/config.stocks.toml")).unwrap();
+        let want = example.pairs[0].clone();
+        assert_eq!(want.guards.len(), 3, "the example's three guards");
+        let (local, config) = serve("stock-pair", |_| {}, accepted()).await;
+        let body = serde_json::to_value(&want).unwrap();
+        let (status, answer) = call(local, "POST", "/api/pairs", Some(body)).await;
+        assert_eq!(status, StatusCode::CREATED, "{answer}");
+        let held = config
+            .snapshot()
+            .pairs
+            .iter()
+            .find(|pair| pair.key_env == want.key_env)
+            .cloned()
+            .expect("the pair was added");
+        assert_eq!(held, want);
+        let path = format!("/api/pairs/{}", want.key_env);
+        let (status, view) = call(local, "GET", &path, None).await;
+        assert_eq!(status, StatusCode::OK, "{view}");
+        assert_eq!(view["pair"], serde_json::to_value(&want).unwrap());
+        assert_eq!(
+            view["pair"]["guards"][0]["api_key"],
+            json!({"env": "ONDO_API_KEY"}),
+            "a key is named, never held"
+        );
+    }
+
+    /// A pair priced by a kind that sources its own mid lists no venue, and is taken that
+    /// way: no symbol, no sources.
+    #[tokio::test]
+    async fn a_pair_whose_pricing_kind_sources_its_own_mid_is_added_with_no_venue() {
+        let (local, config) = serve("no-venue", |_| {}, accepted()).await;
+        let pair = json!({
+            "tokens": [USDC, USDT],
+            "key_env": "UPDATER_KEY_NO_VENUE",
+            "pricing": {"kind": "skewed", "half_spread": 0.001},
+        });
+        let (status, answer) = call(local, "POST", "/api/pairs", Some(pair)).await;
+        assert_eq!(status, StatusCode::CREATED, "{answer}");
+        let snapshot = config.snapshot();
+        let held = snapshot
+            .pairs
+            .iter()
+            .find(|pair| pair.key_env == "UPDATER_KEY_NO_VENUE")
+            .expect("the pair was added");
+        assert_eq!(held.symbol, None);
+        assert!(held.sources.is_empty());
+        assert_eq!(held.min_sources, None);
+    }
+
+    /// A key written where its variable's name belongs is refused before anything is
+    /// written, on an add and on an edit, and the answer does not repeat it.
+    #[tokio::test]
+    async fn a_key_in_place_of_its_variable_name_is_refused_unrepeated() {
+        let example: RawConfig =
+            toml::from_str(include_str!("../../example/config.stocks.toml")).unwrap();
+        let (local, config) = serve("inline-secret", |_| {}, accepted()).await;
+        let secret = "sk-live-123";
+        let cases = [
+            json!(secret),
+            json!({"env": secret}),
+            json!({"env": "ONDO_API_KEY", "value": secret}),
+        ];
+        for api_key in cases {
+            let mut pair = serde_json::to_value(&example.pairs[0]).unwrap();
+            pair["guards"][0]["api_key"] = api_key.clone();
+            let (status, body) = call(local, "POST", "/api/pairs", Some(pair)).await;
+            assert_eq!(
+                status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{api_key}: {body}"
+            );
+            let error = body["error"].as_str().unwrap();
+            assert!(error.contains("api_key"), "{error}");
+            assert!(!error.contains(secret), "the key is repeated: {error}");
+        }
+        assert_eq!(config.snapshot().pairs.len(), 1, "nothing was added");
+        let written = std::fs::read_to_string(config.path()).unwrap();
+        assert!(!written.contains(secret), "the key reached the file");
+
+        // An edit too, of a pair already holding the guard.
+        let (status, body) = call(
+            local,
+            "POST",
+            "/api/pairs",
+            Some(serde_json::to_value(&example.pairs[0]).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let mut pair = serde_json::to_value(&example.pairs[0]).unwrap();
+        pair["guards"][0]["api_key"] = json!(secret);
+        let path = format!("/api/pairs/{}", example.pairs[0].key_env);
+        let (status, body) = call(local, "PUT", &path, Some(pair)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(!body["error"].as_str().unwrap().contains(secret), "{body}");
+        assert!(
+            !std::fs::read_to_string(config.path())
+                .unwrap()
+                .contains(secret)
+        );
     }
 
     /// Through a socket, for the tests that read the raw answer.
@@ -3696,6 +4005,7 @@ mod tests {
             ("DELETE", "/api/builders/titan".to_owned()),
             ("GET", "/api/settings".to_owned()),
             ("GET", "/api/kinds".to_owned()),
+            ("GET", "/api/guards".to_owned()),
             ("GET", "/api/venues".to_owned()),
             ("GET", "/api/lookup?token0=0x1&token1=0x2".to_owned()),
             ("GET", "/api/preview".to_owned()),

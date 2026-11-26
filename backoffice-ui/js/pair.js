@@ -550,8 +550,8 @@ export async function pairView(root, { key }) {
   }
 
   // -------------------------------------------------------------------------------------
-  // Guards: no route lists the registered guard kinds, so they are written as their
-  // `[[pairs.guards]]` stanzas, a JSON list.
+  // Guards: written as their `[[pairs.guards]]` stanzas, a JSON list. `GET /api/guards`
+  // lists the registered kinds and their typed fields, for a form this page does not draw yet.
   // -------------------------------------------------------------------------------------
 
   const guards = h("textarea", {
