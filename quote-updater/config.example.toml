@@ -15,29 +15,39 @@
 # drive everything from the command line against a file with no settings table at all,
 # while on a server the unit passes only `--config` and the file decides.
 #
-# This file is the desired state of a running updater, not just its startup input. Send it a
-# SIGHUP (`systemctl --user reload <unit>`) and it re-reads this file and converges:
-# a pair added here is started, one deleted is withdrawn at every builder and stopped, one
-# whose stanza changed is restarted from it, and a pair you did not touch keeps quoting
-# throughout. A reload that fails to validate changes nothing at all, so run `--check`
-# against the edited file first.
+# The updater reads this file once, at start. From then on its configuration changes only
+# through the backoffice API (`backoffice_addr` below) or a binary's `UpdaterHandle`, and
+# every such change is written back here and converged onto: a pair added is started, one
+# removed is withdrawn at every builder and stopped, one whose stanza changed is restarted
+# from it, and a pair nobody touched keeps quoting throughout. A change the updater rejects
+# changes nothing at all, and this file is put back exactly as it was. Each write rewrites
+# the file in full, so comments in it (these included) are not kept. A hand edit of this
+# file takes effect only at the next start; run `--check` against it first. A write keeps
+# the `target` and [settings] this file holds, so a hand edit of those waiting for a restart
+# survives changes made through the API meanwhile, but a hand edit of [[pairs]] or
+# [[builder]] is overwritten by the next one: change those through the API. SIGHUP does not
+# reload this file: the updater ignores the signal.
 #
-# A reload also brings back a pair halted by its circuit breaker — that lane is exactly a
-# lane this file says should be quoting and which is not. Do it once you trust the feed
-# again; see docs/manual.md, "Circuit breaker".
+# A pair halted by its circuit breaker comes back only through its own re-arm (the
+# backoffice's `POST /api/pairs/<key_env>/rearm`, or a binary's `UpdaterHandle::rearm`). A
+# reload leaves it halted, and so does an edit of its own stanza. The re-armed lane trusts
+# the price it finds, which the re-arm's answer names. Do it once you trust the feed again;
+# see docs/manual.md, "Circuit breaker". A run with neither a backoffice nor a handle cannot
+# re-arm, so a tripped pair there needs a restart, which clears every lane's breaker.
 #
-# It does not bring back a pair with `halted = true`: that one is kept, with every setting,
-# and not run until the flag is cleared (the backoffice's Resume, or a binary's
-# `UpdaterHandle::resume`). A binary's `UpdaterHandle::halt` sets the flag with a
-# `halt_reason` beside it, which the backoffice shows and the reload logs. A halt with a
-# reason is a kill switch: the backoffice's "Restart halted pairs" resumes only the pairs
-# halted without one (its own Halt writes none) and names the rest, which only their own
-# Resume clears.
+# A pair with `halted = true` is kept, with every setting, and not run until the flag is
+# cleared (the backoffice's `POST /api/pairs/<key_env>/resume`, or a binary's
+# `UpdaterHandle::resume`). A halt through the backoffice or a binary takes effect at once,
+# without a reload: the pair's quote is withdrawn on its next tick, whatever else the
+# updater is doing, and then the flag is written here. A binary's `UpdaterHandle::halt` sets the flag with a
+# `halt_reason` beside it, which the backoffice API shows and the reload logs. A halt with a
+# reason is a kill switch: `POST /api/reload` resumes only the pairs halted without one (the
+# API's own halt writes none) and names the rest, which only their own resume clears.
 #
-# `target` below is NOT reloadable, because every lane's identity is derived from it: the
-# updater refuses the reload and asks for a restart. Neither is a `key_env` naming a variable
-# that was not in the environment when the process started, since systemd reads .env only
-# at exec.
+# `target` below cannot change while the updater runs, because every lane's identity is
+# derived from it: the backoffice API only shows it, so changing it is an edit of this file
+# and a restart (changes made through the API meanwhile keep the edit). Nor can a pair use a `key_env` naming a variable that was not in the
+# environment when the process started, since systemd reads .env only at exec.
 
 # The PropAMM every lane below belongs to. All pairs share one target.
 target = "0x0000000000000000000000000000000000000000"
@@ -46,8 +56,9 @@ target = "0x0000000000000000000000000000000000000000"
 # back to the same default its flag has; a key given here is overridden by the flag or the
 # environment variable of the same name, if one was actually passed.
 #
-# None of these is reloadable. They are read once, at startup, so changing one is a
-# restart: the updater refuses the reload and says which key it was.
+# None of these can change while the updater runs. They are read once, at startup, and the
+# backoffice API only shows them, so changing one is an edit of this file and a restart;
+# changes made through the API meanwhile keep the edit.
 [settings]
 
 # Where updates go. "builder" (the default) signs each pair's per-block update and streams
@@ -88,8 +99,9 @@ disable_cross_region = false
 # this back at it.
 # registry = "0xDa7AfEeD021EAFC1c1Af9C362dE477DaD0396B81"
 
-# Decimal places the published mid and delta are scaled by. PropAMM reads both at 1e18,
-# which is the default. Capped at 38 when any pair inverts, because inverting squares it.
+# Decimal places the published mid and delta are scaled by. PropAMM reads both at 1e18, so
+# 18 is the default and the only value accepted: at any other scale every price is off by a
+# power of ten, and the updater refuses to start. There is nothing to set here.
 # price_decimals = 18
 
 # Binance WebSocket base endpoint; override for binance.us or a mock. The older spelling
@@ -101,7 +113,7 @@ disable_cross_region = false
 # [settings], because it is a sub-table.
 # [settings.endpoints]
 # binance = "wss://stream.binance.com:9443/ws"
-# coinbase = "wss://ws-feed.exchange.coinbase.com"
+# coinbase = "wss://advanced-trade-ws.coinbase.com"
 # kucoin = "https://api.kucoin.com"        # the REST host its socket URL is fetched from
 # mexc = "https://api.mexc.com"            # polled
 # ondo = "https://api.gm.ondo.finance"     # polled; the key comes from ONDO_API_KEY
@@ -110,29 +122,54 @@ disable_cross_region = false
 # Seconds between pushes in node mode. No effect in builder mode.
 # interval = 12
 
-# Serve the backoffice here: a small web page for adding and removing pairs and builders,
-# editing bands, and resuming a pair halted on its breaker, without a deploy. Unset
-# disables it, which is the default.
+# Serve the backoffice here: a JSON API, under /api, for adding, editing and removing pairs
+# and builders, halting and resuming pairs, and re-arming a pair halted on its breaker,
+# without a deploy. It serves no pages; docs/manual.md, "The backoffice", lists its routes.
+# Unset disables it, which is the default.
 #
-# It has no login of its own. Bind it to this host's *tailnet* address, so reaching it at
-# all means being on the tailnet and past its ACL; binding 0.0.0.0 is refused rather than
+# It has no login of its own unless Google sign-in is on (below). Bind it to this host's
+# *tailnet* address either way, so reaching it at all means being on the tailnet and past its
+# ACL; binding 0.0.0.0 is refused rather than
 # warned about, because unlike the metrics endpoint this one writes: anything that can
 # reach it can repoint a pair's price source.
 #
-# Every change it makes is written to this file and then reloaded. If the reload is
-# rejected the previous file is put back, so what is on disk always describes what is
-# running.
+# Every change it makes is written to this file and the running pairs are converged onto
+# it. If the updater rejects the change the previous file is put back, so the pairs and
+# builders on disk always describe what is running.
 #
 # Builder mode only. The reload it drives belongs to the per-lane service builder mode
 # runs, so setting this under mode = "node" is refused at startup rather than bound and
 # left inert.
 #
+# --backoffice-ip and --backoffice-port (BACKOFFICE_IP, BACKOFFICE_PORT) override the address
+# and the port half of this, each on its own; either flag alone turns the backoffice on, the
+# missing half being 127.0.0.1 or 8088. A browser front end served from another origin needs
+# that origin listed with --backoffice-cors-origin (BACKOFFICE_CORS_ORIGINS, comma-separated):
+# the API answers CORS for those origins only, and `*` is refused.
+#
+# It is plain HTTP unless --backoffice-tls-cert and --backoffice-tls-key (BACKOFFICE_TLS_CERT,
+# BACKOFFICE_TLS_KEY) name a PEM certificate and its key, `tailscale cert`'s included; then
+# it is HTTPS only, and a renewed certificate is picked up without a restart.
+#
+# --backoffice-google-client-id (BACKOFFICE_GOOGLE_CLIENT_ID) requires a Google sign-in on
+# every request: the ID token of an account --backoffice-allow-domain (a Workspace domain,
+# BACKOFFICE_ALLOW_DOMAINS) or --backoffice-allow-email (BACKOFFICE_ALLOW_EMAILS) lets in, as
+# Authorization: Bearer. No client secret; see docs/manual.md, "Google sign-in".
+#
 # Setting it also lets the updater start with no pairs and no builders, which is what makes
 # a fresh host bootable from a config file holding nothing but a target and this address:
-# everything else is then added through the page. Without a backoffice an empty [[pairs]]
+# everything else is then added through the API. Without a backoffice an empty [[pairs]]
 # stays refused, because a updater quoting nothing is normally a file that failed to say
 # what it meant.
 # backoffice_addr = "100.64.1.2:8088"
+#
+# The names it answers to besides an IP address and localhost, which it always does: the
+# name you reach it by, if not its IP (its tailnet name, which an HTTPS certificate from
+# `tailscale cert` names, or a reverse proxy's). The name alone, no scheme, port or path. A
+# request addressed to any other name is refused: that is what stops a site from pointing
+# its own domain at this host and driving the API from an operator's browser (DNS
+# rebinding). --backoffice-host / BACKOFFICE_HOSTS replaces this list.
+# backoffice_hosts = ["pusher.your-tailnet.ts.net"]
 
 # `tokens` is [base, quote] in market orientation — the order a human says the pair in.
 # The lane is keccak256 of the two address-sorted tokens, matching PropAMM._pairKey, and
@@ -149,11 +186,14 @@ key_env = "UPDATER_KEY_WETH_USDC"
 # How this pair turns its market into the [delta, mid] it publishes. Every pair names a
 # pricing kind, and the binary decides which kinds exist by registering them (README,
 # "What you can plug in"); the three this crate ships are `feed`, `fixed` and `volatile`, and a
-# binary may register its own beside them. `feed` publishes the streamed mid with the
-# book's own half-spread, or with `delta` as the half-spread:
-# pricing = { kind = "feed", delta = "0.0005" }. Any key the kind takes goes in the same
-# table, and only that kind reads and checks it.
-pricing = { kind = "feed" }
+# binary may register its own beside them. `feed` publishes the streamed mid with `delta` as
+# the half-spread: pricing = { kind = "feed", delta = "0.0005" }. With no `delta` it copies
+# the book's own half-spread, and never publishes less than `min_delta`: a liquid book's
+# half-spread is a fraction of a basis point, which suits a quote the venue can pull in
+# milliseconds and not one that stands for a whole block. `min_delta` defaults to "0.0001"
+# (1 bp) when left out; state the one your pair should have. Any key the kind takes goes in
+# the same table, and only that kind reads and checks it.
+pricing = { kind = "feed", min_delta = "0.0005" }
 # The band this pair's published mid must fall inside. Nothing else catches a corrupt book,
 # and one would otherwise put an arbitrary price on chain that the next fill prices against.
 # A mid outside the band is refused: the RPC service skips the push, and Titan mode
@@ -167,8 +207,9 @@ min_mid = "0.0001"
 max_mid = "0.001"
 # Trips this pair's circuit breaker when the streamed mid jumps more than this fraction
 # away from the mid observed before it (2% here): the live quote is withdrawn from every
-# builder and this lane stops quoting. It does not come back on a timer; resuming is an
-# operator reloading this file once they trust the feed. Other pairs keep quoting throughout.
+# builder and this lane stops quoting. It does not come back on a timer; bringing it back
+# is an operator's re-arm (`POST /api/pairs/<key_env>/rearm`) once they trust the feed.
+# Other pairs keep quoting throughout.
 #
 # The band above catches a price that is absurd; this catches one that is merely
 # impossible to have arrived at honestly in one tick. Unset, the pair has no breaker.
@@ -188,17 +229,18 @@ max_deviation = "0.02"
 # seconds, and bucketing can add up to a second more. That makes the guard marginally more
 # permissive than the block count suggests, not stricter.
 #
-# A reload re-anchors the window, so a pair resumed after a halt starts measuring from the
-# price it resumes at. That is what resuming means: an operator has looked at the feed and
-# accepted the current price.
+# A reload re-anchors the window of a pair it restarts, and a re-arm that of the pair it
+# re-arms, so a pair resumed or re-armed after a halt starts measuring from the price it
+# comes back at. That is what resuming or re-arming means: an operator has looked at the
+# feed and accepted the current price.
 max_deviation_window = "0.20"
 max_deviation_window_blocks = "1000"
 
 # The same pair priced as a volatile one: instead of copying Binance's spread or sending a
 # fixed `delta`, we recompute the spread every block from how much the price has been moving
 # and how much of the vault's value is in WETH (see docs/manual.md, "Volatile pairs"). `gamma`, `k`
-# and `kappa` come as a set; the four below them have defaults. All seven are editable from
-# the backoffice, which is where γ, k and κ get tuned: they are guesses, nothing measures
+# and `kappa` come as a set; the four below them have defaults. All seven are editable through
+# the backoffice API, which is where γ, k and κ get tuned: they are guesses, nothing measures
 # them. A kind's keys live in its `[pairs.pricing]` table, which in TOML comes after the
 # pair's own keys.
 #
@@ -255,7 +297,7 @@ tokens  = ["0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599",
            "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"]
 symbol  = "BTCUSDC"
 key_env = "UPDATER_KEY_WBTC_USDC"
-pricing = { kind = "feed" }
+pricing = { kind = "feed", min_delta = "0.0005" }
 
 [[pairs]]
 # USDC, USDT.
@@ -263,13 +305,17 @@ tokens  = ["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
            "0xdAC17F958D2ee523a2206206994597C13D831ec7"]
 symbol  = "USDCUSDT"
 key_env = "UPDATER_KEY_USDC_USDT"
-pricing = { kind = "feed" }
+# The depeg guard: the band judges the market's mid as well as the published one, so the
+# pair stops quoting once USDC trades outside [0.995, 1.005] USDT.
+min_mid = "0.995"
+max_mid = "1.005"
+pricing = { kind = "feed", min_delta = "0.0002" }
 # Why the threshold is per pair and not one setting for the run: on a stablecoin, the 2%
 # above is a depeg the breaker exists to catch, while on ETHUSDC it is an ordinary hour.
 # A single process-wide number would have to be loose enough for the loosest pair.
 #
 # Set it to the move you would want to be woken up for, because that is what it means:
-# tripping stops this lane until a human has looked at the feed and reloaded.
+# tripping stops this lane until a human has looked at the feed and re-armed it.
 max_deviation = "0.002"
 
 # `symbol` is the short form of one Binance market. A pair can instead average the mid of
@@ -317,6 +363,18 @@ max_deviation = "0.002"
 # See "Late venues" in docs/manual.md.
 # max_source_lag_ms = "1500"
 
+# How far this pair's venues may disagree before its quote is withdrawn, as a fraction of
+# the mid (0.0005 = 0.05%). The check is on for every pair with two or more venues: the
+# gap between the primary venue (the one with the most weight) and any other fresh one is
+# held to this limit, and the pair quotes again on the first tick they agree. It is what
+# catches a venue whose price froze behind a live socket, one delivering a backlog, and
+# one whose thin book was pushed, none of which the average shows. Left unset, the limit
+# is 20 times the half-spread the pair publishes, and at least 0.05%. Set it to tighten
+# that for venues you know (read quote_updater_feed_divergence for what they ordinarily
+# do), or to loosen it. Needs two or more venues.
+# See "Venues that disagree" in docs/manual.md.
+# max_source_divergence = "0.0005"
+
 # A pair priced by a pricing kind a binary registered (docs/building-your-own.md),
 # the same way `feed`, `fixed` and `volatile` are. A stanza naming a kind its
 # binary did not register is refused at startup, so a binary that registers none refuses
@@ -337,7 +395,7 @@ max_deviation = "0.002"
 # [pairs.pricing]
 # kind        = "skewed"
 # half_spread = 0.0005
-# skew        = 0.001
+# skew        = 0.0002
 
 # A pair can also run guards a binary registered, `[[pairs.guards]]` stanzas in the order
 # they judge, after the built-in deviation guard (which keeps its own keys, `max_deviation`
@@ -352,13 +410,20 @@ max_deviation = "0.002"
 # kind       = "dispersion"
 # max_spread = "0.003"
 
-# Instead of `symbol`, a pair can publish a fixed price: the `fixed` kind, with `mid` and
-# `delta` as decimal strings in whole-token units. Used by the end-to-end make targets so
-# their assertions do not depend on a live Binance book:
+# A pair can publish a fixed price: the `fixed` kind, with `mid` and `delta` as decimal
+# strings in whole-token units. The end-to-end make targets use it so their assertions do
+# not depend on the book's spread. A fixed price does not follow the market, so it keeps a
+# `symbol` and quotes only while the market's mid sits inside its own bid and ask,
+# mid · (1 − delta) to mid · (1 + delta); outside them a taker would trade the vault at a
+# stale price, the way a depeg drains a stable pair at par. With no market at all it fails
+# to start, unless the stanza says `unguarded = true` (a smoke test's, never a real pair's):
 #
 # [[pairs]]
 # tokens  = ["0xA0b8…", "0xdAC1…"]
+# symbol  = "USDCUSDT"
 # key_env = "UPDATER_KEY_USDC_USDT"
+# min_mid = "0.995"
+# max_mid = "1.005"
 # pricing = { kind = "fixed", mid = "0.9998", delta = "0.0005" }
 #
 # `mid` is in the SAME market orientation as `tokens` — the price of one whole `tokens[0]`
@@ -377,7 +442,7 @@ max_deviation = "0.002"
 #
 # `max_deviation` arms this pair's price circuit breaker; see the WETH/USDC and USDC/USDT
 # pairs above. Tripping stops the lane for good until a human intervenes: it withdraws its
-# quote and stops, and only a reload brings it back. Builder mode only — node mode sends
+# quote and stops, and only its re-arm brings it back. Builder mode only — node mode sends
 # updateState straight to the RPC and has no live quote to withdraw, so a config that arms
 # a breaker is refused under `--mode node` rather than quietly running unprotected. It
 # applies to a `symbol` pair only: a fixed `mid` cannot deviate, and setting one is an
@@ -395,15 +460,17 @@ max_deviation = "0.002"
 # was meant to be guarded and is not shows up before anything is published.
 #
 # `allow_symbol_mismatch = true` opts a pair out of the startup check that its stream
-# matches its tokens. Required only when pricing a pair off a deliberately different
-# market, e.g. quoting WETH/USDC from ETHUSDT.
+# matches its tokens. Required when pricing a pair off a deliberately different market,
+# e.g. quoting WETH/USDC from ETHUSDT, and for a token whose `symbol()` cannot be read: the
+# check has nothing to compare the stream with, so the pair fails `--check` until this says
+# you compared them yourself.
 
 # ---------------------------------------------------------------------------
 # Builders
 # ---------------------------------------------------------------------------
 # The builders quoted in builder mode, one [[builder]] each. Previously their own
 # builders.toml; they live here now so the whole configuration is one file, which is also
-# what makes a reload a single atomic read.
+# what makes each change a single atomic write of it.
 #
 # Every configured builder is quoted with the same signed update, each over its own
 # connection and its own API key. One block's update is signed exactly once and sent
@@ -414,13 +481,22 @@ max_deviation = "0.002"
 # nothing connects is nearly always a typo or a revoked key. After that nothing is fatal: a
 # builder that goes down is redialed every 2s while the others keep quoting.
 #
-# Changing this list reloads, but unlike a pair edit it restarts every lane: each builder
-# connection is opened inside a pair's own quoting loop, so a lane cannot pick up a new list
-# without being rebuilt. The reload dials the new list first and refuses the whole thing,
-# touching nothing, unless at least one of them connects.
+# Changing this list through the backoffice applies at once, but unlike a pair edit it
+# restarts every lane: each builder connection is opened inside a pair's own quoting loop, so
+# a lane cannot pick up a new list without being rebuilt. The updater dials the new list
+# first and refuses the whole change, touching nothing, unless at least one of them connects.
+# A lane that cannot be rebuilt onto a list that lost a builder (or changed any field of its
+# entry) is stopped, its quote withdrawn at every builder, rather than left quoting to the
+# removed one; the next reload starts it again.
 #
 # Regional endpoints are just separate entries: add titan-ap and titan-us alongside this
 # one to fan out across regions.
+#
+# Keep this list to builders you trust. Every requote within a slot is a complete signed
+# transaction, valid for the whole slot, and a withdraw only asks a builder to drop it: any
+# builder holding the stream (and any region it passes it to) can include any version of a
+# slot's quote, an earlier price or a withdrawn one included. See docs/manual.md, "Builder
+# mode".
 
 [[builder]]
 # How this builder appears in the logs. Must be unique across the file.

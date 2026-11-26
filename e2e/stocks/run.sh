@@ -99,7 +99,7 @@ send "$ORACLE" 'setMultiplier(address,uint128,uint256)' "$AAPLON" "$SVALUE" 0 --
 IMPL=$(deploy src/PropAMM.sol:PropAMM)
 INIT=$(cast calldata 'initialize(address,address[],address,(address,address,address)[])' \
   "$DEPLOYER" "[$UPDATER]" "$REGISTRY" "[($AAPLON,$USDC,$VAULT)]")
-PROPAMM=$(deploy lib/openzeppelin-contracts/contracts/proxy/ERC1967/ERC1967Proxy.sol:ERC1967Proxy \
+PROPAMM=$(deploy lib/openzeppelin-contracts-upgradeable/lib/openzeppelin-contracts/contracts/proxy/ERC1967/ERC1967Proxy.sol:ERC1967Proxy \
   --constructor-args "$IMPL" "$INIT")
 send "$AAPLON" 'mint(address,uint256)' "$VAULT" 1000000000000000000000 --private-key "$DEPLOYER_KEY"
 send "$USDC" 'mint(address,uint256)' "$VAULT" 250000000000 --private-key "$DEPLOYER_KEY"

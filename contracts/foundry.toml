@@ -2,10 +2,18 @@
 src = "src"
 out = "out"
 libs = ["lib"]
+# Pinned so every machine and CI build the same bytecode. The sources say `^0.8.35`, which
+# alone lets each forge pick the newest compiler it knows, and forge's default EVM version
+# moves with forge. Change either on purpose, in a commit of its own.
+solc = "0.8.37"
+evm_version = "osaka"
+# Off, which is how snapshots/PropAMMGasTest.json is taken. forge 1.9 isolates by default:
+# each top-level call in a test runs as its own transaction, so every call is cold, the warm
+# figures come out equal to the cold ones, and a plain `forge test` rewrites the snapshot.
+isolate = false
 optimizer = true
 optimizer_runs = 999
 via_ir = true
-ffi = true
 ast = true
 build_info = true
 extra_output = ["storageLayout"]
@@ -15,5 +23,11 @@ remappings = [
     "@openzeppelin/contracts/=lib/openzeppelin-contracts-upgradeable/lib/openzeppelin-contracts/contracts/",
     "@openzeppelin/contracts-upgradeable=lib/openzeppelin-contracts-upgradeable/contracts/",
 ]
+
+# `vm.ffi` lets test code run shell commands, and test code includes whatever the tests
+# import from lib/. Nothing here calls it, so it is off by default; a test that needs it runs
+# under this profile: `FOUNDRY_PROFILE=ffi forge test`.
+[profile.ffi]
+ffi = true
 
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options

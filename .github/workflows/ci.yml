@@ -12,6 +12,11 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Every action is pinned to a commit, with the release it was in a comment beside it. A tag
+# or a branch can be moved to different code by whoever controls the action's repository,
+# and that code then runs here with this job's token; a commit cannot. To take a newer
+# release, change the SHA and the comment together.
+
 jobs:
   contracts:
     name: Contracts (build / format / tests)
@@ -22,13 +27,28 @@ jobs:
         working-directory: contracts
     steps:
       # The Foundry dependencies in contracts/lib are git submodules, empty without this.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: recursive
+      - uses: foundry-rs/foundry-toolchain@dba66c27052e63476d886f22216e119ba7e615bf # v1.9.2
+      - run: forge build
+      - run: forge fmt --check
+      - run: forge test
+
+  mutation:
+    name: Contracts (mutation run)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Plants one bug at a time in PropAMM.sol and PropAMMFactory.sol (an owner check dropped,
+    # a swap guard removed, the freshness window opened) and fails if the tests pass with any
+    # of them: a suite can be green and still not notice a guard is gone. A change to the
+    # contracts that breaks a mutant's text fails here too; fix the mutant in the same PR.
+    steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
       - uses: foundry-rs/foundry-toolchain@v1
-      - run: forge build
-      - run: forge fmt --check
-      - run: forge test
+      - run: python3 contracts/test/mutation/run_mutants.py
 
   quote-updater:
     name: Quote updater (format / clippy / tests)
@@ -36,17 +56,17 @@ jobs:
     timeout-minutes: 30
     steps:
       # No submodules: the Rust crate needs none, and contracts/lib is a slow checkout.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # Pinned rather than `stable`: with -D warnings a new Rust release landing on the
       # runners would turn every open PR red at once. Move it deliberately, in a PR that
       # passes on it. rust-toolchain.toml pins the same version for local builds.
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
         with:
           toolchain: 1.98.1
           components: rustfmt, clippy
       # The pinned ethrex crates come from git and pull ~460 packages, so a cold build
       # dominates this job. Keyed on Cargo.lock, which the pinned rev makes stable.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo fmt --all --check
       # --all-targets so the test modules are linted too; --locked so a Cargo.lock that no
       # longer matches the manifests fails here instead of being re-resolved on the runner.
@@ -62,11 +82,11 @@ jobs:
     # git: proves the ethrex pins resolve through the library and the public API is enough
     # for examples/tilted.rs, which its main.rs is byte for byte.
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
         with:
           toolchain: 1.98.1
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: e2e/downstream
       - run: cargo build --locked --manifest-path e2e/downstream/Cargo.toml
@@ -105,7 +125,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # The rules encode thresholds that mirror Rust constants (quote-updater/src/landing.rs
       # asserts they match); this checks the PromQL parses and the fixture fires.
       - name: Install promtool
@@ -149,7 +169,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # With the example env and config in place the compose file must resolve, and the
       # updater image must build from the example crate.
       - run: |

@@ -4,7 +4,7 @@
 # the circuit breaker and the band like every venue's; its pricing kind is any the binary
 # registers (`feed` at a fixed spread here); and the guards named in [[pairs.guards]] are
 # the ones src/main.rs registers through .us_market_hours() and .stock_issuer(Ondo). The
-# backoffice adds the same pair from its page (docs/stocks.md).
+# backoffice API takes the same stanza as JSON (docs/stocks.md).
 #
 # Before it runs:
 # - ONDO_API_KEY: an Ondo GM API key (partner-only; Ondo onboarding). The `ondo` venue

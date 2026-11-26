@@ -22,17 +22,25 @@ services:
     environment:
       CONFIG: /config/config.toml
       RECORD_DB_URL: postgresql://quote_updater:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}@postgres:5432/quote_updater
+      # Blank (or absent from .env) keeps every recorded row forever.
+      RECORD_RETENTION_DAYS: ${RECORD_RETENTION_DAYS:-}
     volumes:
-      # Read and written: the backoffice rewrites config.toml in place, and the updater
-      # reloads it.
+      # Read and written: the updater reads config.toml once, at start, and the backoffice
+      # API rewrites it in place with every change it applies.
       - ./config:/config
+      # The backoffice's HTTPS certificate and key, when BACKOFFICE_TLS_CERT and
+      # BACKOFFICE_TLS_KEY in .env name them as /tls/...; empty, and unused, otherwise. The
+      # directory rather than the two files: a renewal that replaces a file (a new one
+      # renamed over the old) shows through a directory mount and not through a file mount,
+      # and the updater picks it up without a restart. deploy/README.md, "HTTPS".
+      - ./tls:/tls:ro
     # An RPC node or a builder running on this host is `host.docker.internal` from inside.
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
       # The backoffice. It refuses to bind every interface, so the config binds the fixed
-      # address below and compose publishes it on the host address you choose. The page has
-      # no login: publish it on your tailnet address, never a public one.
+      # address below and compose publishes it on the host address you choose. Publish it on
+      # your tailnet address, never a public one, with or without Google sign-in.
       - "${BACKOFFICE_BIND:-127.0.0.1}:8088:8088"
     networks:
       propamm:

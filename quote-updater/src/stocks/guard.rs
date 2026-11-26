@@ -688,30 +688,11 @@ mod tests {
         testing::assert_rejects_unknown_fields::<GuardCfg>("poll_secs = 12");
     }
 
-    /// Every field the form declares is a key the stanza reads, and every key the example
-    /// stanza sets is declared, so a form round trip rebuilds the stanza unchanged.
+    /// Every field the form declares is a key the stanza reads, and the example stanza
+    /// comes back unchanged through the fields, as a front end shows and writes them.
     #[test]
     fn every_declared_field_is_a_key_the_stanza_reads_and_every_key_is_declared() {
-        use crate::{
-            backoffice::{field_value, kind_stanza},
-            kinds::typed,
-            pricing::QuoteGuardFactory,
-        };
-        let factory = factory();
-        let fields = factory.fields();
-        assert!(!fields.is_empty(), "the kind declares no fields");
-        let posted: std::collections::HashMap<String, String> = fields
-            .iter()
-            .map(|f| {
-                (
-                    format!("guard_ondo_token_{}", f.name),
-                    f.placeholder.to_owned(),
-                )
-            })
-            .collect();
-        let table = kind_stanza("guard", fields, "ondo_token", None, &posted).unwrap();
-        typed::<GuardCfg>(&table).unwrap();
-
+        use crate::pricing::QuoteGuardFactory;
         let example: toml::Value =
             toml::from_str(include_str!("../../../example/config.stocks.toml")).unwrap();
         let stanza = example["pairs"][0]["guards"]
@@ -723,16 +704,6 @@ mod tests {
             .as_table()
             .unwrap()
             .clone();
-        let posted: std::collections::HashMap<String, String> = fields
-            .iter()
-            .map(|f| {
-                (
-                    format!("guard_ondo_token_{}", f.name),
-                    field_value(f, stanza.get(f.name)),
-                )
-            })
-            .collect();
-        let rebuilt = kind_stanza("guard", fields, "ondo_token", Some(&stanza), &posted).unwrap();
-        assert_eq!(rebuilt, stanza);
+        crate::testing::assert_fields_round_trip::<GuardCfg>(factory().fields(), &stanza);
     }
 }

@@ -14,10 +14,17 @@
 //! stops pushing looks exactly like a quiet chain, and only a poll can tell them apart.
 //! Either way a pair sees a [`Head`] carrying what it stamps an update from, and never
 //! fetches a block itself.
+//!
+//! Neither way is taken at its word. A head is published when it follows the one that
+//! stands, by no more than [`MAX_HEAD_JUMP`]; any other reading is kept out, and only
+//! replaces the standing head once the node has kept saying so for [`REANCHOR_AFTER`].
+//! Without the first, one absurd header (a buggy node, one replica of several) stood as
+//! the head and every real one after it read as older. Without the second, a standing head
+//! that was itself wrong could never be left. [`judge`] is the rule.
 
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -30,7 +37,7 @@ use ethrex_rpc::{
 };
 use eyre::{Result, WrapErr, bail, eyre};
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::watch;
+use tokio::{sync::watch, time::Instant};
 use tokio_tungstenite::tungstenite::Message;
 use url::Url;
 
@@ -75,6 +82,205 @@ const SUBSCRIPTION_QUIET: Duration = Duration::from_secs(60);
 /// Delay between redials of the subscription endpoint. Matches binance.rs.
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
+/// How far past the standing head a new one may be and still be taken at its word. Blocks
+/// arrive one at a time, and a watcher cut off from its node for a few minutes comes back
+/// that many blocks on; one epoch covers both. A head further on than that is not the
+/// chain's next block. Either the node said something absurd, or the chain moved on while
+/// nothing was watching, and only the second keeps being said (see [`REANCHOR_AFTER`]).
+pub const MAX_HEAD_JUMP: u64 = 32;
+
+/// How long the node has to keep contradicting the standing head, the same way and without
+/// a break, before the watcher takes the node's word over its own. Three slots. A replica
+/// a block behind has caught up, or another has answered, long before that, so a lagging
+/// answer still never moves the head back; and one absurd answer is not repeated for
+/// three blocks' worth of time.
+pub const REANCHOR_AFTER: Duration = Duration::from_secs(36);
+
+/// The longest two contradicting readings may be apart and still be one run: a slot, or
+/// four polls where the poll is slower than that. The node is read several times a slot,
+/// so a silence longer than this is the node not answering, not the node repeating itself,
+/// and what it says when it answers again starts the count over. Without it two stray
+/// answers with an outage between them counted as the node saying one thing throughout.
+const DISPUTE_GAP: Duration = Duration::from_secs(12);
+
+/// What one reading of the node's head means for the head that stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Verdict {
+    /// The block the standing head already is. Nothing to publish.
+    Stands,
+    /// The first head there is, or one that follows the standing head: published.
+    Follows,
+    /// Behind the standing head, or further past it than [`MAX_HEAD_JUMP`]: kept out.
+    Disputed,
+    /// As `Disputed`, and the node has said so without a break for [`REANCHOR_AFTER`]:
+    /// this reading replaces the standing head.
+    Reanchor,
+}
+
+/// An unbroken run of readings that contradict the standing head the same way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Run {
+    /// When the run's first reading was taken, and the block it read.
+    since: Instant,
+    first: u64,
+    /// When its latest was taken, and the block it read.
+    last: Instant,
+    number: u64,
+}
+
+/// The runs in progress, one for each way a reading can contradict the standing head. Two,
+/// because what ends one does not end the other (see [`judge`]).
+#[derive(Debug, Default)]
+struct Disputes {
+    behind: Option<Run>,
+    ahead: Option<Run>,
+}
+
+/// Judges a reading numbered `number`, taken at `now`, against the head numbered `standing`,
+/// and keeps `disputes` up to date with it. `gap` is the longest two readings of one run
+/// may be apart.
+///
+/// The two ways of contradicting the standing head are held to different evidence, because
+/// they are wrong in different ways.
+///
+/// A reading *behind* it is most often a replica that has not caught up, and then some
+/// other reading soon says the standing block or one after it. Any such reading ends the
+/// run: the standing block is a node's head, so it is not one to go back from. Only a node
+/// that says nothing else for [`REANCHOR_AFTER`] is believed.
+///
+/// A reading *far ahead* of it is either absurd or true, and a true one is repeated and
+/// grows: the next reading is the same block or one near it, and within
+/// [`REANCHOR_AFTER`] it is past where the run began. So a run of them is believed only
+/// once it has grown; a node repeating one absurd number never is. Near, and not only
+/// past: the replicas behind one endpoint are a block or two apart at every new block, so
+/// the readings of a chain that really is there dip as often as they rise, and a run that
+/// ended at every dip never lasted [`REANCHOR_AFTER`]. Readings that agree with the
+/// standing head do not end this run. If they did, one replica stuck far behind would hold
+/// the head there for as long as it answered, its every reading vouching for a head the
+/// rest of the chain had left.
+fn judge(
+    standing: u64,
+    number: u64,
+    disputes: &mut Disputes,
+    now: Instant,
+    gap: Duration,
+) -> Verdict {
+    if number == standing {
+        disputes.behind = None;
+        return Verdict::Stands;
+    }
+    // Before the first head nothing stands (`Head::default()` is block 0), so there is
+    // nothing for a reading to be too far from.
+    if number > standing && (standing == 0 || number - standing <= MAX_HEAD_JUMP) {
+        disputes.behind = None;
+        return Verdict::Follows;
+    }
+    let ahead = number > standing;
+    let (run, same_claim) = if ahead {
+        // The chain the last reading was of: what it could have grown into, or a replica
+        // a little behind the one that gave it.
+        let near = disputes
+            .ahead
+            .is_some_and(|run| number.abs_diff(run.number) <= MAX_HEAD_JUMP);
+        (&mut disputes.ahead, near)
+    } else {
+        // Whatever older block it is: replicas lag by different amounts, and a node
+        // catching up reads a little further each time.
+        (&mut disputes.behind, true)
+    };
+    let (since, first) = match run {
+        Some(run) if same_claim && now.duration_since(run.last) <= gap => (run.since, run.first),
+        _ => (now, number),
+    };
+    *run = Some(Run {
+        since,
+        first,
+        last: now,
+        number,
+    });
+    let said_long_enough = now.duration_since(since) >= REANCHOR_AFTER;
+    if said_long_enough && (!ahead || number > first) {
+        Verdict::Reanchor
+    } else {
+        Verdict::Disputed
+    }
+}
+
+/// The head the pairs observe, with what deciding whether to replace it needs. One, shared
+/// by the poll and the subscription: a reading counts the same whichever way it arrived.
+struct Standing {
+    tx: watch::Sender<Head>,
+    metrics: HeadMetrics,
+    /// See [`judge`].
+    disputes: Mutex<Disputes>,
+    /// See [`DISPUTE_GAP`].
+    gap: Duration,
+}
+
+impl Standing {
+    /// `poll` is how often the node is read when nothing pushes heads.
+    fn new(tx: watch::Sender<Head>, metrics: HeadMetrics, poll: Duration) -> Self {
+        Standing {
+            tx,
+            metrics,
+            disputes: Mutex::new(Disputes::default()),
+            gap: DISPUTE_GAP.max(poll * 4),
+        }
+    }
+
+    /// Publishes `head` if it follows the one that stands, or if the node has contradicted
+    /// the standing one for long enough that `head` replaces it (see [`judge`]).
+    ///
+    /// Also the one site that writes `head_number`, and inside the accepted branch: this is
+    /// the only place the channel's value changes, and both ways a head arrives — the poll
+    /// and the subscription — come through here, so the gauge cannot drift from what the
+    /// pairs actually observe. Not written on a rejected head: a lagging replica answering
+    /// with an older block must no more move the gauge than it moves the channel.
+    fn publish(&self, head: Head) {
+        let mut disputes = self.disputes.lock().unwrap_or_else(|e| e.into_inner());
+        self.tx.send_if_modified(|current| {
+            match judge(
+                current.number,
+                head.number,
+                &mut disputes,
+                Instant::now(),
+                self.gap,
+            ) {
+                Verdict::Stands | Verdict::Disputed => return false,
+                Verdict::Follows => {}
+                Verdict::Reanchor => {
+                    // The one case the head can move back. A pair that was quoting past
+                    // the old one sees it and goes on from this one (`quoting::drive`).
+                    tracing::warn!(
+                        "[head] for {REANCHOR_AFTER:?} the node has kept reporting a head \
+                         that does not follow block {}; taking its block {} as the head \
+                         instead",
+                        current.number,
+                        head.number
+                    );
+                    *disputes = Disputes::default();
+                }
+            }
+            *current = head;
+            self.metrics.number.set(head.number as f64);
+            true
+        });
+    }
+
+    /// Whether a block numbered `number` could change what stands, so its header is worth
+    /// fetching. Counted as a reading either way: a poll that finds the standing block
+    /// still at the head is what ends a dispute, and one that keeps finding another is
+    /// what a re-anchor waits for.
+    fn wants(&self, number: u64) -> bool {
+        let mut disputes = self.disputes.lock().unwrap_or_else(|e| e.into_inner());
+        let standing = self.tx.borrow().number;
+        matches!(
+            judge(standing, number, &mut disputes, Instant::now(), self.gap),
+            Verdict::Follows | Verdict::Reanchor
+        )
+    }
+}
+
 /// How often to poll, given the requote cadence. Blocks land every ~12s, so polling at
 /// the requote cadence would spend an RPC round-trip per tick for nothing; a stale view
 /// only delays rolling to the next target block by up to this interval.
@@ -84,9 +290,10 @@ pub fn poll_interval(requote_ms: u64) -> Duration {
 
 /// Starts watching the head: polling `client` every `poll`, and — given `ws_url` —
 /// subscribed to its `newHeads` as well. Publishes each new head with its header. The
-/// value only ever rises: a lagging replica behind a load balancer answering with an
-/// older head must not roll a pair back to a block it has already quoted past. The
-/// tasks end once every receiver is gone.
+/// value rises: a lagging replica behind a load balancer answering with an older head must
+/// not roll a pair back to a block it has already quoted past. It moves back only when the
+/// watcher re-anchors, after the node has contradicted the standing head for
+/// [`REANCHOR_AFTER`]. The tasks end once every receiver is gone.
 pub fn spawn(
     tasks: &mut crate::tasks::Tasks,
     client: EthClient,
@@ -96,57 +303,32 @@ pub fn spawn(
     metrics: HeadMetrics,
 ) -> watch::Receiver<Head> {
     let (tx, rx) = watch::channel(Head::default());
-    let tx = Arc::new(tx);
+    let standing = Arc::new(Standing::new(tx, metrics, poll));
     let subscribed = Arc::new(AtomicBool::new(false));
     if let Some(url) = ws_url {
-        tasks.spawn(subscribe_forever(
-            url,
-            tx.clone(),
-            subscribed.clone(),
-            metrics.clone(),
-        ));
+        tasks.spawn(subscribe_forever(url, standing.clone(), subscribed.clone()));
     }
     tasks.spawn(poll_forever(
         client,
         poll,
         poll_timeout,
-        tx,
+        standing,
         subscribed,
-        metrics,
     ));
     rx
-}
-
-/// Publishes `head` unless an equal or later one already stands.
-///
-/// Also the one site that writes `head_number`, and inside the accepted branch: this is the
-/// only place the channel's value changes, and both ways a head arrives — the poll and the
-/// subscription — come through here, so the gauge cannot drift from what the pairs actually
-/// observe. Not written on a rejected head: a lagging replica answering with an older block
-/// must no more move the gauge than it moves the channel.
-fn publish(tx: &watch::Sender<Head>, head: Head, metrics: &HeadMetrics) {
-    tx.send_if_modified(|current| {
-        if head.number > current.number {
-            *current = head;
-            metrics.number.set(head.number as f64);
-            true
-        } else {
-            false
-        }
-    });
 }
 
 async fn poll_forever(
     client: EthClient,
     poll: Duration,
     poll_timeout: Duration,
-    tx: Arc<watch::Sender<Head>>,
+    standing: Arc<Standing>,
     subscribed: Arc<AtomicBool>,
-    metrics: HeadMetrics,
 ) {
+    let metrics = &standing.metrics;
     let mut last_error: Option<String> = None;
     loop {
-        if tx.is_closed() {
+        if standing.tx.is_closed() {
             return;
         }
         // Timed and counted here rather than inside `poll_once`: this is where the verdict
@@ -154,7 +336,7 @@ async fn poll_forever(
         // when the head moved — which is part of what a pair waits for, and is exactly what
         // a timer inside the number fetch would leave out.
         let started = std::time::Instant::now();
-        let polled = poll_once(&client, poll_timeout, &tx, &metrics).await;
+        let polled = poll_once(&client, poll_timeout, &standing).await;
         metrics
             .poll_duration
             .observe(started.elapsed().as_secs_f64());
@@ -186,35 +368,25 @@ async fn poll_forever(
     }
 }
 
-/// One poll: the block number, and the block's header when the number has moved past
-/// what stands. Returns the number polled.
-async fn poll_once(
-    client: &EthClient,
-    poll_timeout: Duration,
-    tx: &watch::Sender<Head>,
-    metrics: &HeadMetrics,
-) -> Result<u64> {
+/// One poll: the block number, and the block's header when that number could change what
+/// stands. Returns the number polled.
+async fn poll_once(client: &EthClient, poll_timeout: Duration, standing: &Standing) -> Result<u64> {
     let number = tokio::time::timeout(poll_timeout, client.get_block_number())
         .await
         .map_err(|_| eyre!("no answer in {poll_timeout:?}"))??;
-    if number > tx.borrow().number {
+    if standing.wants(number) {
         // `latest`, not `number`: the chain may have moved again meanwhile, and the
         // latest block is the parent a pair wants either way.
         let block =
             bounded(client.get_block_by_number(BlockIdentifier::Tag(BlockTag::Latest), false))
                 .await
                 .wrap_err("failed to fetch latest block")?;
-        publish(tx, Head::from(&block.header), metrics);
+        standing.publish(Head::from(&block.header));
     }
     Ok(number)
 }
 
-async fn subscribe_forever(
-    url: String,
-    tx: Arc<watch::Sender<Head>>,
-    subscribed: Arc<AtomicBool>,
-    metrics: HeadMetrics,
-) {
+async fn subscribe_forever(url: String, standing: Arc<Standing>, subscribed: Arc<AtomicBool>) {
     // The host only, never the URL: a provider's key rides in the path.
     let host = Url::parse(&url)
         .ok()
@@ -222,9 +394,9 @@ async fn subscribe_forever(
         .unwrap_or_else(|| "?".to_owned());
     let mut last_error: Option<String> = None;
     loop {
-        let outcome = subscription(&url, &host, &tx, &subscribed, &metrics).await;
+        let outcome = subscription(&url, &host, &standing, &subscribed).await;
         subscribed.store(false, Ordering::Relaxed);
-        if tx.is_closed() {
+        if standing.tx.is_closed() {
             return;
         }
         match outcome {
@@ -253,9 +425,8 @@ async fn subscribe_forever(
 async fn subscription(
     url: &str,
     host: &str,
-    tx: &watch::Sender<Head>,
+    standing: &Standing,
     subscribed: &AtomicBool,
-    metrics: &HeadMetrics,
 ) -> Result<()> {
     let mut ws = ws::connect(url).await?;
     let request = serde_json::json!({
@@ -285,7 +456,7 @@ async fn subscription(
                     subscribed.store(true, Ordering::Relaxed);
                     tracing::info!("[head] subscribed to new heads at {host}");
                 } else if reply["method"] == "eth_subscription" {
-                    publish(tx, head_from_json(&reply["params"]["result"])?, metrics);
+                    standing.publish(head_from_json(&reply["params"]["result"])?);
                 }
             }
             Message::Close(_) => return Ok(()),
@@ -339,6 +510,285 @@ mod tests {
             .unwrap()
             .register_head()
             .unwrap()
+    }
+
+    fn head_at(number: u64) -> Head {
+        Head {
+            number,
+            timestamp: 1_700_000_000,
+            base_fee_per_gas: Some(1_000_000_000),
+        }
+    }
+
+    /// A standing head of its own, with no node behind it: these tests are about what a
+    /// run of readings does to it, and the clock is tokio's paused one.
+    fn standing() -> (Standing, watch::Receiver<Head>) {
+        let (tx, rx) = watch::channel(Head::default());
+        (
+            Standing::new(tx, test_head_metrics(), Duration::from_millis(250)),
+            rx,
+        )
+    }
+
+    /// The node read every three seconds for `secs`, the way a poll reads it: `block` is
+    /// what it answers at each second since the call. The header is fetched and published
+    /// only when the number is worth one, as `poll_once` does.
+    async fn read_every_3s(standing: &Standing, secs: u64, block: impl Fn(u64) -> u64) {
+        for at in (0..secs).step_by(3) {
+            let number = block(at);
+            if standing.wants(number) {
+                standing.publish(head_at(number));
+            }
+            tokio::time::advance(Duration::from_secs(3)).await;
+        }
+    }
+
+    /// One absurd header, from a buggy node or one replica of several, used to be kept as
+    /// the head for being the greatest number seen, and every real head after it read as
+    /// older until the process was restarted. It is kept out, and the chain goes on.
+    #[tokio::test(start_paused = true)]
+    async fn a_head_too_far_past_the_standing_one_is_kept_out() {
+        let (standing, head) = standing();
+        standing.publish(head_at(100));
+        standing.publish(head_at(u64::MAX));
+        standing.publish(head_at(100 + MAX_HEAD_JUMP + 1));
+        assert_eq!(
+            head.borrow().number,
+            100,
+            "neither is the chain's next block"
+        );
+
+        standing.publish(head_at(101));
+        assert_eq!(
+            head.borrow().number,
+            101,
+            "the real head after it is followed"
+        );
+        // As far as a head may move in one step, for a watcher that was cut off a while.
+        standing.publish(head_at(101 + MAX_HEAD_JUMP));
+        assert_eq!(head.borrow().number, 101 + MAX_HEAD_JUMP);
+        assert_eq!(
+            standing.metrics.number.get(),
+            (101 + MAX_HEAD_JUMP) as f64,
+            "the gauge carries what the pairs observe"
+        );
+
+        // Said again and again it is still not the chain: an absurd number repeated does
+        // not grow, and the real blocks in between are followed as they come.
+        read_every_3s(&standing, 60, |at| match at % 6 {
+            0 => 1 << 60,
+            _ => 133 + at / 12,
+        })
+        .await;
+        assert_eq!(head.borrow().number, 137);
+    }
+
+    /// The absurd header can be the first one, with nothing standing for it to be too far
+    /// from. Then it is the standing head that is wrong, and the node saying otherwise,
+    /// block after block, is what replaces it.
+    #[tokio::test(start_paused = true)]
+    async fn a_standing_head_the_node_keeps_contradicting_is_replaced() {
+        let (standing, head) = standing();
+        standing.publish(head_at(1 << 60));
+        assert_eq!(head.borrow().number, 1 << 60, "the first head is taken");
+
+        // The real chain, a block every twelve seconds, read from t = 0 to t = 30.
+        read_every_3s(&standing, 33, |at| 100 + at / 12).await;
+        assert_eq!(head.borrow().number, 1 << 60, "not before REANCHOR_AFTER");
+        // And at t = 33 and t = 36, where the run is REANCHOR_AFTER old.
+        read_every_3s(&standing, 6, |_| 103).await;
+        assert_eq!(head.borrow().number, 103, "the node's head replaces it");
+        assert_eq!(standing.metrics.number.get(), 103.0);
+
+        // And from there the chain is followed block by block again.
+        standing.publish(head_at(104));
+        assert_eq!(head.borrow().number, 104);
+    }
+
+    /// A chain that moved on by more than `MAX_HEAD_JUMP` while nothing was watching is
+    /// kept out like an absurd header, and unlike one it keeps being said and keeps growing.
+    #[tokio::test(start_paused = true)]
+    async fn a_chain_that_moved_far_ahead_is_followed_once_it_keeps_being_said() {
+        let (standing, head) = standing();
+        standing.publish(head_at(100));
+        read_every_3s(&standing, 36, |at| 1_000 + at / 12).await;
+        assert_eq!(
+            head.borrow().number,
+            100,
+            "36s of it is not yet REANCHOR_AFTER"
+        );
+        read_every_3s(&standing, 3, |_| 1_003).await;
+        assert_eq!(head.borrow().number, 1_003);
+    }
+
+    /// Behind one endpoint the replicas are a block apart as often as not, so the readings
+    /// of a chain that moved far ahead dip by one every other read. Each dip used to start
+    /// the run over, so it never lasted `REANCHOR_AFTER` and the head stayed where the
+    /// outage had left it until the process was restarted.
+    #[tokio::test(start_paused = true)]
+    async fn a_chain_that_moved_far_ahead_is_followed_though_its_replicas_disagree() {
+        let (standing, head) = standing();
+        standing.publish(head_at(100));
+        // The head, and every other read a replica one block behind it.
+        let dipping =
+            |since: u64| move |at: u64| 1_000 + (since + at) / 12 - ((since + at) / 3) % 2;
+        read_every_3s(&standing, 36, dipping(0)).await;
+        assert_eq!(head.borrow().number, 100, "not before REANCHOR_AFTER");
+        read_every_3s(&standing, 3, dipping(36)).await;
+        assert_eq!(head.borrow().number, 1_003, "the dips did not end the run");
+    }
+
+    /// One replica stuck far behind, answering every other read, used to be able to hold
+    /// the head where it was: each of its answers agreed with the standing head and ended
+    /// the dispute the rest of the chain had raised. Agreement does not end a run of
+    /// readings far ahead, so the chain is followed, and the stale answers that keep
+    /// coming afterwards do not take the head back.
+    #[tokio::test(start_paused = true)]
+    async fn a_replica_stuck_far_behind_does_not_hold_the_head_there() {
+        let (standing, head) = standing();
+        // The stale replica answered first.
+        standing.publish(head_at(900));
+        let alternating = |since: u64| {
+            move |at: u64| match (at / 3) % 2 {
+                0 => 900,
+                _ => 1_000 + (since + at) / 12,
+            }
+        };
+        read_every_3s(&standing, 36, alternating(0)).await;
+        assert_eq!(head.borrow().number, 900, "not before REANCHOR_AFTER");
+        read_every_3s(&standing, 6, alternating(36)).await;
+        assert_eq!(
+            head.borrow().number,
+            1_003,
+            "the live replica's head is taken"
+        );
+
+        // A minute more of the same two replicas: every other answer is 900, far behind,
+        // and every other one is the head, which is what ends that run each time.
+        read_every_3s(&standing, 60, alternating(42)).await;
+        assert_eq!(
+            head.borrow().number,
+            1_008,
+            "and it is followed, never left"
+        );
+    }
+
+    /// Two stray answers with an outage between them are not the node saying one thing for
+    /// the whole of the outage: a reading more than a slot after the last starts the run
+    /// over, so a flapping endpoint cannot move the head back with a pair of them.
+    #[tokio::test(start_paused = true)]
+    async fn two_lagging_answers_an_outage_apart_do_not_move_the_head_back() {
+        let (standing, head) = standing();
+        standing.publish(head_at(100));
+        assert!(!standing.wants(97));
+        // Nothing answers for longer than REANCHOR_AFTER.
+        tokio::time::advance(REANCHOR_AFTER + Duration::from_secs(4)).await;
+        assert!(!standing.wants(97), "the second answer starts a new run");
+        standing.publish(head_at(97));
+        assert_eq!(head.borrow().number, 100);
+
+        // Said without a break from here, it is believed REANCHOR_AFTER later, not sooner.
+        read_every_3s(&standing, 36, |_| 97).await;
+        assert_eq!(head.borrow().number, 100);
+        read_every_3s(&standing, 3, |_| 97).await;
+        assert_eq!(head.borrow().number, 97);
+    }
+
+    /// A replica behind the one that answered before must still never move the head back:
+    /// any reading that agrees with the standing head ends the run, however long the
+    /// lagging answers have been coming.
+    #[tokio::test(start_paused = true)]
+    async fn a_reading_that_agrees_with_the_standing_head_ends_a_run_behind_it() {
+        let (standing, head) = standing();
+        standing.publish(head_at(100));
+        read_every_3s(&standing, 33, |_| 99).await;
+        // The replica that is not behind answers: block 100 is still the head.
+        assert!(!standing.wants(100));
+        read_every_3s(&standing, 33, |_| 99).await;
+        assert_eq!(
+            head.borrow().number,
+            100,
+            "the run started over when a reading agreed"
+        );
+        // So does the block after it.
+        standing.publish(head_at(101));
+        read_every_3s(&standing, 33, |_| 99).await;
+        assert_eq!(head.borrow().number, 101);
+    }
+
+    /// The verdicts one by one, and the bounds at their edges.
+    #[tokio::test(start_paused = true)]
+    async fn a_reading_is_judged_against_the_standing_head() {
+        let gap = DISPUTE_GAP;
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let mut d = Disputes::default();
+        // Nothing stands yet: any block is the first head, and block 0 is no head at all.
+        assert_eq!(judge(0, 1 << 60, &mut d, t0, gap), Verdict::Follows);
+        assert_eq!(judge(0, 0, &mut d, t0, gap), Verdict::Stands);
+        assert_eq!(judge(100, 100, &mut d, t0, gap), Verdict::Stands);
+        assert_eq!(judge(100, 101, &mut d, t0, gap), Verdict::Follows);
+        let edge = 100 + MAX_HEAD_JUMP;
+        assert_eq!(judge(100, edge, &mut d, t0, gap), Verdict::Follows);
+        assert!(
+            d.behind.is_none() && d.ahead.is_none(),
+            "nothing contradicted it"
+        );
+
+        // Behind: a run, whatever older block each reading names, until it is old enough.
+        assert_eq!(judge(100, 99, &mut d, at(0), gap), Verdict::Disputed);
+        assert_eq!(judge(100, 97, &mut d, at(12), gap), Verdict::Disputed);
+        assert_eq!(judge(100, 98, &mut d, at(24), gap), Verdict::Disputed);
+        assert_eq!(d.behind.map(|run| run.since), Some(at(0)));
+        assert_eq!(judge(100, 98, &mut d, at(35), gap), Verdict::Disputed);
+        assert_eq!(judge(100, 98, &mut d, at(36), gap), Verdict::Reanchor);
+        // One reading longer than the gap after the last starts it over.
+        assert_eq!(judge(100, 98, &mut d, at(49), gap), Verdict::Disputed);
+        assert_eq!(d.behind.map(|run| run.since), Some(at(49)));
+        // And a reading that agrees ends it.
+        assert_eq!(judge(100, 100, &mut d, at(50), gap), Verdict::Stands);
+        assert_eq!(d.behind, None);
+
+        // Far ahead: a run only while each reading is near the last.
+        assert_eq!(judge(100, edge + 1, &mut d, at(60), gap), Verdict::Disputed);
+        assert_eq!(judge(100, edge + 2, &mut d, at(66), gap), Verdict::Disputed);
+        assert_eq!(d.ahead.map(|run| run.since), Some(at(60)));
+        // Readings that agree with the standing head do not end it.
+        assert_eq!(judge(100, 100, &mut d, at(67), gap), Verdict::Stands);
+        assert_eq!(judge(100, 101, &mut d, at(68), gap), Verdict::Follows);
+        assert_eq!(d.ahead.map(|run| run.since), Some(at(60)));
+        // A reading a little lower is the same chain, from a replica behind the one that
+        // gave the last: the run goes on.
+        assert_eq!(judge(100, edge + 1, &mut d, at(70), gap), Verdict::Disputed);
+        assert_eq!(d.ahead.map(|run| run.since), Some(at(60)));
+        // One out of reach of the last is another claim: a new run.
+        let far = edge + 2 + MAX_HEAD_JUMP;
+        assert_eq!(judge(100, far, &mut d, at(72), gap), Verdict::Disputed);
+        assert_eq!(d.ahead.map(|run| run.since), Some(at(72)));
+        assert_eq!(judge(100, far, &mut d, at(84), gap), Verdict::Disputed);
+        assert_eq!(judge(100, far, &mut d, at(96), gap), Verdict::Disputed);
+        // Old enough, and still the number the run started with: a node repeating itself.
+        assert_eq!(judge(100, far, &mut d, at(108), gap), Verdict::Disputed);
+        // Grown by a block, it is a chain.
+        assert_eq!(judge(100, far + 1, &mut d, at(109), gap), Verdict::Reanchor);
+        // Out of reach below the last is no replica's dip either: a new run.
+        assert_eq!(
+            judge(100, edge + 1, &mut d, at(110), gap),
+            Verdict::Disputed
+        );
+        assert_eq!(d.ahead.map(|run| run.since), Some(at(110)));
+    }
+
+    /// A poll slower than a slot still gets a run: four of its readings may be one.
+    #[test]
+    fn the_gap_between_readings_of_a_run_follows_a_slow_poll() {
+        let gap = |poll_ms: u64| {
+            let (tx, _rx) = watch::channel(Head::default());
+            Standing::new(tx, test_head_metrics(), Duration::from_millis(poll_ms)).gap
+        };
+        assert_eq!(gap(250), DISPUTE_GAP);
+        assert_eq!(gap(3_000), DISPUTE_GAP);
+        assert_eq!(gap(15_000), Duration::from_secs(60));
     }
 
     #[tokio::test]

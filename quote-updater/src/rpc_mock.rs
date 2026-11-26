@@ -280,8 +280,9 @@ impl MockRpc {
             .insert(token, symbol.to_owned());
     }
 
-    /// Makes every `eth_call` to `signature` (as `transferFrom(address,address,uint256)`)
-    /// revert with `data`, on any contract, until the mock is dropped.
+    /// Makes every `eth_call` to `signature` (as `symbol()` or
+    /// `transferFrom(address,address,uint256)`) revert with `data`, on any contract, until the
+    /// mock is dropped.
     pub(crate) fn set_revert(&self, signature: &str, data: Vec<u8>) {
         let selector = ethrex_common::utils::keccak(signature.as_bytes()).0[..4].to_vec();
         self.state.lock().unwrap().reverts.insert(selector, data);

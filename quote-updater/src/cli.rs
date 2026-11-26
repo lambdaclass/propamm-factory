@@ -3,13 +3,16 @@
 //! startup refusals that depend only on what was asked for (`--mode` against the flags and
 //! the config that only make sense in the other mode).
 
-use std::{net::SocketAddr, path::PathBuf};
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::PathBuf,
+};
 
 use clap::{CommandFactory, FromArgMatches, Parser, builder::FalseyValueParser};
 use ethrex_common::Address;
 use eyre::{Result, WrapErr, bail, ensure};
 
-use crate::{MAX_PRICE_DECIMALS, config, venue};
+use crate::{PRICE_DECIMALS, config, venue};
 
 /// Mainnet PrioUpdateRegistry (MAX_UPDATE_AGE = 0, MAX_UPDATE_LEAD_TIME = 0). The
 /// deployment PropAMM reads from since 2026-09-15. The first one, at
@@ -17,6 +20,14 @@ use crate::{MAX_PRICE_DECIMALS, config, venue};
 /// the default again: a config with no `registry` line falls back to this constant, so a
 /// wrong value here is a pusher that pushes to the wrong contract without saying so.
 const MAINNET_REGISTRY: &str = "0xDa7AfEeD021EAFC1c1Af9C362dE477DaD0396B81";
+
+/// The backoffice's address when a flag or `[settings] backoffice_addr` names only its port:
+/// this host alone, which is never the wrong place to have bound an API that writes.
+const DEFAULT_BACKOFFICE_IP: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+/// The backoffice's port when a flag names only its address: the one every doc and the
+/// compose file use.
+const DEFAULT_BACKOFFICE_PORT: u16 = 8088;
 
 /// Variables that used to configure the single-builder mode. Kept only to refuse them.
 const REMOVED_VARS: [&str; 2] = ["TITAN_WS", "TITAN_API_KEY"];
@@ -105,10 +116,10 @@ pub(crate) struct Flags {
     pub(crate) registry: Address,
 
     /// Decimal places the published mid and delta are scaled by. PropAMM reads both at
-    /// 1e18 (its PRICE_SCALE and SPREAD_SCALE), the default. A config with an inverted
-    /// pair caps this at 38, because inverting squares the scale.
-    #[arg(long, env = "PRICE_DECIMALS", default_value_t = 18)]
-    #[arg(value_parser = clap::value_parser!(u32).range(..=MAX_PRICE_DECIMALS as i64))]
+    /// 1e18 (its PRICE_SCALE and SPREAD_SCALE), so 18 is the default and the only value
+    /// accepted: there is nothing to set here.
+    #[arg(long, env = "PRICE_DECIMALS", default_value_t = PRICE_DECIMALS)]
+    #[arg(value_parser = parse_price_decimals)]
     pub(crate) price_decimals: u32,
 
     /// Binance WebSocket base endpoint (overridable for binance.us or a mock)
@@ -170,6 +181,86 @@ pub(crate) struct Flags {
     #[arg(long, env = "METRICS_ADDR")]
     pub(crate) metrics_addr: Option<SocketAddr>,
 
+    /// Serve the backoffice API on this address: this host's tailnet address, say
+    /// (100.64.1.2). The address half of [settings] backoffice_addr, which this overrides;
+    /// with only --backoffice-port given, 127.0.0.1. Either flag alone turns the backoffice
+    /// on. An unspecified address (0.0.0.0, ::) is refused: the API writes, and that would bind
+    /// every interface. Builder mode only
+    #[arg(long, env = "BACKOFFICE_IP")]
+    pub(crate) backoffice_ip: Option<IpAddr>,
+
+    /// Serve the backoffice API on this port. The port half of [settings] backoffice_addr,
+    /// which this overrides; with only --backoffice-ip given, 8088
+    #[arg(long, env = "BACKOFFICE_PORT")]
+    pub(crate) backoffice_port: Option<u16>,
+
+    /// A name the backoffice is reached by, besides an IP address and localhost, which it
+    /// always answers to: this host's tailnet name (the one its HTTPS certificate names), or a
+    /// reverse proxy's. A request addressed to any other name is refused, which stops a site
+    /// that points its own domain at this host (DNS rebinding). The name alone, with no scheme
+    /// or port; repeat the flag, or comma-separate the variable, for more than one. Replaces
+    /// [settings] backoffice_hosts. Not a front end's address: that is
+    /// --backoffice-cors-origin
+    #[arg(
+        long = "backoffice-host",
+        env = "BACKOFFICE_HOSTS",
+        value_delimiter = ','
+    )]
+    pub(crate) backoffice_hosts: Vec<String>,
+
+    /// Let a browser page served from this origin (scheme://host[:port], e.g.
+    /// http://100.64.1.2:3000) call the backoffice API: it is answered with CORS headers
+    /// and its changes are taken. Repeat the flag, or comma-separate the variable, for more
+    /// than one. `*` is refused: without a sign-in, any site an operator's browser visits
+    /// could then drive it. Without this only a page served under the API's own
+    /// address, or a client that is not a browser, can make a change
+    #[arg(
+        long = "backoffice-cors-origin",
+        env = "BACKOFFICE_CORS_ORIGINS",
+        value_delimiter = ','
+    )]
+    pub(crate) backoffice_cors_origins: Vec<String>,
+
+    /// Serve the backoffice API over HTTPS with this certificate: a PEM file holding the
+    /// certificate and any intermediates, the server's own first (what `tailscale cert`
+    /// writes as <name>.crt). Needs --backoffice-tls-key. Read again whenever it changes,
+    /// so a renewal needs no restart. Without both, the backoffice is plain HTTP
+    #[arg(long, env = "BACKOFFICE_TLS_CERT")]
+    pub(crate) backoffice_tls_cert: Option<PathBuf>,
+
+    /// The private key of --backoffice-tls-cert: one unencrypted PEM key, PKCS#8, SEC1
+    /// (what `tailscale cert` writes as <name>.key) or PKCS#1
+    #[arg(long, env = "BACKOFFICE_TLS_KEY")]
+    pub(crate) backoffice_tls_key: Option<PathBuf>,
+
+    /// Require a Google sign-in on every backoffice request: the OAuth client ID the front
+    /// end signs in with (a "Web application" client, ending in .apps.googleusercontent.com;
+    /// no client secret). Every request then needs the ID token of an account
+    /// --backoffice-allow-domain or --backoffice-allow-email lets in, as Authorization:
+    /// Bearer <token>. Without it the backoffice takes no sign-in
+    #[arg(long, env = "BACKOFFICE_GOOGLE_CLIENT_ID")]
+    pub(crate) backoffice_google_client_id: Option<String>,
+
+    /// With --backoffice-google-client-id: a Google Workspace domain whose accounts may sign
+    /// in. Matched on the domain Google says manages the account, never on the address, so a
+    /// personal account under a work address is not let in. Repeat the flag, or
+    /// comma-separate the variable, for more than one
+    #[arg(
+        long = "backoffice-allow-domain",
+        env = "BACKOFFICE_ALLOW_DOMAINS",
+        value_delimiter = ','
+    )]
+    pub(crate) backoffice_allow_domains: Vec<String>,
+
+    /// With --backoffice-google-client-id: a Google account that may sign in, by its address.
+    /// Repeat the flag, or comma-separate the variable, for more than one
+    #[arg(
+        long = "backoffice-allow-email",
+        env = "BACKOFFICE_ALLOW_EMAILS",
+        value_delimiter = ','
+    )]
+    pub(crate) backoffice_allow_emails: Vec<String>,
+
     /// Keep builder quote updates in the region they were submitted to
     #[arg(long, env = "DISABLE_CROSS_REGION", value_parser = FalseyValueParser::new())]
     pub(crate) disable_cross_region: bool,
@@ -185,10 +276,52 @@ pub(crate) struct Flags {
     /// Postgres (e.g. postgresql://ponder:pass@127.0.0.1:5432/ponder), the indexer's
     /// database, for the P&L dashboard. Unset disables recording. Ignored under --check and
     /// --once. Flag or environment only, deliberately not a `[settings]` key: the URL
-    /// carries a password, and the backoffice rewrites `[settings]` from its form, so it
-    /// belongs in `.env` beside the updater keys. See record.rs.
+    /// carries a password, and the backoffice API shows `[settings]` to anyone who reaches
+    /// it, so it belongs in `.env` beside the updater keys. See record.rs.
     #[arg(long, env = "RECORD_DB_URL")]
     pub(crate) record_db_url: Option<String>,
+
+    /// How many days of recorded history to keep. Rows older than this are deleted from
+    /// the tables that grow with time (feed.mids, feed.quotes, feed.vault_balances), once
+    /// at startup and hourly after; the config history is never deleted. Unset keeps
+    /// everything, and the database then grows for as long as the updater runs. Beside
+    /// --record-db-url, and like it a flag or environment variable only.
+    #[arg(long, env = "RECORD_RETENTION_DAYS")]
+    #[arg(value_parser = clap::value_parser!(u32).range(1..))]
+    pub(crate) record_retention_days: Option<u32>,
+}
+
+impl Flags {
+    /// Where the backoffice is served, once [`apply_file_settings`] has filled in what the
+    /// command line left to `[settings] backoffice_addr`: `None` when nothing asks for one,
+    /// and a missing half defaulted when only the other was given.
+    pub(crate) fn backoffice_addr(&self) -> Option<SocketAddr> {
+        match (self.backoffice_ip, self.backoffice_port) {
+            (None, None) => None,
+            (ip, port) => Some(SocketAddr::new(
+                ip.unwrap_or(DEFAULT_BACKOFFICE_IP),
+                port.unwrap_or(DEFAULT_BACKOFFICE_PORT),
+            )),
+        }
+    }
+
+    /// The backoffice's certificate and key files, `None` when it is plain HTTP. One
+    /// without the other is refused: half a TLS setup is a mistake, and serving plain HTTP
+    /// over it would hide that.
+    pub(crate) fn backoffice_tls(&self) -> Result<Option<(&std::path::Path, &std::path::Path)>> {
+        match (&self.backoffice_tls_cert, &self.backoffice_tls_key) {
+            (Some(cert), Some(key)) => Ok(Some((cert, key))),
+            (None, None) => Ok(None),
+            (Some(_), None) => bail!(
+                "--backoffice-tls-cert is set without --backoffice-tls-key; HTTPS needs the \
+                 certificate's private key too"
+            ),
+            (None, Some(_)) => bail!(
+                "--backoffice-tls-key is set without --backoffice-tls-cert; HTTPS needs the \
+                 certificate the key belongs to"
+            ),
+        }
+    }
 }
 
 /// The argument ids a parse took from the command line or the environment.
@@ -394,12 +527,9 @@ pub(crate) fn apply_file_settings(
     if let Some(decimals) = settings.price_decimals
         && !given("price_decimals")
     {
-        // The bound clap puts on --price-decimals, repeated because its range parser
-        // cannot be reached from here.
-        ensure!(
-            decimals <= MAX_PRICE_DECIMALS,
-            "[settings] price_decimals is {decimals}; the maximum is {MAX_PRICE_DECIMALS}"
-        );
+        // The check clap runs on --price-decimals, repeated because its parser cannot be
+        // reached from here.
+        crate::ensure_price_decimals(decimals, "[settings] price_decimals")?;
         args.flags.price_decimals = decimals;
     }
     if let Some(url) = &settings.binance_ws
@@ -430,12 +560,40 @@ pub(crate) fn apply_file_settings(
     {
         args.flags.disable_cross_region = disable;
     }
+    // A list given on the command line replaces the file's, as every other setting does.
+    if !settings.backoffice_hosts.is_empty() && !given("backoffice_hosts") {
+        args.flags.backoffice_hosts = settings.backoffice_hosts.clone();
+    }
+    // Each half on its own, so `--backoffice-port` moves the port of an address the file
+    // gives and keeps its IP.
+    if let Some(addr) = &settings.backoffice_addr {
+        let addr: SocketAddr = addr
+            .parse()
+            .wrap_err_with(|| format!("[settings] backoffice_addr {addr:?} is not host:port"))?;
+        if !given("backoffice_ip") {
+            args.flags.backoffice_ip = Some(addr.ip());
+        }
+        if !given("backoffice_port") {
+            args.flags.backoffice_port = Some(addr.port());
+        }
+    }
     if let Some(quote_id) = settings.quote_id
         && !given("quote_id")
     {
         args.flags.quote_id = quote_id;
     }
     Ok(())
+}
+
+/// clap's parser for `--price-decimals`, which needs a `String` error. Delegates so the
+/// one rule about the scale (and its message) is the one `[settings]` is held to.
+fn parse_price_decimals(s: &str) -> Result<u32, String> {
+    let decimals: u32 = s
+        .parse()
+        .map_err(|_| format!("{s:?} is not a number of decimal places"))?;
+    crate::ensure_price_decimals(decimals, "--price-decimals")
+        .map(|()| decimals)
+        .map_err(|e| format!("{e:#}"))
 }
 
 /// clap's parser, which needs a `String` error. Delegates so the one address-parsing
@@ -465,19 +623,20 @@ pub(crate) fn removed_vars_error(present: &[&str]) -> String {
     )
 }
 
-/// The backoffice's only verb is reload, and the reload path belongs to the `Service`,
-/// which node mode never builds. A backoffice there would serve a page whose every button
-/// failed, so it is refused at startup rather than bound and left inert.
+/// Every change the backoffice API makes is a reload, and the reload path belongs to the
+/// `Service`, which node mode never builds. A backoffice there would serve an API whose
+/// every change failed, so it is refused at startup rather than bound and left inert.
 pub(crate) fn refuse_backoffice_in_node_mode(
     mode: Mode,
-    backoffice_addr: Option<&str>,
+    backoffice_addr: Option<SocketAddr>,
 ) -> Result<()> {
     ensure!(
         mode != Mode::Node || backoffice_addr.is_none(),
-        "[settings] backoffice_addr is set, but --mode node has no config reload for it to \
-         drive: the convergence it would trigger belongs to builder mode, which node mode \
-         does not run. Drop the setting, or use --mode builder (see the mock-builder recipe \
-         in the README for a local run)."
+        "a backoffice is configured (--backoffice-ip, --backoffice-port or [settings] \
+         backoffice_addr), but --mode node has no config reload for it to drive: the \
+         convergence it would trigger belongs to builder mode, which node mode does not run. \
+         Drop it, or use --mode builder (see the mock-builder recipe in the README for a \
+         local run)."
     );
     Ok(())
 }
@@ -603,7 +762,7 @@ mod tests {
             requote_ms: Some(25),
             interval: Some(3),
             metrics_addr: Some("127.0.0.1:9464".to_owned()),
-            price_decimals: Some(6),
+            price_decimals: Some(18),
             disable_cross_region: Some(true),
             quote_id: Some(true),
             ..Default::default()
@@ -614,7 +773,7 @@ mod tests {
         assert_eq!(args.flags.rpc_url, "https://from-the-file.example");
         assert_eq!(args.flags.requote_ms, 25);
         assert_eq!(args.flags.interval, 3);
-        assert_eq!(args.flags.price_decimals, 6);
+        assert_eq!(args.flags.price_decimals, 18);
         assert!(args.flags.disable_cross_region);
         assert!(args.flags.quote_id);
         assert_eq!(
@@ -686,10 +845,20 @@ mod tests {
             (
                 "price_decimals",
                 config::FileSettings {
-                    price_decimals: Some(60),
+                    // Inside the old ceiling, and the dangerous side of 18: a mid a
+                    // trillionth of the price.
+                    price_decimals: Some(6),
                     ..Default::default()
                 },
-                "price_decimals",
+                "price_decimals is 6",
+            ),
+            (
+                "backoffice_addr",
+                config::FileSettings {
+                    backoffice_addr: Some("tailnet:8088".to_owned()),
+                    ..Default::default()
+                },
+                "backoffice_addr",
             ),
         ];
         for (case, settings, expected) in cases {
@@ -702,17 +871,168 @@ mod tests {
         }
     }
 
-    /// A backoffice bound in a mode with no reload would serve a page whose every button
+    /// The backoffice's address, a half at a time: the file's `backoffice_addr` fills in
+    /// whichever of `--backoffice-ip` and `--backoffice-port` the command line left alone,
+    /// and a half nothing gives is defaulted when the other is given.
+    #[test]
+    fn the_backoffice_address_is_resolved_a_half_at_a_time() {
+        let addr = |argv: &[&str], file: Option<&str>| {
+            let mut full = vec!["quote-updater", "--config", "config.toml"];
+            full.extend_from_slice(argv);
+            let mut args = Args::try_parse_from(full).unwrap();
+            let settings = config::FileSettings {
+                backoffice_addr: file.map(str::to_owned),
+                ..Default::default()
+            };
+            let given = args.given.clone();
+            apply_file_settings(&mut args, &|id| given.contains(id), &settings).unwrap();
+            args.flags.backoffice_addr().map(|addr| addr.to_string())
+        };
+        assert_eq!(addr(&[], None), None, "nothing asks for one");
+        assert_eq!(
+            addr(&[], Some("100.64.1.2:8088")).as_deref(),
+            Some("100.64.1.2:8088")
+        );
+        assert_eq!(
+            addr(&["--backoffice-port", "9000"], Some("100.64.1.2:8088")).as_deref(),
+            Some("100.64.1.2:9000"),
+            "the flag moves the port and keeps the file's address"
+        );
+        assert_eq!(
+            addr(&["--backoffice-ip", "100.64.9.9"], Some("100.64.1.2:8088")).as_deref(),
+            Some("100.64.9.9:8088")
+        );
+        assert_eq!(
+            addr(&["--backoffice-port", "9000"], None).as_deref(),
+            Some("127.0.0.1:9000"),
+            "a port alone is this host alone"
+        );
+        assert_eq!(
+            addr(&["--backoffice-ip", "100.64.9.9"], None).as_deref(),
+            Some("100.64.9.9:8088")
+        );
+        assert_eq!(
+            addr(&["--backoffice-ip", "::1", "--backoffice-port", "0"], None).as_deref(),
+            Some("[::1]:0")
+        );
+    }
+
+    /// The backoffice's names: the file's list unless the command line gives one, which
+    /// replaces it rather than adding to it.
+    #[test]
+    fn backoffice_hosts_come_from_the_file_unless_given() {
+        let hosts = |argv: &[&str]| {
+            let mut full = vec!["quote-updater", "--config", "config.toml"];
+            full.extend_from_slice(argv);
+            let mut args = Args::try_parse_from(full).unwrap();
+            let settings = config::FileSettings {
+                backoffice_hosts: vec!["from-file.example".to_owned()],
+                ..Default::default()
+            };
+            let given = args.given.clone();
+            apply_file_settings(&mut args, &|id| given.contains(id), &settings).unwrap();
+            args.flags.backoffice_hosts
+        };
+        assert_eq!(hosts(&[]), ["from-file.example"]);
+        assert_eq!(
+            hosts(&["--backoffice-host", "a.example,b.example"]),
+            ["a.example", "b.example"]
+        );
+    }
+
+    /// The CORS origins: the flag repeated, or one value split on commas, which is how the
+    /// variable lists more than one.
+    #[test]
+    fn cors_origins_are_repeated_or_comma_separated() {
+        let args = Args::try_parse_from([
+            "quote-updater",
+            "--config",
+            "config.toml",
+            "--backoffice-cors-origin",
+            "http://a.example,http://b.example",
+            "--backoffice-cors-origin",
+            "http://c.example",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.flags.backoffice_cors_origins,
+            ["http://a.example", "http://b.example", "http://c.example"]
+        );
+        assert!(defaulted_args().flags.backoffice_cors_origins.is_empty());
+    }
+
+    /// Google sign-in's lists, repeated or comma-separated like the others, read into who
+    /// the backoffice lets in.
+    #[test]
+    fn google_sign_in_reads_its_client_id_and_who_is_let_in() {
+        let args = Args::try_parse_from([
+            "quote-updater",
+            "--config",
+            "config.toml",
+            "--backoffice-google-client-id",
+            "1234-abc.apps.googleusercontent.com",
+            "--backoffice-allow-domain",
+            "example.com,example.org",
+            "--backoffice-allow-email",
+            "Ops@Gmail.com",
+        ])
+        .unwrap();
+        let google = crate::auth::GoogleSignIn::from_flags(
+            args.flags.backoffice_google_client_id.as_deref(),
+            &args.flags.backoffice_allow_domains,
+            &args.flags.backoffice_allow_emails,
+        )
+        .unwrap()
+        .expect("on");
+        assert_eq!(google.client_id, "1234-abc.apps.googleusercontent.com");
+        assert_eq!(google.domains, ["example.com", "example.org"]);
+        assert_eq!(google.emails, ["ops@gmail.com"]);
+        let off = defaulted_args();
+        assert!(off.flags.backoffice_google_client_id.is_none());
+        assert!(off.flags.backoffice_allow_domains.is_empty());
+        assert!(off.flags.backoffice_allow_emails.is_empty());
+    }
+
+    /// The TLS files go together: both, or neither for plain HTTP.
+    #[test]
+    fn the_tls_certificate_and_key_go_together() {
+        let tls = |argv: &[&str]| {
+            let mut full = vec!["quote-updater", "--config", "config.toml"];
+            full.extend_from_slice(argv);
+            let args = Args::try_parse_from(full).unwrap();
+            args.flags
+                .backoffice_tls()
+                .map(|files| files.map(|(c, k)| (c.to_owned(), k.to_owned())))
+                .map_err(|err| format!("{err:#}"))
+        };
+        assert_eq!(tls(&[]), Ok(None));
+        assert_eq!(
+            tls(&[
+                "--backoffice-tls-cert",
+                "s.crt",
+                "--backoffice-tls-key",
+                "s.key"
+            ]),
+            Ok(Some((PathBuf::from("s.crt"), PathBuf::from("s.key"))))
+        );
+        let err = tls(&["--backoffice-tls-cert", "s.crt"]).unwrap_err();
+        assert!(err.contains("--backoffice-tls-key"), "{err}");
+        let err = tls(&["--backoffice-tls-key", "s.key"]).unwrap_err();
+        assert!(err.contains("--backoffice-tls-cert"), "{err}");
+    }
+
+    /// A backoffice bound in a mode with no reload would serve an API whose every change
     /// failed. Refused at startup rather than discovered at the moment it was needed.
     #[test]
     fn a_backoffice_in_node_mode_is_refused() {
+        let addr: SocketAddr = "100.64.1.2:8088".parse().unwrap();
         refuse_backoffice_in_node_mode(Mode::Node, None).expect("node mode without one is fine");
-        refuse_backoffice_in_node_mode(Mode::Builder, Some("100.64.1.2:8088"))
+        refuse_backoffice_in_node_mode(Mode::Builder, Some(addr))
             .expect("builder mode is what it is for");
 
         let err = format!(
             "{:#}",
-            refuse_backoffice_in_node_mode(Mode::Node, Some("100.64.1.2:8088")).unwrap_err()
+            refuse_backoffice_in_node_mode(Mode::Node, Some(addr)).unwrap_err()
         );
         assert!(err.contains("backoffice_addr"), "{err}");
         assert!(err.contains("--mode builder"), "{err}");
@@ -751,6 +1071,32 @@ mod tests {
             Address::from_slice(&hex::decode("Da7AfEeD021EAFC1c1Af9C362dE477DaD0396B81").unwrap())
         );
         assert!(parse_address("0x123").is_err());
+    }
+
+    /// The scale is not a choice: PropAMM reads 1e18, and a flag naming anything else used
+    /// to be taken and every pair published a power of ten off.
+    #[test]
+    fn the_price_decimals_flag_takes_18_and_nothing_else() {
+        assert_eq!(parse_price_decimals("18"), Ok(18));
+        for wrong in ["0", "6", "17", "19", "38", "59"] {
+            let err = parse_price_decimals(wrong).unwrap_err();
+            assert!(err.contains("1e18"), "{wrong}: {err}");
+        }
+        assert!(parse_price_decimals("eighteen").is_err());
+        // Through clap: the default stands, 18 said aloud is fine, anything else is refused
+        // before the config is even read.
+        let with = |decimals: &str| {
+            Args::try_parse_from([
+                "quote-updater",
+                "--config",
+                "config.toml",
+                "--price-decimals",
+                decimals,
+            ])
+        };
+        assert_eq!(defaulted_args().flags.price_decimals, 18);
+        assert_eq!(with("18").expect("parses").flags.price_decimals, 18);
+        assert!(with("6").is_err());
     }
 
     /// The removed variables must not silently become inert: someone whose service starts

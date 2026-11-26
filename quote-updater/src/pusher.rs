@@ -1,8 +1,9 @@
-//! Startup: read the config, build the client and the metrics, run preflight, then either
-//! the builder-mode `Service` with its reload loop or the node-mode ticker. This is the
-//! composition root today and becomes the `Pusher` builder when the extension API lands.
+//! Startup: read the config file into the shared config (`state.rs`), build the client and
+//! the metrics, run preflight, then either the builder-mode `Service` with its reload loop
+//! or the node-mode ticker. This is the composition root today and becomes the `Pusher`
+//! builder when the extension API lands.
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use ethrex_rpc::{
     clients::eth::EthClient,
@@ -22,7 +23,8 @@ use crate::{
     node::push_update,
     pair::{Live, SendOpts, all_or_none, build_live, collect_prices, colliding_label},
     preflight, record,
-    service::{Service, finish_recording, install_hangup, record_config},
+    service::{Service, finish_recording, record_config},
+    state::SharedConfig,
     supervisor,
     tasks::Tasks,
     updater::{Outcome, Parts},
@@ -44,6 +46,44 @@ fn refuse_panic_abort(aborts: bool) -> Result<()> {
          panic = \"unwind\" (see the release profile in this repository's Cargo.toml)"
     );
     Ok(())
+}
+
+/// SIGHUP used to re-read the config file. Nothing does now: the config is read once, at
+/// start, and changed through the shared config (`state.rs`). The signal's default
+/// disposition is still to terminate, though, so one sent out of habit, or by a unit that
+/// still declares `ExecReload`, would end the pusher without withdrawing a single quote.
+/// So it is held for the whole run and answered with a line saying where changes go.
+fn ignore_hangup(tasks: &mut Tasks, config: &std::path::Path) {
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+        Ok(mut stream) => {
+            let config = config.display().to_string();
+            tasks.spawn(async move {
+                while stream.recv().await.is_some() {
+                    tracing::warn!(
+                        "SIGHUP ignored: {config} is read once, at start; change the pairs and \
+                         builders through the backoffice API, and reload with POST /api/reload"
+                    );
+                }
+            });
+        }
+        Err(err) => tracing::warn!(
+            "could not listen for SIGHUP ({err}); one sent to this process will terminate it \
+             without withdrawing its quotes"
+        ),
+    }
+}
+
+/// How the halt notice tells an operator to re-arm a pair its breaker halted: the one
+/// thing that brings it back without restarting the others, one pair at a time (audit
+/// F-17). `backoffice` is its base URL, scheme included.
+fn rearm_hint(backoffice: Option<&str>, handle: bool) -> String {
+    match (backoffice, handle) {
+        (Some(url), _) => format!("POST {url}/api/pairs/<key_env>/rearm"),
+        (None, true) => "UpdaterHandle::rearm".to_owned(),
+        (None, false) => "this run has no backoffice to re-arm through; set [settings] \
+                          backoffice_addr, which takes a restart"
+            .to_owned(),
+    }
 }
 
 /// `--check`'s verdict: it passes only when the chain report, every pair's price preview
@@ -116,12 +156,7 @@ async fn run_inner(
         // Consumed by `run_from_env` before the run; a run inside a binary's own runtime
         // has that binary's subscriber.
         log_targets: _,
-        unit,
     } = parts;
-    // Before anything prints a hint: the unit is a fact about the process (see hints.rs).
-    if let Some(unit) = unit {
-        crate::hints::set_unit(unit);
-    }
     let kinds = Arc::new(kinds);
     let key_lookup = key_lookup.unwrap_or_else(|| Arc::new(config::env_lookup));
     // Every long-lived task below is spawned through this, so none outlives `run`, on any
@@ -132,13 +167,47 @@ async fn run_inner(
     let removed = removed_vars_present();
     ensure!(removed.is_empty(), "{}", removed_vars_error(&removed));
 
-    // Before every check below: each reads a setting the file may supply.
-    let file_settings = config::load_file_settings(&args.flags.config)?;
+    // The one time the config is read from the file. From here on the run's configuration is
+    // the shared config built from it, which the backoffice API and an `UpdaterHandle`
+    // change and the service converges onto; a change writes the file, keeping only its
+    // `target` and `[settings]`, and never reads its pairs back (see state.rs). Before every
+    // check below: each reads a setting the file may supply.
+    let raw = config::load_raw(&args.flags.config)?;
+    let file_settings = raw.settings.clone();
     let given = args.given.clone();
     apply_file_settings(&mut args, &|id| given.contains(id), &file_settings)?;
+
+    // The reloads that wait for a verdict: the backoffice's, and an `UpdaterHandle`'s when
+    // the run was `start`ed, which then supplies the channel so both share one. Bounded at
+    // one in flight: the asker waits for its answer, so a second click is better made to
+    // wait than buffered into a convergence nobody asked for. Read by every mode: a request
+    // nobody answers would hang its sender.
+    let (reloads, mut reload_requests, settled) = match control {
+        Some(crate::updater::Control {
+            reloads,
+            requests,
+            settled,
+        }) => (reloads, requests, Some(settled)),
+        None => {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            (tx, rx, None)
+        }
+    };
+    // Where the service hears of a halt the kill switch made and the shared config recorded.
+    // Unbounded: a halt never waits on the service.
+    let (halts, mut halted) = tokio::sync::mpsc::unbounded_channel();
+    let shared = Arc::new(SharedConfig::new(
+        args.flags.config.clone(),
+        raw,
+        reloads,
+        halts,
+    ));
     // The handle's halt and resume are refused in node mode, which only now is known.
-    if let Some(control) = &control {
-        control.mode.send_replace(Some(args.flags.mode));
+    if let Some(settled) = &settled {
+        settled.send_replace(Some(crate::updater::Settled {
+            mode: args.flags.mode,
+            config: Arc::clone(&shared),
+        }));
     }
 
     ensure!(
@@ -157,7 +226,70 @@ async fn run_inner(
         args.flags.no_pin,
         args.flags.builders.is_some(),
     )?;
-    refuse_backoffice_in_node_mode(args.flags.mode, file_settings.backoffice_addr.as_deref())?;
+    // Where the backoffice is served, if anywhere: `--backoffice-ip` and `--backoffice-port`
+    // over `[settings] backoffice_addr` (see `apply_file_settings`). Resolved once, and
+    // refused here rather than at the bind, which comes after the RPC and preflight.
+    let backoffice_addr = args.flags.backoffice_addr();
+    refuse_backoffice_in_node_mode(args.flags.mode, backoffice_addr)?;
+    let backoffice_addr = backoffice_addr.filter(|_| !args.flags.once);
+    if let Some(addr) = backoffice_addr {
+        backoffice::refuse_unspecified_bind(addr)?;
+    }
+    let cors_origins = backoffice::parse_origins(&args.flags.backoffice_cors_origins)
+        .wrap_err("--backoffice-cors-origin")?;
+    if !cors_origins.is_empty() && backoffice_addr.is_none() {
+        tracing::warn!(
+            "--backoffice-cors-origin is set, but this run serves no backoffice for it to \
+             answer for; it is ignored"
+        );
+    }
+    let backoffice_hosts = backoffice::parse_hosts(&args.flags.backoffice_hosts)
+        .wrap_err("--backoffice-host or [settings] backoffice_hosts")?;
+    // The certificate is read here too, so a bad path or a key that is not the
+    // certificate's is refused, by `--check` as well, before anything connects.
+    let backoffice_tls = match (args.flags.backoffice_tls()?, backoffice_addr) {
+        (Some((cert, key)), Some(_)) => Some(crate::tls::Tls::load(cert, key)?),
+        (Some(_), None) => {
+            tracing::warn!(
+                "--backoffice-tls-cert is set, but this run serves no backoffice to serve it \
+                 on; it is ignored"
+            );
+            None
+        }
+        (None, _) => None,
+    };
+    // Checked here too, so a half setup (a client ID with no one allowed in, say) is refused,
+    // by `--check` as well, before anything connects.
+    let backoffice_google = match (
+        crate::auth::GoogleSignIn::from_flags(
+            args.flags.backoffice_google_client_id.as_deref(),
+            &args.flags.backoffice_allow_domains,
+            &args.flags.backoffice_allow_emails,
+        )?,
+        backoffice_addr,
+    ) {
+        (Some(google), Some(_)) => Some(google),
+        (Some(_), None) => {
+            tracing::warn!(
+                "--backoffice-google-client-id is set, but this run serves no backoffice to \
+                 sign in to; it is ignored"
+            );
+            None
+        }
+        (None, _) => None,
+    };
+    // How the backoffice is reached, for every line that tells an operator where to go: by
+    // the first name it answers to when it has one (over HTTPS, the one its certificate
+    // names), by its address otherwise.
+    let backoffice_scheme = if backoffice_tls.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    let backoffice_url = backoffice_addr.map(|addr| match backoffice_hosts.first() {
+        Some(name) => format!("{backoffice_scheme}://{name}:{}", addr.port()),
+        None => format!("{backoffice_scheme}://{addr}"),
+    });
 
     // Loaded before anything connects, though nothing here needs the chain: the file is
     // local, cheap and deterministic, while the RPC calls below are slow and can fail
@@ -165,13 +297,14 @@ async fn run_inner(
     // written for — whoever has no builders configured would first have to get an RPC up,
     // the registry deployed and the updaters authorized to be told so.
     // With a backoffice an empty config is a fresh server about to be configured through
-    // the page. Without one it is the mistake it has always been.
-    let backoffice_bound = file_settings.backoffice_addr.is_some() && !args.flags.once;
-    let config = config::load_config(
-        &args.flags.config,
+    // its API. Without one it is the mistake it has always been.
+    let backoffice_bound = backoffice_addr.is_some();
+    let config = config::config_from_raw(
+        crate::config::RawConfig::clone(&shared.snapshot()),
         args.flags.price_decimals,
         backoffice_bound,
-    )?;
+    )
+    .wrap_err_with(|| format!("invalid config {}", args.flags.config.display()))?;
     // Every stanza names a registered kind and fits its config: checked with the file, before
     // anything connects.
     kinds.check(&config)?;
@@ -388,7 +521,7 @@ async fn run_inner(
         .as_ref()
         .filter(|_| !args.flags.once)
         .map(|_| record::Recorder::new());
-    record_config(recorder.as_ref(), &args.flags.config, "startup");
+    record_config(recorder.as_ref(), &shared.snapshot(), "startup");
 
     let opts = SendOpts {
         registry: args.flags.registry,
@@ -488,34 +621,29 @@ async fn run_inner(
     let recording = match (&recorder, &args.flags.record_db_url) {
         (Some(recorder), Some(url)) => {
             tracing::info!("recording the feed and vault balances to postgres");
-            let writer = record::spawn(url.clone(), recorder.clone(), cancel.clone());
+            let retention = args
+                .flags
+                .record_retention_days
+                .map(|days| Duration::from_secs(u64::from(days) * 86_400));
+            match retention {
+                Some(_) => tracing::info!(
+                    "recorded rows older than {} days are deleted",
+                    args.flags.record_retention_days.unwrap_or_default()
+                ),
+                None => tracing::info!(
+                    "no RECORD_RETENTION_DAYS: recorded rows are kept forever, and the \
+                     database grows for as long as this runs"
+                ),
+            }
+            let writer = record::spawn(url.clone(), recorder.clone(), cancel.clone(), retention);
             tasks.adopt(&writer);
             Some(writer)
         }
         _ => None,
     };
 
-    // Installed here, above the mode branch, and held for the whole run. See
-    // `install_hangup`: not installing it is not the same as ignoring the signal.
-    let mut reloads = install_hangup(&args.flags.config);
-
-    // The reloads that wait for a verdict: the backoffice's, and an `UpdaterHandle`'s when
-    // the run was `start`ed, which then supplies the channel so both share one. Bounded at
-    // one in flight: the page (or the caller) waits for its answer, so a second click is
-    // better made to wait than buffered into a convergence nobody asked for. Above the mode
-    // branch so every mode reads it: a request nobody answers would hang its sender.
-    let (backoffice_tx, mut backoffice_reloads, edits) = match control {
-        Some(crate::updater::Control {
-            reloads,
-            requests,
-            edits,
-            mode: _,
-        }) => (reloads, requests, edits),
-        None => {
-            let (tx, rx) = tokio::sync::mpsc::channel(1);
-            (tx, rx, Arc::new(tokio::sync::Mutex::new(())))
-        }
-    };
+    // Above the mode branch, and held for the whole run. See `ignore_hangup`.
+    ignore_hangup(&mut tasks, &args.flags.config);
 
     // Builder mode: one supervised task per pair, each fanning its signed update out to
     // every configured builder (see quoting.rs).
@@ -534,12 +662,9 @@ async fn run_inner(
         {
             let health = health.clone();
             // Named in the notice, so it says where to go and fix it. The configured
-            // string, not the bound one, since the listener is opened further down.
-            let backoffice_addr = if backoffice_bound {
-                file_settings.backoffice_addr.clone()
-            } else {
-                None
-            };
+            // address, not the bound one, since the listener is opened further down.
+            let backoffice_url = backoffice_url.clone();
+            let rearm_hint = rearm_hint(backoffice_url.as_deref(), settled.is_some());
             tasks.spawn(async move {
                 let mut last_notice: Option<tokio::time::Instant> = None;
                 loop {
@@ -553,9 +678,9 @@ async fn run_inner(
                                 "{}",
                                 halt_notice(
                                     health.census(),
-                                    backoffice_addr.as_deref(),
+                                    backoffice_url.as_deref(),
                                     &health.trips(),
-                                    &crate::hints::reload()
+                                    &rearm_hint
                                 )
                             );
                         }
@@ -596,14 +721,12 @@ async fn run_inner(
             builders_path,
             builders_from_config: args.flags.builders.is_none(),
             backoffice_bound,
-            file_settings: file_settings.clone(),
             head,
             metrics: metrics.clone(),
             health: health.clone(),
             reload_metrics: metrics.register_reload()?,
             endpoints: endpoints.clone(),
             price_decimals: args.flags.price_decimals,
-            config_path: args.flags.config.clone(),
             registry: args.flags.registry,
             histories,
             readers,
@@ -617,6 +740,10 @@ async fn run_inner(
             key_lookup: Arc::clone(&key_lookup),
             kinds: Arc::clone(&kinds),
             observers: observers.clone(),
+            halt_flags: shared.halt_flags(),
+            kept_trips: Default::default(),
+            #[cfg(test)]
+            on_stopping: None,
         };
         // From here a shutdown goes through the loop below, which withdraws every quote.
         quoting.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -624,44 +751,46 @@ async fn run_inner(
             service.spawn(built, spec, done.clone());
         }
 
-        // SIGHUP, the signal whose meaning is "re-read your config file" — which since
-        // `pairs.toml` is the desired state is the whole of this service's control surface.
-        // No socket, no port, nothing to authenticate: `systemctl --user reload` and
-        // `kill -HUP` both reach it, and the file's own permissions are the only access
-        // control there is, exactly as for the keys beside it.
-        //
-        // This is the only mode with a supervised pair set to converge, so it is the only
-        // one that reads the stream `install_hangup` opened above.
-        if reloads.is_some() && !args.flags.once {
-            tracing::info!(
-                "reload {} with {}; check it first with --check",
-                args.flags.config.display(),
-                crate::hints::reload_command()
-            );
-        }
-
         // Not under `--once`: there is nothing to converge, and binding a port from a batch
         // run is a surprise.
-        let _backoffice = match file_settings.backoffice_addr.as_deref() {
-            Some(addr) if !args.flags.once => {
-                let addr: SocketAddr = addr.parse().wrap_err_with(|| {
-                    format!("[settings] backoffice_addr {addr:?} is not host:port")
-                })?;
+        let _backoffice = match backoffice_addr {
+            Some(addr) => {
+                let scheme = backoffice_scheme;
+                let mut answering = Vec::new();
+                if !backoffice_hosts.is_empty() {
+                    answering.push(format!("reached as {}", backoffice_hosts.join(", ")));
+                }
+                if !cors_origins.is_empty() {
+                    answering.push(format!("CORS for {}", cors_origins.join(", ")));
+                }
+                if let Some(google) = &backoffice_google {
+                    answering.push(google.describe());
+                }
                 let (local, task) = backoffice::bind(
                     addr,
-                    args.flags.config.clone(),
-                    backoffice_tx.clone(),
+                    Arc::clone(&shared),
                     client.clone(),
                     pair_states.clone(),
-                    edits.clone(),
                     Arc::clone(&kinds),
+                    backoffice::Access {
+                        hosts: backoffice_hosts,
+                        origins: cors_origins,
+                        tls: backoffice_tls,
+                        google: backoffice_google,
+                    },
                 )
                 .await?;
-                tracing::info!("backoffice listening on http://{local}/");
+                match answering.as_slice() {
+                    [] => tracing::info!("backoffice API listening on {scheme}://{local}/api/"),
+                    parts => tracing::info!(
+                        "backoffice API listening on {scheme}://{local}/api/ ({})",
+                        parts.join("; ")
+                    ),
+                }
                 tasks.adopt(&task);
                 Some(task)
             }
-            _ => None,
+            None => None,
         };
 
         loop {
@@ -683,34 +812,30 @@ async fn run_inner(
                         break;
                     }
                 }
-                Some(_) = async { match reloads.as_mut() {
-                    Some(stream) => stream.recv().await,
-                    // Never fires. `select!` still polls this arm, so it must be a future
-                    // that does not resolve rather than one that resolves to None, which
-                    // would spin the loop.
-                    None => std::future::pending().await,
-                } } => {
-                    if args.flags.once {
-                        // `--once` is a batch invocation: the pairs publish once and the run
-                        // ends. There is no desired state to converge onto and nothing that
-                        // would still be running to converge, so the signal is acknowledged
-                        // and dropped rather than silently ignored — see the handler above
-                        // for why it is installed at all.
-                        tracing::warn!("SIGHUP ignored: --once has no running pair set to reload");
-                        continue;
-                    }
-                    let _ = service.reload_and_report(&done, &args.flags.config).await;
+                // A halt the kill switch already made: its lanes went silent at their next
+                // tick, and are shut down here, in the loop's own time.
+                Some(halt) = halted.recv() => {
+                    service.retire_halted(halt).await;
                 }
-                // The backoffice or the handle, which unlike SIGHUP wait for the verdict:
-                // a rejection means putting the operator's file back.
-                Some(request) = backoffice_reloads.recv() => {
+                // The backoffice or the handle, through the shared config, which waits for
+                // the verdict to keep or drop the change it carries.
+                Some(request) = reload_requests.recv() => {
+                    // A halt is recorded, and its notice sent, before any change made
+                    // after it asks for this reload: read first, so a resume never finds
+                    // the notice of the halt it lifts still waiting.
+                    while let Ok(halt) = halted.try_recv() {
+                        service.retire_halted(halt).await;
+                    }
                     let outcome = if args.flags.once {
-                        // As for SIGHUP above: a batch run has no pair set to converge.
+                        // `--once` is a batch invocation: the pairs publish once and the run
+                        // ends, so there is nothing still running to converge.
                         Err(crate::service::ReloadFailure::Rejected(
                             "--once has no running pair set to reload".to_owned(),
                         ))
                     } else {
-                        service.reload_and_report(&done, &args.flags.config).await
+                        service
+                            .reload_and_report(&done, &request.config, &request.rearm)
+                            .await
                     };
                     let _ = request.reply.send(outcome);
                 }
@@ -732,8 +857,8 @@ async fn run_inner(
         // prevent: zero reads as success to a shell loop or `Restart=always`, and non-zero is
         // precisely what `Restart=on-failure` acts on. The loop above is now what keeps the
         // process up — it exits only when the operator asks it to — and it does something the
-        // park could not: a reload brings the halted lane back without the restart that would
-        // have cleared every other lane's breaker too.
+        // park could not: the pair's re-arm brings the halted lane back without the restart
+        // that would have cleared every other lane's breaker too.
         //
         // `--once` is unchanged. It is a batch invocation, not a service: a script or CI job
         // is waiting on it, and a trip means the run did not do what it was asked, so it fails
@@ -803,27 +928,17 @@ async fn run_inner(
                 finish_recording(recording).await;
                 return Ok(Outcome::Success);
             }
-            // Node mode runs no supervised pair set, so there is nothing for a reload to
-            // converge — but the signal must still be handled rather than left to its
-            // default disposition, which is to kill this process. See `install_hangup`.
-            Some(_) = async { match reloads.as_mut() {
-                Some(stream) => stream.recv().await,
-                None => std::future::pending().await,
-            } } => {
-                tracing::warn!(
-                    "SIGHUP ignored: --mode node has no supervised pair set to reload, so \
-                     changing {} needs a restart",
-                    args.flags.config.display()
-                );
-            }
+            // No halt reaches node mode (the handle refuses it there), and nothing would run
+            // to retire; read so the channel never fills.
+            Some(_) = halted.recv() => {}
             // The handle's reload, answered rather than left waiting: the backoffice is
             // refused in this mode, so only a `start`ed run can ask.
-            Some(request) = backoffice_reloads.recv() => {
-                let _ = request.reply.send(Err(crate::service::ReloadFailure::Rejected(format!(
-                    "--mode node has no supervised pair set to reload, so changing {} needs \
-                     a restart",
-                    args.flags.config.display()
-                ))));
+            Some(request) = reload_requests.recv() => {
+                let _ = request.reply.send(Err(crate::service::ReloadFailure::Rejected(
+                    "--mode node has no supervised pair set to reload; it runs the config \
+                     it started with"
+                        .to_owned(),
+                )));
             }
             _ = ticker.tick() => {
                 // 0 is a multiple of everything, so the first tick prices the runway, just
@@ -884,7 +999,9 @@ mod tests {
     const ANVIL_KEY_0: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
     /// What every in-process run test starts from: a mock RPC serving one USDC/USDT pair
-    /// with a vault, an acking mock builder, and a config file naming both.
+    /// with a vault, an acking mock builder, and a config file naming both. The pair is
+    /// `fixed` and `unguarded`: these runs stream nothing, and a fixed price otherwise needs
+    /// a market to compare its price with (audit F-04).
     struct Fixture {
         rpc: crate::rpc_mock::MockRpc,
         /// Shared, so a `shutdown_on` future can wait on it.
@@ -933,7 +1050,7 @@ binance_ws = "ws://127.0.0.1:1/ws"
 [[pairs]]
 tokens  = ["{usdc:#x}", "{usdt:#x}"]
 key_env = "QU_TEST_KEY"
-pricing = {{ kind = "fixed", mid = "1.0001", delta = "0.0002" }}
+pricing = {{ kind = "fixed", mid = "1.0001", delta = "0.0002", unguarded = true }}
 {pair_tail}
 [[builder]]
 name = "mock"
@@ -1422,18 +1539,19 @@ api_key = "k"
         let ten = std::time::Duration::from_secs(10);
         assert!(fx.builder.wait_for(1, ten).await, "the lane quotes first");
 
-        let text = std::fs::read_to_string(&fx.config).unwrap().replacen(
-            "\n[[builder]]",
-            "\n[[pairs.guards]]\nkind = \"tripwire\"\nfail = true\n\n[[builder]]",
-            1,
-        );
-        std::fs::write(&fx.config, text).unwrap();
-        // Partial: the rest of the file applied and stays, so the handle answers `Ok` with
-        // the line that says which pair kept its previous config.
-        let line = tokio::time::timeout(ten, handle.reload())
-            .await
-            .expect("answered")
-            .expect("the rebuild fails, so the reload is partial, and the file stays");
+        // Partial: the rest of the change applied and stays, so the handle answers `Ok`
+        // with the line that says which pair kept its previous config.
+        let line = tokio::time::timeout(
+            ten,
+            handle.change(|config| {
+                config.pairs[0]
+                    .guards
+                    .push(toml::from_str("kind = \"tripwire\"\nfail = true").unwrap());
+            }),
+        )
+        .await
+        .expect("answered")
+        .expect("the rebuild fails, so the reload is partial, and the change stays");
         assert!(line.contains("1 failed"), "{line}");
         let quotes = fx.builder.count();
         fx.rpc.set_head(101);
@@ -1564,7 +1682,8 @@ api_key = "k"
     }
 
     /// A halt is an intent, in the file: a reload leaves it alone and only `resume` clears
-    /// it. A trip is a judgement, on the latch: the next reload re-arms the lane.
+    /// it. A trip is a judgement, on the latch: a reload leaves it too, and only the pair's
+    /// re-arm clears it (audit F-17).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_halt_survives_a_reload_and_a_trip_does_not() {
         use std::{
@@ -1618,7 +1737,8 @@ api_key = "k"
             .expect_err("nothing to resume");
         assert!(err.contains("not halted"), "{err}");
 
-        // The trip: the guard halts the lane on the next block, and a reload re-arms it.
+        // The trip: the guard halts the lane on the next block. A reload leaves it halted
+        // (audit F-17); only its own re-arm brings it back, naming the mid it now trusts.
         killed.store(true, Ordering::SeqCst);
         fx.rpc.set_head(101);
         assert!(
@@ -1626,12 +1746,76 @@ api_key = "k"
             "the tripped lane withdraws"
         );
         killed.store(false, Ordering::SeqCst);
-        let quotes = fx.builder.count();
         let line = tokio::time::timeout(ten, handle.reload())
             .await
             .expect("the run answers")
-            .expect("the reload re-arms");
-        assert!(line.contains("1 restarted"), "{line}");
+            .expect("the reload applies");
+        assert!(
+            line.contains("nothing to do"),
+            "a reload re-arms nothing: {line}"
+        );
+        let quotes = fx.builder.count();
+        fx.rpc.set_head(102);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            fx.builder.received()[quotes..]
+                .iter()
+                .all(|frame| frame.tx.is_empty()),
+            "the tripped lane stays halted through the reload"
+        );
+        // Nor does an edit of its own stanza bring it back: that is not someone deciding
+        // they trust the feed again.
+        tokio::time::timeout(
+            ten,
+            handle.change(|config| {
+                config.pairs[0].min_mid = Some("0.5".to_owned());
+            }),
+        )
+        .await
+        .expect("answered")
+        .expect("the edit applies");
+        let quotes = fx.builder.count();
+        fx.rpc.set_head(103);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            fx.builder.received()[quotes..]
+                .iter()
+                .all(|frame| frame.tx.is_empty()),
+            "the tripped lane stays halted through an edit of its own stanza"
+        );
+        // Nor a halt and a resume: the trip outlives the halted lane.
+        tokio::time::timeout(ten, handle.halt(fx.tokens, "desk"))
+            .await
+            .expect("answered")
+            .expect("the halt applies");
+        let resumed = tokio::time::timeout(ten, handle.resume(fx.tokens))
+            .await
+            .expect("answered")
+            .expect("the resume applies");
+        assert!(
+            resumed.contains("left halted on its breaker"),
+            "the resume says the trip still holds: {resumed}"
+        );
+        let quotes = fx.builder.count();
+        fx.rpc.set_head(104);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            fx.builder.received()[quotes..]
+                .iter()
+                .all(|frame| frame.tx.is_empty()),
+            "the tripped pair stays halted through a halt and a resume"
+        );
+        let quotes = fx.builder.count();
+        let line = tokio::time::timeout(ten, handle.rearm(fx.tokens))
+            .await
+            .expect("the run answers")
+            .expect("the re-arm applies");
+        // A fixed-price pair has no market to trust a price from: the line names the trip
+        // it cleared (`a_rearm_line_names_the_mid_it_trusts` covers a pair with a market).
+        assert!(
+            line.contains("1 added") && line.contains("re-armed, clearing the halt"),
+            "started again by its re-arm, naming the trip it clears: {line}"
+        );
         assert!(
             fx.builder.wait_for(quotes + 1, ten).await,
             "the re-armed lane quotes"
@@ -1645,10 +1829,337 @@ api_key = "k"
         assert_eq!(outcome, Outcome::Success);
     }
 
-    /// A halt whose reload applies only in part, because another lane added beside it would
-    /// not build, is still a halt: the reload stopped the pair, so the file keeps saying
-    /// so, the answer says the change applied rather than "nothing changed", and the next
-    /// reload leaves the pair stopped instead of reading a put-back file and restarting it.
+    /// A free port for a backoffice a test turns on by flag, and the flags that bind it.
+    fn backoffice_flags() -> (u16, [String; 4]) {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let flags = [
+            "--backoffice-ip".to_owned(),
+            "127.0.0.1".to_owned(),
+            "--backoffice-port".to_owned(),
+            port.to_string(),
+        ];
+        (port, flags)
+    }
+
+    /// Waits until the backoffice answers: it is bound after the pairs start.
+    async fn until_backoffice(port: u16) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while reqwest::get(format!("http://127.0.0.1:{port}/api/pairs"))
+                .await
+                .is_err()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the backoffice is up within 10s");
+    }
+
+    /// The backoffice API a real run binds, by flag alone, reaches the real service through
+    /// the shared config: a halt sent to it withdraws the lane's quote at the builder and
+    /// lands in the file, a resume brings the lane back, and the API says what the pusher
+    /// is doing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_backoffice_api_halts_and_resumes_a_running_pair() {
+        use std::time::Duration;
+        let fx = Fixture::spawn("api-halt").await;
+        let (port, flags) = backoffice_flags();
+        let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+        let handle = fx.updater().start(fx.args(&flags));
+        let ten = Duration::from_secs(10);
+        assert!(fx.builder.wait_for(1, ten).await, "the lane quotes first");
+        until_backoffice(port).await;
+
+        let api = format!("http://127.0.0.1:{port}/api");
+        let client = reqwest::Client::new();
+        let get = |path: &str| {
+            let request = client.get(format!("{api}{path}"));
+            async move {
+                let body = request.send().await.unwrap().bytes().await.unwrap();
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+            }
+        };
+        let post = |path: &str| {
+            let request = client
+                .post(format!("{api}{path}"))
+                .header("content-type", "application/json");
+            async move {
+                let response = request.send().await.unwrap();
+                let status = response.status().as_u16();
+                let body = response.bytes().await.unwrap();
+                (
+                    status,
+                    serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                )
+            }
+        };
+        assert_eq!(get("/pairs").await[0]["status"], "live");
+
+        let (status, body) = post("/pairs/QU_TEST_KEY/halt").await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["status"], "applied", "{body}");
+        assert!(fx.wait_for_withdraw(ten).await, "the quote is withdrawn");
+        assert!(fx.raw_pair().halted, "the file carries the halt");
+        assert_eq!(get("/pairs/QU_TEST_KEY").await["status"], "halted");
+
+        let quotes = fx.builder.count();
+        let (status, body) = post("/pairs/QU_TEST_KEY/resume").await;
+        assert_eq!(status, 200, "{body}");
+        assert!(!fx.raw_pair().halted);
+        fx.rpc.set_head(101);
+        assert!(
+            fx.builder.wait_for(quotes + 1, ten).await,
+            "the lane quotes again"
+        );
+
+        handle.shutdown();
+        tokio::time::timeout(Duration::from_secs(20), handle.wait())
+            .await
+            .expect("stops within 20s")
+            .expect("runs and stops cleanly");
+    }
+
+    /// HTTPS by flag, through the real startup: the backoffice is served over https://
+    /// with the certificate given; and a certificate whose key is not its own refuses the
+    /// run before it connects to anything, naming the file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_backoffice_is_served_over_https_by_flag() {
+        use std::time::Duration;
+        let fixture = |name: &str| crate::tls::tests::fixture(name).display().to_string();
+        let fx = Fixture::spawn("api-https").await;
+        let (port, flags) = backoffice_flags();
+        let mut argv: Vec<String> = flags.to_vec();
+        argv.extend([
+            "--backoffice-tls-cert".to_owned(),
+            fixture("a.crt"),
+            "--backoffice-tls-key".to_owned(),
+            fixture("a.key"),
+        ]);
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let handle = fx.updater().start(fx.args(&argv));
+
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap();
+        let url = format!("https://127.0.0.1:{port}/api/pairs");
+        let answer = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(answer) = client.get(&url).send().await {
+                    break answer;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the backoffice answers over https:// within 10s");
+        assert_eq!(answer.status().as_u16(), 200);
+        let pairs: serde_json::Value =
+            serde_json::from_slice(&answer.bytes().await.unwrap()).unwrap();
+        assert_eq!(pairs[0]["pair"]["key_env"], "QU_TEST_KEY", "{pairs}");
+        handle.shutdown();
+        tokio::time::timeout(Duration::from_secs(20), handle.wait())
+            .await
+            .expect("stops within 20s")
+            .expect("runs and stops cleanly");
+
+        let (_, flags) = backoffice_flags();
+        let mut argv: Vec<String> = flags.to_vec();
+        argv.extend([
+            "--backoffice-tls-cert".to_owned(),
+            fixture("a.crt"),
+            "--backoffice-tls-key".to_owned(),
+            fixture("b.key"),
+        ]);
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let refused = fx.updater().start(fx.args(&argv));
+        let err = tokio::time::timeout(Duration::from_secs(10), refused.wait())
+            .await
+            .expect("refused at once")
+            .expect_err("a key that is not the certificate's refuses the run");
+        let err = format!("{err:#}");
+        assert!(err.contains("a.crt") && err.contains("b.key"), "{err}");
+    }
+
+    /// A fresh host: no pairs in the file, and the backoffice turned on by flag alone. The
+    /// run starts with nothing to quote, which only a backoffice makes allowed, and a pair
+    /// added through the API is started and quotes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pair_added_through_the_api_to_an_empty_config_quotes() {
+        use std::time::Duration;
+        let fx = Fixture::spawn("api-empty").await;
+        let text = std::fs::read_to_string(&fx.config).unwrap();
+        let (pairs, builder) = (
+            text.find("[[pairs]]").unwrap(),
+            text.find("[[builder]]").unwrap(),
+        );
+        let empty = format!("{}{}", &text[..pairs], &text[builder..]).replacen(
+            "\n\n[settings]",
+            "\npairs = []\n\n[settings]",
+            1,
+        );
+        std::fs::write(&fx.config, empty).unwrap();
+        let (port, flags) = backoffice_flags();
+        let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+        let handle = fx.updater().start(fx.args(&flags));
+        until_backoffice(port).await;
+
+        let client = reqwest::Client::new();
+        let pairs: serde_json::Value = serde_json::from_slice(
+            &client
+                .get(format!("http://127.0.0.1:{port}/api/pairs"))
+                .send()
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pairs, serde_json::json!([]));
+        assert_eq!(fx.builder.count(), 0, "nothing quotes yet");
+
+        // `unguarded`, as the fixture's own pair is: the pair streams nothing, and a fixed
+        // price with no market is otherwise refused (audit F-04).
+        let added = client
+            .post(format!("http://127.0.0.1:{port}/api/pairs"))
+            .header("content-type", "application/json")
+            .body(
+                serde_json::json!({
+                    "tokens": [format!("{:#x}", fx.tokens.0), format!("{:#x}", fx.tokens.1)],
+                    "key_env": "QU_TEST_KEY",
+                    "pricing": {
+                        "kind": "fixed",
+                        "mid": "1.0001",
+                        "delta": "0.0002",
+                        "unguarded": true,
+                    },
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        let status = added.status().as_u16();
+        let body = String::from_utf8_lossy(&added.bytes().await.unwrap()).into_owned();
+        assert_eq!(status, 201, "{body}");
+        assert!(body.contains("\"applied\""), "{body}");
+        assert!(
+            fx.builder.wait_for(1, Duration::from_secs(10)).await,
+            "the added pair quotes"
+        );
+        let written = fx.raw_pair();
+        assert_eq!(written.key_env, "QU_TEST_KEY", "and is in the file");
+        assert_eq!(
+            written.pricing.get("unguarded"),
+            Some(&toml::Value::Boolean(true)),
+            "with the flag it was sent with, so the file still passes its checks"
+        );
+
+        handle.shutdown();
+        tokio::time::timeout(Duration::from_secs(20), handle.wait())
+            .await
+            .expect("stops within 20s")
+            .expect("runs and stops cleanly");
+    }
+
+    /// Audit F-06, its first half: a halt is not refused while a pair fails its checks. With
+    /// the chain answering no `eth_call`, preflight cannot confirm any updater, so a reload
+    /// is refused, as every halt used to be; the halt goes through all the same, the quote
+    /// is withdrawn and the file keeps it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_halt_is_not_refused_while_a_pair_fails_its_checks() {
+        use std::time::Duration;
+        let fx = Fixture::spawn("halt-failing-checks").await;
+        let handle = fx.updater().start(fx.args(&[]));
+        let ten = Duration::from_secs(10);
+        assert!(fx.builder.wait_for(1, ten).await, "the lane quotes first");
+
+        fx.rpc.set_failing("eth_call", true);
+        let refused = tokio::time::timeout(ten, handle.reload())
+            .await
+            .expect("answered")
+            .expect_err("no updater can be confirmed, so a reload is refused");
+        assert!(refused.contains("failed its checks"), "{refused}");
+
+        let line = tokio::time::timeout(ten, handle.halt(fx.tokens, "desk"))
+            .await
+            .expect("answered")
+            .expect("a halt is not refused for the checks");
+        assert!(line.contains("halted pair"), "{line}");
+        assert!(fx.wait_for_withdraw(ten).await, "the quote is withdrawn");
+        assert!(fx.raw_pair().halted, "and the file keeps the halt");
+
+        handle.shutdown();
+        tokio::time::timeout(Duration::from_secs(20), handle.wait())
+            .await
+            .expect("stops within 20s")
+            .expect("runs and stops cleanly");
+    }
+
+    /// Audit F-06, its second half: a halt does not wait on the chain. With the RPC slow to
+    /// answer a read every reload makes, a reload is in flight for seconds, holding the
+    /// config's edit lock and the service; a halt made meanwhile has the quote withdrawn at
+    /// once, long before that reload is done, and is recorded after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_halt_does_not_wait_for_a_reload_stuck_on_the_rpc() {
+        use std::time::Duration;
+        let fx = Fixture::spawn("halt-hung-rpc").await;
+        let handle = std::sync::Arc::new(fx.updater().start(fx.args(&[])));
+        let ten = Duration::from_secs(10);
+        assert!(fx.builder.wait_for(1, ten).await, "the lane quotes first");
+
+        // Preflight's read of the target's code: answered only past its 3s bound.
+        fx.rpc.set_delay("eth_getCode", Duration::from_secs(30));
+        let asked = fx.rpc.calls("eth_getCode").len();
+        let reloading = tokio::spawn({
+            let handle = std::sync::Arc::clone(&handle);
+            async move { handle.reload().await }
+        });
+        assert!(
+            fx.rpc.wait_for_calls("eth_getCode", asked + 1, ten).await,
+            "the reload is waiting on the chain"
+        );
+
+        let halting = tokio::spawn({
+            let (handle, tokens) = (std::sync::Arc::clone(&handle), fx.tokens);
+            async move { handle.halt(tokens, "desk").await }
+        });
+        assert!(
+            fx.wait_for_withdraw(Duration::from_secs(2)).await,
+            "the quote is withdrawn while the reload still waits"
+        );
+        assert!(!reloading.is_finished(), "the reload is still in flight");
+
+        let reloaded = tokio::time::timeout(ten, reloading)
+            .await
+            .expect("the reload ends");
+        reloaded
+            .unwrap()
+            .expect("and applies, the read having timed out");
+        let line = tokio::time::timeout(ten, halting)
+            .await
+            .expect("the halt is answered once its record is made")
+            .unwrap()
+            .expect("the halt applies");
+        assert!(line.contains("halted pair"), "{line}");
+        assert!(fx.raw_pair().halted);
+
+        handle.shutdown();
+        tokio::time::timeout(Duration::from_secs(20), handle.wait())
+            .await
+            .expect("stops within 20s")
+            .expect("runs and stops cleanly");
+    }
+
+    /// A halt beside a lane that fails every reload, because it never builds: the halt is
+    /// not a reload (audit F-06), so that lane has no say in it. It applies, cleanly, the
+    /// file keeps it, the quote is withdrawn, and the next reload, which fails that lane
+    /// again, leaves the halted pair stopped.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_halt_sticks_when_another_lane_fails_its_reload() {
         use std::time::Duration;
@@ -1676,40 +2187,47 @@ api_key = "k"
             .start(fx.args(&[]));
         assert!(fx.builder.wait_for(1, ten).await, "the lane quotes first");
 
-        // A lane added by hand on that kind, so its build fails at once and the reload the
-        // halt asks for applies everywhere but there.
+        // A lane added on that kind, so its build fails at once (this change applies in
+        // part) and the reload the halt asks for applies everywhere but there.
         let weth: Address = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
             .parse()
             .unwrap();
         fx.rpc.set_symbol(weth, "WETH");
-        let text = std::fs::read_to_string(&fx.config).unwrap();
         let usdc = format!("{:#x}", fx.tokens.0);
-        std::fs::write(
-            &fx.config,
-            text.replacen(
-                "[[builder]]",
-                &format!(
-                    "[[pairs]]\ntokens = [\"{weth:#x}\", \"{usdc}\"]\n\
-                     key_env = \"QU_TEST_KEY_B\"\npricing = {{ kind = \"unbuildable\" }}\n\n[[builder]]"
-                ),
-                1,
-            ),
+        let added = tokio::time::timeout(
+            ten,
+            handle.change(|config| {
+                config.pairs.push(
+                    toml::from_str(&format!(
+                        "tokens = [\"{weth:#x}\", \"{usdc}\"]\n\
+                         key_env = \"QU_TEST_KEY_B\"\npricing = {{ kind = \"unbuildable\" }}"
+                    ))
+                    .unwrap(),
+                );
+            }),
         )
-        .unwrap();
+        .await
+        .expect("answered")
+        .expect("kept, though the new lane would not build");
+        assert!(added.contains("1 failed"), "{added}");
 
         let line = tokio::time::timeout(ten, handle.halt(fx.tokens, "desk"))
             .await
             .expect("answered")
-            .expect("the halt applied, though not every lane did");
-        assert!(!line.contains("nothing changed"), "{line}");
+            .expect("the halt applies whatever another lane does");
         assert!(
-            line.contains("1 halted") && line.contains("1 failed"),
+            line.contains("halted pair") && line.contains("withdrawn at every builder"),
             "{line}"
+        );
+        assert!(
+            !line.contains("failed"),
+            "no reload, so no other lane in it: {line}"
         );
         assert!(fx.raw_pair().halted, "the file keeps the halt");
         assert!(fx.wait_for_withdraw(ten).await, "the lane was stopped");
 
-        // And stays stopped: the next reload reads `halted = true`, not a put-back file.
+        // And stays stopped: the next reload converges onto `halted = true`, the change
+        // kept rather than dropped.
         let quoted = fx.builder.received().len();
         let _ = tokio::time::timeout(ten, handle.reload())
             .await
@@ -1730,7 +2248,7 @@ api_key = "k"
     }
 
     /// An observer registered on the builder sees the run's transitions in order (a lane
-    /// started, tripped and stopped, re-armed by a reload, halted by the handle) and one
+    /// started, tripped and stopped, re-armed by its re-arm, halted by the handle) and one
     /// `Block` per block that passed, never one per tick, with the block's landing. None
     /// for the block a halt broke out of: it has not passed, and the generation the reload
     /// re-arms is the one that sees it pass and says so.
@@ -1770,7 +2288,7 @@ api_key = "k"
         fx.rpc.set_head(101);
         assert!(fx.builder.wait_for(2, ten).await, "block 101 is quoted");
 
-        // The trip, on the next block; then a reload re-arms the lane.
+        // The trip, on the next block; then its re-arm.
         killed.store(true, Ordering::SeqCst);
         fx.rpc.set_head(102);
         assert!(
@@ -1779,7 +2297,7 @@ api_key = "k"
         );
         killed.store(false, Ordering::SeqCst);
         let quotes = fx.builder.count();
-        let line = tokio::time::timeout(ten, handle.reload())
+        let line = tokio::time::timeout(ten, handle.rearm(fx.tokens))
             .await
             .expect("answered")
             .expect("re-arms");
@@ -1838,9 +2356,9 @@ api_key = "k"
             .collect();
         assert_eq!(
             transitions,
+            // The halt last: its lane stopped, and no reload, which a halt is not.
             [
-                "started", "tripped", "stopped", "started", "rearmed", "reload", "stopped",
-                "reload"
+                "started", "tripped", "stopped", "started", "rearmed", "reload", "stopped"
             ],
             "{seen:?}"
         );
@@ -1935,7 +2453,7 @@ api_key = "k"
         );
 
         killed.store(false, Ordering::SeqCst);
-        tokio::time::timeout(ten, handle.reload())
+        tokio::time::timeout(ten, handle.rearm(fx.tokens))
             .await
             .expect("answered")
             .expect("re-arms");
@@ -1969,10 +2487,11 @@ api_key = "k"
             .expect("cleanly");
     }
 
-    /// A halt and a reload issued together: whichever the service takes first, the halt is
-    /// applied exactly once, both are answered, and neither claims what the other did.
+    /// A halt and a reload issued together: both are answered, whichever the service takes
+    /// first, and the pair ends halted and silent. A reload taken first, before the halt is
+    /// recorded, does not start the pair quoting again: its kill switch is already set.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_halt_and_a_reload_serialize_through_the_service() {
+    async fn a_halt_and_a_reload_at_once_leave_the_pair_halted() {
         use std::time::Duration;
         let fx = Fixture::spawn("halt-race").await;
         let handle = fx.updater().start(fx.args(&[]));
@@ -1984,19 +2503,23 @@ api_key = "k"
             .await
             .expect("both answered");
         let halt = halt.expect("the halt is applied whichever ran first");
-        let reload = reload.expect("the reload is answered whichever ran first");
-        let applied = [&halt, &reload]
-            .iter()
-            .filter(|line| line.contains("1 halted"))
-            .count();
-        assert_eq!(
-            applied, 1,
-            "exactly one reload stopped the lane: {halt} / {reload}"
-        );
+        reload.expect("the reload is answered whichever ran first");
+        assert!(halt.contains("halted pair"), "{halt}");
         assert!(fx.raw_pair().halted);
         assert!(
             fx.wait_for_withdraw(ten).await,
             "the quote is withdrawn at the builder"
+        );
+        // Whichever came first, nothing quotes again: a reload that ran before the halt
+        // was recorded found the kill switch set on the lane.
+        let quoted = fx.builder.received().len();
+        fx.rpc.set_head(101);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            fx.builder.received()[quoted..]
+                .iter()
+                .all(|frame| frame.tx.is_empty()),
+            "the halted pair quoted again"
         );
 
         handle.shutdown();

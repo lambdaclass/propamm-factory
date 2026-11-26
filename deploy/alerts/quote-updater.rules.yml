@@ -3,7 +3,7 @@
 # `up == 1` is deliberately NOT the primary health signal. The updater stays running when
 # every pair has halted on its circuit breaker — exiting would be read by systemd as
 # "restart me", which clears the very state a human is meant to look at, and it is also what
-# a reload needs to find in order to bring the lane back — and the unit is Restart=on-failure.
+# a re-arm needs to find in order to bring the lane back — and the unit is Restart=on-failure.
 # A fully halted updater is therefore a green process quoting nothing.
 # The page-severity rules below are about quoting, not liveness.
 #
@@ -22,10 +22,11 @@ groups:
             guard, the feed moved further in one tick than this pair's max_deviation allows;
             quote_updater_trip_source{pair,source,cause} says what tripped it and how (a
             registered guard, a panic, an external trip). It does NOT come back on its own.
-            Verify the feed, then reload the config (SIGHUP) — which brings this
-            lane back without disturbing the others or clearing their breakers.
-            This alert resolves when someone reloads or restarts, which means someone acted
-            — not that the feed is fixed.
+            Verify the feed, then re-arm this pair (POST /api/pairs/{key_env}/rearm on the
+            backoffice) — which brings this lane back, trusting the price it names, without
+            disturbing the others or clearing their breakers. A reload does not bring it back.
+            This alert resolves when someone re-arms the pair or restarts, which means someone
+            acted — not that the feed is fixed.
 
       - alert: PusherNothingQuoting
         expr: >-
@@ -93,6 +94,36 @@ groups:
             50 consecutive target blocks (~10 minutes) where getState on the registry failed
             or returned nothing, so the updater cannot tell whether its updates land. Check
             the RPC: quote_updater_rpc_errors_total{call="eth_call"} and its latency.
+
+      # The other thing the read-back can find: the lane holds a price for the block, and it
+      # is not one this updater signed. The registry authorizes an updater for every lane of
+      # its target, so any other pair's key can write this one, and every write to a lane in
+      # a block carries the same timestamp: the price is the only thing that tells two
+      # writers apart, and this counter is the one place it is compared.
+      #
+      # Counted only when this pair's own key landed nothing in that block (its nonce there
+      # says so). The loop a restart or a reload replaced signed for the same block with the
+      # same key, and so does a second updater left running; either one's update landing is
+      # a landing, not this. The lane is read back on blocks the pair was not quoting for
+      # too, which is when another key's price is the only one in it.
+      #
+      # On the first one, since it is never ordinary. `increase` over a window rather than a
+      # rate, so a single occurrence fires and stays up long enough to be seen.
+      - alert: PusherForeignLaneWrite
+        expr: increase(quote_updater_landings_total{result="foreign"}[30m]) > 0
+        for: 0m
+        labels: { severity: page }
+        annotations:
+          summary: "{{ $labels.pair }}: another key wrote this lane"
+          description: >-
+            The updater read this lane back after a block and found a price stamped
+            for that block that it did not sign, in a block where this pair's own key
+            landed nothing. Another updater key of the same PropAMM wrote the lane:
+            the registry authorizes a key for every lane of its target, not for one
+            pair. A fill at that price came out of this pair's vault. The updater's
+            log names the block. Read the lane there, find the key in the registry's
+            UpdaterAdded log for the target, revoke it with removeUpdater, and check
+            the vault's balances.
 
       # Node mode's answer to PusherLandingUnverified, which cannot see it: that rule reads
       # consecutive_landing_misses, and `--mode node` runs no quote loop and no landing
@@ -166,11 +197,13 @@ groups:
           summary: "{{ $labels.pair }}: vault is {{ $value | humanizePercentage }} off its target share"
           description: >-
             The pool has passed 80/20 and is close to holding a single asset. The inventory
-            tilt cannot correct this on its own past here — the skew is clamped at ±delta so a
-            side never crosses the market mid, and the volatile kind's `skew` diagnostic
-            sitting on that cap means further drift changes the quote by nothing. Check its
-            `inventory_base_share` diagnostic for the direction, then rebalance the vault or
-            widen the pair. PusherPoolImbalanced is suppressed while this fires.
+            tilt cannot correct this on its own past here — the volatile kind clamps its tilt
+            at ±delta so a side never crosses the market mid, and its `skew` diagnostic
+            sitting on that cap means further drift changes the quote by nothing. The clamp
+            is that kind's own, and this rule reads no other: a pricer of yours is bounded by
+            what it does itself. Check the `inventory_base_share` diagnostic for the
+            direction, then rebalance the vault or widen the pair. PusherPoolImbalanced is
+            suppressed while this fires.
 
       # "A week of ETH left", asked of the ETH itself rather than of a count of updates.
       #
@@ -250,6 +283,66 @@ groups:
             land and the lane is dead until someone tops it up. PusherSignerNearlyDry cannot say
             this: a balance that is already flat at zero extrapolates to zero, not below it.
 
+      # The vault being drained while everything "works". Every other page here is about a
+      # lane that is not quoting; this one, and PusherVaultLosingValue in the ticket group,
+      # are about a lane that is quoting and losing. The loss paths (a quote through the
+      # market, a price left behind by a depeg, a venue that froze or was pushed) all look
+      # the same from here: the vault hands out more than it takes in.
+      #
+      # The measure is what the vault holds now against what it held an hour ago, both
+      # priced at today's prices, as a share of the vault's value:
+      #
+      #   sum over its tokens of (balance now − balance 1h ago) × price now
+      #
+      # Pricing both sides at one price is what keeps a market move out of it. A vault
+      # holding ETH is worth less after ETH falls, and this reads zero for that: no balance
+      # changed. It moves only when balances do. A vault trading at fair prices reads about
+      # zero, or a little above, since it earns its spread; one being arbitraged reads
+      # below, by what it gave away.
+      #
+      # `ignoring (vault) group_left` joins each balance to its token's one price series.
+      # `without (token)` rather than `by (vault)` keeps whatever labels the scrape adds
+      # (job, instance), so two updaters under one Prometheus do not merge.
+      #
+      # The `and` clause is what makes the number mean anything: it holds only while every
+      # token the vault holds has a USD value. With one token unpriced (CoinGecko does not
+      # know it, or its price is over ten minutes old and the value series is dropped), the
+      # sum would cover the other token alone and every ordinary trade would read as a loss
+      # or a gain of the whole amount. PusherVaultUnpriced says when a vault is in that
+      # state, which is when this rule cannot see it.
+      #
+      # What it cannot tell apart from a loss: the operator withdrawing from the vault. A
+      # deposit hides a loss of the same size, for the same hour. And an ordinary
+      # market-making loss counts: a vault that bought a token which then fell did lose,
+      # and the thresholds have to sit above how much of that a pair does on a normal day.
+      # Both numbers here are starting points, not measurements: 2% of a vault inside an
+      # hour is a drain by any reading, and 0.5% is where a pair is worth a look.
+      - alert: PusherVaultDraining
+        expr: >-
+          (
+            sum without (token) (
+              (quote_updater_vault_balance - quote_updater_vault_balance offset 1h)
+                * ignoring (vault) group_left quote_updater_token_price_usd
+            )
+              /
+            sum without (token) (quote_updater_vault_value_usd)
+          ) < -0.02
+            and
+          (
+            count without (token) (quote_updater_vault_balance)
+              == count without (token) (quote_updater_vault_value_usd)
+          )
+        for: 5m
+        labels: { severity: page }
+        annotations:
+          summary: "Vault {{ $labels.vault }} gave away {{ $value | humanizePercentage }} of its value in the last hour"
+          description: >-
+            Priced at today's prices, the vault holds over 2% less than it did an hour ago, so
+            it is paying out more than it takes in. If nobody withdrew from it, it is being
+            traded against at a wrong price: halt its pairs first, then check each pair's
+            published mid against the market and what its venues are reporting. A withdrawal
+            by the operator reads the same way and clears within the hour.
+
       - alert: PusherScrapeDown
         expr: up{job="quote-updater"} == 0
         for: 2m
@@ -260,13 +353,13 @@ groups:
 
   - name: quote-updater-ticket
     rules:
-      # The failure mode a file-authoritative config introduces. `pairs.toml` is the desired
-      # state and a reload converges the running pairs onto it — but a reload that fails to
-      # validate applies nothing at all, deliberately, so the pairs carry on quoting the
-      # previous config perfectly well. Nothing else in the process says otherwise: every
-      # other series stays exactly as healthy as it was. The gap is only in what the operator
-      # believes, having just edited the file, and this counter is the one thing that can see
-      # it.
+      # The failure mode that changing a running updater's config introduces. Each change made
+      # through the backoffice API (or a binary's UpdaterHandle) converges the running pairs
+      # onto the new config — but one that fails to validate applies nothing at all,
+      # deliberately, and config.toml is put back, so the pairs carry on quoting the previous
+      # config perfectly well. Nothing else in the process says otherwise: every other series
+      # stays exactly as healthy as it was. The gap is only in what the operator believes,
+      # having just made the change, and this counter is how an alert can see it.
       #
       # `increase(...) > 0` over an hour rather than a `for:` on a level: a rejection is an
       # instant, not a state, so there is no condition to sit in for five minutes.
@@ -278,12 +371,13 @@ groups:
         for: 0m
         labels: { severity: ticket }
         annotations:
-          summary: "A config reload was rejected; the running pairs are not what pairs.toml says"
+          summary: "A config change or reload was rejected; it did not take effect"
           description: >-
-            The updater re-read its config, refused it, and changed nothing — so every pair is
-            still running the previous config while the file on disk says something else.
-            The journal names the reason. Fix the file, check it with
-            `quote-updater --check`, and reload again.
+            A change made through the backoffice API (or an UpdaterHandle), or a reload, was
+            refused and changed nothing — every pair is still running the previous config, and
+            config.toml was put back to match it, so whoever made the change may believe it
+            took. The journal names the reason, as did the answer to the change. Fix the
+            change and send it again.
 
       # The other half of the same gap, and the worse half. A reload validates whole but
       # cannot know whether a feed will come up without dialling it, so a lane whose symbol
@@ -296,21 +390,23 @@ groups:
         for: 0m
         labels: { severity: ticket }
         annotations:
-          summary: "A config reload only partly applied; some pairs are on the old config"
+          summary: "A config reload only partly applied; some pairs are on the old config or stopped"
           description: >-
-            The updater accepted pairs.toml but at least one pair's feed would not come up, so
-            that pair is still quoting its previous config (or was never started) while the
-            rest moved onto the new one. Nothing is mispriced and no quote is wrong — the
+            The updater kept a config change but at least one pair's feed would not come up,
+            so that pair is still quoting its previous config (or was never started, or was
+            stopped because the change removed a builder it quoted to) while the rest moved
+            onto the new one. Nothing is mispriced and no quote is wrong — the
             pairs that failed are named in the journal, usually a wrong symbol or a blocked
-            endpoint. Fix them, check with `quote-updater --check`, and reload again.
+            endpoint. Fix them through the backoffice API, or retry them with
+            POST /api/reload.
 
       # Not a fault. The only rule in this file that fires on something working, and it is
       # here because a change to a live lane's pricing is otherwise invisible: the two rules
       # above catch a reload that was *refused* or that half-applied, and a reload that
-      # succeeds cleanly says nothing at all. `config.toml` is edited by hand over ssh and by
-      # the backoffice, which does the edit-and-reload on an operator's behalf and has no
-      # login, only a tailnet address (deploy/README.md). So delta, max_deviation
-      # or a band can change on a quoting lane with no trace outside the journal.
+      # succeeds cleanly says nothing at all. A running updater's config is changed through
+      # the backoffice API, which writes config.toml and converges onto it on an operator's
+      # behalf, behind a tailnet address and an optional Google sign-in (deploy/README.md). So delta,
+      # max_deviation or a band can change on a quoting lane with no trace outside the journal.
       #
       # What it buys is adjacency. When a page arrives twenty minutes after someone widened a
       # band, the two land in the same channel in the right order, and nobody has to go and
@@ -480,10 +576,51 @@ groups:
         for: 5m
         labels: { severity: ticket }
         annotations:
-          summary: "{{ $labels.pair }}: mids are falling outside min_mid/max_mid"
+          summary: "{{ $labels.pair }}: the mid, or the market's mid, is outside min_mid/max_mid"
           description: >-
             The band is the only thing between a corrupt book and an arbitrary on-chain
-            price the next fill is priced against. Either the book is wrong or the band is.
+            price the next fill is priced against. It judges the published mid and, on a
+            pair with a market, the market's own mid, so this also fires through a depeg:
+            on a stable pair, check the peg first. Otherwise either the book is wrong or
+            the band is.
+
+      # A `fixed` pair withdrawn because its market left its own quote (audit F-04). That is
+      # the guard working: outside its bid and ask a taker would trade the vault at a stale
+      # price. Sustained, it is a depeg or a fixed mid that no longer matches the market.
+      - alert: PusherFixedPriceOffMarket
+        expr: rate(quote_updater_price_unusable_total{reason="market_outside_quote"}[5m]) > 0
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.pair }}: the market is outside the fixed price's quote"
+          description: >-
+            A fixed price quotes only while its market sits inside its own bid and ask, so
+            this pair is withdrawn. Through a depeg that is what keeps the vault from being
+            drained at par; otherwise the fixed mid or its delta no longer matches the
+            market, and the pair stays quiet until the market comes back or the stanza
+            changes.
+
+      # A pair with two or more venues is withdrawn while its primary venue and any other
+      # disagree by more than its limit (max_source_divergence, or by default 20 times the
+      # half-spread it publishes and at least 5 bp). A moment of it on a fast move is the
+      # check working. Five minutes of it is a venue that froze behind a live socket, one
+      # delivering a backlog, a thin book that was pushed, or a limit set inside the
+      # venues' ordinary noise.
+      #
+      # The rate is over one minute, not five, so `for: 5m` means withdrawn in every one of
+      # five minutes. Over five, one withdrawn tick reads as nonzero for the whole five that
+      # follow, and two of them a few minutes apart raised a ticket saying five minutes.
+      - alert: PusherSourcesDisagree
+        expr: rate(quote_updater_price_unusable_total{reason="source_divergence"}[1m]) > 0
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.pair }}: withdrawn because its venues disagree"
+          description: >-
+            The pair's venues have disagreed by more than its limit for five minutes, so it
+            is not quoting. quote_updater_feed_divergence shows the gap and the per-venue
+            mids show which venue is off. Fix or remove that venue, or raise
+            max_source_divergence if the gap is the venues' ordinary one.
 
       # The vault drifting away from the share it is configured to hold. Nothing else in
       # this file reads the inventory series at all: they arrived with volatile pricing and
@@ -528,9 +665,120 @@ groups:
           description: >-
             The quote has been tilted to correct this for fifteen minutes and the pool has not
             come back. Check the volatile kind's `inventory_base_share` diagnostic for which
-            way it is leaning and its `skew` diagnostic for whether the tilt has hit its cap — the skew is
-            clamped at ±delta so a side never crosses the market mid, and a skew sitting on
-            that cap means the pricing has stopped responding to further drift.
+            way it is leaning and its `skew` diagnostic for whether the tilt has hit its cap —
+            the volatile kind clamps its tilt at ±delta so a side never crosses the market
+            mid, and a skew sitting on that cap means the pricing has stopped responding to
+            further drift. The clamp is that kind's own, and this rule reads no other pricer.
+
+      # The ticket level of PusherVaultDraining in the page group, on the same measure; see
+      # there for what it is and what it cannot tell from a loss. Longer `for`, lower
+      # threshold: a pair that keeps ending the hour 0.5% down is one to look at before it
+      # is one to be woken for.
+      - alert: PusherVaultLosingValue
+        expr: >-
+          (
+            sum without (token) (
+              (quote_updater_vault_balance - quote_updater_vault_balance offset 1h)
+                * ignoring (vault) group_left quote_updater_token_price_usd
+            )
+              /
+            sum without (token) (quote_updater_vault_value_usd)
+          ) < -0.005
+            and
+          (
+            count without (token) (quote_updater_vault_balance)
+              == count without (token) (quote_updater_vault_value_usd)
+          )
+        for: 10m
+        labels: { severity: ticket }
+        annotations:
+          summary: "Vault {{ $labels.vault }} gave away {{ $value | humanizePercentage }} of its value in the last hour"
+          description: >-
+            Priced at today's prices, the vault holds over 0.5% less than it did an hour ago.
+            A vault trading at fair prices ends an hour about level, so this is either
+            trades landing at a wrong price or a withdrawal. Check the pair's published mid
+            against the market and its spread against how far the market moves in a block.
+
+      # A vault the two rules above cannot see. They need a USD value for every token the
+      # vault holds, and a token has none while CoinGecko does not price it (a long-tail
+      # token, a tokenized stock) or its last price is over ten minutes old. `unless`
+      # matches on every label, so this is each (token, vault) with a balance and no value.
+      - alert: PusherVaultUnpriced
+        expr: quote_updater_vault_balance > 0 unless quote_updater_vault_value_usd
+        for: 30m
+        labels: { severity: ticket }
+        annotations:
+          summary: "Vault {{ $labels.vault }}: no USD price for {{ $labels.token }}"
+          description: >-
+            The vault holds this token and the updater has had no USD price for it for half
+            an hour, so the vault's value is unknown and PusherVaultLosingValue,
+            PusherVaultDraining and PusherVaultOneSided are silent for it. Check the CoinGecko
+            key and whether CoinGecko lists the token by its contract address.
+
+      # A quote the market has walked through: the market's mid is outside what the pair
+      # last published by more than its half-spread. Inside the half-spread the market is
+      # between our two prices, which is the only place a quote is safe; outside it one of
+      # them is on the wrong side, and a taker fills it and unwinds on the market. A pricer
+      # that moves its mid too far does this, and so does a fixed price the market left.
+      #
+      # The margin past the half-spread (half of it again, and at least 1 bp) is for the
+      # two gauges not being one instant: `published_mid` is as of the last send and
+      # `feed_mid` as of the last sample, a few tens of milliseconds apart, and the volatile
+      # kind sits exactly on the edge whenever its tilt is at its cap.
+      #
+      # The two guards. `feed_up == 1`: a pair with no market leaves `feed_mid` at 0. The
+      # publish counter: `published_mid` keeps its last value while a pair is withdrawn,
+      # and the market moving away from a quote nobody can fill is not a loss. A quoting
+      # pair sends at least once a block, so two minutes with no publish is a pair that is
+      # not quoting.
+      #
+      # Builder mode only: node mode does not write the published gauges.
+      - alert: PusherQuoteThroughMarket
+        expr: >-
+          abs(quote_updater_feed_mid / quote_updater_published_mid - 1)
+            > quote_updater_published_delta
+              + clamp_min(0.5 * quote_updater_published_delta, 0.0001)
+            and on (pair) quote_updater_feed_up == 1
+            and on (pair) increase(quote_updater_publish_decisions_total{action="publish"}[2m]) > 0
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.pair }}: the market is outside the published quote"
+          description: >-
+            For five minutes the market's mid has been further from the published mid than
+            the published half-spread, so one of the pair's two prices is on the wrong side
+            of the market and a taker can fill it and unwind at a profit. Halt the pair, then
+            look at its pricing: a mid moved further than its spread, or a fixed price the
+            market has left.
+
+      # The vault nearly all in one token, for a pair priced by any kind. The two
+      # PusherPoolImbalanced rules read the volatile kind's own diagnostics, so a vault
+      # priced by `feed`, `fixed` or a binary's own kind had no imbalance alert at all.
+      # This reads the balances: the largest share of the vault's USD value held in one
+      # token. It knows no target, so it is set where any vault has stopped being two-sided,
+      # and a volatile pair past that is already paging under PusherPoolSeverelyImbalanced.
+      # Guarded like the value rules: with a token unpriced the other would read as 100%.
+      - alert: PusherVaultOneSided
+        expr: >-
+          max without (token) (
+            quote_updater_vault_value_usd
+              / ignoring (token) group_left
+            sum without (token) (quote_updater_vault_value_usd)
+          ) > 0.9
+            and
+          (
+            count without (token) (quote_updater_vault_balance)
+              == count without (token) (quote_updater_vault_value_usd)
+          )
+        for: 15m
+        labels: { severity: ticket }
+        annotations:
+          summary: "Vault {{ $labels.vault }}: {{ $value | humanizePercentage }} of its value is in one token"
+          description: >-
+            The vault has been over 90% in one token for fifteen minutes, so it can fill
+            trades in one direction only and whatever moved it there is still in the
+            position. Check which way it went and at what prices, then rebalance the vault or
+            halt the pair.
 
       - alert: PusherPairRestarting
         expr: rate(quote_updater_pair_restarts_total[15m]) > 0
@@ -592,9 +840,9 @@ groups:
           summary: "{{ $labels.pair }}: the trading calendar ends in {{ $value }} days"
           description: >-
             The us_market_hours guard withdraws every quote past its listed_through date,
-            since it cannot tell a holiday from a trading day there. List the next year's NYSE
-            holidays and early closes in the pair's guard stanza, move listed_through, and
-            reload.
+            since it cannot tell a holiday from a trading day there. Through the backoffice
+            API, list the next year's NYSE holidays and early closes in the pair's guard
+            stanza and move listed_through; the change applies without a restart.
 
       # The same calendar past its end: from then on the guard withdraws every quote on the
       # pair, and this is the only rule that says so. A withdrawn quote is not a halt, so
@@ -609,6 +857,6 @@ groups:
           summary: "{{ $labels.pair }}: {{ $value }} days past the end of its trading calendar, nothing is quoting"
           description: >-
             The pair's calendar ran past its listed_through date without being extended, so
-            the us_market_hours guard has withdrawn every quote since. List the next year's
-            NYSE holidays and early closes in the pair's guard stanza, move listed_through,
-            and reload.
+            the us_market_hours guard has withdrawn every quote since. Through the backoffice
+            API, list the next year's NYSE holidays and early closes in the pair's guard
+            stanza and move listed_through; the change applies without a restart.

@@ -77,14 +77,17 @@ You need:
 - a vault holding the stock token and USDC, with approvals for the PropAMM on both;
 - the pair on the PropAMM (`addPair`), as for any pair ([production.md](production.md)).
 
-Then add the pair from the backoffice: its tokens and key variable; the `ondo` row of the
-venue table with the token's symbol (the lookup lists no Ondo markets, so it is typed, and
-the live preview shows Ondo's price); the breaker and the band; a pricing kind (`feed` with
-a `delta`); and in the guards section `ondo` with its fields (the API key as the name of the
-variable holding it, the sessions ticked), `us_market_hours` with its calendar and
-`ondo_token`, all three checked. Saving reloads the running updater. In the file, the stanza is the one in
-[`example/config.stocks.toml`](../example/config.stocks.toml): copy it into your config and
-reload with a SIGHUP. Either way, `--check` first:
+The stanza is the one in [`example/config.stocks.toml`](../example/config.stocks.toml).
+Either send it to the running updater's backoffice API (`POST /api/pairs`, the stanza as
+JSON, as [`backoffice-ui/`](../backoffice-ui/README.md) does), which applies it without a
+restart, or copy it into your config before the updater starts: the file is read once, at
+start. The pair is its tokens and key variable; the `ondo` venue with the token's symbol
+(the lookup lists no Ondo markets, so it is typed, and the live preview shows Ondo's
+price); the breaker and the band; a pricing kind (`feed` with a `delta`); and the three
+guards, `ondo` (the API key as `{ env = "NAME" }`, naming the variable holding it: the API
+refuses a key written in its place), `us_market_hours` with its calendar, and
+`ondo_token`. `GET /api/guards` lists each guard kind's fields and their types, for a front
+end that draws a form for them. Either way, `--check` first:
 
 ```bash
 cd example && cargo run --release -- --config config.toml --check
@@ -159,11 +162,10 @@ with the workspace, so that path cannot close unnoticed. An issuer is:
    `status::build`) and `Issuer`, which names its two kinds and gives the token guard:
    `RestrictionGuardFactory::new(issuer, closure)` for a design whose rules the core's guard
    reads through `Restrictions`, the closure carrying any setting the rules need;
-5. `fields()` and `form_help()` on the factory, so the backoffice edits the pair. The
-   round-trip test beside `Ondo` is the template: every declared field is a key the config
-   reads, and the example stanza survives the form unchanged. A key the config accepts but
-   the form does not declare survives a save too, since the page rebuilds a stanza from the
-   one the pair has;
+5. `fields()` and `form_help()` on the factory, which the backoffice API lists
+   (`GET /api/guards`) for a front end to draw the guard's form from. The round-trip test
+   beside `Ondo` is the template (`testing::assert_fields_round_trip`): every declared
+   field is a key the config reads, and the example stanza survives the fields unchanged;
 6. for a token design of its own, a Solidity test of PropAMM against it. In this repository
    that is a mock under `contracts/test/mocks/` and a test inheriting
    `PropAMMStockTokenTest` (`PropAMMOndoToken.t.sol` is the template); from another

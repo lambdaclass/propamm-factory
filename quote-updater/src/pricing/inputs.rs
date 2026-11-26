@@ -168,8 +168,8 @@ pub struct LandingReport {
     pub at: Instant,
 }
 
-/// The four ways a block can go for a lane. `#[non_exhaustive]` like every enum an
-/// observer or a pricer matches on: a fifth would not be a breaking change.
+/// The ways a block can go for a lane. `#[non_exhaustive]` like every enum an observer or
+/// a pricer matches on: another is not a breaking change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LandingOutcome {
@@ -177,6 +177,9 @@ pub enum LandingOutcome {
     Landed,
     /// An update was quoted for the block and the lane does not hold it.
     Missed,
+    /// The lane holds an update for the block at a price this pair's key did not sign:
+    /// another updater key wrote the lane. Never a healthy sign either.
+    Foreign,
     /// The read-back failed, so whether it landed is not known. Never a healthy sign.
     Unknown,
     /// Nothing was quoted for the block (the feed was stale, or the quote withdrawn), so
@@ -190,6 +193,7 @@ impl From<crate::landing::Landing> for LandingOutcome {
         match landing {
             Landing::Landed => LandingOutcome::Landed,
             Landing::Missed => LandingOutcome::Missed,
+            Landing::Foreign => LandingOutcome::Foreign,
             Landing::Unknown => LandingOutcome::Unknown,
             Landing::NotQuoted => LandingOutcome::NotQuoted,
         }

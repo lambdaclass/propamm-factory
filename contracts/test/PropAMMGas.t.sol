@@ -32,10 +32,15 @@ contract PropAMMGasTest is Test {
     /// router concludes the instance does not implement `IPropAMMFillable`, and falls back to its
     /// blind probe without any error to notice.
     uint256 constant ERC165_CHECKER_GAS = 30_000;
-    /// What `quoteFillable` may cost over a cold `quote` of the same order. Measured at 5,326
-    /// (5,520 when the vault binds): one cold `allowance` read plus the closed-form sizing. The
+    /// What `quoteFillable` may cost over a cold `quote` of the same order. Measured at 5,283
+    /// (5,488 when the vault binds): one cold `allowance` read plus the closed-form sizing. The
     /// headroom absorbs compiler drift; a second registry read or a search loop would not fit in it.
     uint256 constant FILLABLE_OVERHEAD_BUDGET = 7_000;
+    /// What probing `isActive` and then quoting may cost over a cold `quote` alone. Measured at
+    /// 5,795: the probe's own call into the instance, its warm second read of the registry and of
+    /// the vault's balance, and reading the answer by hand. Pricing the pair in the probe (the
+    /// tokens' decimals, the conversion) would not fit in it.
+    uint256 constant PROBE_OVERHEAD_BUDGET = 7_500;
 
     address owner = makeAddr("owner");
     address vault = makeAddr("vault");
@@ -111,6 +116,26 @@ contract PropAMMGasTest is Test {
 
         assertLt(uncapped - quoted, FILLABLE_OVERHEAD_BUDGET, "uncapped overhead over quote");
         assertLt(capped - quoted, FILLABLE_OVERHEAD_BUDGET, "capped overhead over quote");
+    }
+
+    /// `IPropAMM` offers `isActive` as a fast path: a router can probe it before it pays for a
+    /// quote. The probe answers what `quote` would, so on a live pair it costs about what a quote
+    /// does, and the quote that follows in the same transaction finds the registry, the tokens
+    /// and the vault warm. Probing first must cost little more than quoting alone, or the fast
+    /// path would not be one.
+    function test_gas_isActiveThenQuoteCostsLittleMoreThanAQuote() public {
+        uint256 cold = vm.snapshotState();
+        propAmm.quote(WETH, USDT, 500e18);
+        uint256 quoted = vm.lastCallGas().gasTotalUsed;
+
+        vm.revertToState(cold);
+        bool active = propAmm.isActive(WETH, USDT);
+        uint256 probe = vm.snapshotGasLastCall("isActive");
+        propAmm.quote(WETH, USDT, 500e18);
+        uint256 afterProbe = vm.snapshotGasLastCall("quote_afterIsActive");
+
+        assertTrue(active);
+        assertLt(probe + afterProbe - quoted, PROBE_OVERHEAD_BUDGET, "probing first costs too much over a quote");
     }
 
     /// A leg the router places at the reported fill, for the record. Measured warm, as the router

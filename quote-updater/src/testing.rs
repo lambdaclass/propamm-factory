@@ -29,8 +29,8 @@ use serde::de::DeserializeOwned;
 use crate::{
     feed::PriceSample,
     pricing::{
-        BuildCtx, Diagnostics, Factory, History, Inventory, InventoryFeed, Market, PairShape,
-        Pricer, PricerOutput, TickCtx,
+        BuildCtx, Diagnostics, Factory, FormField, History, Inventory, InventoryFeed, Market,
+        PairShape, Pricer, PricerOutput, TickCtx,
     },
 };
 
@@ -69,6 +69,7 @@ pub fn pair_for(
         mid_only_sources: 0,
         min_mid: None,
         max_mid: None,
+        max_source_divergence: None,
     }
 }
 
@@ -89,6 +90,7 @@ pub fn pair_with(inverted: bool, price_decimals: u32) -> PairShape {
         mid_only_sources: 0,
         min_mid: None,
         max_mid: None,
+        max_source_divergence: None,
     }
 }
 
@@ -130,6 +132,7 @@ pub fn market_at(
             at: sampled_at,
             // The wall-clock stamp is the recorder's; nothing a pricer sees reads it.
             wall: std::time::SystemTime::now(),
+            divergence: ethrex_common::U256::zero(),
         },
         pair,
     )
@@ -339,6 +342,42 @@ fn config<C: DeserializeOwned>(stanza: &str) -> eyre::Result<C> {
     let mut table: toml::Table = toml::from_str(stanza)?;
     table.remove("kind");
     Ok(toml::Value::Table(table).try_into()?)
+}
+
+/// Checks a kind's form fields against its config type `C`, for a kind that declares them
+/// (a pricing kind's `Factory::fields`, a guard kind's `fields`): a stanza written from
+/// every field's placeholder, as a form left at its defaults writes it, reads as `C`; and
+/// `example`, a stanza of the kind as a config holds it, shown in the fields and written
+/// back ([`FormField::show`], [`FormField::write`]), comes back unchanged. So every key a
+/// form writes is one the stanza reads, and a form round trip loses nothing. Panics with
+/// the reason otherwise.
+pub fn assert_fields_round_trip<C: DeserializeOwned>(fields: &[FormField], example: &toml::Table) {
+    assert!(!fields.is_empty(), "the kind declares no fields");
+    let write = |field: &FormField, text: &str| {
+        field
+            .write(text)
+            .unwrap_or_else(|err| panic!("`{}`: {err:#}", field.name))
+    };
+    let mut defaults = toml::Table::new();
+    for field in fields {
+        if let Some(value) = write(field, field.placeholder) {
+            defaults.insert(field.name.to_owned(), value);
+        }
+    }
+    if let Err(err) = crate::kinds::typed::<C>(&defaults) {
+        panic!("a stanza of the placeholders does not read: {err:#}");
+    }
+    let mut rebuilt = example.clone();
+    for field in fields {
+        match write(field, &field.show(example.get(field.name))) {
+            Some(value) => rebuilt.insert(field.name.to_owned(), value),
+            None => rebuilt.remove(field.name),
+        };
+    }
+    assert_eq!(
+        &rebuilt, example,
+        "a round trip through the fields changed the stanza"
+    );
 }
 
 /// Builds a pricer the way `UpdaterBuilder::pricer_fn` would: `make` gets `stanza`'s config

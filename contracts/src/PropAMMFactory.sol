@@ -22,7 +22,10 @@ error CreationIsDisabled();
 /// `disableCreation`). It has no say over the instances: each belongs to the owner its creator
 /// names.
 contract PropAMMFactory is Ownable2Step {
-    event PropAMMCreated(address indexed propAmm, address indexed creator, address oracle, address[] updaters);
+    /// `owner` is indexed so an owner can find every instance created for it, whoever created it.
+    event PropAMMCreated(
+        address indexed propAmm, address indexed creator, address indexed owner, address oracle, address[] updaters
+    );
     /// Emitted once, by `disableCreation`. No `PropAMMCreated` follows it.
     event CreationDisabled();
 
@@ -77,7 +80,7 @@ contract PropAMMFactory is Ownable2Step {
         );
         allPropAMMs.push(propAmm);
         _byCreator[msg.sender].push(propAmm);
-        emit PropAMMCreated(propAmm, msg.sender, oracle, updaters);
+        emit PropAMMCreated(propAmm, msg.sender, owner, oracle, updaters);
     }
 
     /// The address createPropAMM would deploy to for these inputs, without deploying. `creator` is

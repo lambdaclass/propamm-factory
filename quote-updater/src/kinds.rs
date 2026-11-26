@@ -413,7 +413,7 @@ impl Kinds {
         self.guards.get_key_value(kind).map(|(name, _)| *name)
     }
 
-    /// The registered guard kinds, by name, in order: what the backoffice's form offers,
+    /// The registered guard kinds, by name, in order: what the backoffice API lists,
     /// market and quote guards together.
     pub(crate) fn guard_kinds(&self) -> Vec<&'static str> {
         self.guards.keys().copied().collect()
@@ -433,7 +433,7 @@ impl Kinds {
     pub(crate) fn pricer_name(&self, kind: &str) -> Option<&'static str> {
         self.pricers.get_key_value(kind).map(|(name, _)| *name)
     }
-    /// The registered pricing kinds, by name, in order: what the backoffice's form offers.
+    /// The registered pricing kinds, by name, in order: what the backoffice API lists.
     pub(crate) fn pricer_kinds(&self) -> Vec<&'static str> {
         self.pricers.keys().copied().collect()
     }
@@ -449,7 +449,7 @@ impl Kinds {
     }
 
     /// One line for a pair's stanza: the kind, then its factory's summary of the stanza,
-    /// for the `--check` report and the backoffice's pair list. A stanza its kind cannot
+    /// for the `--check` report and the backoffice API's pair list. A stanza its kind cannot
     /// read, or an unregistered kind, shows the kind alone.
     pub(crate) fn pricer_summary(&self, spec: &PricingSpec) -> String {
         let summary = self
@@ -536,6 +536,7 @@ impl Kinds {
                     mid_only_sources: spec.feeds.as_ref().map_or(0, |f| f.mid_only_sources()),
                     min_mid: spec.band.min,
                     max_mid: spec.band.max,
+                    max_source_divergence: None,
                 };
                 guarded(kind, "validating", || factory.validate(table, &shape))
                     .wrap_err_with(|| format!("{at} (halted): [pairs.pricing] `{kind}`"))?;
@@ -794,7 +795,7 @@ api_key = "k"
 
     /// A secret typed where `{ env = "NAME" }` belongs is refused, at startup, in a reload's
     /// refusal and under `--check`, without the refusal printing it: those lines reach the
-    /// journal, the backoffice banner and whoever ran the check.
+    /// journal, the backoffice API's answer and whoever ran the check.
     #[test]
     fn a_secret_typed_inline_is_refused_without_echoing_it() {
         #[derive(Clone, serde::Deserialize)]

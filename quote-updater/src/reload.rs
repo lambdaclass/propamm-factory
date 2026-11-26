@@ -30,6 +30,10 @@ pub enum Action {
     /// Running, but not as the file now describes it — or not running at all because it
     /// halted. Stop it and start it from this spec.
     Restart(PairSpec),
+    /// Halted on its circuit breaker, and the file would have it started or rebuilt: left
+    /// halted, since only its re-arm brings it back (audit F-17). Emitted so the reload
+    /// says so, rather than leaving an operator who resumed or edited it to wonder.
+    StayTripped(U256),
 }
 
 impl Action {
@@ -37,27 +41,26 @@ impl Action {
     pub fn lane(&self) -> U256 {
         match self {
             Action::Add(spec) | Action::Restart(spec) => spec.lane,
-            Action::Remove(lane) => *lane,
+            Action::Remove(lane) | Action::StayTripped(lane) => *lane,
         }
     }
 }
 
 /// Diffs the desired pairs against the running ones.
 ///
-/// `halted` is the set of lanes whose pair stopped on its circuit breaker. They are
-/// restarted even when their stanza is byte-identical, and that is not a special case
-/// bolted on: a halted lane is the plainest possible instance of the running state not
-/// matching the file. The file says that pair should be quoting and it is not, so
-/// converging it is this function's ordinary job. It is also what makes a reload the way an
-/// operator resumes a halted pair, with no edit to invent — the alternative was asking them
-/// to touch whitespace to mean "I have looked at this feed and I trust it again".
+/// `tripped` is the set of lanes whose pair stopped on its circuit breaker: running, or
+/// shut down since (halted, or removed from the file) with the trip remembered. Such a lane
+/// stays stopped, whatever the reload is for (audit F-17): an edit of another pair, an edit
+/// of its own stanza, a new builder list, a resume of the pair after a halt, the pair added
+/// back after a removal. Starting it would re-arm a breaker nobody looked at, and the new
+/// lane would trust the very price that tripped it. Only a lane in `rearm` is started,
+/// which is someone saying of that one pair "I have looked at this feed and I trust it
+/// again" (`POST /api/pairs/{key_env}/rearm`, `UpdaterHandle::rearm`); it is built from
+/// its stanza as the file has it then. Where the file would otherwise have started or
+/// rebuilt one, [`Action::StayTripped`] says it was left. A running tripped lane the file
+/// drops or halts is still removed.
 ///
-/// The cost is real and deliberate: a reload run for an unrelated `delta` change also
-/// re-arms any halted lane. The caller answers for that by naming every re-armed pair and
-/// the trip it cleared (see `Service::reload`), rather than by making the rule more
-/// clever — a guard an operator cannot predict is worse than one they can see happen.
-///
-/// `builders_changed` restarts every lane, whatever its stanza says. Each builder
+/// `builders_changed` restarts every lane that is not tripped, whatever its stanza says. Each builder
 /// connection is opened inside the pair's own quoting loop, so a lane cannot pick up a new
 /// builder list without being rebuilt: the list is not per-lane state that can be swapped
 /// underneath it. Marking them all as diverged is not a special case either, for the same
@@ -73,7 +76,8 @@ impl Action {
 pub fn plan(
     running: &BTreeMap<U256, PairSpec>,
     desired: &[PairSpec],
-    halted: &BTreeSet<U256>,
+    tripped: &BTreeSet<U256>,
+    rearm: &BTreeSet<U256>,
     builders_changed: bool,
 ) -> Vec<Action> {
     let desired: BTreeMap<U256, &PairSpec> = desired.iter().map(|spec| (spec.lane, spec)).collect();
@@ -86,11 +90,23 @@ pub fn plan(
         .into_iter()
         .filter_map(|lane| match (running.get(&lane), desired.get(&lane)) {
             (Some(_), None) => Some(Action::Remove(lane)),
+            (current, Some(spec)) if tripped.contains(&lane) => {
+                if rearm.contains(&lane) {
+                    return Some(match current {
+                        Some(_) => Action::Restart((*spec).clone()),
+                        None => Action::Add((*spec).clone()),
+                    });
+                }
+                let would_start = match current {
+                    Some(current) => current != *spec || builders_changed,
+                    None => true,
+                };
+                would_start.then_some(Action::StayTripped(lane))
+            }
             (None, Some(spec)) => Some(Action::Add((*spec).clone())),
             (Some(current), Some(spec)) => {
                 let changed = current != *spec;
-                (changed || halted.contains(&lane) || builders_changed)
-                    .then(|| Action::Restart((*spec).clone()))
+                (changed || builders_changed).then(|| Action::Restart((*spec).clone()))
             }
             // Not reachable: `lanes` is built from these two maps, so a lane in neither
             // cannot appear. Nothing to do about it either way.
@@ -137,7 +153,13 @@ mod tests {
     #[test]
     fn an_unchanged_healthy_pair_is_left_alone() {
         let pairs = [spec(1, None), spec(2, None)];
-        let actions = plan(&running(&pairs), &pairs, &BTreeSet::new(), false);
+        let actions = plan(
+            &running(&pairs),
+            &pairs,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            false,
+        );
         assert_eq!(actions, vec![], "nothing changed, so nothing to do");
     }
 
@@ -146,6 +168,7 @@ mod tests {
         let actions = plan(
             &running(&[spec(1, None)]),
             &[spec(1, None), spec(2, None)],
+            &BTreeSet::new(),
             &BTreeSet::new(),
             false,
         );
@@ -158,6 +181,7 @@ mod tests {
             &running(&[spec(1, None), spec(2, None)]),
             &[spec(1, None)],
             &BTreeSet::new(),
+            &BTreeSet::new(),
             false,
         );
         assert_eq!(actions, vec![Action::Remove(lane(2))]);
@@ -169,6 +193,7 @@ mod tests {
             &running(&[spec(1, None)]),
             &[spec(1, Some(5))],
             &BTreeSet::new(),
+            &BTreeSet::new(),
             false,
         );
         assert_eq!(
@@ -178,19 +203,71 @@ mod tests {
         );
     }
 
-    /// The rule that makes `systemctl --user reload` the way a halted pair comes back:
-    /// nothing in the file changed, and the lane is still restarted.
+    /// Audit F-17: a lane halted on its breaker stays halted through every reload, one for
+    /// an unrelated pair, one that edits its own stanza, one that changes the builder list.
+    /// Only its own re-arm restarts it, from the stanza as it is then.
     #[test]
-    fn a_halted_pair_is_restarted_even_though_its_stanza_is_identical() {
+    fn a_tripped_pair_is_restarted_only_when_it_is_re_armed() {
         let pairs = [spec(1, None), spec(2, None)];
-        let halted = BTreeSet::from([lane(2)]);
-
-        let actions = plan(&running(&pairs), &pairs, &halted, false);
+        let tripped = BTreeSet::from([lane(2)]);
+        let nobody = BTreeSet::new();
 
         assert_eq!(
-            actions,
-            vec![Action::Restart(spec(2, None))],
-            "only the halted lane; the one still quoting is not disturbed"
+            plan(&running(&pairs), &pairs, &tripped, &nobody, false),
+            vec![]
+        );
+        let edited = [spec(1, Some(7)), spec(2, Some(9))];
+        assert_eq!(
+            plan(&running(&pairs), &edited, &tripped, &nobody, false),
+            vec![
+                Action::Restart(spec(1, Some(7))),
+                Action::StayTripped(lane(2))
+            ],
+            "its own edit does not re-arm it either, and the reload says it was left"
+        );
+        assert_eq!(
+            plan(&running(&pairs), &pairs, &tripped, &nobody, true),
+            vec![Action::Restart(spec(1, None)), Action::StayTripped(lane(2))],
+            "nor a new builder list"
+        );
+
+        let rearm = BTreeSet::from([lane(2)]);
+        assert_eq!(
+            plan(&running(&pairs), &edited, &tripped, &rearm, false),
+            vec![
+                Action::Restart(spec(1, Some(7))),
+                Action::Restart(spec(2, Some(9)))
+            ],
+            "re-armed, from its stanza as it is now"
+        );
+        assert_eq!(
+            plan(&running(&pairs), &pairs, &BTreeSet::new(), &rearm, false),
+            vec![],
+            "a re-arm of a lane that is not tripped does nothing"
+        );
+    }
+
+    /// A tripped lane the service shut down (a halt, a removal) and whose pair the file has
+    /// again (a resume, an add) is not started: its trip is remembered, and only its re-arm
+    /// starts it.
+    #[test]
+    fn a_remembered_trip_holds_a_lane_the_file_asks_for_until_its_re_arm() {
+        let pairs = [spec(1, None), spec(2, None)];
+        let only_one = running(&[spec(1, None)]);
+        let tripped = BTreeSet::from([lane(2)]);
+        assert_eq!(
+            plan(&only_one, &pairs, &tripped, &BTreeSet::new(), false),
+            vec![Action::StayTripped(lane(2))]
+        );
+        assert_eq!(
+            plan(
+                &only_one,
+                &pairs,
+                &tripped,
+                &BTreeSet::from([lane(2)]),
+                false
+            ),
+            vec![Action::Add(spec(2, None))]
         );
     }
 
@@ -202,6 +279,7 @@ mod tests {
             &running(&[spec(1, None), spec(2, None)]),
             &[spec(1, None)],
             &BTreeSet::from([lane(2)]),
+            &BTreeSet::new(),
             false,
         );
         assert_eq!(actions, vec![Action::Remove(lane(2))]);
@@ -212,9 +290,9 @@ mod tests {
     #[test]
     fn actions_come_out_in_lane_order() {
         let actions = plan(
-            &running(&[spec(1, None), spec(2, None), spec(4, None)]),
-            // Deliberately not in lane order.
+            &running(&[spec(1, None), spec(2, None), spec(4, None)]), // Deliberately not in lane order.
             &[spec(3, None), spec(1, Some(9)), spec(2, None)],
+            &BTreeSet::new(),
             &BTreeSet::new(),
             false,
         );
@@ -235,7 +313,13 @@ mod tests {
     #[test]
     fn a_changed_builder_list_restarts_every_lane() {
         let pairs = [spec(1, None), spec(2, None), spec(3, None)];
-        let actions = plan(&running(&pairs), &pairs, &BTreeSet::new(), true);
+        let actions = plan(
+            &running(&pairs),
+            &pairs,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            true,
+        );
         assert_eq!(
             actions,
             vec![
@@ -252,6 +336,7 @@ mod tests {
         let actions = plan(
             &running(&[spec(1, None), spec(2, None)]),
             &[spec(2, None), spec(3, None)],
+            &BTreeSet::new(),
             &BTreeSet::new(),
             true,
         );

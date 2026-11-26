@@ -133,15 +133,17 @@ pub enum LandingResult {
     Missed,
     Unknown,
     NotQuoted,
+    Foreign,
 }
 
 impl LandingResult {
     /// Declaration order is load-bearing: children are indexed by `variant as usize`.
-    pub const ALL: [LandingResult; 4] = [
+    pub const ALL: [LandingResult; 5] = [
         LandingResult::Landed,
         LandingResult::Missed,
         LandingResult::Unknown,
         LandingResult::NotQuoted,
+        LandingResult::Foreign,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -150,6 +152,7 @@ impl LandingResult {
             LandingResult::Missed => "missed",
             LandingResult::Unknown => "unknown",
             LandingResult::NotQuoted => "not_quoted",
+            LandingResult::Foreign => "foreign",
         }
     }
 }
@@ -193,9 +196,10 @@ impl TickReject {
 /// - `rejected`: the file did not validate, so **nothing** was touched. Consistent, at
 ///   least: every lane is on the previous config together.
 /// - `partial`: the file validated and was applied, but at least one lane's feed would not
-///   come up, so that lane is still on its old config (or was never started) while the rest
-///   moved. A *mixture*, which is strictly worse to reason about than `rejected` — hence
-///   its own value rather than being folded into `applied`.
+///   come up, so that lane is still on its old config (or was never started, or was stopped
+///   because the change took out a builder it quoted to: audit F-18) while the rest moved.
+///   A *mixture*, which is strictly worse to reason about than `rejected` — hence its own
+///   value rather than being folded into `applied`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reload {
     Applied,
@@ -261,6 +265,7 @@ pub struct Metrics {
     feed_delta: GaugeVec,
     feed_sources_fresh: GaugeVec,
     feed_sources_min: GaugeVec,
+    feed_divergence: GaugeVec,
     venue_feed_up: GaugeVec,
     venue_feed_ticks: IntCounterVec,
     venue_feed_rejected: IntCounterVec,
@@ -329,6 +334,7 @@ pub struct PairMetrics {
     pub feed_delta: Gauge,
     pub feed_sources_fresh: Gauge,
     pub feed_sources_min: Gauge,
+    pub feed_divergence: Gauge,
     price_unusable: [IntCounter; UnusableKind::ALL.len()],
     publish_decisions: [IntCounter; 4],
     pub published_mid: Gauge,
@@ -345,7 +351,7 @@ pub struct PairMetrics {
     pub target_blocks: IntCounter,
     pub signer_balance_wei: Gauge,
     pub signer_runway_updates: Gauge,
-    landings: [IntCounter; 4],
+    landings: [IntCounter; 5],
     pub consecutive_landing_misses: Gauge,
     // Counted in `Service::spawn` (`service.rs`), at the call that passes `supervise` its
     // closure: see the comment there for why (a `supervise` parameter would cost seven existing
@@ -565,6 +571,14 @@ impl Metrics {
                 &r,
                 "quote_updater_feed_sources_min",
                 "Venues that must be fresh for the pair to publish (min_sources).",
+                pair,
+            )?,
+            feed_divergence: gauge(
+                &r,
+                "quote_updater_feed_divergence",
+                "Largest gap between the pair's primary venue and any other fresh one, as a \
+                 fraction of the other's mid, at the last composite tick. 0 with one fresh \
+                 venue.",
                 pair,
             )?,
             venue_feed_up: gauge(
@@ -793,7 +807,8 @@ impl Metrics {
             landings: counter(
                 &r,
                 "quote_updater_landings_total",
-                "Per-block landing outcomes.",
+                "Per-block landing outcomes. foreign: the lane holds a price for the block \
+                 that another key wrote.",
                 &["pair", "result"],
             )?,
             consecutive_landing_misses: gauge(
@@ -1031,6 +1046,7 @@ impl Metrics {
             feed_delta: self.feed_delta.with_label_values(p),
             feed_sources_fresh: self.feed_sources_fresh.with_label_values(p),
             feed_sources_min: self.feed_sources_min.with_label_values(p),
+            feed_divergence: self.feed_divergence.with_label_values(p),
             price_unusable: UnusableKind::ALL
                 .map(|k| self.price_unusable.with_label_values(&[pair, k.as_str()])),
             publish_decisions: PublishAction::ALL.map(|a| {
@@ -1355,6 +1371,7 @@ impl PairMetrics {
             &self.feed_delta,
             &self.feed_sources_fresh,
             &self.feed_sources_min,
+            &self.feed_divergence,
             &self.published_mid,
             &self.published_delta,
             &self.breaker_armed,
@@ -1630,6 +1647,7 @@ mod tests {
             (UnusableKind::OutOfBand, 3),
             (UnusableKind::DeltaOverflow, 4),
             (UnusableKind::Panic, 5),
+            (UnusableKind::SourceDivergence, 6),
         ];
         assert_eq!(kinds.len(), UnusableKind::ALL.len());
         for (kind, n) in kinds {

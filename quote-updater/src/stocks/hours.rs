@@ -995,30 +995,11 @@ mod tests {
         assert!(Calendar::new(&[], &[], THROUGH, 1, u64::MAX).is_err());
     }
 
-    /// Every field the form declares is a key the stanza reads, and every key the example
-    /// stanza sets is declared, so a form round trip rebuilds the stanza unchanged.
+    /// Every field the form declares is a key the stanza reads, and the example stanza
+    /// comes back unchanged through the fields, as a front end shows and writes them.
     #[test]
     fn every_declared_field_is_a_key_the_stanza_reads_and_every_key_is_declared() {
-        use crate::{
-            backoffice::{field_value, kind_stanza},
-            kinds::typed,
-            pricing::QuoteGuardFactory,
-        };
-        let factory = UsMarketHoursFactory;
-        let fields = factory.fields();
-        assert!(!fields.is_empty(), "the kind declares no fields");
-        let posted: std::collections::HashMap<String, String> = fields
-            .iter()
-            .map(|f| {
-                (
-                    format!("guard_us_market_hours_{}", f.name),
-                    f.placeholder.to_owned(),
-                )
-            })
-            .collect();
-        let table = kind_stanza("guard", fields, "us_market_hours", None, &posted).unwrap();
-        typed::<UsMarketHoursCfg>(&table).unwrap();
-
+        use crate::pricing::QuoteGuardFactory;
         let example: toml::Value =
             toml::from_str(include_str!("../../../example/config.stocks.toml")).unwrap();
         let stanza = example["pairs"][0]["guards"]
@@ -1030,17 +1011,9 @@ mod tests {
             .as_table()
             .unwrap()
             .clone();
-        let posted: std::collections::HashMap<String, String> = fields
-            .iter()
-            .map(|f| {
-                (
-                    format!("guard_us_market_hours_{}", f.name),
-                    field_value(f, stanza.get(f.name)),
-                )
-            })
-            .collect();
-        let rebuilt =
-            kind_stanza("guard", fields, "us_market_hours", Some(&stanza), &posted).unwrap();
-        assert_eq!(rebuilt, stanza);
+        crate::testing::assert_fields_round_trip::<UsMarketHoursCfg>(
+            UsMarketHoursFactory.fields(),
+            &stanza,
+        );
     }
 }
