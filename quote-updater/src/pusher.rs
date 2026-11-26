@@ -463,6 +463,13 @@ async fn run_inner(
         args.flags.record_db_url =
             crate::secrets::lookup("RECORD_DB_URL").filter(|url| !url.is_empty());
     }
+    // The host carries the recorder's connection too, so inside an enclave it holds to the
+    // TLS-only rule the endpoints did above: refused here, at startup, before anything runs.
+    if enclave.is_some()
+        && let Some(url) = &args.flags.record_db_url
+    {
+        record::require_tls(url)?;
+    }
     let recorder = args
         .flags
         .record_db_url

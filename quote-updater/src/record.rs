@@ -26,7 +26,8 @@ use std::{
 };
 
 use ethrex_common::{Address, U256};
-use tokio_postgres::NoTls;
+use postgres_native_tls::MakeTlsConnector;
+use tokio_postgres::{NoTls, config::SslMode};
 
 use crate::supervisor::Shutdown;
 
@@ -823,17 +824,72 @@ impl Writer {
 
     /// Dials, runs the connection on its own task, and makes sure the tables exist.
     async fn connect(&self) -> eyre::Result<tokio_postgres::Client> {
-        // Plain TCP: the database is on this host (loopback), see the deploy. A URL asking
-        // for TLS is refused here rather than silently downgraded.
-        let (client, connection) = tokio_postgres::connect(&self.url, NoTls).await?;
-        tokio::spawn(async move {
-            if let Err(err) = connection.await {
-                tracing::warn!("[record] postgres connection ended: {err}");
-            }
-        });
+        let client = dial(&self.url, None).await?;
         migrate(&client).await?;
         Ok(client)
     }
+}
+
+/// Parses `RECORD_DB_URL`. The error never quotes it: it carries the database password.
+fn parse_url(url: &str) -> eyre::Result<tokio_postgres::Config> {
+    url.parse()
+        .map_err(|_| eyre::eyre!("RECORD_DB_URL is not a Postgres URL"))
+}
+
+/// Inside an enclave the recorder's connection is carried by the host like every other, so
+/// its URL must ask for TLS (`sslmode=require`), which [`dial`] checks against the image's
+/// certificates. Over anything else the host could read the rows (a config among them),
+/// change them, and ask for the password in the clear by answering as the server. Checked
+/// at startup, beside `enclave::require_tls` for the endpoints, and again by [`dial`].
+pub fn require_tls(url: &str) -> eyre::Result<()> {
+    eyre::ensure!(
+        parse_url(url)?.get_ssl_mode() == SslMode::Require,
+        "in an enclave RECORD_DB_URL must ask for TLS with sslmode=require, since the host \
+         carries the connection and could read or change anything else"
+    );
+    Ok(())
+}
+
+/// Dials `url`. With `sslmode=require`, TLS through native-tls (OpenSSL on Linux), which
+/// checks the chain against the system's certificates (the image's, in an enclave) and that
+/// the certificate names the URL's host, and `require` never falls back to plain when the
+/// other end declines TLS. Without it, plain TCP, as for a database on the same host;
+/// refused inside an enclave. `tls` replaces the system's connector: the tests hand one that
+/// trusts their own authority.
+async fn dial(
+    url: &str,
+    tls: Option<native_tls::TlsConnector>,
+) -> eyre::Result<tokio_postgres::Client> {
+    let config = parse_url(url)?;
+    if config.get_ssl_mode() == SslMode::Require {
+        let tls = match tls {
+            Some(tls) => tls,
+            None => native_tls::TlsConnector::new()?,
+        };
+        let (client, connection) = config.connect(MakeTlsConnector::new(tls)).await?;
+        drive(connection);
+        Ok(client)
+    } else {
+        // Startup refused such a URL already; this holds the rule for any other caller.
+        if crate::enclave::active() {
+            require_tls(url)?;
+        }
+        let (client, connection) = config.connect(NoTls).await?;
+        drive(connection);
+        Ok(client)
+    }
+}
+
+/// Runs a connection on its own task until it ends, which the next write then notices.
+fn drive<C>(connection: C)
+where
+    C: std::future::Future<Output = Result<(), tokio_postgres::Error>> + Send + 'static,
+{
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            tracing::warn!("[record] postgres connection ended: {err}");
+        }
+    });
 }
 
 /// The schema, created if missing: `indexer/backfill/feed.sql`, the one definition both
@@ -1538,6 +1594,226 @@ api_key = "{builder_key}"
         assert!(
             !printed.contains("very-secret") && !printed.contains("builder-secret"),
             "{printed}"
+        );
+    }
+
+    // The connection: TLS when the URL asks for it, plain TCP otherwise. Against a stand-in
+    // for Postgres's opening, so no database is needed: the client's TLS request, the
+    // answer, the handshake, and the startup message the client sends next, which the
+    // stand-in answers with an error naming what it saw. Nothing goes further, and nothing
+    // needs to: what is under test is whether the startup (the user, and the password
+    // exchange after it) travels under TLS, to a server whose certificate checked.
+
+    use tokio::{
+        io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    /// What a client sends first when it wants TLS: Postgres's SSLRequest.
+    const SSL_REQUEST: [u8; 8] = [0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f];
+
+    /// An authority, and a server certificate it signed for `name`, made in memory for this
+    /// run of the tests so no key is ever committed: (the authority's PEM, the server's
+    /// certificate PEM, its key PEM). Each has a subject of its own: rcgen gives every
+    /// certificate the same default one, and OpenSSL takes a certificate whose subject is its
+    /// issuer's for self-signed instead of looking for the authority above it.
+    fn authority_and_server(name: &str) -> (String, String, String) {
+        let authority_key = rcgen::KeyPair::generate().unwrap();
+        let mut authority = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        authority
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "record test authority");
+        authority.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        authority.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        let authority = authority.self_signed(&authority_key).unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut server = rcgen::CertificateParams::new(vec![name.to_owned()]).unwrap();
+        server
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, name);
+        server.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let server = server.signed_by(&key, &authority, &authority_key).unwrap();
+        (authority.pem(), server.pem(), key.serialize_pem())
+    }
+
+    /// A client connector that trusts `authority` besides the system's certificates.
+    fn trusting(authority: &str) -> native_tls::TlsConnector {
+        native_tls::TlsConnector::builder()
+            .add_root_certificate(native_tls::Certificate::from_pem(authority.as_bytes()).unwrap())
+            .build()
+            .unwrap()
+    }
+
+    /// The recorder's URL for a stand-in on `port`: named `localhost`, as an enclave's URL
+    /// names the database's host, and dialled at 127.0.0.1 (`hostaddr`), as the enclave's
+    /// hosts file points that name at its tunnel. Its password must never be seen in the
+    /// clear.
+    fn url(port: u16, tail: &str) -> String {
+        format!(
+            "postgresql://ponder:not-to-be-seen@localhost:{port}/ponder?hostaddr=127.0.0.1{tail}"
+        )
+    }
+
+    /// Reads one startup-phase message: a length that counts itself, then the body.
+    async fn read_startup(stream: &mut (impl AsyncRead + Unpin)) -> Vec<u8> {
+        let mut length = [0u8; 4];
+        stream.read_exact(&mut length).await.unwrap();
+        let mut body = vec![0u8; u32::from_be_bytes(length) as usize - 4];
+        stream.read_exact(&mut body).await.unwrap();
+        body
+    }
+
+    /// Postgres's ErrorResponse, FATAL, with `message`: what ends the stand-in's part.
+    async fn refuse(stream: &mut (impl AsyncWrite + Unpin), message: &str) {
+        let mut fields = Vec::new();
+        for (code, value) in [
+            (b'S', "FATAL"),
+            (b'V', "FATAL"),
+            (b'C', "28000"),
+            (b'M', message),
+        ] {
+            fields.push(code);
+            fields.extend_from_slice(value.as_bytes());
+            fields.push(0);
+        }
+        fields.push(0);
+        let mut out = vec![b'E'];
+        out.extend_from_slice(&(fields.len() as u32 + 4).to_be_bytes());
+        out.extend_from_slice(&fields);
+        stream.write_all(&out).await.unwrap();
+        stream.flush().await.unwrap();
+    }
+
+    /// A stand-in on 127.0.0.1 for one client: answers its TLS request with TLS under
+    /// `certificate` and `key`, and yields the startup message it then read, or `None` when
+    /// the handshake failed (the client refused the certificate).
+    async fn tls_stand_in(
+        certificate: String,
+        key: String,
+    ) -> (u16, tokio::task::JoinHandle<Option<Vec<u8>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let acceptor = tokio_rustls::TlsAcceptor::from(
+            crate::login::tls_config(certificate.as_bytes(), key.as_bytes()).unwrap(),
+        );
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 8];
+            socket.read_exact(&mut request).await.unwrap();
+            assert_eq!(request, SSL_REQUEST, "the client opens by asking for TLS");
+            socket.write_all(b"S").await.unwrap();
+            let mut tls = acceptor.accept(socket).await.ok()?;
+            let startup = read_startup(&mut tls).await;
+            refuse(&mut tls, "the stand-in read the startup under TLS").await;
+            Some(startup)
+        });
+        (port, server)
+    }
+
+    #[test]
+    fn inside_an_enclave_only_a_url_asking_for_tls_is_accepted() {
+        let base = "postgresql://ponder:not-to-be-seen@db.example.ts.net:5432/ponder";
+        assert!(require_tls(&format!("{base}?sslmode=require")).is_ok());
+        for tail in ["", "?sslmode=prefer", "?sslmode=disable", "?sslmode=bogus"] {
+            let err = format!("{:#}", require_tls(&format!("{base}{tail}")).unwrap_err());
+            assert!(
+                !err.contains("not-to-be-seen"),
+                "the error quotes the password: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sslmode_require_sends_the_startup_under_tls_to_a_server_whose_certificate_checks() {
+        let (authority, certificate, key) = authority_and_server("localhost");
+        let (port, server) = tls_stand_in(certificate, key).await;
+        let err = dial(&url(port, "&sslmode=require"), Some(trusting(&authority)))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("the stand-in read the startup under TLS"),
+            "{err:?}"
+        );
+        let startup = server.await.unwrap().expect("the handshake completed");
+        assert!(
+            startup.windows(6).any(|w| w == b"ponder"),
+            "the startup names the user"
+        );
+    }
+
+    #[tokio::test]
+    async fn sslmode_require_refuses_a_certificate_the_system_does_not_trust() {
+        let (_, certificate, key) = authority_and_server("localhost");
+        let (port, server) = tls_stand_in(certificate, key).await;
+        let err = dial(&url(port, "&sslmode=require"), None)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("TLS handshake"),
+            "refused by the handshake, not by anything before it: {err:#}"
+        );
+        assert_eq!(server.await.unwrap(), None, "no startup crossed");
+    }
+
+    #[tokio::test]
+    async fn sslmode_require_refuses_a_certificate_for_another_name() {
+        let (authority, certificate, key) = authority_and_server("elsewhere.example");
+        let (port, server) = tls_stand_in(certificate, key).await;
+        let err = dial(&url(port, "&sslmode=require"), Some(trusting(&authority)))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("TLS handshake"),
+            "refused by the handshake, not by anything before it: {err:#}"
+        );
+        assert_eq!(server.await.unwrap(), None, "no startup crossed");
+    }
+
+    #[tokio::test]
+    async fn sslmode_require_never_falls_back_to_plain_when_the_server_declines_tls() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 8];
+            socket.read_exact(&mut request).await.unwrap();
+            assert_eq!(request, SSL_REQUEST, "the client opens by asking for TLS");
+            socket.write_all(b"N").await.unwrap();
+            // Everything the client sends after being told no: nothing, then the close.
+            let mut rest = Vec::new();
+            socket.read_to_end(&mut rest).await.unwrap();
+            rest
+        });
+        let (authority, _, _) = authority_and_server("localhost");
+        let err = dial(&url(port, "&sslmode=require"), Some(trusting(&authority)))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("server does not support TLS"),
+            "{err:#}"
+        );
+        assert_eq!(server.await.unwrap(), b"", "nothing was sent in the clear");
+    }
+
+    #[tokio::test]
+    async fn without_sslmode_require_a_database_is_dialled_in_plain_as_before() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let startup = read_startup(&mut socket).await;
+            refuse(&mut socket, "the stand-in read the startup in the clear").await;
+            startup
+        });
+        let err = dial(&url(port, ""), None).await.unwrap_err();
+        assert!(format!("{err:?}").contains("in the clear"), "{err:?}");
+        assert_eq!(
+            &server.await.unwrap()[..4],
+            &[0, 3, 0, 0],
+            "protocol 3.0 straight away, no TLS request first"
         );
     }
 }

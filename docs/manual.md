@@ -1052,6 +1052,12 @@ the updater compiles in and runs on every connect; nothing else writes that sche
 redeploying the updater is how a change to it reaches the database. Expect about a million
 mid rows a month per pair; a few hundred balance rows.
 
+The connection is plain TCP, for a database on the same host. For one on another host, end
+the URL in `sslmode=require`: the connection is then TLS, checked against the system's
+certificates and the URL's host name, and never falls back to plain if the server declines
+it. Inside an enclave that is the only kind accepted (see `docs/enclave.md`): every
+database is on another host there, reached through one the run does not trust.
+
 What it can never do is slow quoting: the database is not on the quoting path, a refused
 connection or a failed write is a log line and a retry with backoff, and rows are kept in
 a bounded backlog meanwhile (an hour's worth; older ones are dropped and counted). Off
