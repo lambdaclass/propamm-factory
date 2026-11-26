@@ -705,7 +705,8 @@ use crate::{
     UPDATE_GAS_LIMIT, call_view,
     config::{Config, resolve_keys},
     decode_return_data,
-    rpc::{CallOutcome, call_view_outcome},
+    pricing::CallOutcome,
+    rpc::call_view_outcome,
 };
 use ethrex_l2_common::calldata::Value;
 use ethrex_l2_sdk::calldata::encode_calldata;

@@ -69,6 +69,8 @@ struct State {
     /// call reaches while every other call (preflight's included) still answers. Answered
     /// the way a node answers a call that reverts: error code 3, "execution reverted".
     reverts: HashMap<Vec<u8>, Vec<u8>>,
+    /// The `from` of every `eth_call`, in order.
+    call_froms: Vec<Address>,
     /// Every request, by method, with the moment it arrived.
     calls: Vec<(String, Instant)>,
 }
@@ -97,6 +99,7 @@ impl MockRpc {
             delays: HashMap::new(),
             failing: HashSet::new(),
             reverts: HashMap::new(),
+            call_froms: Vec::new(),
             calls: Vec::new(),
         }));
         let served = state.clone();
@@ -277,11 +280,17 @@ impl MockRpc {
             .insert(token, symbol.to_owned());
     }
 
-    /// Makes every `eth_call` to `signature` (as `symbol()`) revert with `data`, on any
-    /// contract, until the mock is dropped.
+    /// Makes every `eth_call` to `signature` (as `symbol()` or
+    /// `transferFrom(address,address,uint256)`) revert with `data`, on any contract, until the
+    /// mock is dropped.
     pub(crate) fn set_revert(&self, signature: &str, data: Vec<u8>) {
         let selector = ethrex_common::utils::keccak(signature.as_bytes()).0[..4].to_vec();
         self.state.lock().unwrap().reverts.insert(selector, data);
+    }
+
+    /// The `from` of every `eth_call` so far, in order.
+    pub(crate) fn call_froms(&self) -> Vec<Address> {
+        self.state.lock().unwrap().call_froms.clone()
     }
 
     /// When each request for `method` arrived, in order.
@@ -324,12 +333,17 @@ impl State {
     /// revert for an `eth_call` whose selector `set_revert` named, "unsupported method" for
     /// anything [`Self::answer`] does not serve.
     fn respond(
-        &self,
+        &mut self,
         method: &str,
         params: &serde_json::Value,
     ) -> Result<serde_json::Value, serde_json::Value> {
         if method == "eth_call" && !self.failing.contains(method) {
             let call = &params[0];
+            let from = call["from"].as_str().unwrap_or("0x");
+            let from = hex::decode(from.strip_prefix("0x").unwrap_or(from)).unwrap_or_default();
+            if from.len() == 20 {
+                self.call_froms.push(Address::from_slice(&from));
+            }
             let data = call["input"]
                 .as_str()
                 .or_else(|| call["data"].as_str())

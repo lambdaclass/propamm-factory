@@ -32,7 +32,8 @@ mod inputs;
 mod volatile;
 
 pub use self::inputs::{
-    Chain, History, Inventory, InventoryFeed, LandingFeed, LandingOutcome, LandingReport,
+    CallOutcome, Chain, History, Inventory, InventoryFeed, LandingFeed, LandingOutcome,
+    LandingReport,
 };
 pub use self::{feed::Feed, fixed::Fixed, volatile::Volatile};
 #[cfg(test)]
@@ -54,11 +55,13 @@ use crate::{
 /// guard reading a [`super::guard::SourceSample`]'s own `mid` and `delta`.
 pub use crate::feed::scaled_to_f64;
 
-/// One input of a pricing kind on a pair form: the stanza key it writes, the placeholder the
-/// empty input shows, and the hint under it. The backoffice API lists every registered
-/// kind's fields (`GET /api/kinds`) for whatever front end draws that form. A kind that
-/// declares its fields ([`Factory::fields`]) can be edited from such a form; one that
-/// declares none has a stanza only written whole, as the config file holds it.
+/// One input of a kind on a pair form: the stanza key it writes, the placeholder the empty
+/// input shows, the hint under it, and its type, which decides how the input's text is
+/// written into the stanza and read back from it. The backoffice API lists every registered
+/// kind's fields (`GET /api/kinds` for pricing kinds, `GET /api/guards` for guard kinds) for
+/// whatever front end draws that form. A kind that declares its fields ([`Factory::fields`],
+/// and the guard factories' `fields`) can be edited from such a form; one that declares none
+/// has a stanza only written whole, as the config file holds it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FormField {
     /// The stanza key the input writes, e.g. `half_spread`.
@@ -67,33 +70,180 @@ pub struct FormField {
     pub placeholder: &'static str,
     /// One or two sentences under the input: what the key means and what blank means.
     pub hint: &'static str,
-    /// Written into the stanza as a TOML number rather than a string, for a config type
-    /// with `f64`/`u64` fields: a form sends it as a JSON number.
-    pub number: bool,
+    /// How the input's text is written into the stanza, and read back.
+    pub kind: FieldKind,
+}
+
+/// How a [`FormField`]'s input is written into the stanza, and read back from it. More
+/// kinds may come, so a match outside this crate needs a wildcard arm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FieldKind {
+    /// A string, as typed. Blank is an absent key.
+    Text,
+    /// A TOML number, integer or float, for a config type with `f64` or integer fields; a
+    /// value that is not one is refused. Blank is an absent key.
+    Number,
+    /// A textarea, one item per line, written as an array of strings: blank lines are
+    /// dropped, and an empty textarea is an empty array with the key present.
+    List,
+    /// The name of an environment variable, written as `{ env = "NAME" }`, the shape
+    /// [`EnvSecret`] reads. The variable's value never crosses the API, in either direction.
+    Env,
+    /// A fixed set of options, one checkbox each, written as an array of the ticked ones in
+    /// this order. The placeholder names the options ticked when the stanza has no key,
+    /// space-separated: the kind's default, so a form shows what the stanza means.
+    Choices(&'static [&'static str]),
 }
 
 impl FormField {
-    /// A field whose value is written as a string, as a `const` so a kind declares its list
-    /// as a `&'static [FormField]`.
-    pub const fn new(name: &'static str, placeholder: &'static str, hint: &'static str) -> Self {
+    const fn of(
+        kind: FieldKind,
+        name: &'static str,
+        placeholder: &'static str,
+        hint: &'static str,
+    ) -> Self {
         FormField {
             name,
             placeholder,
             hint,
-            number: false,
+            kind,
         }
+    }
+
+    /// A field whose value is written as a string, as a `const` so a kind declares its list
+    /// as a `&'static [FormField]`.
+    pub const fn new(name: &'static str, placeholder: &'static str, hint: &'static str) -> Self {
+        Self::of(FieldKind::Text, name, placeholder, hint)
     }
 
     /// A field whose value is written as a number (`half_spread = 0.0005`), for a config
     /// type that reads `f64` or integer fields.
     pub const fn number(name: &'static str, placeholder: &'static str, hint: &'static str) -> Self {
-        FormField {
-            name,
-            placeholder,
-            hint,
-            number: true,
+        Self::of(FieldKind::Number, name, placeholder, hint)
+    }
+
+    /// A field whose value is a list, one item per line, written as an array of strings
+    /// (`holidays = ["2026-11-26", ...]`).
+    pub const fn list(name: &'static str, placeholder: &'static str, hint: &'static str) -> Self {
+        Self::of(FieldKind::List, name, placeholder, hint)
+    }
+
+    /// A field whose value is a choice among `options`, one checkbox each, written as an
+    /// array of the ticked ones (`sessions = ["regular", "postmarket"]`). `placeholder`
+    /// names the options ticked when the stanza has no key, space-separated.
+    pub const fn choices(
+        name: &'static str,
+        options: &'static [&'static str],
+        placeholder: &'static str,
+        hint: &'static str,
+    ) -> Self {
+        Self::of(FieldKind::Choices(options), name, placeholder, hint)
+    }
+
+    /// A field holding the name of an environment variable, written as `{ env = "NAME" }`
+    /// for a config type with an [`EnvSecret`] field.
+    pub const fn env(name: &'static str, placeholder: &'static str, hint: &'static str) -> Self {
+        Self::of(FieldKind::Env, name, placeholder, hint)
+    }
+
+    /// What a form's text for this field writes into the stanza, by its [`FieldKind`], or
+    /// `None` for a blank, which is an absent key so the kind's default applies. A list is
+    /// the exception: its empty text is an empty array, since the key is required where a
+    /// list is used. A choice is the options named, one per line or space-separated, held
+    /// to the declared ones. These are the rules a front end drawing a form from the
+    /// backoffice API's field lists follows. An env field refuses what is not a variable's
+    /// name without echoing it, since what is not a name may be the secret itself.
+    pub fn write(&self, text: &str) -> eyre::Result<Option<toml::Value>> {
+        let text = text.trim();
+        let blank = text.is_empty();
+        Ok(match self.kind {
+            FieldKind::Text => (!blank).then(|| toml::Value::String(text.to_owned())),
+            FieldKind::Number if blank => None,
+            FieldKind::Number => Some(match (text.parse::<i64>(), text.parse::<f64>()) {
+                (Ok(int), _) => toml::Value::Integer(int),
+                (_, Ok(float)) if float.is_finite() => toml::Value::Float(float),
+                _ => eyre::bail!("`{}` must be a number, got {text:?}", self.name),
+            }),
+            FieldKind::List => Some(toml::Value::Array(
+                text.lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(|line| toml::Value::String(line.to_owned()))
+                    .collect(),
+            )),
+            FieldKind::Choices(options) => Some(toml::Value::Array(
+                text.split(|c: char| c.is_whitespace() || c == ',')
+                    .filter(|word| !word.is_empty())
+                    .map(|word| {
+                        options
+                            .iter()
+                            .find(|option| option.eq_ignore_ascii_case(word))
+                            .map(|option| toml::Value::String((*option).to_owned()))
+                            .ok_or_else(|| {
+                                eyre::eyre!(
+                                    "`{}` takes {}, not {word:?}",
+                                    self.name,
+                                    options.join(", ")
+                                )
+                            })
+                    })
+                    .collect::<eyre::Result<Vec<_>>>()?,
+            )),
+            FieldKind::Env if blank => None,
+            FieldKind::Env => {
+                eyre::ensure!(
+                    is_variable_name(text),
+                    "`{}` must be the name of an environment variable (letters, digits and \
+                     underscores), never its value",
+                    self.name
+                );
+                let mut env = toml::Table::new();
+                env.insert("env".to_owned(), toml::Value::String(text.to_owned()));
+                Some(toml::Value::Table(env))
+            }
+        })
+    }
+
+    /// A stanza value as this field's input shows it, which [`FormField::write`] writes
+    /// back as it was: a number as TOML writes it, a list or a choice one item per line, an
+    /// env reference as the variable's name, a string as it is. A value of another shape
+    /// than the field's type writes (a number written by hand for a text field, say) still
+    /// shows; what cannot show is blank.
+    pub fn show(&self, value: Option<&toml::Value>) -> String {
+        match (self.kind, value) {
+            (_, None) => String::new(),
+            (FieldKind::List | FieldKind::Choices(_), Some(toml::Value::Array(items))) => items
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            (FieldKind::Env, Some(toml::Value::Table(table))) => table
+                .get("env")
+                .and_then(toml::Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            (FieldKind::Env | FieldKind::List | FieldKind::Choices(_), Some(_)) => String::new(),
+            (FieldKind::Text | FieldKind::Number, Some(scalar)) => match scalar {
+                toml::Value::String(text) => text.clone(),
+                toml::Value::Integer(int) => int.to_string(),
+                // `{:?}` keeps a whole float a float (`1.0`), so it is written back as one.
+                toml::Value::Float(float) => format!("{float:?}"),
+                toml::Value::Boolean(flag) => flag.to_string(),
+                _ => String::new(),
+            },
         }
     }
+}
+
+/// Whether `name` is spelled like an environment variable: a letter or underscore, then
+/// letters, digits and underscores.
+pub(crate) fn is_variable_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// The future a [`Factory`] builds in: boxed and `Send`, so building needs no
@@ -169,10 +319,9 @@ pub trait Factory: Send + Sync + 'static {
     }
 
     /// The stanza's keys as inputs on a pair form, in the order shown, as the backoffice API
-    /// lists them (`GET /api/kinds`). A field is written into the stanza as a string unless
-    /// it is a [`FormField::number`], so a kind that declares fields reads its config as
-    /// strings (the kinds this crate ships do). Empty, the default, means the stanza is
-    /// only written whole.
+    /// lists them (`GET /api/kinds`). A front end writes each into the stanza as the field's
+    /// [`FieldKind`] says: a string, a number, a list or an env reference. Empty, the
+    /// default, means the stanza is only written whole.
     fn fields(&self) -> &'static [FormField] {
         &[]
     }
@@ -217,6 +366,18 @@ pub trait MarketGuardFactory: Send + Sync + 'static {
         Ok(())
     }
 
+    /// The stanza's keys as inputs on a pair form, in the order shown, as the backoffice API
+    /// lists them (`GET /api/guards`); as [`Factory::fields`] for a pricing kind. Empty, the
+    /// default, means the stanza is only written whole.
+    fn fields(&self) -> &'static [FormField] {
+        &[]
+    }
+
+    /// HTML a pair form shows above this kind's fields; see [`Factory::form_help`].
+    fn form_help(&self) -> &'static str {
+        ""
+    }
+
     /// One short line for `--check`'s `guards` column, e.g. `max_spread 0.3%`. The kind's
     /// name is shown either way; this is the settings after it. Empty shows the name alone.
     fn summary(&self, _cfg: &Self::Config) -> String {
@@ -246,6 +407,18 @@ pub trait QuoteGuardFactory: Send + Sync + 'static {
     /// Checks a stanza against the pair it would judge. Synchronous and without I/O.
     fn validate(&self, _cfg: &Self::Config, _pair: &PairShape) -> eyre::Result<()> {
         Ok(())
+    }
+
+    /// The stanza's keys as inputs on a pair form, in the order shown, as the backoffice API
+    /// lists them (`GET /api/guards`); as [`Factory::fields`] for a pricing kind. Empty, the
+    /// default, means the stanza is only written whole.
+    fn fields(&self) -> &'static [FormField] {
+        &[]
+    }
+
+    /// HTML a pair form shows above this kind's fields; see [`Factory::form_help`].
+    fn form_help(&self) -> &'static str {
+        ""
     }
 
     /// One short line for `--check`'s `guards` column; see [`MarketGuardFactory::summary`].
@@ -381,6 +554,9 @@ pub struct PairShape {
     /// How many venues the pair's `symbol`/`sources` stream from: 0 for a pair with no
     /// market, which a kind that reads one refuses in its `validate`.
     pub sources: usize,
+    /// How many of those quote one price with no book behind it (`ondo`, an issuer's own
+    /// price): their half-spread is zero, so a kind that copies the book's copies nothing.
+    pub mid_only_sources: usize,
     /// The pair's `min_mid`, in lane orientation, which the core holds every published mid
     /// to, and on a pair with a market the market's mid as well; a kind whose mid is a
     /// setting checks it here, so a mistake fails the file instead of every tick.
@@ -1245,6 +1421,7 @@ mod tests {
     fn pair(inverted: bool, price_decimals: u32) -> PairShape {
         PairShape {
             sources: 1,
+            mid_only_sources: 0,
             min_mid: None,
             max_mid: None,
             max_source_divergence: None,

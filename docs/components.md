@@ -98,11 +98,11 @@ publish, without sending anything. [`manual.md`](manual.md) is the operating man
 
 **The backoffice** is a JSON API the updater serves under `/api`. Through it you add and
 remove pairs, pick the exchanges a pair follows and their weights, change a pair's pricing
-settings, add builders, and halt or resume a pair. It serves no pages: a front end, such as
-the one in [`backoffice-ui/`](../backoffice-ui/README.md), or `curl`, talks to it. Every
-change is written to the config file and applied without a restart. You put it on a private
-address (your tailnet), and can also require a Google sign-in from an allowed Workspace
-domain or address.
+settings and its guards, add builders, and halt or resume a pair. It serves no pages: a
+front end, such as the one in [`backoffice-ui/`](../backoffice-ui/README.md), or `curl`,
+talks to it. Every change is written to the config file and applied without a restart. You
+put it on a private address (your tailnet), and can also require a Google sign-in from an
+allowed Workspace domain or address.
 
 ## Monitoring
 

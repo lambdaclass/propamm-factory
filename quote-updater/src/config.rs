@@ -82,6 +82,10 @@ pub struct FileSettings {
     pub metrics_addr: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disable_cross_region: Option<bool>,
+    /// Publish each update with its signing instant (UNIX ns) as a third slot; see
+    /// `--quote-id`. Off unless set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quote_id: Option<bool>,
     /// Where the backoffice listens, e.g. `100.x.y.z:8088`. Unset disables it, which is the
     /// default: a service that listens on nothing is the one that cannot be reached wrong.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -340,6 +344,15 @@ impl Feeds {
             min_sources: 1,
             checks: SourceChecks::default(),
         }
+    }
+
+    /// How many sources quote one price with no book behind it ([`VenueId::quotes_a_book`]):
+    /// what [`crate::pricing::PairShape::mid_only_sources`] tells a pricer.
+    pub fn mid_only_sources(&self) -> usize {
+        self.sources
+            .iter()
+            .filter(|source| !source.venue.quotes_a_book())
+            .count()
     }
 
     /// The one-line description the report and the backoffice print: `binance:ETHUSDC`, or
@@ -1853,6 +1866,31 @@ sources = [
             let err = parse_config(&pair_with(&body), 18).map(|_| ()).unwrap_err();
             assert!(format!("{err:#}").contains(expected), "{body}: {err:#}");
         }
+    }
+
+    /// The sources that quote one price with no book behind it, which a kind copying the
+    /// book's half-spread would copy as zero: Ondo's, and no exchange's.
+    #[test]
+    fn a_source_with_no_book_is_counted_as_mid_only() {
+        let text = pair_with(
+            r#"sources = [
+  { venue = "ondo", symbol = "AAPLon" },
+  { venue = "okx", symbol = "ETH-USDC" },
+]
+pricing = { kind = "feed", delta = "0.003" }
+"#,
+        );
+        let config = parse_config(&text, 18).unwrap();
+        assert_eq!(
+            config.pairs[0].feeds.as_ref().unwrap().mid_only_sources(),
+            1
+        );
+        let text = pair_with(r#"symbol = "ETHUSDC""#);
+        let config = parse_config(&text, 18).unwrap();
+        assert_eq!(
+            config.pairs[0].feeds.as_ref().unwrap().mid_only_sources(),
+            0
+        );
     }
 
     /// The late-venue key is off unless set, and read as written when it is.
