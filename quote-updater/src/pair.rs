@@ -237,6 +237,7 @@ pub(crate) fn shape_of(resolved: &ResolvedPair, price_decimals: u32, target: Add
         price_decimals,
         target,
         sources: resolved.feeds.as_ref().map_or(0, |f| f.sources.len()),
+        mid_only_sources: resolved.feeds.as_ref().map_or(0, |f| f.mid_only_sources()),
         min_mid: resolved.pair.band.min,
         max_mid: resolved.pair.band.max,
         max_source_divergence: resolved
@@ -835,6 +836,7 @@ pub(crate) async fn collect_prices(
                 price_decimals,
                 target: chain.1,
                 sources: spec.feeds.as_ref().map_or(0, |f| f.sources.len()),
+                mid_only_sources: spec.feeds.as_ref().map_or(0, |f| f.mid_only_sources()),
                 min_mid: spec.band.min,
                 max_mid: spec.band.max,
                 max_source_divergence: spec
@@ -986,6 +988,8 @@ pub(crate) struct SendOpts {
     /// Where the quote loop records every update it signs, when recording is on. Carried
     /// here for the same reason as `price_decimals`.
     pub(crate) recorder: Option<record::Recorder>,
+    /// Whether each update carries its signing instant as a third slot; see `--quote-id`.
+    pub(crate) quote_id: bool,
 }
 
 #[cfg(test)]
@@ -1524,6 +1528,7 @@ mod tests {
             price_decimals: 18,
             target: Address::zero(),
             sources: 1,
+            mid_only_sources: 0,
             min_mid: None,
             max_mid: None,
             max_source_divergence: None,
@@ -1553,6 +1558,7 @@ mod tests {
             price_decimals: 18,
             target: Address::zero(),
             sources: 1,
+            mid_only_sources: 0,
             min_mid: Some(U256::from(995_000_000_000_000_000u64)),
             max_mid: Some(U256::from(1_005_000_000_000_000_000u64)),
             max_source_divergence: None,
@@ -1608,6 +1614,7 @@ mod tests {
         fn shape() -> PairShape {
             PairShape {
                 sources: 1,
+                mid_only_sources: 0,
                 min_mid: None,
                 max_mid: None,
                 max_source_divergence: None,

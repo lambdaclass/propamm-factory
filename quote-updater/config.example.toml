@@ -87,6 +87,13 @@ metrics_addr = "127.0.0.1:9464"
 # disable_cross_region below overrides this for that builder.
 disable_cross_region = false
 
+# Publish each update with a third slot holding the signing instant in UNIX nanoseconds, so
+# an update found on chain says by itself when its price was computed. Public: anyone
+# reading the calldata sees it. PropAMM reads only the first two slots. Off by default; on,
+# each landed update pays one more storage write (~22k gas the first time per lane, ~5k
+# after).
+# quote_id = false
+
 # The PrioUpdateRegistry. Defaults to the mainnet deployment PropAMM reads from since
 # 2026-09-15; the first one (0xDa7AfeeD01fe…8C5F) has a known vulnerability, do not point
 # this back at it.
@@ -109,6 +116,7 @@ disable_cross_region = false
 # coinbase = "wss://advanced-trade-ws.coinbase.com"
 # kucoin = "https://api.kucoin.com"        # the REST host its socket URL is fetched from
 # mexc = "https://api.mexc.com"            # polled
+# ondo = "https://api.gm.ondo.finance"     # polled; the key comes from ONDO_API_KEY
 # coingecko = "https://api.coingecko.com/api/v3"  # not a venue: where vault USD prices come from
 
 # Seconds between pushes in node mode. No effect in builder mode.

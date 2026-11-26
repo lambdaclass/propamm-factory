@@ -57,6 +57,9 @@ Settings: `half_spread`, `strength` (how far the mid moves per unit of imbalance
 `max_inventory_age_secs`. It is the one to read to see how a model that looks at the vault is
 written, start to finish, with comments.
 
+**`ondo`**, for tokenized stocks, ships in the library's `stocks` module with the two guards a
+stock pair needs, and the example registers it in two lines; see [stocks.md](stocks.md).
+
 ## Writing your own
 
 A model is a Rust struct with one method. It gets the market, returns a mid and a
