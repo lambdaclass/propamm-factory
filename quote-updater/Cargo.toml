@@ -67,10 +67,19 @@ askama = { version = "0.16.0", default-features = false, features = ["derive", "
 # into the indexer's Postgres, off the quoting path through one writer task. Measured cost
 # in Cargo.lock: 19 new package entries (tokio-postgres, postgres-protocol, postgres-types,
 # phf, stringprep, md-5, whoami and their leaves), six of which are Windows or macOS only
-# and never compile on the server. Plain TCP (`NoTls`): the database is on the same host.
-# `with-serde_json-1` lets a `serde_json::Value` bind as a jsonb parameter (the config
-# snapshots); serde_json is already a dependency, so the feature adds no package.
+# and never compile on the server. Plain TCP (`NoTls`) for a database on the same host;
+# TLS below for one elsewhere. `with-serde_json-1` lets a `serde_json::Value` bind as a
+# jsonb parameter (the config snapshots); serde_json is already a dependency, so the
+# feature adds no package.
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+# The recorder's TLS, for a database on another host (`sslmode=require` in RECORD_DB_URL),
+# which is every database seen from inside an enclave: the host carries the connection.
+# native-tls like the rest of the crate's client TLS (see tokio-tungstenite above), so
+# OpenSSL on Linux, already linked, checking the chain and the host name against the
+# system's certificates (the image's, in an enclave). native-tls itself is already in
+# Cargo.lock through tokio-tungstenite and reqwest; postgres-native-tls is one new entry.
+postgres-native-tls = "0.5"
+native-tls = "0.2"
 # The venues that have no stream (MEXC's is protobuf-only, CoinGecko is an HTTP API) are
 # polled, and KuCoin hands out its WebSocket URL over HTTP. Already in the tree with
 # default features through ethrex-rpc's EthClient, so this adds no package to Cargo.lock.

@@ -24,6 +24,11 @@ What that buys, against someone with root on the host:
   in the image; the host only copies encrypted bytes. A plain `http://` or `ws://` endpoint
   is refused inside an enclave: at startup, and when the backoffice or a reload would add
   one.
+- **The recorder's rows and its password stay between the run and the database.** Its
+  connection to Postgres is TLS opened from inside too, checked the same way against the
+  database's host name: `RECORD_DB_URL` must end in `sslmode=require`, and one that does
+  not is refused at startup. The database needs a certificate the image trusts for that
+  name (a public one, such as `tailscale cert` issues for a `ts.net` name).
 
 What the host can still do:
 
@@ -31,13 +36,9 @@ What the host can still do:
 - Restart it with an older sealed config it copied earlier.
 - Read the log lines and the metrics. They say which pairs run and what they publish, and
   who changed what through the backoffice.
-- Read and change what the recorder writes to Postgres, which goes over plain TCP and feeds
-  dashboards, not quoting. That includes a copy of the config with its credentials removed
-  (builder API keys, the RPC URLs cut to their host, credential-named pricer keys): the
-  pairs, their parameters and the venue and builder endpoints are readable there.
-- Read the recorder's database password. The connection is plain TCP, so the host's end of
-  the tunnel can ask for the password in the clear. Give `RECORD_DB_URL` a role of its own
-  that can only insert into the recorder's tables, on a database used for nothing else.
+- Withhold the recorder's rows, by cutting its connection: the dashboards it feeds go
+  stale, quoting does not notice. Whoever else can write to that database can still change
+  what it holds, so the recorder's role there is still best kept to its own tables.
 
 These hold only on a platform where root on the host really cannot reach into the enclave.
 An AWS Nitro enclave is one. A confidential VM is not, for this purpose: it is protected from
@@ -66,8 +67,8 @@ quote-updater --config /run/quote-updater/config.toml --enclave /app/enclave.tom
    message: credentials for the key service, every secret as ciphertext, the sealed config,
    and the backoffice certificate.
 2. The release decrypts the secrets. They become what every secret lookup reads: a pair's
-   `key_env`, a pricer's secret, `ONDO_API_KEY`, `COINGECKO_API_KEY`, `RECORD_DB_URL` (whose
-   password the host can still learn, see above), and the names the enclave file gives.
+   `key_env`, a pricer's secret, `ONDO_API_KEY`, `COINGECKO_API_KEY`, `RECORD_DB_URL` (with
+   `sslmode=require`, see above), and the names the enclave file gives.
 3. The config is opened onto `--config`, and the run proceeds as it does anywhere else.
 4. From then on the same link carries every log line to the host, the sealed config to the
    host after every save, and the host's reload and shutdown requests to the run. The link

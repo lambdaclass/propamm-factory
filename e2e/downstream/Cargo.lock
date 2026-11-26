@@ -3028,6 +3028,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "postgres-native-tls"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fef4de47bb81477e0c3deaf153a1b10ae176484713ff1640969f4cb96b653ebc"
+dependencies = [
+ "native-tls",
+ "tokio",
+ "tokio-native-tls",
+ "tokio-postgres",
+]
+
+[[package]]
 name = "postgres-protocol"
 version = "0.6.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3232,6 +3244,8 @@ dependencies = [
  "hyper",
  "hyper-util",
  "jsonwebtoken",
+ "native-tls",
+ "postgres-native-tls",
  "prometheus",
  "rand 0.8.8",
  "reqwest",
