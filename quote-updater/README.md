@@ -11,7 +11,7 @@ your binary (main.rs)                    this library
 register your pricing model      ──►     price feeds (Binance, Kraken, Coinbase, ...)
 register guards (optional)       ──►     per-block quote loop, signing, builders
 register an observer (optional)  ──►     landing checks, metrics, config reload, --check
-call run_from_env()                      backoffice web page, circuit breaker
+call run_from_env()                      backoffice API, circuit breaker
 ```
 
 ## Five minutes to a running quote updater
@@ -40,10 +40,12 @@ impl Pricer for SkewedPricer {
     // half-spread out. The library converts both to what the contract stores.
     fn price(&mut self, tick: &TickCtx, _out: &mut Diagnostics) -> Result<PricerOutput, Refusal> {
         let market = tick.market()?;
-        Ok(PricerOutput::new(
-            market.scaled_fraction(self.cfg.half_spread)?,   // 0.0005 = 5 bp
-            market.shift(self.cfg.skew)?,                    // +0.01 = a mid 1% below market
-        ))
+        let half_spread = self.cfg.half_spread;
+        let delta = market.scaled_fraction(half_spread)?;    // 0.0005 = 5 bp; refuses < 0 or NaN
+        // Never move the mid further than the half-spread: past it you sell below the
+        // market price (or buy above it), and a taker pockets the difference.
+        let skew = self.cfg.skew.clamp(-half_spread, half_spread);
+        Ok(PricerOutput::new(delta, market.shift(skew)?))    // +0.0002 = a mid 2 bp below market
     }
 }
 
@@ -102,10 +104,10 @@ A fuller example with a pricer that reads the vault, two guards and an observer 
 
 ## What the library does for you
 
-Config file with validation and hot reload, `--check` dry runs, the feeds, signing and
-sending to builders every block, landing checks, Prometheus metrics, a backoffice web page
-to edit pairs, a circuit breaker per pair, and a recorder that writes every quote to
-Postgres if you want one. [docs/manual.md](../docs/manual.md) is the operator's manual for all
+Config file with validation, `--check` dry runs, the feeds, signing and sending to
+builders every block, landing checks, Prometheus metrics, a backoffice JSON API to change
+pairs and builders without a restart, a circuit breaker per pair, and a recorder that
+writes every quote to Postgres if you want one. [docs/manual.md](../docs/manual.md) is the operator's manual for all
 of it.
 
 Rust 1.98.1, pinned in the repo's `rust-toolchain.toml`. `make lint`, `make cargo-test`, `make e2e` and `make downstream` from the repo root are what CI runs.

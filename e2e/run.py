@@ -6,13 +6,17 @@ reads back everything the mocks saw: the signed bytes each builder was sent, dec
 checked field by field; that each update lands and its nonces run in order; that a killed
 builder leaves the other quoting; that SIGINT withdraws both quotes; and /metrics.
 
-    python3 e2e/run.py --binary target/debug/quote-updater
-    python3 e2e/run.py --binary target/release/quote-updater --baseline /path/to/old
+    python3 e2e/run.py --binary target/debug/examples/minimal
+    python3 e2e/run.py --binary target/release/examples/minimal --baseline /path/to/old
     python3 e2e/run.py --binary target/debug/examples/tilted --custom
+
+Without `--custom` WETH/USDC is priced by the `feed` kind, so `--binary` must be one that
+registers the kinds the library ships: `quote-updater/examples/minimal.rs` does, and
+nothing else (`cargo build -p quote-updater --example minimal`).
 
 `--custom` prices WETH/USDC through the `tilted` kind, which `quote-updater/examples/tilted.rs`
 registers, so `--binary` must be that example: the library's custom path end to end, the
-vault read through the build context included (`make e2e-custom`).
+vault read through the build context included. This is the run `make e2e` does.
 
 `--baseline` runs a second binary through the same script on the same ports and compares:
 the `--check` report, the signed bytes and every log line must match. The chain is

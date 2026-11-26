@@ -30,9 +30,10 @@ const MAX_INVERTED_PRICE_DECIMALS: u32 = 38;
 /// otherwise arm a guard measuring over days and looking like it measured over hours.
 pub const MAX_BREAKER_WINDOW_BLOCKS: u64 = 7200;
 
-/// The config file as written on disk. `Serialize` too, because the backoffice edits it by
-/// reading it into this and writing it back: one type for both directions, so a field the
-/// writer forgot fails to compile rather than vanishing from someone's config.
+/// The config file as written on disk, and the pusher's configuration while it runs (see
+/// `state.rs`). `Serialize` too, because every change is written back to the file from
+/// this: one type for both directions, so a field the writer forgot fails to compile
+/// rather than vanishing from someone's config.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawConfig {
@@ -81,10 +82,19 @@ pub struct FileSettings {
     pub metrics_addr: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disable_cross_region: Option<bool>,
+    /// Publish each update with its signing instant (UNIX ns) as a third slot; see
+    /// `--quote-id`. Off unless set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quote_id: Option<bool>,
     /// Where the backoffice listens, e.g. `100.x.y.z:8088`. Unset disables it, which is the
     /// default: a service that listens on nothing is the one that cannot be reached wrong.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backoffice_addr: Option<String>,
+    /// The names the backoffice answers to besides an IP address and `localhost`, which it
+    /// always does: its tailnet name, or a reverse proxy's (`--backoffice-host`). A request
+    /// addressed to any other name is refused; see `backoffice::guard`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backoffice_hosts: Vec<String>,
 }
 
 impl FileSettings {
@@ -92,66 +102,31 @@ impl FileSettings {
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
     }
-
-    /// The keys that differ, so a refused reload can name the one that changed.
-    pub fn changed_keys(&self, other: &Self) -> Vec<&'static str> {
-        let mut changed = Vec::new();
-        let mut check = |name, differs| {
-            if differs {
-                changed.push(name);
-            }
-        };
-        check("mode", self.mode != other.mode);
-        check("rpc_url", self.rpc_url != other.rpc_url);
-        check("rpc_ws_url", self.rpc_ws_url != other.rpc_ws_url);
-        check("registry", self.registry != other.registry);
-        check(
-            "price_decimals",
-            self.price_decimals != other.price_decimals,
-        );
-        check("binance_ws", self.binance_ws != other.binance_ws);
-        check("endpoints", self.endpoints != other.endpoints);
-        check("interval", self.interval != other.interval);
-        check("requote_ms", self.requote_ms != other.requote_ms);
-        check("metrics_addr", self.metrics_addr != other.metrics_addr);
-        check(
-            "disable_cross_region",
-            self.disable_cross_region != other.disable_cross_region,
-        );
-        check(
-            "backoffice_addr",
-            self.backoffice_addr != other.backoffice_addr,
-        );
-        changed
-    }
 }
 
 /// A serde round-trip cannot keep comments, so a rewritten file says where they went.
-fn written_header() -> String {
-    format!(
-        "\
-# The pusher's configuration. Rewritten in full whenever the backoffice changes it, which
-# is why it carries no comments: see quote-updater/config.example.toml for what every key
-# means. Editing it by hand is fine ({} applies the
-# [[pairs]]), but the next backoffice write reformats whatever you leave here.
+const WRITTEN_HEADER: &str = "\
+# The pusher's configuration. Read once, when the pusher starts; after that its pairs and
+# builders are changed through the backoffice API, which rewrites this file in full on every
+# change. That is why it carries no comments: see quote-updater/config.example.toml for what
+# every key means. A hand edit here takes effect at the next start. Until then, a change made
+# through the API keeps `target` and the settings table as you left them, but rewrites the
+# pairs and builders from what is running.
 #
 # It holds the builder API keys, so it stays mode 0600.
-",
-        crate::hints::reload_in_prose()
-    )
-}
+";
 
 /// Reads the file exactly as written, for a caller that is about to change one entry.
 pub fn load_raw(path: &Path) -> Result<RawConfig> {
     let text = std::fs::read_to_string(path)
         .wrap_err_with(|| format!("failed to read config {}", path.display()))?;
-    toml::from_str(&text).wrap_err_with(|| format!("invalid config {}", path.display()))
+    parse_raw(&text).wrap_err_with(|| format!("invalid config {}", path.display()))
 }
 
 /// Renders a config back to TOML, header and all.
 pub fn render_raw(config: &RawConfig) -> Result<String> {
     let body = toml::to_string_pretty(config).wrap_err("failed to render the config as TOML")?;
-    Ok(format!("{}\n{body}", written_header()))
+    Ok(format!("{WRITTEN_HEADER}\n{body}"))
 }
 
 /// Write-then-rename into the same directory, so a reload racing this sees the whole old
@@ -163,6 +138,12 @@ pub fn write_raw_atomically(path: &Path, config: &RawConfig) -> Result<()> {
     // now, expensive at the next reload.
     parse_file_settings(&rendered).wrap_err("the rendered config does not parse back")?;
 
+    write_bytes_atomically(path, rendered.as_bytes())
+}
+
+/// [`write_raw_atomically`] for bytes already rendered: how a rejected change puts back the
+/// file it replaced, exactly as it was.
+pub(crate) fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let tmp = dir.join(format!(
         ".{}.tmp",
@@ -183,7 +164,7 @@ pub fn write_raw_atomically(path: &Path, config: &RawConfig) -> Result<()> {
         let mut file = options
             .open(&tmp)
             .wrap_err_with(|| format!("failed to open {}", tmp.display()))?;
-        file.write_all(rendered.as_bytes())
+        file.write_all(bytes)
             .wrap_err_with(|| format!("failed to write {}", tmp.display()))?;
         // Before the rename: otherwise a crash could leave an empty file at the real path.
         file.sync_all()
@@ -217,14 +198,6 @@ pub fn parse_file_settings(toml_text: &str) -> Result<FileSettings> {
     Ok(probe.settings)
 }
 
-/// Same, from a path, so a caller reading the file for its settings reports a missing or
-/// unreadable file the way `load_config` does.
-pub fn load_file_settings(path: &Path) -> Result<FileSettings> {
-    let text = std::fs::read_to_string(path)
-        .wrap_err_with(|| format!("failed to read config {}", path.display()))?;
-    parse_file_settings(&text).wrap_err_with(|| format!("invalid config {}", path.display()))
-}
-
 /// One `[[pairs]]` stanza, as written. See `RawConfig` for why this is serializable.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -246,6 +219,11 @@ pub struct RawPair {
     /// no such check.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_source_lag_ms: Option<String>,
+    /// How far the pair's venues may disagree before its quote is withdrawn, as a fraction
+    /// of the mid (0.001 = 0.1%). See [`SourceChecks`]. Blank: the default limit, which
+    /// follows the spread the pair publishes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_source_divergence: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_mid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -264,11 +242,11 @@ pub struct RawPair {
     /// cleared. Parsed and validated like any other pair, so resuming one cannot surprise.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub halted: bool,
-    /// Why, when a binary's `UpdaterHandle::halt` set the flag: the backoffice shows it and
-    /// the reload logs it when it stops the lane. Cleared with the flag by a resume. The
-    /// quoting never acts on it; the backoffice does, once: its "Restart halted pairs"
-    /// leaves a halt with a reason for that pair's own Resume, so a kill switch outlives
-    /// the button. One written by hand beside `halted = true` makes that halt as sticky.
+    /// Why, when a binary's `UpdaterHandle::halt` set the flag: the backoffice API shows it
+    /// and the reload logs it when it stops the lane. Cleared with the flag by a resume. The
+    /// quoting never acts on it; the backoffice does, once: its `POST /api/reload` leaves a
+    /// halt with a reason for that pair's own resume, so a kill switch outlives the bulk
+    /// restart. One written by hand beside `halted = true` makes that halt as sticky.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub halt_reason: Option<String>,
     /// The pair's pricing stanza: `kind` names a pricing kind the binary registered
@@ -324,7 +302,8 @@ pub struct Source {
 pub struct Feeds {
     pub sources: Vec<Source>,
     pub min_sources: usize,
-    /// The late-venue check; off unless the stanza sets it.
+    /// The late-venue check, off unless the stanza sets it, and the limit on how far the
+    /// venues may disagree, the default one unless the stanza sets it.
     pub checks: SourceChecks,
 }
 
@@ -346,6 +325,11 @@ pub const MAX_SOURCE_LAG_MS: u64 = 30_000;
 pub struct SourceChecks {
     /// `max_source_lag_ms`.
     pub max_lag: Option<std::time::Duration>,
+    /// `max_source_divergence`, scaled by `10^price_decimals`: the most the pair's primary
+    /// venue may sit from any other fresh one before the quote is withdrawn. On for every
+    /// pair with two or more venues, whether or not this is set: `None` is the default
+    /// limit, a multiple of the half-spread the pair publishes (`pricing::agreement`).
+    pub max_divergence: Option<U256>,
 }
 
 impl Feeds {
@@ -360,6 +344,15 @@ impl Feeds {
             min_sources: 1,
             checks: SourceChecks::default(),
         }
+    }
+
+    /// How many sources quote one price with no book behind it ([`VenueId::quotes_a_book`]):
+    /// what [`crate::pricing::PairShape::mid_only_sources`] tells a pricer.
+    pub fn mid_only_sources(&self) -> usize {
+        self.sources
+            .iter()
+            .filter(|source| !source.venue.quotes_a_book())
+            .count()
     }
 
     /// The one-line description the report and the backoffice print: `binance:ETHUSDC`, or
@@ -444,6 +437,38 @@ impl MidBand {
         }
         Ok(())
     }
+
+    /// The same bounds on the pair's market: the composite mid, in lane orientation and at
+    /// the published mid's scale. Judged after [`Self::check`] for a pair that streams, so a
+    /// kind whose mid does not follow the market (a `fixed` price) still stops when the
+    /// market leaves the band. Without it a fixed stable pair's band judged only the fixed
+    /// number, and the pair sold at par through a depeg (audit F-04).
+    pub fn check_market(&self, market_mid: U256) -> Result<(), crate::update::Unusable> {
+        use crate::update::{Unusable, UnusableKind};
+        if let Some(min) = self.min
+            && market_mid < min
+        {
+            return Err(Unusable::new(
+                UnusableKind::OutOfBand,
+                format!(
+                    "the market's mid {market_mid} is below this pair's min_mid {min}: the \
+                     market has left the band; refusing to publish"
+                ),
+            ));
+        }
+        if let Some(max) = self.max
+            && market_mid > max
+        {
+            return Err(Unusable::new(
+                UnusableKind::OutOfBand,
+                format!(
+                    "the market's mid {market_mid} is above this pair's max_mid {max}: the \
+                     market has left the band; refusing to publish"
+                ),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// One `[pairs.pricing]` stanza: the registered kind it names, and the stanza as written
@@ -471,8 +496,13 @@ impl PricingSpec {
         }
     }
 
+    /// A `fixed` stanza for a test pair that streams nothing, so `unguarded` (audit F-04: a
+    /// fixed price otherwise needs a market to compare its price with).
     pub(crate) fn fixed_for_tests(mid: &str, delta: &str) -> Self {
-        Self::for_tests("fixed", &[("mid", mid), ("delta", delta)])
+        Self::for_tests(
+            "fixed",
+            &[("mid", mid), ("delta", delta), ("unguarded", "true")],
+        )
     }
 
     pub(crate) fn feed_for_tests(delta: Option<&str>) -> Self {
@@ -552,7 +582,7 @@ pub fn spread_scale(price_decimals: u32) -> U256 {
 ///
 /// `symbol` is the short form of one Binance source and the two keys are exclusive, so a
 /// stanza cannot say two different things about where its price comes from.
-fn parse_feeds(raw: &RawPair, at: &str) -> Result<Option<Feeds>> {
+fn parse_feeds(raw: &RawPair, price_decimals: u32, at: &str) -> Result<Option<Feeds>> {
     let mut sources = Vec::with_capacity(raw.sources.len() + 1);
     match (&raw.symbol, raw.sources.is_empty()) {
         (Some(_), false) => bail!(
@@ -565,7 +595,7 @@ fn parse_feeds(raw: &RawPair, at: &str) -> Result<Option<Feeds>> {
                 "{at}: min_sources needs sources to count"
             );
             let mut feeds = Feeds::single_binance(symbol);
-            feeds.checks = parse_source_checks(raw, &feeds.sources, at)?;
+            feeds.checks = parse_source_checks(raw, &feeds.sources, price_decimals, at)?;
             return Ok(Some(feeds));
         }
         (None, true) => {
@@ -576,6 +606,10 @@ fn parse_feeds(raw: &RawPair, at: &str) -> Result<Option<Feeds>> {
             ensure!(
                 raw.max_source_lag_ms.is_none(),
                 "{at}: max_source_lag_ms judges a pair's venues, and this pair has none"
+            );
+            ensure!(
+                raw.max_source_divergence.is_none(),
+                "{at}: max_source_divergence compares a pair's venues, and this pair has none"
             );
             return Ok(None);
         }
@@ -636,7 +670,7 @@ fn parse_feeds(raw: &RawPair, at: &str) -> Result<Option<Feeds>> {
             n
         }
     };
-    let checks = parse_source_checks(raw, &sources, at)?;
+    let checks = parse_source_checks(raw, &sources, price_decimals, at)?;
     Ok(Some(Feeds {
         sources,
         min_sources,
@@ -648,17 +682,24 @@ fn parse_feeds(raw: &RawPair, at: &str) -> Result<Option<Feeds>> {
 /// message: for the backoffice, which checks an edit before writing it. A pair not setting
 /// it is not looked at, so nothing else changes there.
 pub(crate) fn check_source_keys(raw: &RawPair) -> Result<()> {
-    if raw.max_source_lag_ms.is_none() {
+    if raw.max_source_lag_ms.is_none() && raw.max_source_divergence.is_none() {
         return Ok(());
     }
-    parse_feeds(raw, "this pair").map(|_| ())
+    // At the one scale a run prices at, so a fraction is refused here for the same reasons
+    // the reload that follows the edit would refuse it.
+    parse_feeds(raw, crate::PRICE_DECIMALS, "this pair").map(|_| ())
 }
 
 /// `max_source_lag_ms`: a whole number of milliseconds, above zero and at most
 /// [`MAX_SOURCE_LAG_MS`], on a pair at least one of whose `sources` stamps its frames.
 /// On one where none does there would be nothing to judge, so the key is refused rather
 /// than quietly doing nothing.
-fn parse_source_checks(raw: &RawPair, sources: &[Source], at: &str) -> Result<SourceChecks> {
+fn parse_source_checks(
+    raw: &RawPair,
+    sources: &[Source],
+    price_decimals: u32,
+    at: &str,
+) -> Result<SourceChecks> {
     let max_lag = match &raw.max_source_lag_ms {
         None => None,
         Some(text) => {
@@ -689,7 +730,28 @@ fn parse_source_checks(raw: &RawPair, sources: &[Source], at: &str) -> Result<So
             Some(std::time::Duration::from_millis(ms))
         }
     };
-    Ok(SourceChecks { max_lag })
+    // `max_source_divergence`: a fraction of the mid, held to what every threshold is (not
+    // zero at this scale, not finer than it, below 1), on a pair with something to compare.
+    let max_divergence = match &raw.max_source_divergence {
+        None => None,
+        Some(text) => {
+            ensure!(
+                sources.len() >= 2,
+                "{at}: max_source_divergence compares a pair's venues with each other, and \
+                 this pair has one; add a second venue, or leave the key unset"
+            );
+            Some(parse_threshold(
+                text.trim(),
+                price_decimals,
+                "max_source_divergence",
+                at,
+            )?)
+        }
+    };
+    Ok(SourceChecks {
+        max_lag,
+        max_divergence,
+    })
 }
 
 /// Parses one threshold fraction, applying every check that makes a threshold trustworthy.
@@ -706,7 +768,7 @@ fn parse_threshold(fraction: &str, price_decimals: u32, key: &str, at: &str) -> 
         "{at}: {key} {fraction} is zero at {price_decimals} decimals, so the second \
          price would trip it and halt the pair"
     );
-    // Digits beyond `--price-decimals` are dropped by `parse_decimal_scaled`, which
+    // Digits beyond the price's decimals are dropped by `parse_decimal_scaled`, which
     // quietly tightens the guard: 0.0000015 at 6 decimals reads as 0.000001. A threshold
     // that is not what the config says is the misconfiguration the zero and upper-bound
     // checks exist to prevent, so it is refused the same way. Trailing zeros are not
@@ -716,9 +778,9 @@ fn parse_threshold(fraction: &str, price_decimals: u32, key: &str, at: &str) -> 
         .map_or(0, |(_, digits)| digits.trim_end_matches('0').len());
     ensure!(
         fraction_digits <= price_decimals as usize,
-        "{at}: {key} {fraction} has more decimal digits than the {price_decimals} \
-         decimals of --price-decimals can hold, so it would be read as {read}; use at most \
-         {price_decimals} decimals, or raise --price-decimals",
+        "{at}: {key} {fraction} has more decimal digits than the {price_decimals} a \
+         published price is scaled by, so it would be read as {read}; use at most \
+         {price_decimals} decimals",
         read = format_scaled(threshold_scaled, price_decimals)
     );
     // Bounded above as well as below, and for the same reason. Every line of prose about
@@ -938,15 +1000,9 @@ pub fn parse_address(s: &str) -> Result<Address> {
     s.parse().map_err(|e| eyre!("invalid address {s:?}: {e:?}"))
 }
 
-pub fn load_config(path: &Path, price_decimals: u32, allow_no_pairs: bool) -> Result<Config> {
-    let text = std::fs::read_to_string(path)
-        .wrap_err_with(|| format!("failed to read config {}", path.display()))?;
-    parse_config_with(&text, price_decimals, allow_no_pairs)
-        .wrap_err_with(|| format!("invalid config {}", path.display()))
-}
-
 /// The strict parse: a config with no pairs is a mistake. Used by the tests, which are
-/// where every parse rule is pinned down; the binary goes through `load_config`.
+/// where every parse rule is pinned down; the binary reads the file once with `load_raw`
+/// and goes through `config_from_raw`.
 #[cfg(test)]
 pub fn parse_config(toml_text: &str, price_decimals: u32) -> Result<Config> {
     parse_config_with(toml_text, price_decimals, false)
@@ -974,15 +1030,11 @@ fn parse_pricing(stanza: &toml::Table, at: &str) -> Result<PricingSpec> {
     })
 }
 
-/// `allow_no_pairs` is for a server whose pairs are going to arrive through the
-/// backoffice. Otherwise an empty `[[pairs]]` is a config that failed to say what it
-/// meant, and is refused.
-pub fn parse_config_with(
-    toml_text: &str,
-    price_decimals: u32,
-    allow_no_pairs: bool,
-) -> Result<Config> {
-    let raw: RawConfig = toml::from_str(toml_text).map_err(|err| {
+/// The TOML text as a [`RawConfig`], every key checked for spelling but no value for
+/// sense. Says where a pricing key that moved into `[pairs.pricing]` went, since serde's
+/// "unknown field" names the key and nothing else.
+pub fn parse_raw(toml_text: &str) -> Result<RawConfig> {
+    toml::from_str(toml_text).map_err(|err| {
         // The pricing keys that used to sit on the pair itself now live in its
         // `[pairs.pricing]` stanza; say so, since serde's "unknown field" names the key
         // and nothing else.
@@ -1015,7 +1067,30 @@ pub fn parse_config_with(
             ""
         };
         eyre!("could not parse TOML: {text}{hint}")
-    })?;
+    })
+}
+
+/// [`parse_raw`] and then [`config_from_raw`], for the tests.
+#[cfg(test)]
+pub fn parse_config_with(
+    toml_text: &str,
+    price_decimals: u32,
+    allow_no_pairs: bool,
+) -> Result<Config> {
+    config_from_raw(parse_raw(toml_text)?, price_decimals, allow_no_pairs)
+}
+
+/// Every rule a config is held to, applied to one already read: the file at boot, and each
+/// change the backoffice API or an `UpdaterHandle` makes to the shared config after that.
+///
+/// `allow_no_pairs` is for a server whose pairs are going to arrive through the
+/// backoffice. Otherwise an empty `[[pairs]]` is a config that failed to say what it
+/// meant, and is refused.
+pub fn config_from_raw(
+    raw: RawConfig,
+    price_decimals: u32,
+    allow_no_pairs: bool,
+) -> Result<Config> {
     ensure!(
         allow_no_pairs || !raw.pairs.is_empty(),
         "no pairs configured; at least one is required"
@@ -1097,7 +1172,7 @@ pub fn parse_config_with(
         );
 
         let pricing = parse_pricing(&raw_pair.pricing, &at)?;
-        let feeds = parse_feeds(raw_pair, &at)?;
+        let feeds = parse_feeds(raw_pair, price_decimals, &at)?;
 
         // Bounds are read in lane orientation, so they need no inversion: they describe the
         // number this lane publishes, which is the one the check below has in hand.
@@ -1725,6 +1800,99 @@ sources = [{ venue = "binance", symbol = "ETHUSDT" }]
         assert!(err.contains("not both"), "{err}");
     }
 
+    /// Audit F-05. The limit on how far a pair's venues may disagree is the default one
+    /// unless the stanza sets it, and then it is a fraction held to what every threshold
+    /// is, on a pair that has two venues to compare.
+    #[test]
+    fn the_divergence_limit_is_the_default_unless_set_and_needs_two_venues() {
+        let two = r#"
+pricing = { kind = "feed", delta = "0.0005" }
+sources = [
+  { venue = "binance", symbol = "ETHUSDC" },
+  { venue = "okx", symbol = "ETH-USDC", weight = "0.001" },
+]
+"#;
+        let plain = parse_config(&pair_with(two), 18).unwrap();
+        let checks = &plain.pairs[0].feeds.as_ref().unwrap().checks;
+        assert_eq!(checks.max_divergence, None, "the default limit");
+
+        let set = parse_config(
+            &pair_with(&format!("{two}max_source_divergence = \"0.001\"\n")),
+            18,
+        )
+        .unwrap();
+        assert_eq!(
+            set.pairs[0].feeds.as_ref().unwrap().checks.max_divergence,
+            Some(U256::exp10(15))
+        );
+        assert_ne!(set.pairs, plain.pairs, "a reload sees the change");
+        let raw: RawConfig = toml::from_str(&pair_with(&format!(
+            "{two}max_source_divergence = \"0.001\"\n"
+        )))
+        .unwrap();
+        assert!(
+            render_raw(&raw)
+                .unwrap()
+                .contains("max_source_divergence = \"0.001\""),
+            "the backoffice's rewrite keeps the key"
+        );
+
+        let cases = [
+            (format!("{two}max_source_divergence = \"0\""), "is zero"),
+            // 2 is 200%, not 2%.
+            (
+                format!("{two}max_source_divergence = \"2\""),
+                "not a percentage",
+            ),
+            (
+                format!("{two}max_source_divergence = \"ten\""),
+                "invalid max_source_divergence",
+            ),
+            // One venue has nothing to compare with, in either spelling.
+            (
+                "symbol = \"ETHUSDC\"\nmax_source_divergence = \"0.001\"".to_owned(),
+                "this pair has one",
+            ),
+            (
+                "sources = [{ venue = \"okx\", symbol = \"ETH-USDC\" }]\nmax_source_divergence = \"0.001\"".to_owned(),
+                "this pair has one",
+            ),
+            (
+                "pricing = { kind = \"fixed\", mid = \"4000\", delta = \"0.0005\" }\nmax_source_divergence = \"0.001\"".to_owned(),
+                "this pair has none",
+            ),
+        ];
+        for (body, expected) in cases {
+            let err = parse_config(&pair_with(&body), 18).map(|_| ()).unwrap_err();
+            assert!(format!("{err:#}").contains(expected), "{body}: {err:#}");
+        }
+    }
+
+    /// The sources that quote one price with no book behind it, which a kind copying the
+    /// book's half-spread would copy as zero: Ondo's, and no exchange's.
+    #[test]
+    fn a_source_with_no_book_is_counted_as_mid_only() {
+        let text = pair_with(
+            r#"sources = [
+  { venue = "ondo", symbol = "AAPLon" },
+  { venue = "okx", symbol = "ETH-USDC" },
+]
+pricing = { kind = "feed", delta = "0.003" }
+"#,
+        );
+        let config = parse_config(&text, 18).unwrap();
+        assert_eq!(
+            config.pairs[0].feeds.as_ref().unwrap().mid_only_sources(),
+            1
+        );
+        let text = pair_with(r#"symbol = "ETHUSDC""#);
+        let config = parse_config(&text, 18).unwrap();
+        assert_eq!(
+            config.pairs[0].feeds.as_ref().unwrap().mid_only_sources(),
+            0
+        );
+    }
+
     /// The late-venue key is off unless set, and read as written when it is.
     #[test]
     fn source_checks_default_off_and_parse_when_set() {
@@ -1905,17 +2073,11 @@ sources = [{ venue = "binance", symbol = "ETHUSDC" }]"#,
     }
 
     #[test]
-    fn the_endpoints_table_is_a_setting_a_reload_refuses_to_change() {
+    fn the_endpoints_table_round_trips_as_a_sub_table() {
         let a = FileSettings {
             endpoints: [("binance".to_owned(), "wss://a".to_owned())].into(),
             ..FileSettings::default()
         };
-        let b = FileSettings {
-            endpoints: [("binance".to_owned(), "wss://b".to_owned())].into(),
-            ..FileSettings::default()
-        };
-        assert_eq!(a.changed_keys(&b), ["endpoints"]);
-        assert!(a.changed_keys(&a.clone()).is_empty());
         // Round trip through TOML as a sub-table.
         let text = toml::to_string(&a).unwrap();
         assert!(text.contains("[endpoints]"), "{text}");
@@ -2129,6 +2291,7 @@ disable_cross_region = false
             &running,
             &desired.pairs,
             &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
             false,
         );
         assert!(actions.is_empty(), "{actions:?}");
@@ -2234,29 +2397,6 @@ disable_cross_region = false
     fn a_config_with_no_builders_parses() {
         let config = parse_config(&three_pair_toml(), 18).unwrap();
         assert!(config.builders.is_empty());
-    }
-
-    /// The reload path refuses a changed setting by naming the key. That message is only
-    /// as good as this diff.
-    #[test]
-    fn changed_keys_names_every_setting_that_moved() {
-        let running = FileSettings {
-            requote_ms: Some(50),
-            rpc_url: Some("https://a.example".to_owned()),
-            ..Default::default()
-        };
-        assert!(running.changed_keys(&running).is_empty());
-
-        let desired = FileSettings {
-            requote_ms: Some(25),
-            rpc_url: Some("https://b.example".to_owned()),
-            metrics_addr: Some("127.0.0.1:9464".to_owned()),
-            ..Default::default()
-        };
-        assert_eq!(
-            running.changed_keys(&desired),
-            vec!["rpc_url", "requote_ms", "metrics_addr"]
-        );
     }
 
     /// Each rejection is a config mistake that would otherwise publish wrong prices or
@@ -2781,7 +2921,7 @@ disable_cross_region = false
     }
 
     /// The backoffice's serde round-trip keeps a stanza it cannot interpret, so an operator
-    /// editing an unrelated field through the page does not lose a guard.
+    /// editing an unrelated field through the API does not lose a guard.
     #[test]
     fn the_backoffice_round_trip_keeps_a_guards_stanza() {
         let text = with_guards("[[pairs.guards]]\nkind = \"dispersion\"\nmax_spread = \"0.003\"\n");

@@ -17,6 +17,11 @@ What it adds, one per extension point the library offers:
 `main()` at the bottom registers the four and calls `run_from_env()`. Everything else is the
 library's. The smallest possible binary is 30 lines; see the library README.
 
+It also registers the library's tokenized-stock kinds in two lines, `.us_market_hours()` and
+`.stock_issuer(Ondo)`, so a stock pair is one more stanza: `config.stocks.toml` is one, and
+[docs/stocks.md](../docs/stocks.md) the guide. The two guards are factory structs rather
+than closures so the backoffice has a form for their knobs.
+
 ## Run it against a local chain with your own PropAMM
 
 From the repo root:
@@ -27,7 +32,7 @@ make quickstart                       # deploys the contracts on anvil, builds t
 
 The quickstart uses `config.local.toml`: builder mode against the repo's two fake builders
 (`e2e/mocks.py`), which include each block's update in the block they mine on the local
-chain, so the backoffice at `http://127.0.0.1:8088` is there too.
+chain, so the backoffice API at `http://127.0.0.1:8088/api/` is there too.
 
 ## Run it against fake builders and a fake Binance
 

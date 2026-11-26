@@ -4,7 +4,7 @@
 
 use std::{
     sync::{Arc, Mutex},
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 
 use ethrex_common::{
@@ -114,10 +114,7 @@ impl UpdateStamp {
 
 /// Seconds since the epoch on the wall clock.
 pub fn wall_clock_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+    (crate::poll::wall_clock_ms() / 1_000) as u64
 }
 
 /// max_fee_per_gas for a transaction that must land in the very next block: twice the
@@ -154,17 +151,21 @@ pub enum UnusableKind {
     /// tripped, so it is counted at most once per lane. Appended last: `ALL`'s order is
     /// the metric array's.
     Panic,
+    /// The pair's venues disagree by more than the pair allows (`pricing::agreement`).
+    /// Appended after `Panic` for the same reason `Panic` was appended.
+    SourceDivergence,
 }
 
 impl UnusableKind {
     /// Declaration order is load-bearing: `metrics::PairMetrics` indexes its pre-bound
     /// children by `kind as usize`.
-    pub const ALL: [UnusableKind; 5] = [
+    pub const ALL: [UnusableKind; 6] = [
         UnusableKind::NoSample,
         UnusableKind::Stale,
         UnusableKind::OutOfBand,
         UnusableKind::DeltaOverflow,
         UnusableKind::Panic,
+        UnusableKind::SourceDivergence,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -174,6 +175,7 @@ impl UnusableKind {
             UnusableKind::OutOfBand => "out_of_band",
             UnusableKind::DeltaOverflow => "delta_overflow",
             UnusableKind::Panic => "panic",
+            UnusableKind::SourceDivergence => "source_divergence",
         }
     }
 }
@@ -585,9 +587,14 @@ impl ValueSource {
     /// included.
     pub fn current_detailed(&self, band: &MidBand) -> Result<Priced, Unusable> {
         let now = Instant::now();
+        // How far the venues behind the market disagree; zero for a pair with no market.
+        let mut divergence = U256::zero();
         let market = match &self.market {
             Some(rx) => match fresh_sample(rx) {
-                Ok(sample) => Some(Market::from_sample(&sample, &self.pair)),
+                Ok(sample) => {
+                    divergence = sample.divergence;
+                    Some(Market::from_sample(&sample, &self.pair))
+                }
                 // Refused before the pricer runs, and still judged by the quote guards: a
                 // feed gone quiet is the commonest way a lane is withdrawn, so a guard that
                 // halts after so long withdrawn has to count these ticks. No market and no
@@ -627,11 +634,16 @@ impl ValueSource {
         // is still worth seeing, as the volatile model's gauges always were.
         self.bound.publish(&out);
         // The core's own judgement of what the pricer published (the backstop, then the
-        // band), folded in with the pricer's refusal into the one answer the quote guards
-        // see: an `Ok` here is a quote the core would publish.
+        // band, on the published mid and then on the market's, then whether the venues
+        // behind the market agree), folded in with the pricer's refusal into the one answer
+        // the quote guards see: an `Ok` here is a quote the core would publish. The market's
+        // turn at the band is what stops a kind whose mid does not follow the market, a
+        // `fixed` price, once the market leaves the band (audit F-04).
         let judged = match priced {
             Ok(priced) => match crate::pricing::backstop(priced, market.as_ref(), &self.pair)
                 .and_then(|()| band.check(priced.mid))
+                .and_then(|()| market.as_ref().map_or(Ok(()), |m| band.check_market(m.mid)))
+                .and_then(|()| crate::pricing::agreement(priced, divergence, &self.pair))
             {
                 Ok(()) => Ok(priced),
                 Err(unusable) => Err(unusable.as_refusal()),
@@ -670,10 +682,41 @@ impl ValueSource {
     #[cfg(test)]
     pub(crate) fn fixed_for_tests(delta: U256, mid: U256, price_decimals: u32) -> Self {
         Self::new(
-            Box::new(crate::pricing::FixedPricer { delta, mid }),
+            Box::new(crate::pricing::FixedPricer::for_tests(delta, mid)),
             "fixed",
             None,
             Arc::new(test_shape(false, price_decimals)),
+            Bound::none(),
+        )
+    }
+
+    /// [`Self::fixed_for_tests`] over a market: a `fixed` pair that also streams, as one with a
+    /// `symbol` does. The pricer still publishes its constant; the core judges the market.
+    #[cfg(test)]
+    pub(crate) fn fixed_over_market_for_tests(
+        rx: tokio::sync::watch::Receiver<Option<PriceSample>>,
+        delta: U256,
+        mid: U256,
+        price_decimals: u32,
+    ) -> Self {
+        Self::fixed_over_market_for_tests_on(rx, delta, mid, price_decimals, false)
+    }
+
+    /// [`Self::fixed_over_market_for_tests`] on a lane of the given orientation; `mid` and
+    /// the market's samples are in lane orientation, as the feed delivers them.
+    #[cfg(test)]
+    pub(crate) fn fixed_over_market_for_tests_on(
+        rx: tokio::sync::watch::Receiver<Option<PriceSample>>,
+        delta: U256,
+        mid: U256,
+        price_decimals: u32,
+        inverted: bool,
+    ) -> Self {
+        Self::new(
+            Box::new(crate::pricing::FixedPricer::for_tests(delta, mid)),
+            "fixed",
+            Some(rx),
+            Arc::new(test_shape(inverted, price_decimals)),
             Bound::none(),
         )
     }
@@ -693,7 +736,14 @@ impl ValueSource {
     ) -> Self {
         Self::new(
             Box::new(crate::pricing::FeedPricer {
-                delta,
+                // No floor: these tests are about the loop around the pricer, and read the
+                // book's own half-spread back out of it. The floor is `Feed::resolve`'s.
+                spread: delta.map_or(
+                    crate::pricing::FeedSpread::Book {
+                        floor: U256::zero(),
+                    },
+                    crate::pricing::FeedSpread::Stated,
+                ),
                 spread_scale: crate::config::spread_scale(price_decimals),
             }),
             "feed",
@@ -716,20 +766,32 @@ fn test_shape(inverted: bool, price_decimals: u32) -> PairShape {
         price_decimals,
         target: Address::zero(),
         sources: 1,
+        mid_only_sources: 0,
         min_mid: None,
         max_mid: None,
+        max_source_divergence: None,
     }
 }
 
-/// updateState(target, lane, ts, [delta, mid]) calldata, shared by both send paths.
-pub fn update_calldata(params: &UpdateParams, ts: u32, delta: U256, mid: U256) -> Result<Vec<u8>> {
+/// updateState(target, lane, ts, slots) calldata, shared by both send paths. The slots are
+/// `[delta, mid]`, plus `quote_id` as a third when one is given; the contract reads the
+/// first two and ignores the rest.
+pub fn update_calldata(
+    params: &UpdateParams,
+    ts: u32,
+    delta: U256,
+    mid: U256,
+    quote_id: Option<U256>,
+) -> Result<Vec<u8>> {
+    let mut slots = vec![Value::Uint(delta), Value::Uint(mid)];
+    slots.extend(quote_id.map(Value::Uint));
     Ok(encode_calldata(
         UPDATE_STATE_SIG,
         &[
             Value::Address(params.target),
             Value::Uint(params.lane),
             Value::Uint(ts.into()),
-            Value::Array(vec![Value::Uint(delta), Value::Uint(mid)]),
+            Value::Array(slots),
         ],
     )?)
 }
@@ -752,13 +814,14 @@ pub async fn sign_update_tx(
     stamp: UpdateStamp,
     nonce: u64,
     (delta, mid): (U256, U256),
+    quote_id: Option<u64>,
 ) -> Result<Vec<u8>> {
     let tx = build_generic_tx(
         client,
         TxType::EIP1559,
         params.registry,
         signer.address(),
-        update_calldata(params, stamp.ts, delta, mid)?.into(),
+        update_calldata(params, stamp.ts, delta, mid, quote_id.map(U256::from))?.into(),
         Overrides {
             gas_limit: Some(UPDATE_GAS_LIMIT),
             max_fee_per_gas: Some(next_block_max_fee(stamp.parent_base_fee, 0)),
@@ -792,8 +855,30 @@ pub(crate) fn stamped_ts(raw_tx: &[u8]) -> u32 {
     ts.as_u32()
 }
 
+/// The slots a signed update carries, read back out of its raw bytes. Test-only, like
+/// `stamped_ts`.
+#[cfg(test)]
+pub(crate) fn stamped_slots(raw_tx: &[u8]) -> Vec<U256> {
+    use ethrex_l2_sdk::calldata::decode_calldata;
+    use ethrex_rlp::decode::RLPDecode;
+    let tx = EIP1559Transaction::decode(&raw_tx[1..]).expect("a type-prefixed EIP-1559 tx");
+    let values = decode_calldata(UPDATE_STATE_SIG, tx.data).expect("updateState calldata");
+    let Value::Array(slots) = &values[3] else {
+        panic!("the fourth argument of updateState is the slots");
+    };
+    slots
+        .iter()
+        .map(|slot| match slot {
+            Value::Uint(v) => *v,
+            other => panic!("a slot is a uint, not {other:?}"),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+    use std::time::SystemTime;
+
     use ethrex_common::Bytes;
     use ethrex_l2_sdk::calldata::decode_calldata;
 
@@ -1003,6 +1088,7 @@ mod tests {
                 mid: U256::exp10(18),
                 at: Instant::now(),
                 wall: std::time::SystemTime::now() - std::time::Duration::from_secs(60),
+                divergence: U256::zero(),
             }));
             let err = source.current_detailed(&band).unwrap_err();
             assert_eq!(
@@ -1097,8 +1183,14 @@ mod tests {
     #[test]
     fn update_calldata_round_trips_through_the_registry_abi() {
         let params = params();
-        let calldata =
-            update_calldata(&params, 1_755_000_012, U256::from(5u64), U256::from(9u64)).unwrap();
+        let calldata = update_calldata(
+            &params,
+            1_755_000_012,
+            U256::from(5u64),
+            U256::from(9u64),
+            None,
+        )
+        .unwrap();
         let decoded = decode_calldata(UPDATE_STATE_SIG, Bytes::from(calldata)).unwrap();
         assert_eq!(
             decoded,
@@ -1114,12 +1206,50 @@ mod tests {
         );
     }
 
+    /// A quote id rides as a third slot after the two the contract reads, and nowhere else:
+    /// everything before the slots is byte-identical to the two-slot calldata.
+    #[test]
+    fn a_quote_id_is_a_third_slot() {
+        let params = params();
+        let quote_id = U256::from(0xDEAD_BEEF_0000_0001u64);
+        let calldata = update_calldata(
+            &params,
+            1_755_000_012,
+            U256::from(5u64),
+            U256::from(9u64),
+            Some(quote_id),
+        )
+        .unwrap();
+        let without = update_calldata(
+            &params,
+            1_755_000_012,
+            U256::from(5u64),
+            U256::from(9u64),
+            None,
+        )
+        .unwrap();
+        // Selector, three static arguments, the array offset and its length: the slots start
+        // after that, and only the length word and the tail differ.
+        let head = 4 + 32 * 4;
+        assert_eq!(calldata[..head], without[..head]);
+        assert_eq!(calldata.len(), without.len() + 32);
+        let decoded = decode_calldata(UPDATE_STATE_SIG, Bytes::from(calldata)).unwrap();
+        assert_eq!(
+            decoded[3],
+            Value::Array(vec![
+                Value::Uint(U256::from(5u64)),
+                Value::Uint(U256::from(9u64)),
+                Value::Uint(quote_id),
+            ])
+        );
+    }
+
     /// The registry is the transaction's `to`, not an ABI argument, so it must not appear
     /// in the calldata — a swap of the two would silently publish for the wrong target.
     #[test]
     fn update_calldata_does_not_encode_the_registry() {
         let params = params();
-        let calldata = update_calldata(&params, 1, U256::one(), U256::one()).unwrap();
+        let calldata = update_calldata(&params, 1, U256::one(), U256::one(), None).unwrap();
         assert!(
             !calldata
                 .windows(20)
@@ -1220,10 +1350,41 @@ mod tests {
             mid,
             at: std::time::Instant::now(),
             wall: SystemTime::now(),
+            divergence: U256::zero(),
         };
         // The sender is returned so the channel outlives the source.
         let (tx, rx) = tokio::sync::watch::channel(Some(sample));
         (tx, ValueSource::feed_for_tests(rx, None, false, 18))
+    }
+
+    /// Audit F-05. The average of a pair's venues looks like a price whether or not the
+    /// venues agree, so the composite says how far they disagree and the core withdraws
+    /// the quote past the pair's limit: here the default, 20 half-spreads of the 0.5 bp
+    /// this lane publishes, 10 bp. Nothing latches: the venues agreeing again is the tick
+    /// that quotes.
+    #[test]
+    fn a_market_whose_venues_disagree_is_withdrawn_until_they_agree() {
+        let mid = U256::from(4_000u64) * U256::exp10(18);
+        let (tx, source) = feed_of(mid);
+        let with = |divergence: u64| {
+            let mut sample = (*tx.borrow()).unwrap();
+            sample.divergence = U256::from(divergence);
+            tx.send_replace(Some(sample));
+            source.current_detailed(&MidBand::default())
+        };
+        let ten_bp = 1_000_000_000_000_000u64;
+
+        assert!(with(0).is_ok(), "one venue, or venues that agree");
+        assert!(with(ten_bp).is_ok(), "at the limit is inside it");
+
+        let err = with(ten_bp + 1).unwrap_err();
+        assert_eq!(err.kind(), Some(UnusableKind::SourceDivergence));
+        assert!(
+            err.to_string().contains("venues disagree by 0.1000%"),
+            "{err}"
+        );
+
+        assert!(with(ten_bp / 2).is_ok(), "they agree again, and it quotes");
     }
 
     fn feed_of_empty() -> (tokio::sync::watch::Sender<Option<PriceSample>>, ValueSource) {
@@ -1252,6 +1413,149 @@ mod tests {
         assert_eq!(delta, U256::from(50_000_000_000_000u64));
     }
 
+    /// A USDC/USDT pair priced `fixed` at 1.0001 with a half-spread of `delta` (2 bp,
+    /// 2e14, is the old deploy template's), streaming USDCUSDT, banded at [0.995, 1.005].
+    fn fixed_stable_over(
+        market_mid: U256,
+        at: std::time::Instant,
+        delta: U256,
+    ) -> (
+        tokio::sync::watch::Sender<Option<PriceSample>>,
+        ValueSource,
+        MidBand,
+    ) {
+        let sample = PriceSample {
+            delta: U256::zero(),
+            mid: market_mid,
+            divergence: U256::zero(),
+            at,
+            wall: SystemTime::now(),
+        };
+        let (tx, rx) = tokio::sync::watch::channel(Some(sample));
+        let source = ValueSource::fixed_over_market_for_tests(
+            rx,
+            delta,
+            U256::from(1_000_100_000_000_000_000u64),
+            18,
+        );
+        let band = MidBand {
+            min: Some(U256::from(995_000_000_000_000_000u64)),
+            max: Some(U256::from(1_005_000_000_000_000_000u64)),
+        };
+        (tx, source, band)
+    }
+
+    const TWO_BP: u64 = 200_000_000_000_000;
+    const FIVE_PERCENT: u64 = 50_000_000_000_000_000;
+
+    /// Audit F-04, path 1, the PoC's slide: USDC at 1.0000, 0.9997, 0.975, 0.915 and 0.88
+    /// USDT. A fixed 1.0001 with a 2 bp half-spread bids about 0.99990, so the first step
+    /// already puts the market under its bid and an arbitrageur sells it USDC at par; the
+    /// pair must not quote from there on. It stops on its own quote, with no band at all,
+    /// and the same the other way, on a USDT depeg past its ask.
+    #[test]
+    fn a_fixed_pair_never_quotes_a_market_outside_its_own_quote() {
+        let now = std::time::Instant::now();
+        let no_band = MidBand::default();
+        let at = |mid: u64| U256::from(mid) * U256::exp10(14);
+        let (_tx, at_par, _) = fixed_stable_over(at(10_000), now, U256::from(TWO_BP));
+        assert_eq!(
+            at_par.current(&no_band).unwrap(),
+            (U256::from(TWO_BP), at(10_001))
+        );
+        for market in [9_997, 9_750, 9_150, 8_800, 10_005] {
+            let (_tx, off, _) = fixed_stable_over(at(market), now, U256::from(TWO_BP));
+            let refused = off
+                .current(&no_band)
+                .expect_err("the market is outside the fixed price's quote");
+            assert!(
+                refused.to_string().contains("own quote"),
+                "{market}: {refused}"
+            );
+        }
+    }
+
+    /// The band judges the market's mid too, not only the published one: a fixed price
+    /// whose quote is wide enough to accept a market at 0.97 still stops there, because
+    /// the market has left [0.995, 1.005]. And the other way, at 1.03.
+    #[test]
+    fn the_band_judges_the_market_as_well_as_the_published_mid() {
+        let now = std::time::Instant::now();
+        let wide = U256::from(FIVE_PERCENT);
+        let (_tx, at_par, band) = fixed_stable_over(U256::exp10(18), now, wide);
+        assert_eq!(
+            at_par.current(&band).unwrap(),
+            (wide, U256::from(1_000_100_000_000_000_000u64))
+        );
+
+        let (_tx, depegged, band) =
+            fixed_stable_over(U256::from(970_000_000_000_000_000u64), now, wide);
+        let refused = depegged
+            .current(&band)
+            .expect_err("USDC at 0.97 USDT is outside the band");
+        assert_eq!(refused.kind(), Some(UnusableKind::OutOfBand));
+        assert!(refused.to_string().contains("market's mid"), "{refused}");
+
+        // And the other way: a USDT depeg raises USDC's price in USDT past max_mid.
+        let (_tx, above, band) =
+            fixed_stable_over(U256::from(1_030_000_000_000_000_000u64), now, wide);
+        let refused = above
+            .current(&band)
+            .expect_err("USDC at 1.03 USDT is outside the band");
+        assert_eq!(refused.kind(), Some(UnusableKind::OutOfBand));
+        assert!(refused.to_string().contains("above"), "{refused}");
+    }
+
+    /// The market's mid is judged in lane orientation, the band's: on an inverted lane (WETH
+    /// per USDC, about 1/4000) a market that leaves the band is refused the same way. The
+    /// fixed price's half-spread is 50%, so its own quote accepts the market and the band
+    /// is what refuses it.
+    #[test]
+    fn the_market_is_judged_in_lane_orientation_on_an_inverted_lane() {
+        let over = |market_mid: U256| {
+            let sample = PriceSample {
+                delta: U256::zero(),
+                mid: market_mid,
+                divergence: U256::zero(),
+                at: std::time::Instant::now(),
+                wall: SystemTime::now(),
+            };
+            let (tx, rx) = tokio::sync::watch::channel(Some(sample));
+            let source = ValueSource::fixed_over_market_for_tests_on(
+                rx,
+                U256::from(500_000_000_000_000_000u64),
+                U256::from(250_000_000_000_000u64),
+                18,
+                true,
+            );
+            (tx, source)
+        };
+        let band = MidBand {
+            min: Some(U256::from(200_000_000_000_000u64)),
+            max: Some(U256::from(300_000_000_000_000u64)),
+        };
+        let (_tx, inside) = over(U256::from(250_000_000_000_000u64));
+        assert!(inside.current(&band).is_ok());
+        // WETH at about 2857 USDC: 0.00035 WETH per USDC, past max_mid on the lane.
+        let (_tx, outside) = over(U256::from(350_000_000_000_000u64));
+        let refused = outside
+            .current(&band)
+            .expect_err("the market left the band");
+        assert_eq!(refused.kind(), Some(UnusableKind::OutOfBand));
+    }
+
+    /// A fixed pair that streams depends on its stream: when the stream goes quiet it stops
+    /// quoting, rather than going back to publishing its constant unwatched.
+    #[test]
+    fn a_fixed_pair_withdraws_when_its_market_goes_stale() {
+        let long_ago = std::time::Instant::now() - MAX_PRICE_AGE - Duration::from_secs(1);
+        let (_tx, stale, band) = fixed_stable_over(U256::exp10(18), long_ago, U256::from(TWO_BP));
+        let refused = stale
+            .current(&band)
+            .expect_err("a stale market is no market");
+        assert_eq!(refused.kind(), Some(UnusableKind::Stale));
+    }
+
     #[tokio::test]
     async fn changed_resolves_on_a_new_sample_and_never_on_a_static_source() {
         let (tx, mut source) = feed_of(U256::exp10(18));
@@ -1261,6 +1565,7 @@ mod tests {
             mid: U256::exp10(18),
             at: std::time::Instant::now(),
             wall: SystemTime::now(),
+            divergence: U256::zero(),
         }))
         .unwrap();
         tokio::time::timeout(Duration::from_secs(1), source.changed())
@@ -1297,6 +1602,7 @@ mod tests {
             mid: U256::exp10(18),
             at: std::time::Instant::now() - Duration::from_secs(60),
             wall: SystemTime::now() - Duration::from_secs(60),
+            divergence: U256::zero(),
         };
         let (_tx, rx) = tokio::sync::watch::channel(Some(sample));
         let source = ValueSource::feed_for_tests(rx, None, false, 18);
@@ -1359,6 +1665,7 @@ mod tests {
                 "out_of_band",
                 "delta_overflow",
                 "panic",
+                "source_divergence",
             ]
         );
         // A pricer may not declare a reason that is the core's: the list it is checked

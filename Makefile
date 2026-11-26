@@ -1,5 +1,5 @@
-.PHONY: deps build test local local-down update-price swap deploy-factory price-service quickstart \
-	cargo-build cargo-test lint e2e mocks downstream install-nix shell default
+.PHONY: deps build test mutants local local-down update-price swap deploy-factory price-service \
+	quickstart backoffice-ui cargo-build cargo-test lint e2e mocks downstream install-nix shell default
 
 # Every target runs inside the shell flake.nix defines: foundry, the Rust version in
 # rust-toolchain.toml, python with the packages the mocks need. Outside that shell, with
@@ -12,11 +12,21 @@ endif
 
 ifneq ($(NIX),)
 
+# `make` here, not $(MAKE): $(MAKE) is the path of the make that read this file, the
+# host's, and inside the shell it is the shell's own that has to run (flake.nix lists
+# gnumake). On macOS the host's is the Command Line Tools' wrapper, which looks for
+# gnumake under DEVELOPER_DIR; the shell points that at its own SDK, which has none, so
+# every target died with `execv(.../usr/bin/gnumake): No such file or directory`.
+# Variables given on the command line still reach the inner make, through MAKEFLAGS.
+#
+# The `+` says what naming $(MAKE) said by itself, that the line is a make: it is run
+# under `make -n` too, where the inner make then lists the target's commands and runs
+# none.
 default:
-	@$(NIX) develop --command $(MAKE) --no-print-directory
+	+@$(NIX) develop --command make --no-print-directory
 
 $(filter-out install-nix shell,$(MAKECMDGOALS)):
-	@$(NIX) develop --command $(MAKE) --no-print-directory $@
+	+@$(NIX) develop --command make --no-print-directory $@
 
 shell:
 	$(NIX) develop
@@ -118,9 +128,16 @@ MINT_AMOUNT := 1000000000000000000000000
 # The key the quote updater reads for the USDC/USDT pair, as `make price-service` names it.
 PUSHER_KEY_ENV := UPDATER_KEY_USDC_USDT
 INTERVAL ?= 12
+# The spread `make price-service` quotes its fixed PRICE with. Not DELTA's 0: a fixed price
+# quotes only while its market sits inside its own spread (audit F-04), so with none it would
+# quote only on a market exactly at PRICE.
+SERVICE_DELTA ?= 0.0005
 
 # $(1) = target address, $(2) = output path: a config for the local pair, fixed price or a
-# Binance symbol (SYMBOL=USDCUSDT streams the live mid and spread instead).
+# Binance symbol (SYMBOL=USDCUSDT streams the live mid and spread instead). The fixed price
+# streams Binance's USDCUSDT too: a fixed price needs a market to compare its price with
+# (audit F-04), and quotes only while that market sits within SERVICE_DELTA of PRICE. So the
+# updater must reach Binance, and PRICE must sit inside the [0.995, 1.005] band.
 define write_updater_config
 mkdir -p .local; \
 { \
@@ -134,7 +151,10 @@ mkdir -p .local; \
     echo 'symbol  = "$(SYMBOL)"'; \
     echo 'pricing = { kind = "feed" }'; \
   else \
-    echo 'pricing = { kind = "fixed", mid = "$(PRICE)", delta = "$(DELTA)" }'; \
+    echo 'symbol  = "USDCUSDT"'; \
+    echo 'min_mid = "0.995"'; \
+    echo 'max_mid = "1.005"'; \
+    echo 'pricing = { kind = "fixed", mid = "$(PRICE)", delta = "$(SERVICE_DELTA)" }'; \
   fi; \
 } > $(2)
 endef
@@ -147,6 +167,11 @@ build: deps
 
 test: build
 	cd contracts && forge test
+
+# One bug planted in the contracts at a time, and the tests have to fail for each: a mutant
+# that survives is a line no test depends on. Works on a copy, and takes a few minutes.
+mutants: deps
+	python3 contracts/test/mutation/run_mutants.py
 
 .local/priority-update-registry:
 	mkdir -p .local
@@ -219,10 +244,11 @@ local: local-down build .local/priority-update-registry
 	$(MAKE) update-price
 	@# Sanity checks through the real registry: isActive and quote both require the stored
 	@# timestamp to equal block.timestamp exactly, which the update above was stamped for.
+	@# isActive also requires the vault to hold USDT, as minted above.
 	@set -e; PROP=$(PROPAMM_LOOKUP); \
 	test "$$(cast call $$PROP 'isActive(address,address)(bool)' \
 		$(USDC) $(USDT) --rpc-url $(RPC_URL))" = "true" || { \
-		echo "isActive() is false: the pushed update's timestamp does not match chain time."; \
+		echo "isActive() is false: the pushed update's timestamp does not match chain time, or the vault holds no USDT."; \
 		exit 1; }; \
 	test "$$(cast call $$PROP 'quote(address,address,uint256)(uint256)' \
 		$(USDC) $(USDT) 100 --rpc-url $(RPC_URL))" = "100" || { \
@@ -292,7 +318,8 @@ local-down:
 
 # Keep the local pair's price fresh with the library's built-in models (no code of yours):
 # one updateState transaction per INTERVAL seconds, mining a block each (`--mine`).
-#   make price-service                  push PRICE (default 1) for USDC/USDT every 12s
+#   make price-service                  push PRICE (default 1) for USDC/USDT every 12s, while
+#                                       Binance's USDCUSDT sits within SERVICE_DELTA of it
 #   make price-service SYMBOL=USDCUSDT  stream Binance's live mid and spread instead
 price-service:
 	@test -n "$$(cast code $(LOCAL_FACTORY) --rpc-url $(RPC_URL) 2>/dev/null | grep -v '^0x$$')" || { \
@@ -304,8 +331,8 @@ price-service:
 # The whole thing on a laptop: `make local`, then the two fake builders from e2e/ (they
 # include each block's update in the block they mine on anvil, every 12s), Prometheus and
 # Grafana with the production dashboard and rules, then example/ quoting the USDC/USDT pair
-# from Binance's live price through the builders, in builder mode, with the backoffice at
-# http://127.0.0.1:8088 and Grafana at http://127.0.0.1:3000. Ctrl-c stops all of it but
+# from Binance's live price through the builders, in builder mode, with the backoffice API at
+# http://127.0.0.1:8088/api/ and Grafana at http://127.0.0.1:3000. Ctrl-c stops all of it but
 # the chain; `make local-down` stops that.
 GRAFANA_ENV := GF_PATHS_DATA=$(CURDIR)/.local/grafana GF_PATHS_LOGS=$(CURDIR)/.local/grafana/log \
 	GF_PATHS_PLUGINS=$(CURDIR)/.local/grafana/plugins GF_PATHS_PROVISIONING=$(CURDIR)/deploy/grafana/provisioning \
@@ -328,9 +355,17 @@ quickstart: local
 	  --homepath "$$(dirname "$$(command -v grafana)")/../share/grafana" > .local/grafana.log 2>&1 & GRAF=$$!; \
 	trap 'kill $$MOCKS $$PROM $$GRAF 2>/dev/null; rm -f $(CURDIR)/.local/mocks.pid' EXIT; \
 	until grep -q READY .local/mocks.log 2>/dev/null; do sleep 0.2; done; \
-	echo "backoffice http://127.0.0.1:8088   grafana http://127.0.0.1:3000   prometheus http://127.0.0.1:9090"; \
+	echo "backoffice API http://127.0.0.1:8088/api/   grafana http://127.0.0.1:3000   prometheus http://127.0.0.1:9090"; \
+	echo "backoffice front end: 'make backoffice-ui' in another terminal, then http://127.0.0.1:8090"; \
 	cd example && $(PUSHER_KEY_ENV)=$(ANVIL_KEY) ./target/debug/my-propamm --config .local.toml --registry $(PUR_ADDR) --check && \
 	$(PUSHER_KEY_ENV)=$(ANVIL_KEY) ./target/debug/my-propamm --config .local.toml --registry $(PUR_ADDR)
+
+# The backoffice's front end (backoffice-ui/) for the backoffice `make quickstart` runs:
+# Vite's dev server on http://127.0.0.1:8090, with /api proxied to http://127.0.0.1:8088 (or
+# BACKOFFICE_API), so the page and the API share an origin and the backoffice lists nothing
+# for it. pnpm fetches the Node version package.json pins.
+backoffice-ui:
+	cd backoffice-ui && pnpm install --frozen-lockfile && pnpm dev
 
 ## QUOTE UPDATER LIBRARY ##
 cargo-build:

@@ -1,19 +1,22 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.35;
 
-import {Test} from "forge-std/Test.sol";
+import {Test, Vm} from "forge-std/Test.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {
     PropAMM,
+    IdenticalTokens,
     InvalidOracle,
     NoVault,
     NotAToken,
+    OracleUnchanged,
     PairAlreadyExists,
     UnsupportedDecimals,
     UnsupportedPair,
     UpdaterAlreadyAuthorized,
-    UpdaterNotAuthorized
+    UpdaterNotAuthorized,
+    VaultUnchanged
 } from "../src/PropAMM.sol";
 import {IPropAMM} from "../src/interfaces/IPropAMM.sol";
 import {MockPUR} from "./mocks/MockPUR.sol";
@@ -38,6 +41,26 @@ contract LegacyRegistry {
 
     function removeUpdater(address updater) external {
         authorized[msg.sender][updater] = false;
+    }
+}
+
+/// A registry that logs each change, as the real one does, so a test can see where its log
+/// falls relative to the instance's own. It answers `isUpdater`, which the instance asks before
+/// either change.
+contract LoggingRegistry {
+    event UpdaterAdded(address indexed target, address indexed updater);
+    event UpdaterRemoved(address indexed target, address indexed updater);
+
+    mapping(address target => mapping(address updater => bool)) public isUpdater;
+
+    function addUpdater(address updater) external {
+        isUpdater[msg.sender][updater] = true;
+        emit UpdaterAdded(msg.sender, updater);
+    }
+
+    function removeUpdater(address updater) external {
+        isUpdater[msg.sender][updater] = false;
+        emit UpdaterRemoved(msg.sender, updater);
     }
 }
 
@@ -128,10 +151,34 @@ contract PropAMMTest is Test {
         _proxy(implementation, new address[](0), _one(USDC, USDT, address(0)));
     }
 
+    function test_initialize_refusesAPairOfOneToken() public {
+        address implementation = address(new PropAMM());
+        vm.expectRevert(abi.encodeWithSelector(IdenticalTokens.selector, USDC));
+        _proxy(implementation, new address[](0), _one(USDC, USDC, vault));
+    }
+
     /// The registry is no longer baked into the implementation, so `initialize` has to record
     /// the one it was handed: everything else on the contract reads prices through it.
     function test_initialize_storesTheOracleItIsGiven() public view {
         assertEq(address(propAmm.oracle()), ORACLE);
+    }
+
+    /// What `setOracle` and `addUpdater` log later, `initialize` logs for the oracle and updaters
+    /// an instance starts with, in the order it works: the oracle, then each updater as it is
+    /// registered.
+    function test_initialize_logsItsOracleThenEachUpdater() public {
+        address implementation = address(new PropAMM());
+        address[] memory updaters = new address[](2);
+        updaters[0] = updater;
+        updaters[1] = makeAddr("second-updater");
+
+        vm.expectEmit(true, true, true, true);
+        emit PropAMM.OracleChanged(ORACLE);
+        vm.expectEmit(true, true, true, true);
+        emit PropAMM.UpdaterAuthorized(updaters[0], ORACLE);
+        vm.expectEmit(true, true, true, true);
+        emit PropAMM.UpdaterAuthorized(updaters[1], ORACLE);
+        _proxy(implementation, updaters, new PropAMM.PairConfig[](0));
     }
 
     /// `initialize` runs `__Pausable_init`, and an instance upgraded onto this implementation
@@ -182,6 +229,14 @@ contract PropAMMTest is Test {
         propAmm.addPair(USDC, USDT, address(0));
     }
 
+    /// `getPairs` promises `token0 < token1`; a pair of one token would be listed as
+    /// `token0 == token1` (audit F-11).
+    function test_addPair_refusesTheSameTokenTwice() public {
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(IdenticalTokens.selector, USDC));
+        propAmm.addPair(USDC, USDC, vault);
+    }
+
     function test_addPair_refusesADuplicateInEitherOrder() public {
         vm.startPrank(owner);
         propAmm.addPair(USDC, USDT, vault);
@@ -204,6 +259,19 @@ contract PropAMMTest is Test {
         assertEq(propAmm.getPairs().length, 0);
     }
 
+    /// Each side of the pair is checked, whichever the bad token sorts as: paired with a token at
+    /// a lower address it is token1, and with one at a higher address, token0.
+    function test_addPair_refusesATokenWithoutCodeOnEitherSide() public {
+        address ghost = makeAddr("ghost");
+        (address below, address above) = _tokensAroundAnyAddress();
+        vm.startPrank(owner);
+        vm.expectRevert(abi.encodeWithSelector(NotAToken.selector, ghost));
+        propAmm.addPair(ghost, below, vault);
+        vm.expectRevert(abi.encodeWithSelector(NotAToken.selector, ghost));
+        propAmm.addPair(ghost, above, vault);
+        vm.stopPrank();
+    }
+
     /// The vault is an account, not a token: an EOA that holds inventory is a valid vault.
     function test_addPair_acceptsAVaultWithoutCode() public {
         vm.prank(owner);
@@ -219,6 +287,20 @@ contract PropAMMTest is Test {
         vm.prank(owner);
         vm.expectRevert(abi.encodeWithSelector(UnsupportedDecimals.selector, address(wide), uint8(37)));
         propAmm.addPair(address(wide), USDT, vault);
+    }
+
+    /// On either side of the pair, like the check for code.
+    function test_addPair_refusesMoreThan36DecimalsOnEitherSide() public {
+        MockERC20 wide = new MockERC20();
+        wide.setMeta("W", "W", 37);
+        (address below, address above) = _tokensAroundAnyAddress();
+        bytes memory tooWide = abi.encodeWithSelector(UnsupportedDecimals.selector, address(wide), uint8(37));
+        vm.startPrank(owner);
+        vm.expectRevert(tooWide);
+        propAmm.addPair(address(wide), below, vault);
+        vm.expectRevert(tooWide);
+        propAmm.addPair(address(wide), above, vault);
+        vm.stopPrank();
     }
 
     function test_addPair_accepts36Decimals() public {
@@ -266,6 +348,19 @@ contract PropAMMTest is Test {
         propAmm.addPair(USDC, USDT, vault);
         vm.expectRevert(abi.encodeWithSelector(NoVault.selector, USDC, USDT));
         propAmm.setPairVault(USDC, USDT, address(0));
+        vm.stopPrank();
+    }
+
+    /// Naming the vault the pair already has changes nothing, so it is refused: `PairVaultChanged`
+    /// is what indexers move a pair's inventory on. In either token order, as everywhere.
+    function test_setPairVault_refusesTheVaultThePairAlreadyHas() public {
+        vm.startPrank(owner);
+        propAmm.addPair(USDC, USDT, vault);
+
+        vm.expectRevert(abi.encodeWithSelector(VaultUnchanged.selector, USDC, USDT, vault));
+        propAmm.setPairVault(USDC, USDT, vault);
+        vm.expectRevert(abi.encodeWithSelector(VaultUnchanged.selector, USDC, USDT, vault));
+        propAmm.setPairVault(USDT, USDC, vault);
         vm.stopPrank();
     }
 
@@ -346,6 +441,14 @@ contract PropAMMTest is Test {
         vm.expectRevert(abi.encodeWithSelector(InvalidOracle.selector, eoa));
         propAmm.setOracle(eoa);
         assertEq(address(propAmm.oracle()), ORACLE);
+    }
+
+    /// Naming the registry the instance already reads changes nothing, so it is refused, like
+    /// `setPairVault` to the vault a pair already has: `OracleChanged` reports a move.
+    function test_setOracle_refusesTheOracleItAlreadyHas() public {
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(OracleUnchanged.selector, ORACLE));
+        propAmm.setOracle(ORACLE);
     }
 
     function test_setOracle_refusesTheZeroAddress() public {
@@ -472,7 +575,12 @@ contract PropAMMTest is Test {
         assertEq(token.balanceOf(address(propAmm)), 600);
     }
 
+    /// Each call is refused for not being the owner's, by name. The withdrawal is of a token the
+    /// instance holds, so with the owner check gone it would go through, not revert for want of
+    /// a balance.
     function test_nonOwnerCannotManageOracleUpdatersOrFunds() public {
+        MockERC20 token = new MockERC20();
+        token.mint(address(propAmm), 1_000);
         address rando = makeAddr("rando");
         // A real oracle, so the only reason `setOracle` can revert below is the caller. Deployed
         // up front: a CREATE between expectRevert and the call it guards would consume the expectation.
@@ -490,13 +598,85 @@ contract PropAMMTest is Test {
         vm.expectRevert(notOwner);
         propAmm.removeUpdaterFrom(ORACLE, updater);
         vm.expectRevert(notOwner);
-        propAmm.withdrawERC20(USDC, rando, 1);
+        propAmm.withdrawERC20(address(token), rando, 1);
         vm.stopPrank();
+    }
+
+    /// The instance logs a change before it calls out to make it, so whatever the callee logs
+    /// (or anything it calls back into) comes after, in the order things happened: the registry's
+    /// own record of an updater follows the instance's, and a token's Transfer follows the
+    /// withdrawal that caused it.
+    function test_eventsComeBeforeTheCallsTheyAnnounce() public {
+        address registry = address(new LoggingRegistry());
+        MockERC20 token = new MockERC20();
+        token.mint(address(propAmm), 1_000);
+        vm.startPrank(owner);
+        propAmm.setOracle(registry);
+
+        vm.recordLogs();
+        propAmm.addUpdater(updater);
+        _assertInstanceLoggedFirst(PropAMM.UpdaterAuthorized.selector, registry);
+
+        propAmm.removeUpdater(updater);
+        _assertInstanceLoggedFirst(PropAMM.UpdaterRevoked.selector, registry);
+
+        propAmm.withdrawERC20(address(token), owner, 400);
+        _assertInstanceLoggedFirst(PropAMM.ERC20Withdrawn.selector, address(token));
+        vm.stopPrank();
+    }
+
+    /// The same at creation: each updater is logged by the instance, then by the registry.
+    function test_initialize_logsEachUpdaterBeforeRegisteringIt() public {
+        address registry = address(new LoggingRegistry());
+        address implementation = address(new PropAMM());
+        address[] memory updaters = new address[](1);
+        updaters[0] = updater;
+
+        vm.recordLogs();
+        address instance = address(
+            new ERC1967Proxy(
+                implementation,
+                abi.encodeCall(PropAMM.initialize, (owner, updaters, registry, new PropAMM.PairConfig[](0)))
+            )
+        );
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        uint256 mine = _indexOf(logs, instance, PropAMM.UpdaterAuthorized.selector);
+        uint256 theirs = _indexOf(logs, registry, LoggingRegistry.UpdaterAdded.selector);
+        assertLt(mine, theirs, "the registry logged the updater before the instance did");
     }
 
     //------------------------------
     // Helpers
     //------------------------------
+
+    /// Reads the logs recorded since the last read, which must be exactly two: the instance's
+    /// `topic0`, then one from `callee`.
+    function _assertInstanceLoggedFirst(bytes32 topic0, address callee) internal view {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        assertEq(logs.length, 2, "expected the instance's event and the callee's");
+        assertEq(logs[0].emitter, address(propAmm), "the callee logged first");
+        assertEq(logs[0].topics[0], topic0);
+        assertEq(logs[1].emitter, callee);
+    }
+
+    function _indexOf(Vm.Log[] memory logs, address emitter, bytes32 topic0) internal pure returns (uint256) {
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].emitter == emitter && logs[i].topics[0] == topic0) return i;
+        }
+        revert("log not found");
+    }
+
+    /// Two tokens that any ordinary address sorts between: one just past the precompiles' range,
+    /// one at the highest address there is. Call it before setting an expectation, since it
+    /// deploys.
+    function _tokensAroundAnyAddress() internal returns (address below, address above) {
+        below = address(0x1000);
+        above = address(type(uint160).max);
+        bytes memory code = address(new MockERC20()).code;
+        vm.etch(below, code);
+        vm.etch(above, code);
+    }
 
     function _deploy(address[] memory updaters, PropAMM.PairConfig[] memory pairs) internal returns (PropAMM) {
         return _proxy(address(new PropAMM()), updaters, pairs);

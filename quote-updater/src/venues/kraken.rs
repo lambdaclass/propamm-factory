@@ -1,6 +1,12 @@
 //! Kraken WebSocket v2: the `ticker` channel, one frame per book change, with bid and ask
 //! as JSON numbers rather than strings. Heartbeats arrive every second on their own
 //! channel and the application-level ping is a JSON method. Markets are `ETH/USD`.
+//!
+//! "Per book change" has to be asked for. The channel's `event_trigger` says what makes it
+//! send, and its default is `trades`: one frame per trade, so between trades the book moves
+//! with no frame while the heartbeats keep re-stamping the last trade's bid and ask as
+//! current (the feed takes a quiet socket to mean an unchanged book). `bbo` sends on every
+//! change of the best bid or ask, which is what that reading needs.
 
 use std::time::SystemTime;
 
@@ -9,20 +15,24 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::venue::{Connection, Keepalive, Quote};
-use crate::venues::{rfc3339_utc, unwrap_alias};
+use crate::venues::{book_stamp, unwrap_alias};
 
 pub const DEFAULT_ENDPOINT: &str = "wss://ws.kraken.com/v2";
 
 pub fn connection(endpoint: &str, symbol: &str) -> Connection {
     Connection::Stream {
         url: endpoint.trim_end_matches('/').to_owned(),
-        subscribe: Some(
+        subscribe: vec![
             json!({
                 "method": "subscribe",
-                "params": { "channel": "ticker", "symbol": [symbol] },
+                "params": {
+                    "channel": "ticker",
+                    "symbol": [symbol],
+                    "event_trigger": "bbo",
+                },
             })
             .to_string(),
-        ),
+        ],
         keepalive: Keepalive::Text(json!({ "method": "ping" }).to_string()),
     }
 }
@@ -77,13 +87,10 @@ pub fn parse_stamped(text: &str) -> Result<Option<(Quote, Option<SystemTime>)>> 
             let ticker = data
                 .pop()
                 .ok_or_else(|| eyre!("ticker frame without data"))?;
-            Ok(Some((
-                Quote::Book {
-                    bid: ticker.bid.get().trim_matches('"').to_owned(),
-                    ask: ticker.ask.get().trim_matches('"').to_owned(),
-                },
-                ticker.timestamp.as_deref().and_then(rfc3339_utc),
-            )))
+            let bid = ticker.bid.get().trim_matches('"').to_owned();
+            let ask = ticker.ask.get().trim_matches('"').to_owned();
+            let stamp = book_stamp(&bid, &ask, ticker.timestamp.as_deref());
+            Ok(Some((Quote::Book { bid, ask }, stamp)))
         }
         // heartbeat, status, and method replies (subscribe ack, pong).
         _ => Ok(None),
@@ -97,6 +104,7 @@ pub fn expected_symbol(base: &str, quote: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::venues::rfc3339_utc;
 
     #[test]
     fn subscribes_with_a_json_ping() {
@@ -108,9 +116,14 @@ mod tests {
         else {
             panic!("streams")
         };
-        let sub: serde_json::Value = serde_json::from_str(&subscribe.unwrap()).unwrap();
+        let [sub] = subscribe.as_slice() else {
+            panic!("one subscribe frame")
+        };
+        let sub: serde_json::Value = serde_json::from_str(sub).unwrap();
         assert_eq!(sub["params"]["channel"], "ticker");
         assert_eq!(sub["params"]["symbol"], json!(["ETH/USD"]));
+        // Not the default, `trades`, under which the bid and ask only move on a trade.
+        assert_eq!(sub["params"]["event_trigger"], "bbo");
         assert_eq!(keepalive, Keepalive::Text(r#"{"method":"ping"}"#.into()));
     }
 

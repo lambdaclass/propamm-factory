@@ -13,7 +13,8 @@ import {
     InsufficientVaultBalance,
     InvalidMid,
     SpreadTooWide,
-    UnsupportedPair
+    UnsupportedPair,
+    ZeroAmountOut
 } from "../src/PropAMM.sol";
 import {IPrioUpdateRegistry} from "../src/interfaces/IPrioUpdateRegistry.sol";
 import {IPropAMM} from "../src/interfaces/IPropAMM.sol";
@@ -21,13 +22,12 @@ import {IPropAMMFillable} from "../src/interfaces/IPropAMMFillable.sol";
 import {MockPUR} from "./mocks/MockPUR.sol";
 import {MockToken} from "./mocks/MockToken.sol";
 
-/// What the real registry reverts with outside the block a price was stamped for.
-error StaleUpdate();
-
 /// Exercises `IPropAMMFillable`, the extension `PropAMMRouter.swapSplitV1` prices a venue through
 /// in one call instead of its blind two-point probe. What the router relies on is narrower than
 /// "the quote is right": every leg it may carve out of the reported fill has to swap, at no less
-/// than its pro-rata share of the reported output. Tokens sit at their mainnet addresses with
+/// than its pro-rata share of the reported output. The one exception is a leg too small to be
+/// worth a wei of the output token, which `swap` refuses (`ZeroAmountOut`) rather than take for
+/// nothing; its share of the output is zero. Tokens sit at their mainnet addresses with
 /// their mainnet decimals, so the fuzzing below covers every decimals pairing from 2 to 24 and
 /// both orientations of `mid`:
 ///     GUSD (0x05, 2) < WBTC (0x22, 8) < NEAR (0x85, 24) < USDC (0xA0, 6) < WETH (0xC0, 18)
@@ -212,6 +212,19 @@ contract PropAMMFillableTest is Test {
         assertEq(out, 0);
     }
 
+    /// A vault down to its last wei of USDT can only cover a fill worth one wei at mid, 4e8 wei of
+    /// WETH at 2500, and the spread takes that wei: the fill would pay nothing. It is answered as
+    /// no fill, not as 4e8 wei of WETH for zero USDT, which `swap` would refuse anyway.
+    function test_quoteFillable_offersNothingWhenTheFillWouldPayNothing() public {
+        _setPrice(2500e18, 5e14);
+        _fundVault(USDT, 1, type(uint256).max);
+
+        (uint256 fill, uint256 out) = propAmm.quoteFillable(WETH, USDT, 1e18);
+
+        assertEq(fill, 0);
+        assertEq(out, 0);
+    }
+
     //------------------------------
     // What the router does with it
     //------------------------------
@@ -251,7 +264,8 @@ contract PropAMMFillableTest is Test {
     /// `remaining` is whatever better-ranked venues left over, so any leg up to the fill can come
     /// back. Each of them has to fit the vault's balance and allowance and clear that floor:
     /// a leg that reverts is not lost, but its input goes to Uniswap with no floor of its own.
-    function testFuzz_quoteFillable_everyLegUpToTheFillSwaps(
+    /// The only leg allowed to revert is one that would pay nothing, and its floor is zero.
+    function testFuzz_quoteFillable_everyLegUpToTheFillSwapsUnlessItPaysNothing(
         uint256 pairSeed,
         bool flip,
         uint256 amountIn,
@@ -273,13 +287,15 @@ contract PropAMMFillableTest is Test {
 
         (uint256 fill, uint256 out) = propAmm.quoteFillable(tokenIn, tokenOut, amountIn);
         assertLe(fill, amountIn, "the router discards a venue that fills more than it was offered");
-        // The router drops a candidate with nothing on either side and never places a leg on it.
-        if (fill == 0 || out == 0) return;
+        // Nothing on one side means nothing on the other: no fill is offered for no output. The
+        // router drops such a candidate and never places a leg on it.
+        assertEq(fill == 0, out == 0, "a fill that pays nothing, or an output for no fill");
+        if (fill == 0) return;
         assertEq(out, propAmm.quote(tokenIn, tokenOut, fill), "out is not the quote for exactly the fill");
 
         leg = bound(leg, 1, fill);
         uint256 minOut = leg == fill ? out : out * leg / fill; // SplitPlanner.proRataMin
-        uint256 delivered = _pushAndSwap(tokenIn, tokenOut, leg, minOut);
+        uint256 delivered = _placeLeg(tokenIn, tokenOut, leg, minOut);
 
         assertGe(delivered, minOut);
         assertEq(MockToken(tokenOut).balanceOf(trader), delivered);
@@ -401,13 +417,14 @@ contract PropAMMFillableTest is Test {
 
         (uint256 fill, uint256 out) = propAmm.quoteFillable(tokenIn, tokenOut, amountIn);
         assertLe(fill, amountIn);
-        if (fill == 0 || out == 0) return;
+        assertEq(fill == 0, out == 0, "a fill that pays nothing, or an output for no fill");
+        if (fill == 0) return;
         assertEq(out, propAmm.quote(tokenIn, tokenOut, fill));
         if (fill < amountIn) assertGe(out, propAmm.quote(tokenIn, tokenOut, fill / 2), "sized past the peak");
 
         leg = bound(leg, 1, fill);
         uint256 minOut = leg == fill ? out : out * leg / fill;
-        assertGe(_pushAndSwap(tokenIn, tokenOut, leg, minOut), minOut);
+        assertGe(_placeLeg(tokenIn, tokenOut, leg, minOut), minOut);
     }
 
     /// Converting the cap back to tokenIn can overflow when the whole vault is worth more than
@@ -451,10 +468,10 @@ contract PropAMMFillableTest is Test {
         vm.mockCallRevert(
             ORACLE,
             abi.encodeWithSelector(IPrioUpdateRegistry.getState.selector),
-            abi.encodeWithSelector(StaleUpdate.selector)
+            abi.encodeWithSelector(MockPUR.StaleUpdate.selector)
         );
 
-        vm.expectRevert(StaleUpdate.selector);
+        vm.expectRevert(MockPUR.StaleUpdate.selector);
         propAmm.quoteFillable(WETH, USDT, 1e18);
     }
 
@@ -495,6 +512,22 @@ contract PropAMMFillableTest is Test {
         propAmm.quoteFillable(WETH, USDT, 1e18);
     }
 
+    /// Any `delta` from one up is refused for the same reason on both quote paths, the largest
+    /// word included: there `quote` used to overflow adding the impact to it, and panicked.
+    function test_quoteFillable_andQuoteRefuseAnOutOfRangeDeltaAlike() public {
+        _fundVault(USDT, 1_600_000e6, type(uint256).max);
+
+        uint256[3] memory deltas = [SPREAD_SCALE, 2 * SPREAD_SCALE, type(uint256).max];
+        for (uint256 i = 0; i < deltas.length; i++) {
+            _setPrice(1600e18, deltas[i]);
+
+            vm.expectRevert(abi.encodeWithSelector(SpreadTooWide.selector, deltas[i]));
+            propAmm.quoteFillable(WETH, USDT, 1e18);
+            vm.expectRevert(abi.encodeWithSelector(SpreadTooWide.selector, deltas[i]));
+            propAmm.quote(WETH, USDT, 1e18);
+        }
+    }
+
     //------------------------------
     // Helpers
     //------------------------------
@@ -524,6 +557,20 @@ contract PropAMMFillableTest is Test {
         (tokenIn, tokenOut) = flip ? (pair[1], pair[0]) : (pair[0], pair[1]);
         unitIn = 10 ** MockToken(tokenIn).decimals();
         unitOut = 10 ** MockToken(tokenOut).decimals();
+    }
+
+    /// Places a leg of a reported fill the way the router does and returns what it delivered. A
+    /// leg worth less than a wei of tokenOut is the one that does not swap: `swap` refuses it
+    /// rather than take it for nothing, and the router, which wraps each leg in a try, keeps its
+    /// input. Such a leg's pro-rata floor is zero, so it clears it all the same.
+    function _placeLeg(address tokenIn, address tokenOut, uint256 leg, uint256 minOut) internal returns (uint256) {
+        if (propAmm.quote(tokenIn, tokenOut, leg) != 0) return _pushAndSwap(tokenIn, tokenOut, leg, minOut);
+
+        assertEq(minOut, 0, "a leg that pays nothing has a floor");
+        MockToken(tokenIn).mint(address(propAmm), leg);
+        vm.expectRevert(ZeroAmountOut.selector);
+        propAmm.swap(tokenIn, tokenOut, leg, minOut, trader, block.timestamp);
+        return 0;
     }
 
     /// Pays `amountIn` in the way the router does (push, then `swap`), to `trader`.

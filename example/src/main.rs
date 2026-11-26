@@ -2,17 +2,20 @@
 //! of our own, one per extension point the library offers.
 //!
 //! - A pricing model, `inventory_skew`: a fixed half-spread, with the mid pushed away from
-//!   the side our vault is long, so fills rebalance us. It reads the vault through the
+//!   the side our vault is long, so fills rebalance us, and never pushed further than the
+//!   half-spread, so the quote stays around the market's mid. It reads the vault through the
 //!   library (`ctx.inventory()`), so it is a `Factory` (its build is async).
 //! - A market guard, `venue_spread`: trips the lane when the venues behind the composite
-//!   price disagree by more than a limit. Runs on every composite sample.
+//!   price disagree by more than a limit. Runs on every composite sample. A factory, like
+//!   the quote guard below, so the backoffice has a form for its knob.
 //! - A quote guard, `share_cap`: withdraws our quote while the vault is more lopsided than a
 //!   cap, and halts the lane if the pricer reports a share that cannot exist.
 //! - An observer, `block_log`: logs lifecycle events (a lane starting, stopping, tripping,
 //!   a reload) and withdrawn blocks with the pricer's diagnostics. Watches, never decides.
 //!
-//! Everything else is the library's: config file and reload, the price feeds, the builders,
-//! `--check`, metrics, the backoffice, the deviation breaker and the core's bounds.
+//! Everything else is the library's: the config file and reload, the price feeds, the
+//! builders, `--check`, metrics, the backoffice API, the deviation breaker and the core's
+//! bounds.
 //!
 //! Run: `cargo run -- --config config.toml` (see README.md).
 
@@ -31,8 +34,9 @@ use serde::Deserialize;
 struct InventorySkewCfg {
     /// Published as the delta: a fraction of the mid (0.0005 = 5 bp).
     half_spread: f64,
-    /// How far the mid moves per unit of imbalance: skew = strength * (base_share - 0.5).
-    /// At strength 0.02 a vault that is 100% base pushes the mid 1% down.
+    /// How far the mid moves per unit of imbalance: skew = strength * (base_share - 0.5),
+    /// capped at `half_spread` either way. At strength 0.02 the mid moves 2 bp for every
+    /// point of base share past 50%, until it has moved by the half-spread.
     strength: f64,
     /// A vault reading older than this refuses the tick (seconds).
     #[serde(default = "default_max_inventory_age_secs")]
@@ -72,12 +76,19 @@ impl Pricer for InventorySkew {
         }
 
         let share = reading.base_share(market.mid_f64());
-        let skew = self.cfg.strength * (share - 0.5);
+        // Never further than the half-spread, where one of our two prices sits on the
+        // market's mid. Past it the quote is through the market: long base we would sell it
+        // below the market's price (short, buy it above), and a taker who put the vault
+        // there fills that and unwinds on the market, at our cost, again after every vault
+        // reading. The core does not check this for a pricer, so every pricer that moves
+        // its mid has to: the shipped `volatile` kind caps its tilt the same way.
+        let half_spread = self.cfg.half_spread;
+        let skew = (self.cfg.strength * (share - 0.5)).clamp(-half_spread, half_spread);
         out.set(&self.base_share, share);
         out.set(&self.skew, skew);
 
         Ok(PricerOutput::new(
-            market.scaled_fraction(self.cfg.half_spread)?,
+            market.scaled_fraction(half_spread)?,
             // Long base (share > 0.5) gives a positive skew, and we want to sell base, so the
             // mid must go down. The library's `shift(+x)` publishes a mid x below the market
             // (the volatile model's tilt direction), so the skew is passed as is.
@@ -100,8 +111,9 @@ const FIELDS: &[FormField] = &[
     FormField::number(
         "strength",
         "0.02",
-        "how far the mid moves per unit of imbalance. 0.02: a vault that is all base pushes \
-         the mid 1% down.",
+        "how far the mid moves per unit of imbalance. 0.02: the mid moves 2 bp for every \
+         point of base share past 50%. It never moves further than half_spread, so the \
+         quote stays around the market price.",
     ),
     FormField::number(
         "max_inventory_age_secs",
@@ -209,6 +221,53 @@ impl MarketGuard for VenueSpread {
     }
 }
 
+/// Registered as `venue_spread`: a factory rather than a closure, so the guard declares its
+/// knob for the backoffice and checks it under `--check`.
+struct VenueSpreadFactory;
+
+impl MarketGuardFactory for VenueSpreadFactory {
+    type Config = VenueSpreadCfg;
+    type Guard = VenueSpread;
+
+    fn validate(&self, cfg: &VenueSpreadCfg, _pair: &PairShape) -> eyre::Result<()> {
+        eyre::ensure!(cfg.max_dispersion > 0.0, "max_dispersion must be positive");
+        Ok(())
+    }
+
+    fn fields(&self) -> &'static [FormField] {
+        const FIELDS: &[FormField] = &[FormField::number(
+            "max_dispersion",
+            "0.01",
+            "trip when the venues' mids disagree by more than this fraction of the composite: \
+             0.01 is 1%.",
+        )];
+        FIELDS
+    }
+
+    fn form_help(&self) -> &'static str {
+        "<p class=explain>Trips the lane while the venues behind the composite price disagree \
+         by more than a limit.</p>"
+    }
+
+    fn summary(&self, cfg: &VenueSpreadCfg) -> String {
+        format!("max_dispersion {:.2}%", cfg.max_dispersion * 100.0)
+    }
+
+    fn build<'a>(
+        &'a self,
+        cfg: &'a VenueSpreadCfg,
+        ctx: &'a mut BuildCtx,
+    ) -> BoxFuture<'a, eyre::Result<VenueSpread>> {
+        Box::pin(async move {
+            let dispersion = ctx.diagnostic("venue_dispersion")?;
+            Ok(VenueSpread {
+                cfg: cfg.clone(),
+                dispersion,
+            })
+        })
+    }
+}
+
 // ----------------------------------------------------------------------------------------
 // 3. A quote guard: the last word on every tick, after the pricer and the core's bounds
 // ----------------------------------------------------------------------------------------
@@ -252,6 +311,56 @@ impl QuoteGuard for ShareCap {
             ));
         }
         Gate::Allow
+    }
+}
+
+/// Registered as `share_cap`; a factory for the same reasons as [`VenueSpreadFactory`].
+struct ShareCapFactory;
+
+impl QuoteGuardFactory for ShareCapFactory {
+    type Config = ShareCapCfg;
+    type Guard = ShareCap;
+
+    fn validate(&self, cfg: &ShareCapCfg, _pair: &PairShape) -> eyre::Result<()> {
+        eyre::ensure!(
+            (0.5..=1.0).contains(&cfg.max_share),
+            "max_share {} is not in 0.5..=1.0",
+            cfg.max_share
+        );
+        Ok(())
+    }
+
+    fn fields(&self) -> &'static [FormField] {
+        const FIELDS: &[FormField] = &[FormField::number(
+            "max_share",
+            "0.8",
+            "withdraw while the vault's base share is outside [1 − max_share, max_share]: \
+             0.8 allows 20/80 either way.",
+        )];
+        FIELDS
+    }
+
+    fn form_help(&self) -> &'static str {
+        "<p class=explain>Withdraws the quote while the vault is more lopsided than the cap, \
+         and halts the lane if the pricer reports a share that cannot exist.</p>"
+    }
+
+    fn summary(&self, cfg: &ShareCapCfg) -> String {
+        format!("max_share {:.2}", cfg.max_share)
+    }
+
+    fn build<'a>(
+        &'a self,
+        cfg: &'a ShareCapCfg,
+        ctx: &'a mut BuildCtx,
+    ) -> BoxFuture<'a, eyre::Result<ShareCap>> {
+        Box::pin(async move {
+            Ok(ShareCap {
+                cfg: cfg.clone(),
+                base_share: ctx.read_diagnostic("base_share")?,
+                lopsided: ctx.refusal("lopsided")?,
+            })
+        })
     }
 }
 
@@ -322,32 +431,33 @@ fn main() -> std::process::ExitCode {
     Updater::builder()
         // So the observer's tracing lines are rendered beside the library's.
         .log_target(env!("CARGO_CRATE_NAME"))
-        // Named in the operator hints ("systemctl --user reload my-propamm"). Optional.
-        .systemd_unit("my-propamm")
         // The three kinds the library ships, registered exactly like our own below.
         .pricer("fixed", quote_updater::pricers::Fixed)
         .pricer("feed", quote_updater::pricers::Feed)
         .pricer("volatile", quote_updater::pricers::Volatile)
         .pricer("inventory_skew", InventorySkewFactory)
-        .market_guard_fn("venue_spread", |cfg: VenueSpreadCfg, ctx: &mut BuildCtx| {
-            eyre::ensure!(cfg.max_dispersion > 0.0, "max_dispersion must be positive");
-            let dispersion = ctx.diagnostic("venue_dispersion")?;
-            Ok(VenueSpread { cfg, dispersion })
-        })
-        .quote_guard_fn("share_cap", |cfg: ShareCapCfg, ctx: &mut BuildCtx| {
-            eyre::ensure!(
-                (0.5..=1.0).contains(&cfg.max_share),
-                "max_share {} is not in 0.5..=1.0",
-                cfg.max_share
-            );
-            Ok(ShareCap {
-                cfg,
-                base_share: ctx.read_diagnostic("base_share")?,
-                lopsided: ctx.refusal("lopsided")?,
-            })
-        })
+        // Tokenized stocks, from the library: the NYSE calendar guard, then each issuer's
+        // pricer and token guard under the issuer's own names (docs/stocks.md).
+        .us_market_hours()
+        .stock_issuer(quote_updater::stocks::issuers::ondo::Ondo)
+        .market_guard("venue_spread", VenueSpreadFactory)
+        .quote_guard("share_cap", ShareCapFactory)
         .observer(BlockLog)
         // A whole `main`: parses the command line and the environment, runs, maps the
         // outcome to an exit code. Nothing in the library calls process::exit.
         .run_from_env()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The example's guards declare their one knob each, so WETH/USDC's guards are edited
+    /// from the backoffice like its pricing.
+    #[test]
+    fn the_examples_guards_declare_their_one_knob_each() {
+        let names = |fields: &[FormField]| fields.iter().map(|f| f.name).collect::<Vec<_>>();
+        assert_eq!(names(VenueSpreadFactory.fields()), ["max_dispersion"]);
+        assert_eq!(names(ShareCapFactory.fields()), ["max_share"]);
+    }
 }

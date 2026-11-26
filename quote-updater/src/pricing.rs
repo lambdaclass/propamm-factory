@@ -6,6 +6,11 @@
 //! and the pair's band. So a pricer only ever makes the updater more cautious: it can
 //! withdraw a quote, never publish one the core would refuse.
 //!
+//! What the core does not judge is where a pricer's quote sits against the market. A pricer
+//! that moves its mid off the market's (to rebalance a vault, say) must keep the market's
+//! mid between the two prices it publishes, which means moving the mid by no more than its
+//! half-spread: see [`Market::shift`].
+//!
 //! Everything a pricer sees is exact and in lane orientation, with helpers for the f64
 //! world: [`Market::mid_f64`] reads the market the way a person says it (USDC per WETH,
 //! whichever way the lane carries it), and [`Market::scaled_fraction`], [`Market::shift`]
@@ -27,11 +32,15 @@ mod inputs;
 mod volatile;
 
 pub use self::inputs::{
-    Chain, History, Inventory, InventoryFeed, LandingFeed, LandingOutcome, LandingReport,
+    CallOutcome, Chain, History, Inventory, InventoryFeed, LandingFeed, LandingOutcome,
+    LandingReport,
 };
 pub use self::{feed::Feed, fixed::Fixed, volatile::Volatile};
 #[cfg(test)]
-pub(crate) use self::{feed::FeedPricer, fixed::FixedPricer};
+pub(crate) use self::{
+    feed::{FeedPricer, Spread as FeedSpread},
+    fixed::FixedPricer,
+};
 
 use crate::{
     feed::{PriceSample, parse_decimal_scaled},
@@ -46,10 +55,13 @@ use crate::{
 /// guard reading a [`super::guard::SourceSample`]'s own `mid` and `delta`.
 pub use crate::feed::scaled_to_f64;
 
-/// One input of a pricing kind on the backoffice's pair form: the stanza key it writes, the
-/// placeholder the empty input shows, and the hint under it. A kind that declares its fields
-/// ([`Factory::fields`]) is editable from the page; one that declares none is edited in the
-/// config file, and the page says so.
+/// One input of a kind on a pair form: the stanza key it writes, the placeholder the empty
+/// input shows, the hint under it, and its type, which decides how the input's text is
+/// written into the stanza and read back from it. The backoffice API lists every registered
+/// kind's fields (`GET /api/kinds` for pricing kinds, `GET /api/guards` for guard kinds) for
+/// whatever front end draws that form. A kind that declares its fields ([`Factory::fields`],
+/// and the guard factories' `fields`) can be edited from such a form; one that declares none
+/// has a stanza only written whole, as the config file holds it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FormField {
     /// The stanza key the input writes, e.g. `half_spread`.
@@ -58,33 +70,180 @@ pub struct FormField {
     pub placeholder: &'static str,
     /// One or two sentences under the input: what the key means and what blank means.
     pub hint: &'static str,
-    /// Written into the stanza as a TOML number rather than a string, for a config type
-    /// with `f64`/`u64` fields; the page refuses a value that is not one.
-    pub number: bool,
+    /// How the input's text is written into the stanza, and read back.
+    pub kind: FieldKind,
+}
+
+/// How a [`FormField`]'s input is written into the stanza, and read back from it. More
+/// kinds may come, so a match outside this crate needs a wildcard arm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FieldKind {
+    /// A string, as typed. Blank is an absent key.
+    Text,
+    /// A TOML number, integer or float, for a config type with `f64` or integer fields; a
+    /// value that is not one is refused. Blank is an absent key.
+    Number,
+    /// A textarea, one item per line, written as an array of strings: blank lines are
+    /// dropped, and an empty textarea is an empty array with the key present.
+    List,
+    /// The name of an environment variable, written as `{ env = "NAME" }`, the shape
+    /// [`EnvSecret`] reads. The variable's value never crosses the API, in either direction.
+    Env,
+    /// A fixed set of options, one checkbox each, written as an array of the ticked ones in
+    /// this order. The placeholder names the options ticked when the stanza has no key,
+    /// space-separated: the kind's default, so a form shows what the stanza means.
+    Choices(&'static [&'static str]),
 }
 
 impl FormField {
-    /// A field whose value is written as a string, as a `const` so a kind declares its list
-    /// as a `&'static [FormField]`.
-    pub const fn new(name: &'static str, placeholder: &'static str, hint: &'static str) -> Self {
+    const fn of(
+        kind: FieldKind,
+        name: &'static str,
+        placeholder: &'static str,
+        hint: &'static str,
+    ) -> Self {
         FormField {
             name,
             placeholder,
             hint,
-            number: false,
+            kind,
         }
+    }
+
+    /// A field whose value is written as a string, as a `const` so a kind declares its list
+    /// as a `&'static [FormField]`.
+    pub const fn new(name: &'static str, placeholder: &'static str, hint: &'static str) -> Self {
+        Self::of(FieldKind::Text, name, placeholder, hint)
     }
 
     /// A field whose value is written as a number (`half_spread = 0.0005`), for a config
     /// type that reads `f64` or integer fields.
     pub const fn number(name: &'static str, placeholder: &'static str, hint: &'static str) -> Self {
-        FormField {
-            name,
-            placeholder,
-            hint,
-            number: true,
+        Self::of(FieldKind::Number, name, placeholder, hint)
+    }
+
+    /// A field whose value is a list, one item per line, written as an array of strings
+    /// (`holidays = ["2026-11-26", ...]`).
+    pub const fn list(name: &'static str, placeholder: &'static str, hint: &'static str) -> Self {
+        Self::of(FieldKind::List, name, placeholder, hint)
+    }
+
+    /// A field whose value is a choice among `options`, one checkbox each, written as an
+    /// array of the ticked ones (`sessions = ["regular", "postmarket"]`). `placeholder`
+    /// names the options ticked when the stanza has no key, space-separated.
+    pub const fn choices(
+        name: &'static str,
+        options: &'static [&'static str],
+        placeholder: &'static str,
+        hint: &'static str,
+    ) -> Self {
+        Self::of(FieldKind::Choices(options), name, placeholder, hint)
+    }
+
+    /// A field holding the name of an environment variable, written as `{ env = "NAME" }`
+    /// for a config type with an [`EnvSecret`] field.
+    pub const fn env(name: &'static str, placeholder: &'static str, hint: &'static str) -> Self {
+        Self::of(FieldKind::Env, name, placeholder, hint)
+    }
+
+    /// What a form's text for this field writes into the stanza, by its [`FieldKind`], or
+    /// `None` for a blank, which is an absent key so the kind's default applies. A list is
+    /// the exception: its empty text is an empty array, since the key is required where a
+    /// list is used. A choice is the options named, one per line or space-separated, held
+    /// to the declared ones. These are the rules a front end drawing a form from the
+    /// backoffice API's field lists follows. An env field refuses what is not a variable's
+    /// name without echoing it, since what is not a name may be the secret itself.
+    pub fn write(&self, text: &str) -> eyre::Result<Option<toml::Value>> {
+        let text = text.trim();
+        let blank = text.is_empty();
+        Ok(match self.kind {
+            FieldKind::Text => (!blank).then(|| toml::Value::String(text.to_owned())),
+            FieldKind::Number if blank => None,
+            FieldKind::Number => Some(match (text.parse::<i64>(), text.parse::<f64>()) {
+                (Ok(int), _) => toml::Value::Integer(int),
+                (_, Ok(float)) if float.is_finite() => toml::Value::Float(float),
+                _ => eyre::bail!("`{}` must be a number, got {text:?}", self.name),
+            }),
+            FieldKind::List => Some(toml::Value::Array(
+                text.lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(|line| toml::Value::String(line.to_owned()))
+                    .collect(),
+            )),
+            FieldKind::Choices(options) => Some(toml::Value::Array(
+                text.split(|c: char| c.is_whitespace() || c == ',')
+                    .filter(|word| !word.is_empty())
+                    .map(|word| {
+                        options
+                            .iter()
+                            .find(|option| option.eq_ignore_ascii_case(word))
+                            .map(|option| toml::Value::String((*option).to_owned()))
+                            .ok_or_else(|| {
+                                eyre::eyre!(
+                                    "`{}` takes {}, not {word:?}",
+                                    self.name,
+                                    options.join(", ")
+                                )
+                            })
+                    })
+                    .collect::<eyre::Result<Vec<_>>>()?,
+            )),
+            FieldKind::Env if blank => None,
+            FieldKind::Env => {
+                eyre::ensure!(
+                    is_variable_name(text),
+                    "`{}` must be the name of an environment variable (letters, digits and \
+                     underscores), never its value",
+                    self.name
+                );
+                let mut env = toml::Table::new();
+                env.insert("env".to_owned(), toml::Value::String(text.to_owned()));
+                Some(toml::Value::Table(env))
+            }
+        })
+    }
+
+    /// A stanza value as this field's input shows it, which [`FormField::write`] writes
+    /// back as it was: a number as TOML writes it, a list or a choice one item per line, an
+    /// env reference as the variable's name, a string as it is. A value of another shape
+    /// than the field's type writes (a number written by hand for a text field, say) still
+    /// shows; what cannot show is blank.
+    pub fn show(&self, value: Option<&toml::Value>) -> String {
+        match (self.kind, value) {
+            (_, None) => String::new(),
+            (FieldKind::List | FieldKind::Choices(_), Some(toml::Value::Array(items))) => items
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            (FieldKind::Env, Some(toml::Value::Table(table))) => table
+                .get("env")
+                .and_then(toml::Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            (FieldKind::Env | FieldKind::List | FieldKind::Choices(_), Some(_)) => String::new(),
+            (FieldKind::Text | FieldKind::Number, Some(scalar)) => match scalar {
+                toml::Value::String(text) => text.clone(),
+                toml::Value::Integer(int) => int.to_string(),
+                // `{:?}` keeps a whole float a float (`1.0`), so it is written back as one.
+                toml::Value::Float(float) => format!("{float:?}"),
+                toml::Value::Boolean(flag) => flag.to_string(),
+                _ => String::new(),
+            },
         }
     }
+}
+
+/// Whether `name` is spelled like an environment variable: a letter or underscore, then
+/// letters, digits and underscores.
+pub(crate) fn is_variable_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// The future a [`Factory`] builds in: boxed and `Send`, so building needs no
@@ -159,21 +318,21 @@ pub trait Factory: Send + Sync + 'static {
         Ok(())
     }
 
-    /// The stanza's keys as inputs on the backoffice's pair form, in the order shown. The
-    /// page posts each as text and writes it into the stanza as a string, so a kind that
-    /// declares fields reads its config as strings (the kinds this crate ships do). Empty, the default,
-    /// means the stanza is edited in the file and the page says so.
+    /// The stanza's keys as inputs on a pair form, in the order shown, as the backoffice API
+    /// lists them (`GET /api/kinds`). A front end writes each into the stanza as the field's
+    /// [`FieldKind`] says: a string, a number, a list or an env reference. Empty, the
+    /// default, means the stanza is only written whole.
     fn fields(&self) -> &'static [FormField] {
         &[]
     }
 
-    /// HTML the pair form shows above this kind's fields: what the model does and how to
-    /// tune it. Empty by default.
+    /// HTML a pair form shows above this kind's fields: what the model does and how to tune
+    /// it. Listed by `GET /api/kinds` as `help_html`. Empty by default.
     fn form_help(&self) -> &'static str {
         ""
     }
 
-    /// One line describing a stanza for the `--check` report and the backoffice's pair
+    /// One line describing a stanza for the `--check` report and the backoffice API's pair
     /// list, e.g. `mid 1.0001 delta 0.0002`. Empty by default, which shows the kind alone.
     fn summary(&self, _cfg: &Self::Config) -> String {
         String::new()
@@ -207,6 +366,18 @@ pub trait MarketGuardFactory: Send + Sync + 'static {
         Ok(())
     }
 
+    /// The stanza's keys as inputs on a pair form, in the order shown, as the backoffice API
+    /// lists them (`GET /api/guards`); as [`Factory::fields`] for a pricing kind. Empty, the
+    /// default, means the stanza is only written whole.
+    fn fields(&self) -> &'static [FormField] {
+        &[]
+    }
+
+    /// HTML a pair form shows above this kind's fields; see [`Factory::form_help`].
+    fn form_help(&self) -> &'static str {
+        ""
+    }
+
     /// One short line for `--check`'s `guards` column, e.g. `max_spread 0.3%`. The kind's
     /// name is shown either way; this is the settings after it. Empty shows the name alone.
     fn summary(&self, _cfg: &Self::Config) -> String {
@@ -238,6 +409,18 @@ pub trait QuoteGuardFactory: Send + Sync + 'static {
         Ok(())
     }
 
+    /// The stanza's keys as inputs on a pair form, in the order shown, as the backoffice API
+    /// lists them (`GET /api/guards`); as [`Factory::fields`] for a pricing kind. Empty, the
+    /// default, means the stanza is only written whole.
+    fn fields(&self) -> &'static [FormField] {
+        &[]
+    }
+
+    /// HTML a pair form shows above this kind's fields; see [`Factory::form_help`].
+    fn form_help(&self) -> &'static str {
+        ""
+    }
+
     /// One short line for `--check`'s `guards` column; see [`MarketGuardFactory::summary`].
     fn summary(&self, _cfg: &Self::Config) -> String {
         String::new()
@@ -259,6 +442,7 @@ pub const RESERVED_REASONS: &[&str] = &[
     "out_of_band",
     "delta_overflow",
     "panic",
+    "source_divergence",
 ];
 
 /// What a pricer publishes: the half-spread and the mid, exact, in lane orientation and at
@@ -370,12 +554,19 @@ pub struct PairShape {
     /// How many venues the pair's `symbol`/`sources` stream from: 0 for a pair with no
     /// market, which a kind that reads one refuses in its `validate`.
     pub sources: usize,
+    /// How many of those quote one price with no book behind it (`ondo`, an issuer's own
+    /// price): their half-spread is zero, so a kind that copies the book's copies nothing.
+    pub mid_only_sources: usize,
     /// The pair's `min_mid`, in lane orientation, which the core holds every published mid
-    /// to; a kind whose mid is a setting checks it here, so a mistake fails the file instead
-    /// of every tick.
+    /// to, and on a pair with a market the market's mid as well; a kind whose mid is a
+    /// setting checks it here, so a mistake fails the file instead of every tick.
     pub min_mid: Option<U256>,
     /// The pair's `max_mid`, likewise.
     pub max_mid: Option<U256>,
+    /// The pair's `max_source_divergence`, a fraction scaled by `10^price_decimals`: how far
+    /// its venues may disagree before the core withdraws the quote. `None` is the default
+    /// limit, which follows the spread the pair publishes; see `agreement`.
+    pub max_source_divergence: Option<U256>,
 }
 
 /// The pair's reference market this tick: the composite of its `symbol`/`sources`, fresh.
@@ -421,6 +612,15 @@ impl Market {
 
     /// The mid moved by `skew` in market orientation: `+0.01` publishes a mid 1% below the
     /// market's (the volatile model's tilt direction), returned in lane orientation.
+    ///
+    /// Keep `skew` within the half-spread published beside it, `±delta`. We buy at
+    /// `mid·(1 − skew)·(1 − delta)` and sell at `mid·(1 − skew)/(1 − delta)`, so at
+    /// `skew = delta` we sell at the market's mid, and past it below: the quote is through
+    /// the market, and a taker fills it and unwinds on the market at the vault's cost. A
+    /// skew that follows the vault's inventory makes that repeatable, since whoever
+    /// unbalances the vault moves the quote. Nothing in the core checks this (the band is an
+    /// absolute bound on the mid, not a distance from the market), so the pricer clamps:
+    /// `skew.clamp(-delta, delta)`, as the volatile model does with its tilt.
     pub fn shift(&self, skew: f64) -> Result<U256, Refusal> {
         shifted_mid(self.mid, skew, self.inverted, self.price_decimals)
             .map_err(|err| Refusal::core(UnusableKind::DeltaOverflow, format!("{err:#}")))
@@ -650,6 +850,10 @@ impl Diagnostics {
 /// the pair's band (`min_mid`/`max_mid`) is the operator's bound
 /// on the mid and is checked after it. Severity only goes up: this can withdraw a quote,
 /// never publish one.
+///
+/// It does not compare the mid with the market's: a pricer may price off something other
+/// than the pair's reference market, so keeping a quote from going through the market is
+/// the pricer's to do (see [`Market::shift`]).
 pub(crate) fn backstop(
     out: PricerOutput,
     market: Option<&Market>,
@@ -676,6 +880,84 @@ pub(crate) fn backstop(
     }
     let _ = market;
     Ok(())
+}
+
+/// How many of its own half-spreads a pair lets its venues disagree by, when it sets no
+/// `max_source_divergence`.
+///
+/// The limit follows the spread because the spread is what the disagreement costs: a
+/// quote is safe to stand behind while the market is somewhere inside it, and venues that
+/// disagree by many spreads are saying nobody knows where the market is to that accuracy.
+/// It is a multiple rather than one spread because venues never agree exactly. A deep book
+/// and a thin one on the same market sit a few spreads apart for a moment on every move,
+/// and a limit that withdrew on each of those would stop a healthy pair many times an hour.
+/// Twenty leaves that alone and still catches what the check is for: a primary venue that
+/// froze or is delivering a backlog while the market moved on, and a venue pushed far off
+/// the others. An operator who knows a pair's venues sets `max_source_divergence` tighter.
+pub const DIVERGENCE_SPREADS: u64 = 20;
+
+/// The least the default limit is, as a fraction of the mid in parts per ten thousand:
+/// 5 bp. A pair quoting a very thin spread (a stable pair's fraction of a basis point)
+/// would otherwise get a limit inside the ordinary noise between two venues.
+pub const DIVERGENCE_FLOOR_BP: u64 = 5;
+
+/// Whether the venues behind the pair's market agree closely enough to publish `out`.
+///
+/// `divergence` is the composite's reading of how far they disagree (`PriceSample`'s:
+/// the primary venue against each other fresh one). It is held to the pair's
+/// `max_source_divergence` when it sets one, and otherwise to [`DIVERGENCE_SPREADS`] times
+/// the half-spread being published, and no less than [`DIVERGENCE_FLOOR_BP`]. Past the
+/// limit the tick is withdrawn under `source_divergence`; nothing latches, so the first
+/// tick on which the venues agree again quotes.
+///
+/// It is the check on what the average cannot show. One venue frozen while the market
+/// moves, one delivering a backlog, one whose thin book was pushed: each leaves an average
+/// that looks like a price. The venues disagreeing is the only sign there is, so that is
+/// what withdraws the quote. A pair with one fresh venue has nothing to compare, reads
+/// zero, and always passes.
+pub(crate) fn agreement(
+    out: PricerOutput,
+    divergence: U256,
+    pair: &PairShape,
+) -> Result<(), Unusable> {
+    let (limit, source) = match pair.max_source_divergence {
+        Some(limit) => (limit, "max_source_divergence".to_owned()),
+        None => {
+            let floor = crate::config::spread_scale(pair.price_decimals)
+                .saturating_mul(U256::from(DIVERGENCE_FLOOR_BP))
+                / U256::from(10_000u64);
+            let spreads = out.delta.saturating_mul(U256::from(DIVERGENCE_SPREADS));
+            if spreads >= floor {
+                (
+                    spreads,
+                    format!("{DIVERGENCE_SPREADS} times the half-spread it would publish"),
+                )
+            } else {
+                (
+                    floor,
+                    format!("the default floor, {DIVERGENCE_FLOOR_BP} bp"),
+                )
+            }
+        }
+    };
+    if divergence <= limit {
+        return Ok(());
+    }
+    let percent = |value: U256| {
+        format!(
+            "{:.4}%",
+            crate::feed::scaled_to_f64(value, pair.price_decimals) * 100.0
+        )
+    };
+    Err(Unusable::new(
+        UnusableKind::SourceDivergence,
+        format!(
+            "the pair's venues disagree by {}, over the limit of {} ({source}); refusing to \
+             quote a price they do not agree on",
+            percent(divergence),
+            percent(limit),
+        ),
+    ))
 }
 
 /// A secret a `[pairs.pricing]` stanza names rather than holds: written `{ env = "NAME" }`,
@@ -890,7 +1172,7 @@ impl BuildCtx {
 
     /// The lane's latch, for a component to trip its own lane from its code or a task of
     /// its own (`cause = external`): a model that sees its inputs go bad, an oracle that
-    /// disagrees for too long. Not a kill switch: a reload re-arms every latch, so
+    /// disagrees for too long. Not a kill switch: the pair's re-arm clears a latch, so
     /// "stop until I say so" is a halt in the config file, never a trip. Under a test build
     /// context this is a latch of the context's own, readable back through the same call.
     pub fn latch(&self) -> crate::guard::Latch {
@@ -1139,8 +1421,10 @@ mod tests {
     fn pair(inverted: bool, price_decimals: u32) -> PairShape {
         PairShape {
             sources: 1,
+            mid_only_sources: 0,
             min_mid: None,
             max_mid: None,
+            max_source_divergence: None,
             label: "WETH/USDC".into(),
             tokens: (Address::repeat_byte(1), Address::repeat_byte(2)),
             lane: U256::from(7),
@@ -1156,6 +1440,7 @@ mod tests {
             delta: crate::feed::parse_decimal_scaled(delta, decimals).unwrap(),
             at: Instant::now(),
             wall: std::time::SystemTime::now(),
+            divergence: U256::zero(),
         }
     }
 
@@ -1236,6 +1521,45 @@ mod tests {
             "{}",
             refusal.message()
         );
+    }
+
+    /// The limit `agreement` holds the venues to: 20 half-spreads of what is being
+    /// published, no less than 5 bp, or the pair's own `max_source_divergence`.
+    #[test]
+    fn the_venues_may_disagree_by_a_multiple_of_the_spread_or_the_pairs_own_limit() {
+        let mut p = pair(false, 18);
+        let bp = U256::exp10(14);
+        let quote = |delta: U256| PricerOutput::new(delta, U256::from(4000u64) * U256::exp10(18));
+        let refused = |out: PricerOutput, divergence: U256, p: &PairShape| {
+            let err = agreement(out, divergence, p).unwrap_err();
+            assert_eq!(err.kind(), Some(UnusableKind::SourceDivergence));
+            err.to_string()
+        };
+
+        // A 0.5 bp half-spread: 20 of them are 10 bp.
+        let half_bp = bp / 2;
+        assert!(agreement(quote(half_bp), bp * 10, &p).is_ok());
+        let said = refused(quote(half_bp), bp * 10 + 1, &p);
+        assert!(said.contains("20 times the half-spread"), "{said}");
+
+        // A 0.1 bp half-spread: 20 of them are 2 bp, under the floor, so the floor is it.
+        let tenth_bp = bp / 10;
+        assert!(agreement(quote(tenth_bp), bp * 5, &p).is_ok());
+        let said = refused(quote(tenth_bp), bp * 5 + 1, &p);
+        assert!(said.contains("the default floor, 5 bp"), "{said}");
+
+        // The pair's own limit replaces both, tighter or looser.
+        p.max_source_divergence = Some(bp);
+        assert!(agreement(quote(half_bp), bp, &p).is_ok());
+        let said = refused(quote(half_bp), bp + 1, &p);
+        assert!(said.contains("max_source_divergence"), "{said}");
+        p.max_source_divergence = Some(bp * 100);
+        assert!(agreement(quote(tenth_bp), bp * 100, &p).is_ok());
+
+        // Nothing to compare (one fresh venue, or no market) reads zero and always passes,
+        // whatever is published.
+        p.max_source_divergence = None;
+        assert!(agreement(quote(U256::zero()), U256::zero(), &p).is_ok());
     }
 
     #[test]

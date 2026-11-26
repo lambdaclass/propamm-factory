@@ -29,6 +29,11 @@ create table if not exists feed.mids (
   source text not null,
   primary key (symbol, ts)
 );
+-- What the retention deletes by (`RECORD_RETENTION_DAYS`, record.rs): the rows older than a
+-- cutoff, oldest first, a batch at a time. The primary key starts with the symbol, so
+-- without this every batch read the whole table to find them. Built once, on the first
+-- connect after it was added, which on a table that has grown for a long time takes a while.
+create index if not exists mids_ts on feed.mids (ts);
 
 -- "Pool `prop_amm`'s vault `vault` held `balance` raw units of `token` at block
 -- `block_number`", read at that block, with the block's own timestamp. Written when the
@@ -81,6 +86,8 @@ create table if not exists feed.quotes (
   primary key (prop_amm, lane, block_number)
 );
 create index if not exists quotes_lane_ts on feed.quotes (lane, ts);
+-- For the retention's delete, like `mids_ts`: neither index above leads with `ts`.
+create index if not exists quotes_ts on feed.quotes (ts);
 -- The pricing kind's declared diagnostics at that update, by name (`{"edge": 0.25, ...}`):
 -- what the model was thinking. The volatile kind records its σ, the three spread terms, the
 -- skew and the inventory it read; a kind that declares none leaves this null. Added after

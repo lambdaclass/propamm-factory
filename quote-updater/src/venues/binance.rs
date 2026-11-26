@@ -20,7 +20,7 @@ pub fn connection(endpoint: &str, symbol: &str) -> Connection {
             endpoint.trim_end_matches('/'),
             symbol.to_lowercase()
         ),
-        subscribe: None,
+        subscribe: Vec::new(),
         keepalive: Keepalive::Ping,
     }
 }
@@ -34,9 +34,8 @@ struct BookTicker {
     ask: String,
     /// The event time, in milliseconds. The spot bookTicker stream does not send one (its
     /// frame is `u s b B a A`), so on the default endpoint a Binance price is aged by when
-    /// it arrived, which sees a stream gone silent but not one delivering a backlog on time
-    /// (`max_source_divergence` is what catches that); read when present, for an endpoint
-    /// whose bookTicker carries it.
+    /// it arrived, which sees a stream gone silent but not one delivering a backlog on
+    /// time; read when present, for an endpoint whose bookTicker carries it.
     #[serde(rename = "E")]
     event_ms: Option<u64>,
 }
@@ -81,7 +80,7 @@ mod tests {
             panic!("streams")
         };
         assert_eq!(url, "wss://stream.binance.com:9443/ws/ethusdc@bookTicker");
-        assert_eq!(subscribe, None);
+        assert!(subscribe.is_empty());
         assert_eq!(keepalive, Keepalive::Ping);
     }
 

@@ -1,0 +1,22 @@
+{
+  "name": "backoffice-ui",
+  "private": true,
+  "description": "A front end for the quote updater's backoffice API",
+  "type": "module",
+  "packageManager": "pnpm@12.18.0",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devEngines": {
+    "runtime": {
+      "name": "node",
+      "version": "24.22.3",
+      "onFail": "download"
+    }
+  },
+  "devDependencies": {
+    "vite": "8.3.8"
+  }
+}

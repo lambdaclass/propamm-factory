@@ -9,13 +9,16 @@ use ethrex_common::{Address, Bytes};
 use ethrex_l2_common::calldata::Value;
 use ethrex_l2_sdk::calldata::decode_calldata;
 use ethrex_rpc::{
-    clients::eth::{EthClient, Overrides},
+    clients::eth::{
+        EthClient, Overrides,
+        errors::{EthClientError, RpcRequestError},
+    },
     types::block_identifier::BlockIdentifier,
     utils::RpcRequest,
 };
 use eyre::{Result, WrapErr, eyre};
 
-use crate::RPC_TIMEOUT;
+use crate::{RPC_TIMEOUT, pricing::CallOutcome};
 
 /// Decodes an `eth_call`'s return data against its return types, written as a tuple:
 /// `(uint80,int256,uint256,uint256,uint80)` for Chainlink's `latestRoundData()`. A name
@@ -61,6 +64,70 @@ pub(crate) async fn call_view(
     ))
     .await?;
     hex::decode(ret.strip_prefix("0x").unwrap_or(&ret)).wrap_err("non-hex eth_call return")
+}
+
+/// [`call_view`] at the latest block with a revert told apart from a failed read: for a
+/// caller to whom "the contract said no" and "nothing answered" are different news.
+pub(crate) async fn call_view_outcome(
+    client: &EthClient,
+    to: Address,
+    calldata: Vec<u8>,
+) -> Result<CallOutcome> {
+    call_outcome(client, Overrides::default(), to, calldata).await
+}
+
+/// An `eth_call` made as `from`, bounded like [`call_view`], with a revert answered as
+/// [`CallOutcome::Reverted`] rather than folded into the error a failed read is.
+pub(crate) async fn call_as(
+    client: &EthClient,
+    from: Address,
+    to: Address,
+    calldata: Vec<u8>,
+) -> Result<CallOutcome> {
+    let overrides = Overrides {
+        from: Some(from),
+        ..Default::default()
+    };
+    call_outcome(client, overrides, to, calldata).await
+}
+
+/// The one body of [`call_view_outcome`] and [`call_as`].
+async fn call_outcome(
+    client: &EthClient,
+    overrides: Overrides,
+    to: Address,
+    calldata: Vec<u8>,
+) -> Result<CallOutcome> {
+    let answer = tokio::time::timeout(RPC_TIMEOUT, client.call(to, calldata.into(), overrides))
+        .await
+        .map_err(|_| eyre!("no answer in {RPC_TIMEOUT:?}"))?;
+    match answer {
+        Ok(ret) => Ok(CallOutcome::Returned(
+            hex::decode(ret.strip_prefix("0x").unwrap_or(&ret))
+                .wrap_err("non-hex eth_call return")?,
+        )),
+        Err(err) => match revert_data(&err) {
+            Some(data) => Ok(CallOutcome::Reverted(data)),
+            None => Err(err.into()),
+        },
+    }
+}
+
+/// The data an `eth_call` reverted with, when `err` is a revert: an error the node answered
+/// whose message says so ("execution reverted" from geth, reth and anvil alike, with or
+/// without a reason after it). ethrex's error keeps the message and the data but not the
+/// code (3), so the message is what is left to tell. Anything else is not a revert: a
+/// transport failure, a rate limit, a method the node does not serve.
+fn revert_data(err: &EthClientError) -> Option<Vec<u8>> {
+    let EthClientError::RpcRequestError(RpcRequestError::RPCError { message, data, .. }) = err
+    else {
+        return None;
+    };
+    if !message.to_ascii_lowercase().contains("revert") {
+        return None;
+    }
+    let data = data.as_deref().unwrap_or("0x");
+    Some(hex::decode(data.strip_prefix("0x").unwrap_or(data)).unwrap_or_default())
 }
 
 /// Sends a bare RPC request (anvil cheatcodes) and surfaces JSON-RPC errors.

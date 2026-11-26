@@ -1,5 +1,5 @@
-//! Finding where a pair trades, so the backoffice can fill the venue table instead of an
-//! operator looking up how each venue spells the market.
+//! Finding where a pair trades, so the backoffice API can fill a pair's venue table
+//! instead of an operator looking up how each venue spells the market.
 //!
 //! The token names come from the chain (`symbol()` on each contract, read by the caller).
 //! Then every exchange is asked for its own list of markets, and a market is the pair's
@@ -29,9 +29,13 @@ const DOLLARS: &[&str] = &["USDC", "USDT", "USD", "FDUSD", "DAI", "USDE", "PYUSD
 /// minutes in any way this suggestion cares about, and Binance's list is megabytes.
 const CACHE_FOR: Duration = Duration::from_secs(600);
 
-/// The exchanges this asks: every venue.
+/// The exchanges this asks: every venue that lists markets. Ondo is an issuer's price for
+/// its own token, with no list to read; its row is the operator's to fill.
 fn exchanges() -> impl Iterator<Item = VenueId> {
-    VenueId::ALL.iter().copied()
+    VenueId::ALL
+        .iter()
+        .copied()
+        .filter(|venue| *venue != VenueId::Ondo)
 }
 
 /// Where each exchange's REST API is. Not the feed endpoints: those are WebSocket hosts.
@@ -231,7 +235,12 @@ pub async fn discover(
                 note: if exact {
                     String::new()
                 } else {
-                    format!("quoted in {}, not {quote_name}", market.quote)
+                    // The backoffice reads a stand-in by this prefix, `quoted in`.
+                    format!(
+                        "quoted in {}, not {quote_name}: not selected, since it would be \
+                         averaged as if at par",
+                        market.quote
+                    )
                 },
                 symbol: market.symbol,
             }
@@ -320,6 +329,7 @@ async fn markets(
         VenueId::Bitget => "/api/v2/spot/public/symbols",
         VenueId::Gate => "/api/v4/spot/currency_pairs",
         VenueId::Mexc => "/api/v3/exchangeInfo",
+        VenueId::Ondo => return Err(eyre!("ondo lists no markets")),
     };
     let body = get_json(http, &format!("{host}{path}")).await?;
     let list = Arc::new(parse_markets(venue, &body)?);
@@ -444,6 +454,7 @@ fn parse_markets(venue: VenueId, body: &Value) -> Result<Vec<Market>> {
             "symbol",
             &|r| text(r, "status") == "1" && r["isSpotTradingAllowed"] != Value::Bool(false),
         ),
+        VenueId::Ondo => return Err(eyre!("ondo lists no markets")),
     })
 }
 
@@ -466,6 +477,7 @@ async fn ticker(
         VenueId::Bitget => format!("{host}/api/v2/spot/market/tickers?symbol={t}"),
         VenueId::Gate => format!("{host}/api/v4/spot/tickers?currency_pair={t}"),
         VenueId::Mexc => format!("{host}/api/v3/ticker/24hr?symbol={t}"),
+        VenueId::Ondo => return Err(eyre!("ondo lists no markets")),
     };
     parse_ticker(venue, &get_json(http, &url).await?)
 }
@@ -505,6 +517,7 @@ fn parse_ticker(venue: VenueId, body: &Value) -> Result<(f64, Option<f64>)> {
             number(&body["data"][0]["lastPr"]),
         ),
         VenueId::Gate => (number(&body[0]["quote_volume"]), number(&body[0]["last"])),
+        VenueId::Ondo => return Err(eyre!("ondo lists no markets")),
     };
     Ok((
         volume.ok_or_else(|| eyre!("no 24h volume in the answer"))?,

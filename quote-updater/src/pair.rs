@@ -105,6 +105,7 @@ pub(crate) fn adopt_metrics(live: &Live, price_decimals: u32, metrics: &crate::m
             m.feed_sample_current.set(f64::NAN);
             m.feed_sources_fresh.set(f64::NAN);
             m.feed_sources_min.set(f64::NAN);
+            m.feed_divergence.set(f64::NAN);
         }
         // The sample `build_live` waited for, written through as this pair's first reading.
         //
@@ -201,6 +202,10 @@ pub(crate) struct Live {
     /// reload reads what tripped it. Cloned with `Live` for a restart, so a trip that
     /// happened while no loop was running is waiting when one returns.
     pub(crate) latch: crate::guard::Latch,
+    /// The pair's kill switch (`halts.rs`): set, the quote loop withdraws at every builder
+    /// and sends nothing more. The service hands each run its lane's flag as it starts it;
+    /// built unset.
+    pub(crate) halt: crate::halts::HaltSignal,
     /// Whether the pair configured a deviation guard, for `breaker_armed`.
     pub(crate) armed: bool,
     /// The registered guard kinds this pair runs (market and quote), for `guards{pair,kind}`.
@@ -232,8 +237,13 @@ pub(crate) fn shape_of(resolved: &ResolvedPair, price_decimals: u32, target: Add
         price_decimals,
         target,
         sources: resolved.feeds.as_ref().map_or(0, |f| f.sources.len()),
+        mid_only_sources: resolved.feeds.as_ref().map_or(0, |f| f.mid_only_sources()),
         min_mid: resolved.pair.band.min,
         max_mid: resolved.pair.band.max,
+        max_source_divergence: resolved
+            .feeds
+            .as_ref()
+            .and_then(|feeds| feeds.checks.max_divergence),
     }
 }
 
@@ -591,6 +601,7 @@ pub(crate) async fn build_live(
     let values = values.with_guards(latch.clone(), quote_guards);
     Ok(Built {
         live: Live {
+            halt: Default::default(),
             pair: resolved.pair,
             values,
             latch,
@@ -694,8 +705,10 @@ pub(crate) fn all_or_none<T>(results: Vec<(String, Result<T>)>) -> Result<Vec<T>
 /// `diagnostics` is how many its build declared, so the buffer has the slots the run's has
 /// and a pricer reading back what it set sees the same here.
 ///
-/// The preview goes through the core's backstop with the same market and shape the run's
-/// every tick does, so a row cannot pass what the run would withdraw.
+/// The preview goes through the core's backstop, then the pair's band, on the published
+/// mid and on the market's, and then the check that the pair's venues agree, with the same
+/// market and shape the run's every tick does, so a row cannot pass what the run would
+/// withdraw.
 pub(crate) fn preview_row(
     pricer: &mut dyn Pricer,
     sample: Option<&feed::PriceSample>,
@@ -705,6 +718,10 @@ pub(crate) fn preview_row(
     let market = sample.map(|sample| Market::from_sample(sample, shape));
     let tick = TickCtx::new(std::time::Instant::now(), market.as_ref(), shape);
     let mut out = Diagnostics::new(diagnostics);
+    let band = crate::config::MidBand {
+        min: shape.min_mid,
+        max: shape.max_mid,
+    };
     // A preview is the binary's code too: its panic is this row's error, and the check
     // goes on to the next pair. There is no lane to trip under `--check`.
     let row = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -713,7 +730,11 @@ pub(crate) fn preview_row(
         Ok(preview) => preview
             .map_err(|refusal| refusal.to_string())
             .and_then(|priced| {
+                let divergence = sample.map_or_else(U256::zero, |sample| sample.divergence);
                 crate::pricing::backstop(priced, market.as_ref(), shape)
+                    .and_then(|()| band.check(priced.mid))
+                    .and_then(|()| market.as_ref().map_or(Ok(()), |m| band.check_market(m.mid)))
+                    .and_then(|()| crate::pricing::agreement(priced, divergence, shape))
                     .map(|()| (priced.delta, priced.mid))
                     .map_err(|unusable| unusable.to_string())
             }),
@@ -798,8 +819,13 @@ pub(crate) async fn collect_prices(
                 price_decimals,
                 target: chain.1,
                 sources: spec.feeds.as_ref().map_or(0, |f| f.sources.len()),
+                mid_only_sources: spec.feeds.as_ref().map_or(0, |f| f.mid_only_sources()),
                 min_mid: spec.band.min,
                 max_mid: spec.band.max,
+                max_source_divergence: spec
+                    .feeds
+                    .as_ref()
+                    .and_then(|feeds| feeds.checks.max_divergence),
             };
             let mut venues = Vec::new();
             // The diagnostics the pair's pricer declared in its build, for its quote guards
@@ -822,10 +848,19 @@ pub(crate) async fn collect_prices(
                 (Err(err), _) => Err(format!("{err:#}")),
                 (Ok(()), Some(feeds)) => match composite::connect(feeds, params()).await {
                     Ok(spawned) => {
+                        // The first sample is often one venue's, which has nothing to
+                        // disagree with: the gap the row is held to is the one between
+                        // every venue that delivers, as the run's is a moment later.
+                        let gap = spawned
+                            .settled_divergence(&feeds.sources, price_decimals)
+                            .await;
                         venues = venue_lines(&spawned);
                         let sample = *spawned.rx.borrow();
                         sample
-                            .map(Some)
+                            .map(|mut sample| {
+                                sample.divergence = sample.divergence.max(gap);
+                                Some(sample)
+                            })
                             .ok_or_else(|| "the feed reported a sample and then lost it".to_owned())
                     }
                     Err(err) => Err(format!("{err:#}")),
@@ -936,6 +971,8 @@ pub(crate) struct SendOpts {
     /// Where the quote loop records every update it signs, when recording is on. Carried
     /// here for the same reason as `price_decimals`.
     pub(crate) recorder: Option<record::Recorder>,
+    /// Whether each update carries its signing instant as a third slot; see `--quote-id`.
+    pub(crate) quote_id: bool,
 }
 
 #[cfg(test)]
@@ -1044,8 +1081,10 @@ mod tests {
             mid: U256::from(2u64) * U256::exp10(18),
             at: std::time::Instant::now(),
             wall,
+            divergence: U256::zero(),
         }));
         let live = Live {
+            halt: Default::default(),
             pair: Pair {
                 tokens: (Address::zero(), Address::zero()),
                 lane: U256::from(3),
@@ -1117,6 +1156,7 @@ mod tests {
             }
         };
         let live = |okx: bool| Live {
+            halt: Default::default(),
             pair: Pair {
                 tokens: (Address::zero(), Address::zero()),
                 lane: U256::from(4),
@@ -1204,8 +1244,10 @@ mod tests {
             mid: U256::from(110u64) * U256::exp10(18),
             at: std::time::Instant::now(),
             wall: std::time::SystemTime::now(),
+            divergence: U256::zero(),
         }));
         let live = Live {
+            halt: Default::default(),
             pair: Pair {
                 tokens: (Address::zero(), Address::zero()),
                 lane: U256::from(9),
@@ -1274,8 +1316,10 @@ mod tests {
             mid: U256::exp10(18),
             at: std::time::Instant::now(),
             wall: std::time::SystemTime::now(),
+            divergence: U256::zero(),
         }));
         let live = Live {
+            halt: Default::default(),
             pair: Pair {
                 tokens: (Address::zero(), Address::zero()),
                 lane: U256::from(9),
@@ -1465,18 +1509,61 @@ mod tests {
             price_decimals: 18,
             target: Address::zero(),
             sources: 1,
+            mid_only_sources: 0,
             min_mid: None,
             max_mid: None,
+            max_source_divergence: None,
         };
         let sample = feed::PriceSample {
             mid: U256::from(4000u64) * U256::exp10(18),
             delta: U256::exp10(14),
             at: std::time::Instant::now(),
             wall: std::time::SystemTime::now(),
+            divergence: U256::zero(),
         };
         let (row, _) = preview_row(&mut WholeUnit, Some(&sample), &shape, 0);
         let refused = row.unwrap_err();
         assert!(refused.contains("not below one whole unit"), "{refused}");
+    }
+
+    /// `--check` applies the band, on the published mid and on the market's, as the run does:
+    /// a fixed USDC/USDT price whose market has left its band is refused here too, rather than
+    /// shown as what the pair would publish. Audit F-04 (review).
+    #[test]
+    fn a_preview_row_is_held_to_the_band_the_run_applies() {
+        let shape = PairShape {
+            label: "USDC/USDT".to_owned(),
+            tokens: (Address::repeat_byte(1), Address::repeat_byte(2)),
+            lane: U256::one(),
+            inverted: false,
+            price_decimals: 18,
+            target: Address::zero(),
+            sources: 1,
+            mid_only_sources: 0,
+            min_mid: Some(U256::from(995_000_000_000_000_000u64)),
+            max_mid: Some(U256::from(1_005_000_000_000_000_000u64)),
+            max_source_divergence: None,
+        };
+        let market = |mid: U256| feed::PriceSample {
+            mid,
+            delta: U256::zero(),
+            divergence: U256::zero(),
+            at: std::time::Instant::now(),
+            wall: std::time::SystemTime::now(),
+        };
+        // A 5% half-spread: the fixed price's own quote accepts a market at 0.97, so what
+        // refuses it below is the band.
+        let (delta, mid) = (
+            U256::from(50_000_000_000_000_000u64),
+            U256::from(1_000_100_000_000_000_000u64),
+        );
+        let mut fixed = crate::pricing::FixedPricer::for_tests(delta, mid);
+        let (row, _) = preview_row(&mut fixed, Some(&market(U256::exp10(18))), &shape, 0);
+        assert_eq!(row, Ok((delta, mid)));
+        let depegged = market(U256::from(970_000_000_000_000_000u64));
+        let (row, _) = preview_row(&mut fixed, Some(&depegged), &shape, 0);
+        let refused = row.expect_err("the market has left the band");
+        assert!(refused.contains("market"), "{refused}");
     }
 
     /// A pricer's background task that panics is reported with its panic, so the lane's
@@ -1508,8 +1595,10 @@ mod tests {
         fn shape() -> PairShape {
             PairShape {
                 sources: 1,
+                mid_only_sources: 0,
                 min_mid: None,
                 max_mid: None,
+                max_source_divergence: None,
                 label: "CUSTOM/TEST".into(),
                 tokens: (Address::repeat_byte(1), Address::repeat_byte(2)),
                 lane: U256::from(9),
@@ -1644,7 +1733,7 @@ mod tests {
 
         /// A component trips its own lane through the latch its build got: a model that
         /// sees its own inputs go bad stops the lane itself, with `cause = external`. (A
-        /// kill switch is a halt in the file, never this: a reload re-arms a latch.) A task
+        /// kill switch is a halt in the file, never this: a re-arm clears a latch.) A task
         /// that then returns is counted, since it fed nothing after.
         #[tokio::test]
         async fn a_component_can_trip_its_own_lane() {
@@ -1988,7 +2077,7 @@ mod tests {
                         [[pairs]]\n\
                         tokens = [\"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48\", \
                         \"0xdAC17F958D2ee523a2206206994597C13D831ec7\"]\n\
-                        key_env = \"K\"\npricing = { kind = \"fixed\", mid = \"1.0001\", delta = \"0\" }\n\n\
+                        key_env = \"K\"\npricing = { kind = \"fixed\", mid = \"1.0001\", delta = \"0\", unguarded = true }\n\n\
                         [[pairs.guards]]\nkind = \"share_band\"\n";
             let config = crate::config::parse_config(toml, 18).unwrap();
             let metrics = metrics::Metrics::new().unwrap();
@@ -2068,7 +2157,7 @@ mod tests {
                         [[pairs]]\n\
                         tokens = [\"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48\", \
                         \"0xdAC17F958D2ee523a2206206994597C13D831ec7\"]\n\
-                        key_env = \"K\"\npricing = { kind = \"fixed\", mid = \"1.0001\", delta = \"0\" }\n\n\
+                        key_env = \"K\"\npricing = { kind = \"fixed\", mid = \"1.0001\", delta = \"0\", unguarded = true }\n\n\
                         [[pairs.guards]]\nkind = \"inverted_only\"\n";
             let config = crate::config::parse_config(toml, 18).unwrap();
             let metrics = metrics::Metrics::new().unwrap();

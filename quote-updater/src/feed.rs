@@ -8,7 +8,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use ethrex_common::U256;
-use eyre::{Result, WrapErr, ensure, eyre};
+use eyre::{Result, WrapErr, bail, ensure, eyre};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::Message;
@@ -349,9 +349,14 @@ impl Adoption {
     }
 }
 
-/// How long a connection may stay silent before it is probed with a ping. bookTicker
-/// emits only when the best bid/ask changes, so silence alone does not mean the
-/// connection is dead — a quiet book on an illiquid pair is healthy.
+/// How often a connection is pinged, in the venue's own keepalive dialect, whether or not
+/// frames are arriving. Two jobs. On a quiet book the answer is the only sign the socket is
+/// alive: bookTicker emits only when the best bid/ask changes, so silence alone does not
+/// mean the connection is dead — a quiet book on an illiquid pair is healthy. And several
+/// venues drop a socket that has not pinged them lately however busy it is: KuCoin's
+/// `bullet` answer sets an 18s ping interval and closes with `ping timeout` past it,
+/// Bitget closes after two minutes without one, Bybit asks for one every 20s. So the ping
+/// has to go out on a clock, not only after a silence; 10s sits under every venue's limit.
 const PING_INTERVAL: Duration = Duration::from_secs(10);
 
 /// How long a connection may go without any inbound frame (price, ping, or pong) before
@@ -379,6 +384,11 @@ pub struct PriceSample {
     pub mid: U256,
     pub at: Instant,
     pub wall: SystemTime,
+    /// How far the pair's venues disagree, on a composite's sample: the largest gap between
+    /// the primary venue's mid and any other fresh venue's, as a fraction of the other's,
+    /// scaled by 10^decimals (see `composite::divergence`). Zero on one venue's own sample
+    /// and on a composite with a single fresh venue, where there is nothing to compare.
+    pub divergence: U256,
 }
 
 impl PriceSample {
@@ -484,10 +494,13 @@ pub fn spawn_feed(
                             url,
                             subscribe,
                             keepalive,
-                        }) => feed.read_stream(&url, subscribe.as_deref(), &keepalive).await,
-                        Ok(Connection::Poll { url, headers, every }) => {
-                            feed.poll(&url, &headers, every).await
-                        }
+                        }) => feed.read_stream(&url, &subscribe, &keepalive).await,
+                        Ok(Connection::Poll {
+                            url,
+                            headers,
+                            every,
+                            follow_redirects,
+                        }) => feed.poll(&url, &headers, every, follow_redirects).await,
                         Err(err) => Err(err),
                     };
                     // The stream is gone the instant `read_stream` returns, on either arm —
@@ -513,6 +526,23 @@ pub fn spawn_feed(
 /// connection pool. Every request times out after [`POLL_TIMEOUT`] unless it sets a
 /// timeout of its own, and names the pusher: CoinGecko (the vault's USD prices) and
 /// Coinbase answer 403 to a request without a User-Agent.
+/// [`http_client`] that follows no redirect, for a poll whose headers carry a key: reqwest
+/// carries a custom header along to wherever a redirect points, and a venue that has no
+/// reason to redirect is better refused than followed with the key.
+fn no_redirect_client() -> reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(POLL_TIMEOUT)
+                .user_agent(concat!("quote-updater/", env!("CARGO_PKG_VERSION")))
+                .build()
+                .expect("a reqwest client with no redirects builds")
+        })
+        .clone()
+}
+
 pub(crate) fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(POLL_TIMEOUT)
@@ -551,7 +581,7 @@ impl Feed {
     async fn read_stream(
         &self,
         url: &str,
-        subscribe: Option<&str>,
+        subscribe: &[String],
         keepalive: &Keepalive,
     ) -> Result<()> {
         let Feed {
@@ -562,28 +592,30 @@ impl Feed {
         // cadence into long dead periods.
         let mut ws = ws::connect(url).await?;
         tracing::info!("[{symbol}] {venue} stream connected: {url}");
-        if let Some(subscribe) = subscribe {
-            ws.send(Message::text(subscribe))
+        for subscribe in subscribe {
+            ws.send(Message::text(subscribe.as_str()))
                 .await
                 .wrap_err("subscribe failed")?;
         }
         self.set_connected(true);
-        let mut last_inbound = Instant::now();
+        let mut last_inbound = tokio::time::Instant::now();
         // Whether the sample in the channel is still backed by a ticker this connection
         // accepted. A rejected ticker (one-sided or crossed book) leaves the previous sample
         // in place, and from that moment on it no longer describes a book anyone can trade —
         // so it must be allowed to age out. See the Ping/Pong arm below.
         let mut sample_is_current = false;
+        // On a clock rather than after a silence: a busy stream never goes quiet, and the
+        // venues that require a ping would close the socket while frames were still
+        // arriving. See PING_INTERVAL. The first ping is one interval out: the subscribe
+        // just went out and the venue has nothing to answer yet.
+        let mut ping_ticker =
+            tokio::time::interval_at(tokio::time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
+        ping_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            let msg = match tokio::time::timeout(PING_INTERVAL, ws.next()).await {
-                Ok(msg) => msg,
-                Err(_) => {
-                    ensure!(
-                        last_inbound.elapsed() < MAX_QUIET,
-                        "no message in {MAX_QUIET:?}"
-                    );
-                    // A quiet book emits nothing, so probe the socket instead of assuming
-                    // the worst; any answering frame below counts as feed liveness.
+            let msg = tokio::select! {
+                msg = ws.next() => msg,
+                _ = ping_ticker.tick() => {
+                    // Any answering frame below counts as feed liveness.
                     let probe = match keepalive.frame() {
                         None => Message::Ping(Vec::new().into()),
                         Some(text) => Message::text(text),
@@ -591,11 +623,18 @@ impl Feed {
                     ws.send(probe).await.wrap_err("ping failed")?;
                     continue;
                 }
+                // Its own deadline from the last frame, not a check on the ping grid: the
+                // grid is laid down at connect and a frame can land anywhere on it, so a
+                // check that ran only on ticks would hang up to one ping late. A fresh
+                // sleep per turn of the loop, which is one timer per inbound frame.
+                _ = tokio::time::sleep_until(last_inbound + MAX_QUIET) => {
+                    bail!("no message in {MAX_QUIET:?}");
+                }
             };
             let Some(msg) = msg else {
                 return Ok(());
             };
-            last_inbound = Instant::now();
+            last_inbound = tokio::time::Instant::now();
             match msg? {
                 Message::Text(text) => self.on_frame(&text, &mut sample_is_current),
                 Message::Close(_) => return Ok(()),
@@ -625,13 +664,24 @@ impl Feed {
     /// retained sample ages out on its own if that keeps happening. A body that does not
     /// parse is a rejected frame, counted and skipped, not a failed fetch: the venue is
     /// answering, just not with a price.
-    async fn poll(&self, url: &str, headers: &[(String, String)], every: Duration) -> Result<()> {
+    async fn poll(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+        every: Duration,
+        follow_redirects: bool,
+    ) -> Result<()> {
         let Feed {
             venue,
             symbol,
             http,
             ..
         } = self;
+        let http = if follow_redirects {
+            http.as_ref().clone()
+        } else {
+            no_redirect_client()
+        };
         let mut sample_is_current = false;
         let mut first = true;
         loop {
@@ -731,6 +781,7 @@ impl Feed {
                     mid,
                     at,
                     wall,
+                    divergence: U256::zero(),
                 }));
             }
             Err(err) => {
@@ -806,13 +857,39 @@ impl std::fmt::Display for Rejected {
 
 /// Turns a venue's quote into the scaled (delta, mid) pair: `mid` is the midpoint of the
 /// best bid/ask and `delta` the half-spread as a fraction of it, (ask - bid) / (ask + bid),
-/// both scaled by 10^decimals — the [delta, mid] slot pair PropAMM prices fills from.
+/// both scaled by 10^decimals — the [delta, mid] slot pair PropAMM prices fills from. A
+/// quote that is one price with no book behind it is that price at no spread.
 fn quote_from_book(
     quote: Quote,
     decimals: u32,
     invert: bool,
 ) -> std::result::Result<(U256, U256), Rejected> {
-    let Quote::Book { bid, ask } = quote;
+    let (bid, ask) = match quote {
+        Quote::Book { bid, ask } => (bid, ask),
+        Quote::Mid(price) => {
+            let mid = parse_decimal_scaled(&price, decimals).map_err(Rejected::malformed)?;
+            if mid.is_zero() {
+                return Err(Rejected::of(
+                    TickReject::OneSided,
+                    eyre!("a price of zero; no meaningful mid"),
+                ));
+            }
+            let mid = if invert {
+                reciprocal_scaled(mid, decimals).ok_or_else(|| {
+                    Rejected::of(
+                        TickReject::Overflow,
+                        eyre!(
+                            "10^{decimals} squared overflows a uint256; inverted pairs need \
+                               price-decimals <= 38"
+                        ),
+                    )
+                })?
+            } else {
+                mid
+            };
+            return Ok((U256::zero(), mid));
+        }
+    };
     // An empty side is an empty side, whether the venue spells it "0" (Binance) or as an
     // empty string (OKX, Bitget and MEXC on a market with nothing on one side).
     let bid = if bid.is_empty() { "0" } else { bid.as_str() };
@@ -874,12 +951,9 @@ fn quote_from_book(
     Ok((delta, mid))
 }
 
-/// Parses a decimal string like "0.99980000" into value * 10^decimals, truncating
-/// fractional digits beyond `decimals`.
-pub fn parse_decimal_scaled(s: &str, decimals: u32) -> Result<U256> {
-    // U256::MAX has 78 digits, so 78+ decimals can never fit; rejecting up front also
-    // bounds the zero-padding allocation below, which grows with `decimals`.
-    ensure!(decimals < 78, "{decimals} decimals cannot fit in a uint256");
+/// A decimal number's digits before and after the point, and its exponent: everything
+/// [`parse_decimal_scaled`] checks about the text before it scales anything.
+fn decimal_parts(s: &str) -> Result<(&str, &str, i32)> {
     // Exponent notation too (`8.31e-6`, `1E3`): JSON allows it and some venues print small
     // prices that way, and a number that is correct but spelled with an exponent must not
     // be refused as malformed. The exponent moves the decimal point; nothing else changes.
@@ -891,8 +965,11 @@ pub fn parse_decimal_scaled(s: &str, decimals: u32) -> Result<U256> {
         ),
         None => (s, 0),
     };
+    // A range, not `exponent.abs()`: the `abs` of `i32::MIN` overflows, which panics a debug
+    // build and in a release one wraps back to `i32::MIN`, below any bound. `1e-2147483648`
+    // then passed, and the padding in `parse_decimal_scaled` asked for two billion zeros.
     ensure!(
-        exponent.abs() <= 100,
+        (-100..=100).contains(&exponent),
         "exponent out of range in number: {s:?}"
     );
     let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
@@ -907,6 +984,23 @@ pub fn parse_decimal_scaled(s: &str, decimals: u32) -> Result<U256> {
             .all(|c| c.is_ascii_digit()),
         "invalid decimal number: {s:?}"
     );
+    Ok((int_part, frac_part, exponent))
+}
+
+/// Whether `s` reads as a decimal number [`parse_decimal_scaled`] would scale. For a venue
+/// parser that has more of a frame to read than its prices: a frame whose prices are not
+/// numbers is refused whatever else it says, so nothing else in it needs reading.
+pub(crate) fn is_decimal(s: &str) -> bool {
+    decimal_parts(s).is_ok()
+}
+
+/// Parses a decimal string like "0.99980000" into value * 10^decimals, truncating
+/// fractional digits beyond `decimals`.
+pub fn parse_decimal_scaled(s: &str, decimals: u32) -> Result<U256> {
+    // U256::MAX has 78 digits, so 78+ decimals can never fit; rejecting up front also
+    // bounds the zero-padding allocation below, which grows with `decimals`.
+    ensure!(decimals < 78, "{decimals} decimals cannot fit in a uint256");
+    let (int_part, frac_part, exponent) = decimal_parts(s)?;
     // All digits in one string, with where the point sits; the exponent shifts it.
     let mut all: String = format!("{int_part}{frac_part}");
     let point = int_part.len() as i64 + exponent as i64;
@@ -1049,6 +1143,17 @@ mod tests {
         assert!(parse_decimal_scaled("1e", 8).is_err());
         assert!(parse_decimal_scaled("e5", 8).is_err());
         assert!(parse_decimal_scaled("1e999", 8).is_err());
+        // The bound holds at both ends of an i32, where `abs()` does not: `i32::MIN` has no
+        // positive counterpart, and read as its own absolute value it passed the bound and
+        // asked for two billion zeros of padding.
+        assert_eq!(p("1e-100", 8), U256::zero());
+        assert!(parse_decimal_scaled("1e-101", 8).is_err());
+        assert!(parse_decimal_scaled("1e101", 8).is_err());
+        assert!(parse_decimal_scaled("1e-2147483648", 8).is_err());
+        assert!(parse_decimal_scaled("1e2147483647", 8).is_err());
+        assert!(parse_decimal_scaled("1e-2147483649", 8).is_err());
+        assert!(is_decimal("8.31e-6") && is_decimal("0") && is_decimal(".5"));
+        assert!(!is_decimal("") && !is_decimal("1e-2147483648") && !is_decimal("1,5"));
         // An empty side reads as zero, which the book check then refuses as one-sided.
         assert_eq!(
             quote_from_book(
@@ -1294,6 +1399,181 @@ mod tests {
         // page the breaker already sent.
         assert!(metrics.last_tick.get().is_nan(), "feed_last_tick");
         assert!(metrics.sample_current.get().is_nan(), "feed_sample_current");
+    }
+
+    /// A stream that never goes quiet is still pinged, in the venue's dialect, every
+    /// PING_INTERVAL. The venues that require a client ping on a cadence close the socket
+    /// otherwise, while frames are still arriving, so a ping sent only after a silence is
+    /// a ping those venues never see on a busy market. The mock streams a ticker every
+    /// 200ms, well inside PING_INTERVAL, and must still receive the venue's text ping.
+    /// Real time, so the test takes a PING_INTERVAL: a paused clock races ahead of the
+    /// socket handshake and cuts it off.
+    #[tokio::test]
+    async fn a_busy_stream_is_still_pinged_on_the_cadence() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (pinged_tx, pinged_rx) = tokio::sync::oneshot::channel::<Duration>();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            let started = Instant::now();
+            let mut pinged_tx = Some(pinged_tx);
+            let mut frames = tokio::time::interval(Duration::from_millis(200));
+            loop {
+                tokio::select! {
+                    _ = frames.tick() => {
+                        let ticker = r#"{"arg":{"channel":"tickers","instId":"ETH-USDC"},"data":[{"instId":"ETH-USDC","askPx":"1.0000","bidPx":"0.9998","ts":"1597026383085"}]}"#;
+                        if ws.send(Message::text(ticker)).await.is_err() {
+                            return;
+                        }
+                    }
+                    msg = ws.next() => match msg {
+                        Some(Ok(Message::Text(text))) if text.as_str() == "ping" => {
+                            if let Some(tx) = pinged_tx.take() {
+                                let _ = tx.send(started.elapsed());
+                            }
+                            if ws.send(Message::text("pong")).await.is_err() {
+                                return;
+                            }
+                        }
+                        Some(Ok(_)) => {}
+                        _ => return,
+                    }
+                }
+            }
+        });
+
+        let _rx = spawn_feed(
+            Arc::new(http_client()),
+            VenueId::Okx,
+            &format!("ws://{addr}/ws"),
+            "ETH-USDC",
+            8,
+            false,
+            adopted(&test_metrics()),
+            None,
+            Default::default(),
+        );
+        let after = tokio::time::timeout(PING_INTERVAL * 2, pinged_rx)
+            .await
+            .expect("a busy stream was never pinged")
+            .expect("the mock went away before a ping arrived");
+        assert!(
+            after >= PING_INTERVAL && after < PING_INTERVAL * 2,
+            "the ping must follow the cadence, not the silence: arrived after {after:?}"
+        );
+    }
+
+    /// A socket that stops answering is hung up on MAX_QUIET after its last inbound frame,
+    /// not at the next ping after that. The pings go out on a grid laid down at connect and
+    /// a frame can land anywhere on it, so a check that ran only on the grid would declare
+    /// the socket dead up to one ping late: a redial up to PING_INTERVAL later on every
+    /// dead-socket event. The mock sends one ticker a quarter of a ping into the connection,
+    /// then swallows every ping, and measures the silence from that ticker to the feed
+    /// hanging up. Real time, so the test takes a MAX_QUIET, for the reason given on the
+    /// busy-stream test.
+    #[tokio::test]
+    async fn a_dead_socket_is_hung_up_on_at_max_quiet_not_at_the_next_ping() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (silence_tx, silence_rx) = tokio::sync::oneshot::channel::<Duration>();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            // Off the ping grid: a quarter of a ping in.
+            tokio::time::sleep(PING_INTERVAL / 4).await;
+            let ticker = r#"{"arg":{"channel":"tickers","instId":"ETH-USDC"},"data":[{"instId":"ETH-USDC","askPx":"1.0000","bidPx":"0.9998","ts":"1597026383085"}]}"#;
+            ws.send(Message::text(ticker)).await.unwrap();
+            let quiet_since = Instant::now();
+            // Half dead from here: reads whatever the feed sends, answers nothing.
+            while let Some(Ok(_)) = ws.next().await {}
+            let _ = silence_tx.send(quiet_since.elapsed());
+        });
+
+        let _rx = spawn_feed(
+            Arc::new(http_client()),
+            VenueId::Okx,
+            &format!("ws://{addr}/ws"),
+            "ETH-USDC",
+            8,
+            false,
+            adopted(&test_metrics()),
+            None,
+            Default::default(),
+        );
+        let silence = tokio::time::timeout(MAX_QUIET + PING_INTERVAL, silence_rx)
+            .await
+            .expect("the feed never hung up on a dead socket")
+            .expect("the mock went away before the feed hung up");
+        assert!(
+            silence >= MAX_QUIET,
+            "hung up before MAX_QUIET: {silence:?} after the last frame"
+        );
+        assert!(
+            silence < MAX_QUIET + PING_INTERVAL / 2,
+            "the hang-up must follow the silence, not the ping grid: {silence:?} after the \
+             last frame"
+        );
+    }
+
+    /// A pong is liveness. On a quiet book the venue's answer to the ping is the only
+    /// inbound frame, and it must both keep the socket up past MAX_QUIET and keep the
+    /// retained sample fresh: a book that has not changed is still the book. The mock sends
+    /// one ticker and then only answers pings, in OKX's dialect so the answer goes through
+    /// the venue's parser as a no-price frame rather than through tungstenite's own pong
+    /// handling. Real time, so the test takes a little over a MAX_QUIET, as above.
+    #[tokio::test]
+    async fn a_pong_is_liveness_on_a_quiet_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            let ticker = r#"{"arg":{"channel":"tickers","instId":"ETH-USDC"},"data":[{"instId":"ETH-USDC","askPx":"1.0000","bidPx":"0.9998","ts":"1597026383085"}]}"#;
+            ws.send(Message::text(ticker)).await.unwrap();
+            // Then only pongs, for as long as the feed keeps asking.
+            while let Some(Ok(msg)) = ws.next().await {
+                if matches!(&msg, Message::Text(text) if text.as_str() == "ping")
+                    && ws.send(Message::text("pong")).await.is_err()
+                {
+                    return;
+                }
+            }
+        });
+
+        let mut rx = spawn_feed(
+            Arc::new(http_client()),
+            VenueId::Okx,
+            &format!("ws://{addr}/ws"),
+            "ETH-USDC",
+            8,
+            false,
+            adopted(&test_metrics()),
+            None,
+            Default::default(),
+        );
+        let first = tokio::time::timeout(Duration::from_secs(5), rx.wait_for(|s| s.is_some()))
+            .await
+            .expect("no price from the mock")
+            .unwrap()
+            .unwrap();
+        // Past MAX_QUIET with no second ticker: the socket is still up only if the pongs
+        // counted, and the stamp has moved only if they refreshed the sample.
+        let refreshed = tokio::time::timeout(
+            MAX_QUIET + PING_INTERVAL * 2,
+            rx.wait_for(|s| {
+                s.as_ref()
+                    .is_some_and(|s| s.at >= first.at + MAX_QUIET + PING_INTERVAL)
+            }),
+        )
+        .await
+        .expect("the sample stopped being refreshed: the pongs did not count as liveness")
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            refreshed.mid, first.mid,
+            "a pong refreshes the sample's stamp, not its value"
+        );
     }
 
     /// End-to-end over a local mock server: the feed delivers the first connection's
