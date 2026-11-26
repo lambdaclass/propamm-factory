@@ -66,6 +66,16 @@ pub(crate) async fn call_view(
     hex::decode(ret.strip_prefix("0x").unwrap_or(&ret)).wrap_err("non-hex eth_call return")
 }
 
+/// [`call_view`] at the latest block with a revert told apart from a failed read: for a
+/// caller to whom "the contract said no" and "nothing answered" are different news.
+pub(crate) async fn call_view_outcome(
+    client: &EthClient,
+    to: Address,
+    calldata: Vec<u8>,
+) -> Result<CallOutcome> {
+    call_outcome(client, Overrides::default(), to, calldata).await
+}
+
 /// An `eth_call` made as `from`, bounded like [`call_view`], with a revert answered as
 /// [`CallOutcome::Reverted`] rather than folded into the error a failed read is.
 pub(crate) async fn call_as(
@@ -78,6 +88,16 @@ pub(crate) async fn call_as(
         from: Some(from),
         ..Default::default()
     };
+    call_outcome(client, overrides, to, calldata).await
+}
+
+/// The one body of [`call_view_outcome`] and [`call_as`].
+async fn call_outcome(
+    client: &EthClient,
+    overrides: Overrides,
+    to: Address,
+    calldata: Vec<u8>,
+) -> Result<CallOutcome> {
     let answer = tokio::time::timeout(RPC_TIMEOUT, client.call(to, calldata.into(), overrides))
         .await
         .map_err(|_| eyre!("no answer in {RPC_TIMEOUT:?}"))?;

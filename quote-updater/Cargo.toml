@@ -22,7 +22,8 @@ secp256k1 = "0.30.0"
 serde = { version = "1", features = ["derive"] }
 # `raw_value` keeps a JSON number as the text the venue sent (kraken.rs, coingecko.rs).
 serde_json = { version = "1", features = ["raw_value"] }
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+# 1.54.1 at least: the first release without RUSTSEC-2026-0386.
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 # Same version axum's ws feature already pulls in via ethrex-rpc, so this adds no new tree.
 #
 # native-tls and not rustls, deliberately. rustls here would not replace native-tls, it
@@ -30,7 +31,9 @@ tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "signal",
 # `default-tls` -> hyper-tls -> native-tls is already in the graph for EthClient's HTTP
 # calls, and Cargo features are additive, so nothing on this side can switch it off.
 # Measured cost of switching: +1.4 MB of binary for a second TLS stack and no OpenSSL
-# removed. Revisit only if ethrex takes reqwest with default-features = false.
+# removed. Revisit only if ethrex takes reqwest with default-features = false. (The
+# backoffice's HTTPS server is rustls, below: a server, for a reason this choice does not
+# cover. The clients stay on native-tls.)
 tokio-tungstenite = { version = "0.29", features = ["native-tls"] }
 # Human-editable pair and builder configs. Measured cost in Cargo.lock: three new package
 # entries (toml, toml_writer, toml_parser); serde_spanned, toml_datetime and winnow all
@@ -45,6 +48,23 @@ prometheus = "0.14.0"
 # The /metrics listener. Same measured cost: axum is already pulled in (with default
 # features) by ethrex-rpc via axum-extra, so this adds no package and no feature.
 axum = { version = "0.8.9", features = ["ws"] }
+# The backoffice API's CORS answers, for a front end served from another origin
+# (`--backoffice-cors-origin`). Zero new package entries in Cargo.lock: ethrex-rpc already
+# pulls tower-http 0.6 in with the `cors` feature on. Pinned to the version that tree locks.
+tower-http = { version = "0.6.11", features = ["cors"] }
+# The backoffice's HTTPS (tls.rs). rustls, not the native-tls the clients use: as a server
+# it must read the key `tailscale cert` writes, SEC1 (`BEGIN EC PRIVATE KEY`), and
+# native-tls takes PKCS#8 alone; rustls also serves the same way on Linux and macOS. ring
+# for its crypto, already compiled here, rather than rustls' default aws-lc-rs, a C library
+# build of its own. Zero new package entries in Cargo.lock (all were locked through ethrex),
+# but rustls, rustls-webpki and tokio-rustls are now compiled in. Measured: a release build
+# of example/ went from 10.18 MB to 11.44 MB (+1.26 MB, macOS arm64), this code included.
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
+# The backoffice's Google sign-in (auth.rs): checks an ID token's RS256 signature against
+# Google's published keys, and its claims. Already compiled in through ethrex-rpc, with the
+# same (default) features, so zero new package entries in Cargo.lock and nothing new to
+# build. Pinned to the version that tree locks.
+jsonwebtoken = "9.3.1"
 
 # ethrex has no standalone lightweight client crate yet, so the client (EthClient, calldata
 # encoding, signer) comes from the node's workspace crates. Pinned to one rev so the five
@@ -55,8 +75,6 @@ ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex", rev = "73318b686fd
 ethrex-l2-rpc = { git = "https://github.com/lambdaclass/ethrex", rev = "73318b686fdc2c3951a67cea9721eb5378855ada" }
 ethrex-rpc = { git = "https://github.com/lambdaclass/ethrex", rev = "73318b686fdc2c3951a67cea9721eb5378855ada" }
 ethrex-sdk = { git = "https://github.com/lambdaclass/ethrex", rev = "73318b686fdc2c3951a67cea9721eb5378855ada" }
-# The backoffice's HTML templates. Four new entries in Cargo.lock, all askama's own.
-askama = { version = "0.16.0", default-features = false, features = ["derive", "std", "urlencode"] }
 # The feed recorder's database client (record.rs): the Binance mid and the vault balances
 # into the indexer's Postgres, off the quoting path through one writer task. Measured cost
 # in Cargo.lock: 19 new package entries (tokio-postgres, postgres-protocol, postgres-types,
@@ -64,7 +82,13 @@ askama = { version = "0.16.0", default-features = false, features = ["derive", "
 # and never compile on the server. Plain TCP (`NoTls`): the database is on the same host.
 # `with-serde_json-1` lets a `serde_json::Value` bind as a jsonb parameter (the config
 # snapshots); serde_json is already a dependency, so the feature adds no package.
-tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+#
+# 0.7.18 at least, with postgres-protocol 0.6.12: the releases before them panic on a
+# malformed row and take an unbounded SCRAM iteration count from the server
+# (RUSTSEC-2026-0178, -0179, -0180). They moved to the next RustCrypto generation, which is
+# 13 more package entries beside the ones ethrex's tree still locks (digest 0.11, sha2 0.11,
+# hmac 0.13, rand 0.10 and their leaves).
+tokio-postgres = { version = "0.7.18", features = ["with-serde_json-1"] }
 # The venues that have no stream (MEXC's is protobuf-only, CoinGecko is an HTTP API) are
 # polled, and KuCoin hands out its WebSocket URL over HTTP. Already in the tree with
 # default features through ethrex-rpc's EthClient, so this adds no package to Cargo.lock.
@@ -77,8 +101,11 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry", "std"] }
 
 [dev-dependencies]
+# The client side of the HTTPS tests: the websocket preview over wss://, accepting the
+# test certificate. Already compiled in through reqwest and tokio-tungstenite.
+native-tls = "0.2.18"
 # Only for tokio's paused clock (`#[tokio::test(start_paused = true)]`), which lets a
 # waited duration (a restart backoff, quoting.rs's shutdown bound) be asserted without
 # waiting it out. test-util = ["rt", "sync", "time"], all already enabled, so this adds
 # no package to Cargo.lock and nothing to the binary.
-tokio = { version = "1.53.1", features = ["test-util"] }
+tokio = { version = "1.54.1", features = ["test-util"] }

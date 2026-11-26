@@ -62,6 +62,7 @@ pub mod prelude {
     };
 }
 
+mod auth;
 mod backoffice;
 mod breaker;
 mod builder;
@@ -72,8 +73,8 @@ mod discover;
 mod exporter;
 mod feed;
 pub mod guard;
+mod halts;
 mod head;
-mod hints;
 mod kinds;
 mod landing;
 mod metrics;
@@ -102,10 +103,12 @@ mod rpc;
 #[cfg(test)]
 mod rpc_mock;
 mod service;
+mod state;
 pub mod stocks;
 mod supervisor;
 mod tasks;
 pub mod testing;
+mod tls;
 mod update;
 mod updater;
 mod vault;
@@ -123,14 +126,32 @@ use std::time::Duration;
 pub(crate) use update::{UPDATE_GAS_LIMIT, ensure_fits_216_bits};
 // The items other modules reach as `crate::…`. Re-exported from the modules they moved
 // to, so nothing outside this file had to change when main.rs was split.
-pub(crate) use landing::{Landing, LandingTracker, landing_label, runway_check, verify_landed};
+pub(crate) use landing::{
+    Landing, LandingTracker, landing_label, runway_check, unquoted, verify_landed,
+};
 pub(crate) use pair::{Live, SendOpts};
 pub(crate) use rpc::{bounded, call_view, decode_return_data};
 
-/// Ceiling on `--price-decimals` (and on `[settings] price_decimals`). Beyond this a
-/// non-inverted 10^d overflows the arithmetic downstream; an inverted pair is capped
-/// tighter still, at 38, by `config`, because inverting squares the scale.
-pub(crate) const MAX_PRICE_DECIMALS: u32 = 59;
+/// The one scale `--price-decimals` (and `[settings] price_decimals`) may name. PropAMM
+/// reads the mid at its `PRICE_SCALE` and the spread at its `SPREAD_SCALE`, both 1e18, and
+/// what is published here is published as scaled, with nothing converting it on the way.
+pub(crate) const PRICE_DECIMALS: u32 = 18;
+
+/// Refuses a price scale PropAMM does not read; `what` names where the number came from.
+///
+/// The setting used to take anything up to 59. At any scale but 18 every pair is off by a
+/// power of ten: below it a vault sells for a fraction of the price in one swap, above it
+/// no fill fits. The band and `--check` were computed at the same wrong scale, so neither
+/// showed it. The setting is still read, so a file or a unit that states 18 keeps working.
+pub(crate) fn ensure_price_decimals(decimals: u32, what: &str) -> eyre::Result<()> {
+    eyre::ensure!(
+        decimals == PRICE_DECIMALS,
+        "{what} is {decimals}; PropAMM reads the mid and the spread at 1e18, so \
+         {PRICE_DECIMALS} is the only scale that prices a pair: at any other, every price is \
+         off by a power of ten. Remove the setting"
+    );
+    Ok(())
+}
 
 /// How many consecutive target blocks a pair may go without a landed update before the
 /// builder loop says so loudly.

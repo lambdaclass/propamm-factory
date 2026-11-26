@@ -8,5 +8,10 @@ resolver = "3"
 lto = "fat"
 codegen-units = 1
 debug = "line-tables-only"
+# Release builds drop the integer overflow checks by default, and an overflow then wraps
+# in silence. Everything here that does arithmetic on a number a venue or an RPC sent is
+# written checked; this is for the one that is not, which becomes a panic the supervisor
+# sees and restarts instead of a wrong number carried on.
+overflow-checks = true
 # Not panic = "abort": the library catches a pair's panic and halts that pair; aborting
 # would take every pair down.

@@ -36,6 +36,10 @@ pub fn epoch_ms_value(value: &serde_json::Value) -> Option<std::time::SystemTime
 /// fraction digits, `Z`. Anything else reads as no stamp. Written out rather than taken
 /// from a date crate because this is the one place a calendar date is read, and the
 /// arithmetic is a dozen lines.
+///
+/// The year is held to the four digits RFC 3339 writes, from the epoch on. The text is the
+/// venue's, so the arithmetic below must not be reachable with a number it cannot hold: a
+/// twelve-digit year carried the seconds past a `u64`, and the feed task with them.
 pub fn rfc3339_utc(text: &str) -> Option<std::time::SystemTime> {
     let text = text.strip_suffix('Z')?;
     let (date, time) = text.split_once('T')?;
@@ -45,7 +49,11 @@ pub fn rfc3339_utc(text: &str) -> Option<std::time::SystemTime> {
         date.next()?.parse().ok()?,
         date.next()?.parse().ok()?,
     );
-    if date.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    if date.next().is_some()
+        || !(1970..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+    {
         return None;
     }
     let (clock, fraction) = time.split_once('.').unwrap_or((time, ""));
@@ -80,8 +88,23 @@ pub fn rfc3339_utc(text: &str) -> Option<std::time::SystemTime> {
     let doy = (153 * i64::from(m) + 2) / 5 + i64::from(day) - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146_097 + doe - 719_468;
-    let secs = u64::try_from(days).ok()? * 86_400 + hour * 3_600 + minute * 60 + second;
-    Some(std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos as u32))
+    // Checked, though the bounds above already keep every step in range: an overflow here
+    // would be a panic in the venue's feed task, and no stamp is worth that.
+    let secs = u64::try_from(days)
+        .ok()?
+        .checked_mul(86_400)?
+        .checked_add(hour * 3_600 + minute * 60 + second)?;
+    std::time::UNIX_EPOCH.checked_add(std::time::Duration::new(secs, nanos as u32))
+}
+
+/// A book frame's RFC 3339 stamp, read only once its bid and ask are known to be numbers.
+/// The prices come first because they are what the frame is for: one the scaling is about
+/// to refuse is refused whatever its stamp says, so its stamp is never read.
+pub fn book_stamp(bid: &str, ask: &str, stamp: Option<&str>) -> Option<std::time::SystemTime> {
+    if !(crate::feed::is_decimal(bid) && crate::feed::is_decimal(ask)) {
+        return None;
+    }
+    stamp.and_then(rfc3339_utc)
 }
 
 /// The quotes a market may be in for a pair quoted in `quote`, besides `quote` itself:
@@ -166,8 +189,33 @@ mod stamp_tests {
             "2023-09-25T09:04:31.12a4Z",
             "not a date",
             "",
+            // A year the arithmetic cannot hold reads as no stamp instead of overflowing:
+            // twelve digits carried the seconds past a u64, and i64::MAX the days past an
+            // i64. Before the epoch there is no stamp to give either.
+            "999999999999-01-01T00:00:00Z",
+            "9223372036854775807-03-01T00:00:00Z",
+            "10000-01-01T00:00:00Z",
+            "1969-12-31T23:59:59Z",
         ] {
             assert_eq!(rfc3339_utc(bad), None, "{bad}");
+        }
+        // The last second the bound admits still reads.
+        assert_eq!(
+            rfc3339_utc("9999-12-31T23:59:59Z"),
+            Some(at(253_402_300_799, 0))
+        );
+    }
+
+    #[test]
+    fn a_book_stamp_is_read_only_when_both_prices_are_numbers() {
+        let stamp = Some("2023-09-25T09:04:31.742648Z");
+        assert_eq!(
+            book_stamp("3999.5", "8.32e-6", stamp),
+            rfc3339_utc("2023-09-25T09:04:31.742648Z")
+        );
+        assert_eq!(book_stamp("3999.5", "4000.25", None), None);
+        for (bid, ask) in [("nope", "4000.25"), ("3999.5", ""), ("1e-2147483648", "1")] {
+            assert_eq!(book_stamp(bid, ask, stamp), None, "{bid} / {ask}");
         }
     }
 }
