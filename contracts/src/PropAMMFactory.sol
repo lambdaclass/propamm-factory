@@ -61,7 +61,7 @@ contract PropAMMFactory is Ownable2Step {
     /// Creates a PropAMM owned by `owner`, who need not be the caller: `owner` can manage the
     /// instance's pairs, their vaults and updaters afterwards, and upgrade it (see PropAMM's
     /// onlyOwner functions), while the caller keeps no rights over it beyond appearing in
-    /// `propAMMsOf`. Each pair names the vault it fills from; there is no instance-wide vault.
+    /// `propAMMsOf`. Each pair names the vault it fills from.
     /// `oracle` is the registry the instance reads prices from and registers its updaters with.
     /// The pairs and their vaults are not in the event: the instance emits one `PairAdded` per
     /// pair from `initialize`, in this same transaction, and that is the one source of pair state.
