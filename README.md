@@ -46,3 +46,11 @@ builders, signer balance).
 - [Deep dive into the internals](docs/components.md)
 - [Pricing models: the shipped ones, and writing your own](docs/pricing.md)
 - [Tokenized stocks: Ondo's pairs, and adding an issuer](docs/stocks.md)
+
+## Audits
+
+[FuzzingLabs](https://fuzzinglabs.com) audited the contracts in October 2026 and then reviewed the fixes.
+
+1. [Security audit report](docs/audits/2026-11-fuzzinglabs/2026-11-03-audit.pdf) (3 November 2026, commit `9732374`)
+2. [Our response to the audit](docs/audits/2026-11-fuzzinglabs/2026-11-17-response.pdf) (17 November 2026)
+3. [Fix review report](docs/audits/2026-11-fuzzinglabs/2026-11-24-fix-review.pdf) (24 November 2026, commit `ddaecc1`)
