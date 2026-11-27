@@ -625,7 +625,7 @@ once.
 A lane whose rebuild onto the new list fails (its feed would not come up) is normally left
 quoting on its old config, as below. When the change took a builder out of the list, or
 changed any field of its entry, that would leave the lane quoting to the builder that was
-removed, so it is stopped instead (audit F-18): its quote is withdrawn at every builder it
+removed, so it is stopped instead: its quote is withdrawn at every builder it
 had, the removed one included, the change is answered `partial` with the pair named as
 stopped, and the next reload starts it on the new list. A change that only adds builders
 leaves such a lane quoting where it was.
@@ -655,7 +655,7 @@ A pair halted by its circuit breaker is the exception: no reload brings it back.
 one converges too), an edit of that pair's own stanza and a new builder list all leave it
 halted, with its quote withdrawn, and `POST /api/reload` names in its answer the pairs it
 left that way. Restarting it would re-arm a breaker nobody had looked at, and the new lane
-would take the very price that tripped it as its reference (audit F-17). A tripped pair that
+would take the very price that tripped it as its reference. A tripped pair that
 the config drops or halts is still removed or stopped, as any other pair would be, but its
 trip outlives it: resuming the pair, or adding it back, leaves it halted on its breaker (the
 backoffice shows it as `breaker_tripped`, and the answer says it was left) until its re-arm.
@@ -855,7 +855,7 @@ mid-change (a `curl` timeout, a closed tab) does not stop it, and the config the
 afterwards is the one that is running.
 
 **Only the names it is served under.** Being on the tailnet is enough to reach the API, and a
-browser on the tailnet sends whatever another site's page tells it to (audit F-02). One way
+browser on the tailnet sends whatever another site's page tells it to. One way
 in is DNS rebinding: a site points its own domain at this host's address after its page has
 loaded, and to the browser that page and the API are then one origin, so the page can send
 anything and read every answer. What gives it away is the name the request is addressed to.
@@ -955,8 +955,8 @@ by Google, for this client ID, not expired, and for a verified address. The keys
 from `https://www.googleapis.com/oauth2/v3/certs` at start and again as Google's
 `Cache-Control` says, so the host needs outbound HTTPS to Google; a failed fetch keeps the
 keys already held and is tried again. A request never waits for that fetch while the key
-its token was signed with is known, so a halt does not depend on reaching Google (audit
-F-06). Until the first fetch succeeds every request answers 503.
+its token was signed with is known, so a halt does not depend on reaching Google.
+Until the first fetch succeeds every request answers 503.
 
 For a page: `GET /api/auth` answers `{"google_client_id": "..."}`, or `null` when sign-in is
 off, without a token, so a front end knows what to sign in with. An ID token is good until
@@ -984,7 +984,7 @@ halt flag, which the pair's lane reads on every tick and is woken by: the lane w
 quote at every builder at once and sends nothing more. Nothing stands in the way. There is
 no re-check of the config on the chain, so another pair failing its checks cannot refuse
 it, and no RPC call, so a hung RPC cannot hold it up. Neither can a change already in
-flight, which the halt does not wait for (audit F-06). The halt is then recorded once that
+flight, which the halt does not wait for. The halt is then recorded once that
 change is done, `halted = true` in the shared config and `config.toml`, and the lane is shut
 down in the background. It is recorded even if the client hangs up before the answer. A halt
 made while a resume of the same pair is in flight wins: the pair stays silent and is halted

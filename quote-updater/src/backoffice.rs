@@ -18,7 +18,7 @@
 //! HTTPS only, with the certificate read again whenever its files change (`tls.rs`).
 //!
 //! Being past the ACL is not the same as meaning to be here: a browser on the tailnet sends
-//! whatever another site's page tells it to (audit F-02). So [`guard`] answers only requests
+//! whatever another site's page tells it to. So [`guard`] answers only requests
 //! addressed to a name the API is served under, which stops a site that points its own
 //! domain at this host (DNS rebinding); takes a change only as JSON, which a page on another
 //! site cannot send here without CORS approval; and refuses one whose `Origin` names another
@@ -396,7 +396,7 @@ async fn bind_with(
 /// Runs before every route. With Google sign-in on, a request first needs a token of an
 /// allowed account ([`signed_in`]); a browser never sends one on its own. Without it this API
 /// has no login, so what it must not do is act on a request that an operator's browser sent
-/// without the operator meaning it (audit F-02). Both ways, the checks below stand.
+/// without the operator meaning it. Both ways, the checks below stand.
 /// A page on another site can make a browser send a plain form post anywhere, without
 /// asking and without the server's say; a `PUT`, a `DELETE`, or a post of JSON it cannot
 /// send without first asking this server, which says yes only to the origins
@@ -959,7 +959,7 @@ async fn remove_pair(
 }
 
 /// Stops a pair quoting and keeps it, with every setting, in the config: the kill switch
-/// (audit F-06, `SharedConfig::halt`). Its lane withdraws its quote at every builder on its
+/// (`SharedConfig::halt`). Its lane withdraws its quote at every builder on its
 /// next tick, with no reload, no RPC call and no other pair's check in the way, so it is
 /// never refused for another pair's sake and never waits on the chain; then the halt is
 /// recorded, in the config and the file.
@@ -1002,7 +1002,7 @@ async fn resume_pair(
     .await
 }
 
-/// Brings back a pair its circuit breaker halted (audit F-17): its lane is restarted from
+/// Brings back a pair its circuit breaker halted: its lane is restarted from
 /// its stanza as it is and trusts the price it finds, which the answer names beside the trip
 /// it clears. Nothing else re-arms a breaker, a reload included, so this is someone deciding
 /// about this one pair, with that price in front of them. Checked like any change starting a
@@ -1043,7 +1043,7 @@ async fn rearm_pair(
 }
 
 /// The tail of a reload's answer naming the pairs left halted on their circuit breaker,
-/// which a reload no longer brings back (audit F-17); empty when there are none.
+/// which a reload no longer brings back; empty when there are none.
 fn tripped_note(states: &PairStates, config: &RawConfig) -> String {
     let running = running(states);
     let tripped: Vec<&str> = config
@@ -1461,7 +1461,7 @@ async fn lookup_pair(State(state): State<Backoffice>, Query(tokens): Query<Token
             let row = found.row(*venue);
             // A market in another dollar is answered but not `selected`, so a front end shows
             // it and leaves it to the operator: averaged at par it fails preflight unless the
-            // pair opts in (audit F-04).
+            // pair opts in.
             let stand_in = row.is_some_and(|r| r.note.starts_with("quoted in"));
             serde_json::json!({
                 "venue": venue.as_str(),
@@ -2306,7 +2306,7 @@ mod tests {
         assert!(config::load_raw(config.path()).unwrap().pairs.is_empty());
     }
 
-    /// A halt is the kill switch, not a converged change (audit F-06): a service that would
+    /// A halt is the kill switch, not a converged change: a service that would
     /// reject every change, as one with a pair failing its checks does, is not asked, and
     /// the halt is recorded in the config and the file all the same.
     #[tokio::test]
@@ -2777,7 +2777,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
     }
 
-    /// Audit F-17: a pair halted on its breaker comes back only through its own re-arm, which
+    /// A pair halted on its breaker comes back only through its own re-arm, which
     /// the service is asked for by lane, with the config as it is. A pair that is not
     /// tripped, one halted rather than tripped, and one that is not there are refused
     /// before anything is asked; and `POST /api/reload` names the tripped pairs it leaves.
@@ -3420,7 +3420,7 @@ mod tests {
         assert_eq!(by("coinbase")["weight"], "10");
         assert_eq!(by("coinbase")["stand_in"], true);
         // Answered, never selected for the operator: averaged at par it fails preflight unless
-        // the pair opts in (audit F-04), so only markets in the pair's own quote are selected.
+        // the pair opts in, so only markets in the pair's own quote are selected.
         assert_eq!(by("binance")["selected"], true);
         assert_eq!(by("coinbase")["selected"], false);
         let note = by("coinbase")["note"]
@@ -4077,7 +4077,7 @@ mod tests {
         assert!(config.snapshot().pairs[0].halted);
     }
 
-    /// The F-06 half: Google's keys endpoint hanging does not hold up a halt signed with a
+    /// Google's keys endpoint hanging does not hold up a halt signed with a
     /// key already fetched.
     #[tokio::test]
     async fn a_halt_does_not_wait_for_googles_keys() {

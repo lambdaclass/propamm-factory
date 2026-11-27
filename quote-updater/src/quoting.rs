@@ -5288,7 +5288,7 @@ mod tests {
         );
     }
 
-    /// The kill switch at the gate (audit F-06): set, a usable price is withdrawn rather
+    /// The kill switch at the gate: set, a usable price is withdrawn rather
     /// than published, once per block like any withdraw; lifted, the price goes out again.
     #[test]
     fn a_halted_gate_withdraws_whatever_the_price_and_a_resume_publishes() {

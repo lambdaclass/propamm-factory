@@ -638,7 +638,7 @@ impl ValueSource {
         // behind the market agree), folded in with the pricer's refusal into the one answer
         // the quote guards see: an `Ok` here is a quote the core would publish. The market's
         // turn at the band is what stops a kind whose mid does not follow the market, a
-        // `fixed` price, once the market leaves the band (audit F-04).
+        // `fixed` price, once the market leaves the band.
         let judged = match priced {
             Ok(priced) => match crate::pricing::backstop(priced, market.as_ref(), &self.pair)
                 .and_then(|()| band.check(priced.mid))
@@ -1357,7 +1357,7 @@ mod tests {
         (tx, ValueSource::feed_for_tests(rx, None, false, 18))
     }
 
-    /// Audit F-05. The average of a pair's venues looks like a price whether or not the
+    /// The average of a pair's venues looks like a price whether or not the
     /// venues agree, so the composite says how far they disagree and the core withdraws
     /// the quote past the pair's limit: here the default, 20 half-spreads of the 0.5 bp
     /// this lane publishes, 10 bp. Nothing latches: the venues agreeing again is the tick
@@ -1448,7 +1448,7 @@ mod tests {
     const TWO_BP: u64 = 200_000_000_000_000;
     const FIVE_PERCENT: u64 = 50_000_000_000_000_000;
 
-    /// Audit F-04, path 1, the PoC's slide: USDC at 1.0000, 0.9997, 0.975, 0.915 and 0.88
+    /// A depeg's slide: USDC at 1.0000, 0.9997, 0.975, 0.915 and 0.88
     /// USDT. A fixed 1.0001 with a 2 bp half-spread bids about 0.99990, so the first step
     /// already puts the market under its bid and an arbitrageur sells it USDC at par; the
     /// pair must not quote from there on. It stops on its own quote, with no band at all,

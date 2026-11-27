@@ -107,7 +107,6 @@ contract PropAMMTest is Test {
     /// The keys an instance starts with are on its own log, like the ones added later. That holds
     /// for instances created on this implementation; one upgraded from an earlier implementation
     /// logged its creation keys nowhere of its own, so for it the registry's log is the record.
-    /// Audit F-16 (and F-15).
     function test_initialize_emitsUpdaterAuthorizedForEachUpdater() public {
         // The implementation's CREATE must not be the call the expectation guards.
         address implementation = address(new PropAMM());
@@ -188,7 +187,7 @@ contract PropAMMTest is Test {
     }
 
     /// With no updaters nothing else would ever call the oracle at creation, so an address
-    /// without code would only surface later, as an instance that never quotes. Audit F-12.
+    /// without code would only surface later, as an instance that never quotes.
     function test_initialize_refusesAnOracleWithoutCode() public {
         // The implementation's CREATE must not be the call expectRevert guards.
         address implementation = address(new PropAMM());
@@ -230,7 +229,7 @@ contract PropAMMTest is Test {
     }
 
     /// `getPairs` promises `token0 < token1`; a pair of one token would be listed as
-    /// `token0 == token1` (audit F-11).
+    /// `token0 == token1`.
     function test_addPair_refusesTheSameTokenTwice() public {
         vm.prank(owner);
         vm.expectRevert(abi.encodeWithSelector(IdenticalTokens.selector, USDC));
@@ -247,7 +246,7 @@ contract PropAMMTest is Test {
 
     /// A token address with no code (a typo, another chain's token, zero) would be listed and
     /// reported active while every quote reverts on `decimals()`, and would trade at the lane's
-    /// price for whatever is deployed there later. Audit F-13.
+    /// price for whatever is deployed there later.
     function test_addPair_refusesATokenWithoutCode() public {
         address ghost = makeAddr("ghost");
         vm.startPrank(owner);
@@ -280,7 +279,7 @@ contract PropAMMTest is Test {
     }
 
     /// `_pricing` multiplies by `10**decimals`; past 36 a pair can overflow on every quote, so it
-    /// is refused when listed rather than discovered at the first quote. Audit F-13.
+    /// is refused when listed rather than discovered at the first quote.
     function test_addPair_refusesMoreThan36Decimals() public {
         MockERC20 wide = new MockERC20();
         wide.setMeta("W", "W", 37);
@@ -434,7 +433,7 @@ contract PropAMMTest is Test {
     }
 
     /// An oracle without code leaves an instance that can never quote, and `isActive` reverting
-    /// on it. Audit F-12.
+    /// on it.
     function test_setOracle_refusesAnAddressWithoutCode() public {
         address eoa = makeAddr("eoa-oracle");
         vm.prank(owner);
@@ -483,7 +482,7 @@ contract PropAMMTest is Test {
         assertFalse(MockPUR(ORACLE).isUpdater(address(propAmm), updater));
     }
 
-    /// The registry ignores a duplicate add, so the instance must not log one. Audit F-16.
+    /// The registry ignores a duplicate add, so the instance must not log one.
     function test_addUpdater_refusesAKeyTheRegistryAlreadyHas() public {
         vm.prank(owner);
         vm.expectRevert(abi.encodeWithSelector(UpdaterAlreadyAuthorized.selector, ORACLE, updater));
@@ -491,7 +490,7 @@ contract PropAMMTest is Test {
     }
 
     /// The registry ignores a remove for a key it does not have, so the instance must not log
-    /// a revocation. Audit F-16.
+    /// a revocation.
     function test_removeUpdater_refusesAKeyTheRegistryDoesNotHave() public {
         address stranger = makeAddr("stranger");
         vm.prank(owner);
@@ -499,8 +498,8 @@ contract PropAMMTest is Test {
         propAmm.removeUpdater(stranger);
     }
 
-    /// The audit's PoC: after a move, removeUpdater reaches only the new registry, so it must not
-    /// log a revocation there while the key stays live on the old one. Audit F-16.
+    /// After a move, removeUpdater reaches only the new registry, so it must not
+    /// log a revocation there while the key stays live on the old one.
     function test_removeUpdater_afterSetOracle_refusesToLogARevocationThatDidNotHappen() public {
         address other = makeAddr("other-registry");
         vm.etch(other, address(new MockPUR()).code);
@@ -513,7 +512,7 @@ contract PropAMMTest is Test {
     }
 
     /// The registry scopes keys to this instance's address, so a key stays live on a registry the
-    /// instance has left; the owner revokes it there without pointing the instance back. Audit F-16.
+    /// instance has left; the owner revokes it there without pointing the instance back.
     function test_removeUpdaterFrom_revokesOnARegistryTheInstanceLeft() public {
         address other = makeAddr("other-registry");
         vm.etch(other, address(new MockPUR()).code);
@@ -529,7 +528,7 @@ contract PropAMMTest is Test {
 
     /// Revoking must never depend on the registry answering `isUpdater`: on one that cannot (an
     /// older build), the removal is forwarded unchecked, so a compromised key can still be
-    /// revoked. Review of audit F-16.
+    /// revoked.
     function test_removeUpdaterFrom_revokesOnARegistryWithoutIsUpdater() public {
         LegacyRegistry legacy = new LegacyRegistry();
         // A key the instance authorized there before `isUpdater` was part of the interface.
@@ -544,7 +543,7 @@ contract PropAMMTest is Test {
     }
 
     /// A mistyped or zero registry gets the same named error `setOracle` gives it, not a bare
-    /// revert from decoding nothing. Review of audit F-16.
+    /// revert from decoding nothing.
     function test_removeUpdaterFrom_refusesARegistryWithoutCode() public {
         address eoa = makeAddr("eoa-registry");
         vm.startPrank(owner);

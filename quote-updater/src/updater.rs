@@ -439,7 +439,7 @@ pub struct UpdaterHandle {
 impl UpdaterHandle {
     /// Converges the running pairs onto the run's config as it is, exactly as the
     /// backoffice's `POST /api/reload` does: a lane whose feed never came up is tried
-    /// again. A lane its circuit breaker halted stays halted (audit F-17): that is
+    /// again. A lane its circuit breaker halted stays halted: that is
     /// [`Self::rearm`]'s, one pair at a time. The config is the one the run read
     /// from its file at start, with every change made since through the backoffice or this
     /// handle; the file is not read again, so a hand edit of it waits for the next start.
@@ -538,7 +538,7 @@ impl UpdaterHandle {
         }
     }
 
-    /// Brings back a pair its circuit breaker halted (audit F-17): its lane is restarted from
+    /// Brings back a pair its circuit breaker halted: its lane is restarted from
     /// its stanza as the run's config has it, and trusts the price it finds, which the
     /// answer names beside the trip it clears. The one way a tripped pair comes back: no
     /// reload re-arms one, [`Self::reload`] included. Checked like any change that starts a

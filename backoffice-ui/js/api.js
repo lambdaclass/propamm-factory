@@ -4,7 +4,7 @@
 // under one address).
 //
 // Every POST and PUT goes as `Content-Type: application/json`, the bodiless ones (halt,
-// resume, reload) included: the API refuses a change sent any other way (audit F-02). When
+// resume, reload) included: the API refuses a change sent any other way. When
 // the backoffice takes a Google sign-in (auth.js), every request carries the ID token as
 // `Authorization: Bearer`. Never cookies (`credentials: "omit"`): a browser sends those on
 // its own, which is what a page on another site would use.

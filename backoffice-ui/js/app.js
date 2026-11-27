@@ -140,7 +140,7 @@ function pairRow(view, refresh) {
           ),
       }, "Halt");
   // The one way back for a pair its circuit breaker halted: no reload, resume or edit
-  // re-arms it (audit F-17). The answer names the price the restarted lane now trusts.
+  // re-arms it. The answer names the price the restarted lane now trusts.
   const rearm =
     status === "breaker_tripped" &&
     h("button", {

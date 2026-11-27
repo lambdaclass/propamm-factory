@@ -136,14 +136,14 @@ contract PropAMMFactoryTest is Test {
     }
 
     /// The documented creation flow passes no updaters, so nothing at creation would call the
-    /// oracle: the factory path has to refuse an address without code too. Audit F-12.
+    /// oracle: the factory path has to refuse an address without code too.
     function test_createPropAMM_refusesAnOracleWithoutCode() public {
         address eoa = makeAddr("eoa-oracle");
         vm.expectRevert(abi.encodeWithSelector(InvalidOracle.selector, eoa));
         factory.createPropAMM(owner, eoa, new address[](0), pairs);
     }
 
-    /// Pairs listed at creation go through the same `_addPair` check as `addPair`. Audit F-13.
+    /// Pairs listed at creation go through the same `_addPair` check as `addPair`.
     function test_createPropAMM_refusesATokenWithoutCode() public {
         address ghost = makeAddr("ghost");
         PropAMM.PairConfig[] memory p = new PropAMM.PairConfig[](1);
@@ -153,7 +153,7 @@ contract PropAMMFactoryTest is Test {
     }
 
     /// `initialize` adds updaters the way `addUpdater` does, so a key listed twice is refused
-    /// rather than logged twice. Audit F-16.
+    /// rather than logged twice.
     function test_createPropAMM_refusesADuplicateUpdater() public {
         address[] memory twice = new address[](2);
         twice[0] = updater;

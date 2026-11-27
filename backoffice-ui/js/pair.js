@@ -245,7 +245,7 @@ export async function pairView(root, { key }) {
     const keepSaved = first && editing;
     // Only markets in the pair's own quote are ticked. One in another dollar (`stand_in`) is
     // filled in but left to the operator, with its note saying why: averaged as if at par, it
-    // fails the startup check unless the pair opts in (audit F-04).
+    // fails the startup check unless the pair opts in.
     const top = new Set(
       data.venues
         .filter((v) => v.listed && !v.stand_in)

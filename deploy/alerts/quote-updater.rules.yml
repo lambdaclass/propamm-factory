@@ -584,7 +584,7 @@ groups:
             on a stable pair, check the peg first. Otherwise either the book is wrong or
             the band is.
 
-      # A `fixed` pair withdrawn because its market left its own quote (audit F-04). That is
+      # A `fixed` pair withdrawn because its market left its own quote. That is
       # the guard working: outside its bid and ask a taker would trade the vault at a stale
       # price. Sustained, it is a depeg or a fixed mid that no longer matches the market.
       - alert: PusherFixedPriceOffMarket

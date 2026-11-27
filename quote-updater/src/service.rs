@@ -73,7 +73,7 @@ impl RunningPair {
     }
 }
 
-/// A trip outliving its lane (audit F-17): a lane halted on its breaker that the service
+/// A trip outliving its lane: a lane halted on its breaker that the service
 /// shut down since, by a halt or a removal. Kept so that resuming the pair, or adding it
 /// back, does not start it unasked: only its re-arm does, and that names this trip.
 pub(crate) struct KeptTrip {
@@ -191,18 +191,18 @@ struct Applied {
     /// run until the flag is cleared.
     halted: Vec<String>,
     restarted: Vec<String>,
-    /// One line per lane re-armed (audit F-17): the mid it now trusts and the trip it
+    /// One line per lane re-armed: the mid it now trusts and the trip it
     /// cleared, so whoever re-armed it reads the price they accepted.
     rearmed: Vec<String>,
     /// Lanes the file would have started or rebuilt, left halted on their breaker until
-    /// their re-arm (audit F-17).
+    /// their re-arm.
     left_tripped: Vec<String>,
     /// Lanes whose feed would not come up. They keep running on their old config (or stay
     /// absent, if they were being added), and this is what says so; unless they are also
     /// in `stopped`.
     failed: Vec<String>,
     /// The failed lanes that were stopped rather than kept: the reload took a builder out
-    /// of the list they quoted to (audit F-18). Not running until a reload starts them.
+    /// of the list they quoted to. Not running until a reload starts them.
     stopped: Vec<String>,
 }
 
@@ -908,8 +908,7 @@ impl Service {
             .map(|pair| pair.spec.key_env.clone());
         let stopped = self.stop(lane).await;
         // A lane halted on its breaker keeps its trip past its own end, so that bringing its
-        // pair back (a resume, an add) does not re-arm it: only its re-arm does (audit
-        // F-17).
+        // pair back (a resume, an add) does not re-arm it: only its re-arm does.
         if let (true, Some(key_env)) = (stopped.halted, key_env) {
             self.kept_trips.insert(
                 lane,
@@ -996,7 +995,7 @@ impl Service {
     ///
     /// The one exception is a reload that takes a builder out of the list (or changes any
     /// field of its entry): a lane kept on its old config would go on quoting to it, so a
-    /// lane that cannot be rebuilt onto the new list is stopped instead (audit F-18).
+    /// lane that cannot be rebuilt onto the new list is stopped instead.
     async fn reload(
         &mut self,
         done: &tokio::sync::mpsc::UnboundedSender<(U256, u64)>,
@@ -1040,7 +1039,7 @@ impl Service {
         //
         // First, whether the new list drops an entry the old one had (a builder removed, or
         // any field of its entry changed): the lanes still on the old list quote to it, and
-        // one whose rebuild fails cannot be left so (audit F-18). A list that only adds builders
+        // one whose rebuild fails cannot be left so. A list that only adds builders
         // leaves a failed lane quoting where it was told to, as any failed rebuild does.
         let builder_dropped = new_builders
             .as_ref()
@@ -1163,7 +1162,7 @@ impl Service {
                 Err(err) if was_running && builder_dropped => {
                     // Its old config quotes to a builder this reload took out of the list:
                     // stopped, which withdraws its quote at every builder it had, that one
-                    // included (audit F-18). Stopped as a removal is, so a trip it carries
+                    // included. Stopped as a removal is, so a trip it carries
                     // outlives it and only its re-arm clears it. Nothing quotes the lane
                     // until a reload starts it again, which the next one does.
                     let label = self.retire(spec.lane).await;
@@ -1189,7 +1188,7 @@ impl Service {
             };
             // A lane that tripped while its replacement was being built (which can take a
             // first price's wait) is not swapped for it unless this is its re-arm: that
-            // would re-arm it by the back door (audit F-17). It stays as it is, halted on
+            // would re-arm it by the back door. It stays as it is, halted on
             // the trip, and the replacement is dropped unstarted.
             if !rearm.contains(&spec.lane)
                 && self
@@ -1284,7 +1283,7 @@ impl Service {
                 applied.added.push(label.clone());
             }
             if stopped.halted || kept.is_some() {
-                // Only a re-arm reaches here (audit F-17): a reload starts no lane its
+                // Only a re-arm reaches here: a reload starts no lane its
                 // breaker halted unless asked to by name. Said in full, with the price the
                 // lane now trusts beside what tripped it, so whoever asked reads the price
                 // they accepted rather than a count.
@@ -1319,7 +1318,7 @@ pub(crate) enum ReloadFailure {
     /// so the change is dropped and the file written for it put back.
     Rejected(String),
     /// Applied to every lane it reached, but at least one kept its previous config (or was
-    /// not started, or was stopped: audit F-18) because its feed would not come up. The
+    /// not started, or was stopped) because its feed would not come up. The
     /// change is kept: it is live on the lanes it reached, a halt among them, and dropping
     /// it would describe neither what runs nor what was asked for, and have the next reload
     /// undo the rest.
@@ -1929,7 +1928,7 @@ mod tests {
     }
 
     /// Shutting down a lane the kill switch silenced touches that lane alone: another lane
-    /// halted on its breaker stays halted, neither restarted nor re-armed (audit F-17 is a
+    /// halted on its breaker stays halted, neither restarted nor re-armed (that rule is a
     /// reload's, and a halt is not one), and the generation moves for the config change.
     #[tokio::test]
     async fn retiring_a_halted_lane_leaves_a_tripped_one_tripped() {
@@ -2333,7 +2332,7 @@ pricing = { kind = "feed" }
     }
 
     /// A re-arm answers with the price the lane now trusts, beside the trip it cleared, so
-    /// whoever re-armed it reads what they accepted (audit F-17); and the summary carries it.
+    /// whoever re-armed it reads what they accepted; and the summary carries it.
     #[test]
     fn a_rearm_line_names_the_mid_it_trusts() {
         let trip = trip_at(
@@ -2384,7 +2383,7 @@ pricing = { kind = "feed" }
     }
 
     /// A partial reload's answer says where its failed lanes were left: a stopped one is not
-    /// read as still quoting (audit F-18).
+    /// read as still quoting.
     #[test]
     fn a_partial_reload_says_which_failed_lanes_were_stopped() {
         let kept = Applied {
@@ -2844,7 +2843,7 @@ api_key = "k"
             tasks
         }
 
-        /// Audit F-18: a builder taken out of the list while one lane's rebuild onto the new
+        /// A builder taken out of the list while one lane's rebuild onto the new
         /// list fails. That lane is stopped, its quote withdrawn at every builder it had, the
         /// removed one included, rather than left quoting to the builder this change took
         /// out. The reload is partial and says so, and the next one starts the lane on the
@@ -3052,7 +3051,7 @@ api_key = "k"
             assert_eq!(specs(&service), before, "nothing changed");
         }
 
-        /// Audit F-17, the side doors: a tripped pair halted and resumed, or removed and
+        /// The side doors: a tripped pair halted and resumed, or removed and
         /// added back, is not started on the way back. Its trip outlived its lane, reads
         /// as tripped to the backoffice, and only its re-arm starts it, naming that trip.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3185,7 +3184,7 @@ api_key = "k"
             assert!(service.running.contains_key(&lane));
         }
 
-        /// Audit F-17, the back door: a lane that trips while a reload is rebuilding it (a
+        /// The back door: a lane that trips while a reload is rebuilding it (a
         /// build that waits, as a feed's first price does) is not swapped for the rebuilt
         /// run, which would re-arm it unasked. It stays halted on its trip, and its own
         /// re-arm then brings it back on the stanza as it is.

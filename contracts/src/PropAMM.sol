@@ -183,7 +183,7 @@ contract PropAMM is
     /// timestamp whose `delta` and `mid` pass `_pricing`'s checks, and the vault holds some
     /// `tokenOut`. So it is per direction: a vault holding one side only is active one way.
     ///
-    /// Never reverts (audit F-14). `IPropAMM` offers this as the probe a router can make before
+    /// Never reverts. `IPropAMM` offers this as the probe a router can make before
     /// it pays for a quote, and an off-chain caller may ask it of several instances in one
     /// batch; a revert would take the probe down, and the batch with it. So the registry and the
     /// token are asked with low-level calls and their answers read only once they are long
@@ -198,7 +198,7 @@ contract PropAMM is
         if (paused()) return false;
         uint256 pairKey = _pairKey(tokenIn, tokenOut);
         address vault = pairVaults[pairKey];
-        // A removed pair's lane can still hold a fresh update (audit F-09), and the zero address
+        // A removed pair's lane can still hold a fresh update, and the zero address
         // holds a balance of most tokens, so the checks below would not turn it away.
         if (vault == address(0)) return false;
 

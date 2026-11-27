@@ -129,14 +129,14 @@ MINT_AMOUNT := 1000000000000000000000000
 PUSHER_KEY_ENV := UPDATER_KEY_USDC_USDT
 INTERVAL ?= 12
 # The spread `make price-service` quotes its fixed PRICE with. Not DELTA's 0: a fixed price
-# quotes only while its market sits inside its own spread (audit F-04), so with none it would
+# quotes only while its market sits inside its own spread, so with none it would
 # quote only on a market exactly at PRICE.
 SERVICE_DELTA ?= 0.0005
 
 # $(1) = target address, $(2) = output path: a config for the local pair, fixed price or a
 # Binance symbol (SYMBOL=USDCUSDT streams the live mid and spread instead). The fixed price
-# streams Binance's USDCUSDT too: a fixed price needs a market to compare its price with
-# (audit F-04), and quotes only while that market sits within SERVICE_DELTA of PRICE. So the
+# streams Binance's USDCUSDT too: a fixed price needs a market to compare its price with,
+# and quotes only while that market sits within SERVICE_DELTA of PRICE. So the
 # updater must reach Binance, and PRICE must sit inside the [0.995, 1.005] band.
 define write_updater_config
 mkdir -p .local; \

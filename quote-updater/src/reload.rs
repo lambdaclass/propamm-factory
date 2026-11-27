@@ -31,7 +31,7 @@ pub enum Action {
     /// halted. Stop it and start it from this spec.
     Restart(PairSpec),
     /// Halted on its circuit breaker, and the file would have it started or rebuilt: left
-    /// halted, since only its re-arm brings it back (audit F-17). Emitted so the reload
+    /// halted, since only its re-arm brings it back. Emitted so the reload
     /// says so, rather than leaving an operator who resumed or edited it to wonder.
     StayTripped(U256),
 }
@@ -50,7 +50,7 @@ impl Action {
 ///
 /// `tripped` is the set of lanes whose pair stopped on its circuit breaker: running, or
 /// shut down since (halted, or removed from the file) with the trip remembered. Such a lane
-/// stays stopped, whatever the reload is for (audit F-17): an edit of another pair, an edit
+/// stays stopped, whatever the reload is for: an edit of another pair, an edit
 /// of its own stanza, a new builder list, a resume of the pair after a halt, the pair added
 /// back after a removal. Starting it would re-arm a breaker nobody looked at, and the new
 /// lane would trust the very price that tripped it. Only a lane in `rearm` is started,
@@ -203,7 +203,7 @@ mod tests {
         );
     }
 
-    /// Audit F-17: a lane halted on its breaker stays halted through every reload, one for
+    /// A lane halted on its breaker stays halted through every reload, one for
     /// an unrelated pair, one that edits its own stanza, one that changes the builder list.
     /// Only its own re-arm restarts it, from the stanza as it is then.
     #[test]

@@ -1528,7 +1528,7 @@ mod tests {
 
     /// `--check` applies the band, on the published mid and on the market's, as the run does:
     /// a fixed USDC/USDT price whose market has left its band is refused here too, rather than
-    /// shown as what the pair would publish. Audit F-04 (review).
+    /// shown as what the pair would publish.
     #[test]
     fn a_preview_row_is_held_to_the_band_the_run_applies() {
         let shape = PairShape {
